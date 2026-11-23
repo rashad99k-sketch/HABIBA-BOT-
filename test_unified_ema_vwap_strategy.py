@@ -91,17 +91,15 @@ def test_buy_and_sell_crosses_are_confirmed_on_closed_candles(tmp_path):
     for side in ("BUY", "SELL"):
         f = cross_frame(side)
         engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / f"{side}.json"))
-        from unified_ema_vwap_strategy import _find_causal_zone, indicators
+        from unified_ema_vwap_strategy import _find_causal_zone, indicators, indicator_series
         vals = indicators(f)
-        cross_idx = int(np.where(np.diff(np.sign(
-            f.close.ewm(span=9, adjust=False).mean() -
-            f.close.ewm(span=15, adjust=False).mean())) != 0)[0][-1] + 1)
+        series = indicator_series(f)
+        ema9, vwap = series["ema9"], series["vwap_series"]
+        cross_idx = int(np.where(np.diff(np.sign(ema9 - vwap)) != 0)[0][-1] + 1)
         assert _find_causal_zone(f, cross_idx, side, vals["atr14"]) is None
         result = engine.evaluate(side, f, now_ms=int(f.timestamp.iloc[-1] + 900_000))
         assert result["direction"] == side
         assert result["crossover_ts"] is not None
-        # A mathematically valid cross without a causal OB/FVG must not become
-        # an executable watchlist setup.
         assert result["status"] == "INVALIDATED"
         assert result["expiration_reason"] == "NO_CAUSAL_ZONE"
 
