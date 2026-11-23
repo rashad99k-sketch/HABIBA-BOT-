@@ -40,5 +40,3 @@ jobs:
         run: python -m compileall -q .
       - name: Full regression suite
         run: python -m pytest -q
-
-# Trigger PR validation after workflow is present on the base branch.
