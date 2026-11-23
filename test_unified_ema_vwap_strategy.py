@@ -93,8 +93,11 @@ def test_buy_and_sell_crosses_are_confirmed_on_closed_candles(tmp_path):
         engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / f"{side}.json"))
         result = engine.evaluate(side, f, now_ms=int(f.timestamp.iloc[-1] + 900_000))
         assert result["direction"] == side
-        assert result["status"] in {"WAITING_FOR_PULLBACK", "WAITING_FOR_REJECTION"}
         assert result["crossover_ts"] is not None
+        # A mathematically valid cross without a causal OB/FVG must not become
+        # an executable watchlist setup.
+        assert result["status"] == "INVALIDATED"
+        assert result["expiration_reason"] == "NO_CAUSAL_ZONE"
 
 
 def test_cross_on_unclosed_bar_is_never_discovered(tmp_path):
