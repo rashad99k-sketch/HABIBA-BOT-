@@ -229,6 +229,90 @@ class UnifiedEMAVWAPPullbackEngine:
             except TypeError:
                 return None
 
+    def authorize(self, symbol: str, price: float, tp1: float) -> Dict[str, Any]:
+        """Consume a completed setup only after validating its causal zone and target space.
+
+        Authorization is a strategy decision, not an exchange order. The GGP execution
+        service remains responsible for sizing, order placement, fills and protection.
+        """
+        with self._lock:
+            setup = self.get(symbol)
+            def reject(reason: str, status: Optional[str] = None) -> Dict[str, Any]:
+                return {"allowed": False, "reason": reason,
+                        "status": status or (setup.status if setup else "UNKNOWN")}
+            if setup is None or setup.status != "ENTRY_READY":
+                return reject("setup_not_entry_ready")
+            if not all(_finite(v) for v in (price, tp1, setup.atr14)):
+                return reject("invalid_price_or_atr")
+            atr = float(setup.atr14)
+            entry = float(price)
+            target = float(tp1)
+            if atr <= 0:
+                return reject("invalid_atr")
+            if (not _finite(setup.causal_zone_low) or not _finite(setup.causal_zone_high)
+                    or float(setup.causal_zone_low) >= float(setup.causal_zone_high)
+                    or setup.causal_zone_type not in {"FVG", "ORDER_BLOCK"}):
+                return reject("tp1_atr_or_causal_zone_unknown")
+            if (setup.rejection_ts is None or setup.confirmation_ts is None
+                    or int(setup.confirmation_ts) <= int(setup.rejection_ts)):
+                return reject("rejection_confirmation_lifecycle_incomplete")
+            if setup.direction == "BUY":
+                if target <= entry:
+                    return reject("tp1_not_forward_of_entry")
+                extension = max(0.0, (entry - float(setup.causal_zone_high)) / atr)
+            elif setup.direction == "SELL":
+                if target >= entry:
+                    return reject("tp1_not_forward_of_entry")
+                extension = max(0.0, (float(setup.causal_zone_low) - entry) / atr)
+            else:
+                return reject("invalid_setup_direction")
+            if extension > MAX_EXTENSION_ATR:
+                setup.status = "NO_CHASE"
+                setup.entry_status = "BLOCKED"
+                setup.reason = "entry_price_too_far_from_causal_zone"
+                setup.expiration_reason = "ENTRY_WINDOW_MISSED"
+                self._persist(setup)
+                return reject("entry_window_missed_no_chase", "NO_CHASE")
+            # TP1 must provide real forward space; a target inside the entry/zone
+            # boundary is not a valid execution handoff.
+            if setup.direction == "BUY" and target <= float(setup.causal_zone_high):
+                return reject("tp1_atr_or_causal_zone_unknown")
+            if setup.direction == "SELL" and target >= float(setup.causal_zone_low):
+                return reject("tp1_atr_or_causal_zone_unknown")
+            setup.entry_status = "AUTHORIZED"
+            setup.reason = "strategy_authorized_closed_candle_confirmation"
+            self._persist(setup)
+            return {"allowed": True, "reason": "authorized",
+                    "status": setup.status, "symbol": setup.symbol,
+                    "side": setup.direction, "entry_price": entry, "tp1": target}
+
+    def mark_executing(self, symbol: str) -> bool:
+        """Move an authorized setup into the single in-flight execution state."""
+        with self._lock:
+            setup = self.get(symbol)
+            if (setup is None or setup.status != "ENTRY_READY"
+                    or setup.entry_status != "AUTHORIZED"
+                    or setup.rejection_ts is None or setup.confirmation_ts is None
+                    or int(setup.confirmation_ts) <= int(setup.rejection_ts)):
+                return False
+            setup.status = "ENTRY_EXECUTING"
+            setup.entry_status = "ENTRY_EXECUTING"
+            setup.reason = "authorized_handoff_consumed_by_execution"
+            self._persist(setup)
+            return True
+
+    def mark_open(self, symbol: str) -> bool:
+        """Mark a setup open only after the existing execution path confirms success."""
+        with self._lock:
+            setup = self.get(symbol)
+            if setup is None or setup.status != "ENTRY_EXECUTING":
+                return False
+            setup.status = "TRADE_OPEN"
+            setup.entry_status = "TRADE_OPEN"
+            setup.reason = "execution_confirmed_trade_open"
+            self._persist(setup)
+            return True
+
     def all(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             return {k: dict(v) for k, v in self._items.items()}
@@ -323,14 +407,14 @@ class UnifiedEMAVWAPPullbackEngine:
                 old.last_candle_ts = latest_ts
                 old.updated_at = now_ms/1000
                 return self._persist(old)
+            side = old.direction
+            j = len(x)-1
+            price, atr = float(x.close.iloc[j]), float(vals["atr14"])
+            vwap = float(vals["vwap"])
             bars = int((x.timestamp > old.crossover_ts).sum())
             if bars > MAX_CROSS_AGE:
                 old.status, old.reason, old.expiration_reason = "EXPIRED", "entry_window_expired", "ENTRY_WINDOW_EXPIRED"
             else:
-                side = old.direction
-                j = len(x)-1
-                price, atr = float(x.close.iloc[j]), float(vals["atr14"])
-                vwap = float(vals["vwap"])
                 aligned = (price > vwap and float(e9.iloc[j]) > vwap) if side == "BUY" else (price < vwap and float(e9.iloc[j]) < vwap)
                 invalid = (price < vwap or float(e9.iloc[j]) <= vwap) if side == "BUY" else (price > vwap or float(e9.iloc[j]) >= vwap)
                 if invalid:
