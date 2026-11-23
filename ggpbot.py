@@ -9139,13 +9139,12 @@ def smart_opportunity_selection():
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "insufficient_fresh_closed_ohlcv"
                 continue
-            # Institutional engines are queried for context only. They cannot
-            # overwrite or veto the closed-candle EMA/VWAP direction. Empty hints
-            # request an unbiased structural snapshot; the strategy side stays canonical.
+            # Evaluate both institutional sides independently for structural context.
+            # Neither side result can override or veto the EMA/VWAP direction.
             fresh = roro_analyze_symbol_both(
                 exchange_sym, closed_df,
                 now_ms=int(time.time() * 1000),
-                side_hints=[],
+                side_hints=["BUY", "SELL"],
             )
             fresh.update(_enrich_with_existing_gpp_engines(closed_df, side, fresh))
             item.update(fresh)
