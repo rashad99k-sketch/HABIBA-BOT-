@@ -9300,11 +9300,15 @@ def smart_opportunity_selection():
                 "causal_zone_ts": setup_obj.causal_zone_ts,
                 "evidence": evidence,
                 "structural_stop": float(sl),
-                "pullback_type": next((x.split(":", 1)[0] for x in evidence
-                                        if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
+                "pullback_type": str(getattr(setup_obj, "entry_path", None) or getattr(setup_obj, "pullback_type", None) or "UNKNOWN"),
+                "entry_crossover_ts": setup_obj.crossover_ts,
+                "entry_rejection_ts": setup_obj.rejection_ts,
+                "entry_confirmation_ts": setup_obj.confirmation_ts,
+                "entry_zone_strength": (setup_obj.trend_evidence or {}).get("zone_status", "UNKNOWN"),
+                "entry_trend_evidence": dict(setup_obj.trend_evidence or {}),
                 "exchange_symbol": exchange_sym,
                 # This handoff token is created only after authorize() accepted the
-                # closed-bar EMA9/EMA15 + Session VWAP + pullback/rejection/confirmation.
+                # closed-bar EMA9/Session-VWAP cross + causal-zone pullback/rejection/confirmation.
                 "ema_vwap_authorized": True,
                 "canonical_symbol": canonical,
                 "side": side,
