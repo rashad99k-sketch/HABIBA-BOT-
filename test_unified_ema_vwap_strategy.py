@@ -108,7 +108,7 @@ def test_cross_on_unclosed_bar_is_never_discovered(tmp_path):
     f = cross_frame("BUY")
     close = np.r_[np.linspace(120, 100, 60), np.linspace(99.8, 95, 9), 120.0]
     f["open"] = close; f["close"] = close; f["high"] = close + .2; f["low"] = close - .2
-    # The only EMA cross is on the latest bar, which remains unclosed at now_ms.
+    # The EMA9/Session-VWAP crossover on the latest bar must remain undiscovered while forming.
     now = int(f.timestamp.iloc[-1] + 900_000 - 1)
     result = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "forming.json")).evaluate("BUY", f, now_ms=now)
     assert result["crossover_ts"] is None
