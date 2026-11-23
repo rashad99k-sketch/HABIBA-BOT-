@@ -1,15 +1,7 @@
-"""Single, deterministic profit-mode policy for the GGP trade manager.
-
-This module makes no exchange calls and never sends orders. It only classifies
-trade-management mode and computes price targets; execution and fill verification
-remain in the existing GGP execution layer.
-"""
+"""Single, deterministic profit policy. Pure functions only; no exchange calls."""
 from __future__ import annotations
-
-from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
-
 
 RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
 RANGE_MODE = "RANGE_SCALP"
@@ -25,35 +17,39 @@ def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _bool(ctx: Dict[str, Any], key: str) -> bool:
+    return bool(ctx.get(key, False))
+
+
+def _side_aligned(side: str, plus: Optional[float], minus: Optional[float]) -> bool:
+    if plus is None or minus is None:
+        return False
+    return plus > minus if side == "BUY" else minus > plus
+
 
 def adaptive_trail_multiplier(base_multiplier: float, continuation_probability: float, adx: float,
                               distribution_risk: float, exit_warning: int, ema_state: str = "UNKNOWN",
-                              peak_drawdown_roe: float = 0.0, tp1_verified: bool = True) -> float:
-    """RORO-derived adaptive runner defense; only returns a multiplier, never sends orders.
-
-    A confirmed expanding trend gets room. Distribution, warnings and giveback
-    progressively tighten the stop. It never widens an already-committed stop;
-    the caller applies the existing monotonic ratchet.
-    """
+                              peak_drawdown_roe: float = 0.0, tp1_verified: bool = True,
+                              trend_evidence_score: float = 0.0) -> float:
+    """Adapt runner ATR defense from trend evidence; ADX is not a numeric trigger."""
     mult = _number(base_multiplier, 1.5) or 1.5
     cont = _number(continuation_probability, 0.0) or 0.0
-    adx_value = _number(adx, 0.0) or 0.0
     dist = _number(distribution_risk, 0.0) or 0.0
     warning = int(_number(exit_warning, 0.0) or 0)
     giveback = max(0.0, _number(peak_drawdown_roe, 0.0) or 0.0)
-    if cont >= 0.78 and adx_value >= 25 and dist < 35 and warning <= 1:
-        mult *= 1.20
-    elif cont < 0.55 or dist >= 45 or warning >= 3:
+    evidence = _number(trend_evidence_score, 0.0) or 0.0
+    if evidence >= 70 and cont >= 0.72 and dist < 35 and warning <= 1:
+        mult *= 1.18
+    elif evidence < 45 or cont < 0.50 or dist >= 45 or warning >= 3:
         mult *= 0.75
     if dist >= 65 or warning >= 4:
         mult *= 0.75
-    if ema_state in {"TREND_RIDE", "EMA20_PULLBACK", "EMA50_PULLBACK"} and cont >= 0.60 and dist < 45 and warning <= 2:
+    if ema_state in {"TREND_RIDE", "EMA20_PULLBACK", "EMA50_PULLBACK"} and evidence >= 60 and cont >= 0.60 and dist < 45 and warning <= 2:
         mult *= 1.08
-    elif ema_state == "EMA20_RETEST_PENDING" and cont >= 0.50 and dist < 45 and warning <= 2:
+    elif ema_state == "EMA20_RETEST_PENDING" and evidence >= 55 and cont >= 0.50 and dist < 45 and warning <= 2:
         mult *= 1.04
     elif ema_state in {"EMA50_BREAK_PENDING", "EMA50_BREAK_CONFIRMED"}:
         mult *= 0.82 if ema_state == "EMA50_BREAK_PENDING" else 0.65
-    # Once meaningful MFE exists, reduce the amount of profit given back.
     if giveback >= 12:
         mult *= 0.80
     if giveback >= 25:
@@ -101,93 +97,101 @@ def ema_trend_context(df_closed: Any, side: str, atr: float = 0.0) -> Dict[str, 
 
 
 def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, ...]]:
-    """Classify only from observed evidence; UNKNOWN never means RANGE_SCALP.
-
-    RANGE_SCALP is deliberately gated by multiple independent signs of a weak,
-    choppy or thin market. Missing data falls back to the safer 50/50 plan.
-    """
+    """Classify weak/range vs trend from independent evidence; ADX has one small vote."""
     ctx = context if isinstance(context, dict) else {}
     side = str(ctx.get("side") or "").upper()
     if side not in {"BUY", "SELL"}:
         return STANDARD_MODE, "invalid_side_default_two_stage", ("invalid_side",)
-
-    regime = str(ctx.get("regime") or "UNKNOWN").upper()
-    state = str(ctx.get("trade_state") or "UNKNOWN").upper()
-    adx = _number(ctx.get("adx"))
-    adx_slope = _number(ctx.get("adx_slope"))
+    adx, adx_slope = _number(ctx.get("adx")), _number(ctx.get("adx_slope"))
+    plus, minus = _number(ctx.get("di_plus")), _number(ctx.get("di_minus"))
     continuation = _number(ctx.get("continuation_probability"))
-    plus = _number(ctx.get("di_plus"))
-    minus = _number(ctx.get("di_minus"))
-    volume_ratio = _number(ctx.get("volume_ratio"))
-    momentum_strength = _number(ctx.get("momentum_strength"))
-    spread_pct = _number(ctx.get("spread_pct"))
-    depth_usdt = _number(ctx.get("orderbook_depth_usdt"))
-    liquidity_quality = str(ctx.get("liquidity_quality") or "UNKNOWN").upper()
-    structure_broken = bool(ctx.get("structure_broken", False))
+    momentum = _number(ctx.get("momentum_strength"))
+    volume = _number(ctx.get("volume_ratio"))
+    atr_exp = _number(ctx.get("atr_expansion_ratio"))
+    vwap_slope = _number(ctx.get("vwap_slope_atr"))
+    ema_slope = _number(ctx.get("ema9_slope_atr"))
+    structure = _number(ctx.get("structure_score"))
+    liquidity = str(ctx.get("liquidity_quality") or "UNKNOWN").upper()
+    spread = _number(ctx.get("spread_pct"))
+    depth = _number(ctx.get("orderbook_depth_usdt"))
+    min_depth = _number(ctx.get("min_orderbook_depth_usdt"), 0.0) or 0.0
+    broken = _bool(ctx, "structure_broken")
+    adverse_div = _bool(ctx, "adverse_divergence")
+    opposing_pool = _bool(ctx, "opposing_liquidity_near")
+    di_ok = _side_aligned(side, plus, minus)
+    di_spread = abs(plus-minus) if plus is not None and minus is not None else None
+    trend = {
+        "directional_di": di_ok and di_spread is not None and di_spread >= 5,
+        "ema_vwap_slope": ema_slope is not None and vwap_slope is not None and
+            (ema_slope > 0 and vwap_slope > 0 if side == "BUY" else ema_slope < 0 and vwap_slope < 0),
+        "structure": structure is not None and structure >= 60 and not broken,
+        "continuation": continuation is not None and continuation >= .62,
+        "momentum": momentum is not None and momentum >= 55,
+        "relative_volume": volume is not None and volume >= 1.0,
+        "atr_expansion": atr_exp is not None and atr_exp >= 1.05,
+        "candle_follow_through": _bool(ctx, "candle_follow_through"),
+        "adx_support": adx is not None and adx_slope is not None and adx >= 18 and adx_slope >= 0,
+    }
+    trend_count = sum(bool(v) for v in trend.values())
+    # Mandatory directional structure, VWAP/EMA slope and continuation, plus at
+    # least three other independent confirmations. ADX is only one vote.
+    if (trend_count >= 6 and trend["directional_di"] and trend["ema_vwap_slope"]
+            and trend["structure"] and trend["continuation"] and not broken and not adverse_div):
+        return TREND_MODE, "multi_factor_directional_trend_confirmed", tuple(k for k,v in trend.items() if v)
 
-    di_known = plus is not None and minus is not None
-    di_aligned = (plus > minus) if side == "BUY" and di_known else (minus > plus) if side == "SELL" and di_known else False
-    di_spread = abs(plus - minus) if di_known else None
-    regime_range = regime in {"RANGE", "RANGE_CHOP", "CHOP", "CHOPPY", "COMPRESSION"} or state in {"RANGE_CHOP", "CHOP", "COMPRESSION"}
-    weak_adx = adx is not None and (adx < 18.0 or (adx < 20.0 and adx_slope is not None and adx_slope <= 0.0))
-    weak_continuation = continuation is not None and continuation <= 0.48
-    low_volume = volume_ratio is not None and volume_ratio <= 0.75
-    very_low_volume = volume_ratio is not None and volume_ratio <= 0.60
-    di_tangled = di_spread is not None and di_spread <= 3.0
-    weak_momentum = momentum_strength is not None and momentum_strength < 35.0
-    wide_spread = spread_pct is not None and spread_pct >= 0.15
-    shallow_book = depth_usdt is not None and depth_usdt > 0 and depth_usdt < _number(ctx.get("min_orderbook_depth_usdt"), 0.0)
-    explicit_thin = liquidity_quality in {"THIN", "LOW", "ILLIQUID", "POOR"}
-    thin_liquidity = explicit_thin or wide_spread or shallow_book
+    thin = (liquidity in {"THIN","LOW","ILLIQUID","POOR"}
+            or (spread is not None and spread >= .15)
+            or (depth is not None and min_depth > 0 and depth < min_depth))
+    weak = {
+        "adx_not_supportive": adx is not None and adx_slope is not None and (adx_slope < 0 or adx < 18),
+        "di_tangled_or_opposed": not di_ok or (di_spread is not None and di_spread < 4),
+        "momentum_weak": momentum is not None and momentum < 35,
+        "continuation_weak": continuation is not None and continuation < .48,
+        "relative_volume_low": volume is not None and volume < .75,
+        "atr_compression": atr_exp is not None and atr_exp < .85,
+        "flat_or_opposed_vwap_ema": ema_slope is not None and vwap_slope is not None and
+            (abs(ema_slope) < .05 or abs(vwap_slope) < .05 or ema_slope*vwap_slope < 0),
+        "structure_weak_or_broken": broken or (structure is not None and structure < 40),
+        "liquidity_thin": thin,
+        "adverse_divergence": adverse_div,
+        "opposing_liquidity_near": opposing_pool,
+    }
+    weak_count = sum(bool(v) for v in weak.values())
+    regime = str(ctx.get("regime") or "").upper()
+    range_regime = regime in {"RANGE","RANGE_CHOP","CHOP","CHOPPY","COMPRESSION"} or _bool(ctx,"range_structure")
+    if (not trend_count >= 6 and
+        ((range_regime and weak_count >= 3) or (thin and weak_count >= 3) or weak_count >= 5)):
+        return RANGE_MODE, "multi_factor_weak_or_range_market_confirmed", tuple(k for k,v in weak.items() if v)
+    return STANDARD_MODE, "evidence_inconclusive_keep_two_stage_50_50", tuple(k for k,v in weak.items() if v) or ("insufficient_evidence",)
 
-    evidence = []
-    if regime_range:
-        evidence.append("range_or_chop_regime")
-    if weak_adx:
-        evidence.append("weak_or_falling_adx")
-    if weak_continuation:
-        evidence.append("weak_continuation_probability")
-    if low_volume:
-        evidence.append("low_relative_volume")
-    if di_tangled:
-        evidence.append("di_pressure_tangled")
-    if weak_momentum:
-        evidence.append("weak_momentum")
-    if thin_liquidity:
-        evidence.append("thin_liquidity_evidence")
-    if structure_broken:
-        evidence.append("trend_structure_broken")
 
-    # Trend riding requires several independent, side-aligned observations.
-    momentum_support = (momentum_strength is not None and momentum_strength >= 55.0) or bool(ctx.get("trend_expansion", False))
-    regime_trend = regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or state in {"TREND_RIDE", "EXPANSION", "HEALTHY_PULLBACK"}
-    confirmed_trend = (
-        not structure_broken
-        and regime_trend
-        and adx is not None and adx >= 22.0
-        and adx_slope is not None and adx_slope >= -1.5
-        and continuation is not None and continuation >= 0.62
-        and di_aligned
-        and momentum_support
-    )
-    if confirmed_trend:
-        return TREND_MODE, "confirmed_directional_regime_and_continuation", tuple(evidence + ["directional_di_alignment"])
-
-    weakness_count = sum((weak_adx, weak_continuation, low_volume, di_tangled, weak_momentum, thin_liquidity, structure_broken))
-    # RANGE_SCALP requires an identifiable range/weak regime plus more than one
-    # supporting weakness, OR explicit thin-liquidity evidence plus weak trend data.
-    range_confirmed = regime_range and weakness_count >= 2 and adx is not None and continuation is not None
-    weak_market_confirmed = (
-        weak_adx and weak_continuation and (low_volume or di_tangled or thin_liquidity)
-    )
-    thin_market_confirmed = thin_liquidity and (weak_adx or weak_continuation or low_volume) and weakness_count >= 2
-    if range_confirmed or weak_market_confirmed or thin_market_confirmed:
-        return RANGE_MODE, "confirmed_range_weak_market_or_thin_liquidity", tuple(evidence)
-
-    # Crucial fail-safe: indicator/API gaps do not automatically force a short
-    # scalp or a full-position exit. Keep the canonical 50/50 management model.
-    return STANDARD_MODE, "range_conditions_not_proven_keep_two_stage_50_50", tuple(evidence or ("insufficient_range_evidence",))
-
+def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
+    """Select 0.25/0.50/1.00% price move after cost and opposing liquidity tests."""
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    costs = _number(ctx.get("estimated_round_trip_cost_pct"))
+    room = _number(ctx.get("opposing_liquidity_distance_pct"))
+    if side not in {"BUY","SELL"} or costs is None or room is None:
+        return 0.0, "missing_side_cost_or_opposing_liquidity"
+    min_net = _number(ctx.get("minimum_net_profit_pct"), .10) or .10
+    quality = _number(ctx.get("entry_quality_score"), 0) or 0
+    momentum = _number(ctx.get("momentum_strength"))
+    cont = _number(ctx.get("continuation_probability"))
+    volume = _number(ctx.get("volume_ratio"))
+    di_ok = _side_aligned(side, _number(ctx.get("di_plus")), _number(ctx.get("di_minus")))
+    adverse = _bool(ctx,"adverse_rejection") or _bool(ctx,"adverse_divergence")
+    thin = _bool(ctx,"thin_liquidity") or str(ctx.get("liquidity_quality") or "").upper() in {"THIN","LOW","ILLIQUID","POOR"}
+    avail = [t for t in RANGE_PROFIT_TARGETS_PCT if t-costs >= min_net and room >= t*1.10]
+    if not avail:
+        return 0.0, "no_target_has_net_edge_and_forward_room"
+    mx = max(avail)
+    strong = quality >= 75 and momentum is not None and momentum >= 60 and cont is not None and cont >= .65 and volume is not None and volume >= 1.15 and di_ok and not adverse and not thin
+    medium = quality >= 55 and momentum is not None and momentum >= 42 and cont is not None and cont >= .50 and not adverse and not thin
+    if mx >= 1.0 and strong:
+        return 1.0, "strong_entry_quality_and_forward_liquidity"
+    if mx >= .50 and medium:
+        return .50, "moderate_entry_quality_and_forward_liquidity"
+    return .25, "selective_micro_scalp_cost_and_room_verified"
 
 
 def range_target_price(side: str, entry_price: float, target_move_pct: float) -> float:
