@@ -166,6 +166,7 @@ class Setup:
     crossover_price: Optional[float] = None
     ema9: Optional[float] = None
     ema15: Optional[float] = None
+    entry_path: Optional[str] = None
     vwap: Optional[float] = None
     atr14: Optional[float] = None
     pullback_type: Optional[str] = None
@@ -184,6 +185,7 @@ class Setup:
     reason: str = ""
     entry_status: str = "NOT_READY"
     expiration_reason: Optional[str] = None
+    trend_evidence: Optional[Dict[str, Any]] = None
 
 
 class UnifiedEMAVWAPPullbackEngine:
@@ -368,13 +370,13 @@ class UnifiedEMAVWAPPullbackEngine:
                     if extension > MAX_EXTENSION_ATR:
                         old.status, old.reason, old.expiration_reason = "NO_CHASE", "price_left_causal_zone_by_more_than_1_5_atr", "ENTRY_WINDOW_MISSED"
                     elif shallow_touch:
-                        old.pullback_type, old.pullback_ts = "MICRO_PULLBACK", latest_ts
+                        old.pullback_type, old.entry_path, old.pullback_ts = "MICRO_PULLBACK", "MICRO_PULLBACK", latest_ts
                         old.status, old.reason = "WAITING_FOR_REJECTION", "micro_pullback_at_causal_zone_waiting_for_rejection"
                     elif deep_touch:
-                        old.pullback_type, old.pullback_ts = "PULLBACK", latest_ts
+                        old.pullback_type, old.entry_path, old.pullback_ts = "PULLBACK", "PULLBACK", latest_ts
                         old.status, old.reason = "WAITING_FOR_REJECTION", "deep_causal_zone_pullback_waiting_for_rejection"
                     elif structure_retest:
-                        old.pullback_type, old.pullback_ts = "RETEST", latest_ts
+                        old.pullback_type, old.entry_path, old.pullback_ts = "RETEST", "RETEST", latest_ts
                         old.status, old.reason = "WAITING_FOR_REJECTION", "broken_level_retest_waiting_for_rejection"
                     else:
                         old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_micro_pullback_pullback_or_retest"
@@ -393,6 +395,26 @@ class UnifiedEMAVWAPPullbackEngine:
                         old.status, old.reason = "WAITING_FOR_CONFIRMATION", "rejection_candle_recorded_confirmation_must_be_later"
                     else:
                         old.status, old.reason = "WAITING_FOR_REJECTION", "valid_rejection_candle_not_seen"
+            # Observe the original causal zone and trend evidence on each new closed bar.
+            zone_ok = (_finite(old.causal_zone_low) and _finite(old.causal_zone_high)
+                       and float(old.causal_zone_low) < float(old.causal_zone_high))
+            zone_intact = bool(zone_ok and (
+                float(x.close.iloc[-1]) >= float(old.causal_zone_low) if side == "BUY"
+                else float(x.close.iloc[-1]) <= float(old.causal_zone_high)))
+            avg_volume = float(x.volume.iloc[-21:-1].mean()) if len(x) >= 22 else 0.0
+            volume_ratio = float(x.volume.iloc[-1]) / avg_volume if avg_volume > 0 else None
+            ema9_slope_atr = ((float(e9.iloc[-1]) - float(e9.iloc[-5])) / atr) if atr > 0 and len(e9) >= 5 else None
+            vwap_slope_atr = ((float(vwap_series.iloc[-1]) - float(vwap_series.iloc[-5])) / atr) if atr > 0 and len(vwap_series) >= 5 else None
+            old.trend_evidence = {
+                "zone_intact": zone_intact,
+                "zone_status": "INTACT" if zone_intact else "WEAKENED_OR_INVALIDATED",
+                "ema9_slope_atr": ema9_slope_atr,
+                "vwap_slope_atr": vwap_slope_atr,
+                "volume_ratio": volume_ratio,
+                "price_vs_vwap": "ABOVE" if price > vwap else "BELOW" if price < vwap else "AT",
+                "ema15_alignment": bool(float(e9.iloc[-1]) > float(e15.iloc[-1]) if side == "BUY" else float(e9.iloc[-1]) < float(e15.iloc[-1])),
+                "last_closed_candle_ts": latest_ts,
+            }
             old.ema9, old.ema15, old.ema50, old.vwap, old.atr14 = float(e9.iloc[-1]), float(e15.iloc[-1]), float(vals["ema50"]), float(vals["vwap"]), float(vals["atr14"])
             old.last_candle_ts, old.updated_at = latest_ts, now_ms/1000
             return self._persist(old)
