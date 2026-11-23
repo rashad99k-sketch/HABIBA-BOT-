@@ -357,15 +357,21 @@ class UnifiedEMAVWAPPullbackEngine:
                     )
                     extension = max(0.0, (price - float(old.causal_zone_high))/atr if side == "BUY"
                                     else (float(old.causal_zone_low) - price)/atr)
-                    prior_structure = float(old.crossover_price or old.causal_level or price)
-                    structure_retest = (
-                        low <= prior_structure + 0.10 * atr and high >= prior_structure - 0.10 * atr
+                    # Retest is valid only when price revisits the causal zone
+                    # or its confirmed edge; the raw crossover price is not a zone.
+                    zone_mid = (float(old.causal_zone_low) + float(old.causal_zone_high)) / 2.0
+                    structure_retest = bool(
+                        touches_zone and (
+                            abs(low - float(old.causal_zone_high)) <= 0.15 * atr
+                            or abs(high - float(old.causal_zone_low)) <= 0.15 * atr
+                            or abs(price - zone_mid) <= 0.15 * atr
+                        )
                     )
                     shallow_touch = (
-                        touches_zone and abs(price - float(old.causal_level)) <= 0.35 * atr
+                        touches_zone and abs(price - zone_mid) <= 0.20 * atr
                     )
                     deep_touch = (
-                        touches_zone and abs(price - float(old.causal_level)) > 0.35 * atr
+                        touches_zone and not shallow_touch and not structure_retest
                     )
                     if extension > MAX_EXTENSION_ATR:
                         old.status, old.reason, old.expiration_reason = "NO_CHASE", "price_left_causal_zone_by_more_than_1_5_atr", "ENTRY_WINDOW_MISSED"
