@@ -51,6 +51,67 @@ def _clean_closed(frame: pd.DataFrame, now_ms: Optional[int], timeframe_s: int) 
     return x
 
 
+def _find_causal_zone(frame: pd.DataFrame, cross_index: int, side: str, atr: float) -> Optional[Dict[str, Any]]:
+    """Find the nearest unmitigated, pre-entry FVG or displacement order block.
+
+    Only candles at/before the closed crossover candle are considered. The zone
+    must be directional, non-zero-volume, bounded, and have a minimum ATR width.
+    """
+    if cross_index < 2 or not _finite(atr) or atr <= 0:
+        return None
+    start = max(2, cross_index - 12)
+    candidates = []
+    for i in range(start, cross_index + 1):
+        a, c = frame.iloc[i - 2], frame.iloc[i]
+        if side == "BUY" and float(c.low) > float(a.high):
+            lo, hi, kind = float(a.high), float(c.low), "FVG"
+        elif side == "SELL" and float(c.high) < float(a.low):
+            lo, hi, kind = float(c.high), float(a.low), "FVG"
+        else:
+            continue
+        width = hi - lo
+        if 0.05 * atr <= width <= 1.5 * atr and float(c.volume) > 0:
+            # A later closed candle must not have fully traded through the gap.
+            later = frame.iloc[i + 1:cross_index + 1]
+            mitigated = (not later.empty and
+                         ((side == "BUY" and float(later.low.min()) <= lo) or
+                          (side == "SELL" and float(later.high.max()) >= hi)))
+            if not mitigated:
+                candidates.append({"low": lo, "high": hi, "type": kind,
+                                   "timestamp": int(c.timestamp), "index": i})
+    # Displacement OB fallback: final opposing candle before a decisive close
+    # beyond the preceding five-bar structure, not an arbitrary candle near price.
+    cross = frame.iloc[cross_index]
+    prior = frame.iloc[max(0, cross_index - 5):cross_index]
+    if len(prior) >= 3:
+        body = abs(float(cross.close) - float(cross.open))
+        if side == "BUY":
+            broke = float(cross.close) > float(prior.high.max())
+            opposing = [i for i in range(max(0, cross_index - 5), cross_index)
+                        if float(frame.open.iloc[i]) > float(frame.close.iloc[i])]
+        else:
+            broke = float(cross.close) < float(prior.low.min())
+            opposing = [i for i in range(max(0, cross_index - 5), cross_index)
+                        if float(frame.open.iloc[i]) < float(frame.close.iloc[i])]
+        if broke and body >= 0.8 * atr and opposing:
+            i = opposing[-1]
+            candle = frame.iloc[i]
+            lo, hi = float(candle.low), float(candle.high)
+            if 0.05 * atr <= hi - lo <= 1.5 * atr:
+                later = frame.iloc[i + 1:cross_index + 1]
+                mitigated = (not later.empty and
+                             ((side == "BUY" and float(later.low.min()) <= lo) or
+                              (side == "SELL" and float(later.high.max()) >= hi)))
+                if not mitigated:
+                    candidates.append({"low": lo, "high": hi, "type": "ORDER_BLOCK",
+                                       "timestamp": int(candle.timestamp), "index": i})
+    if not candidates:
+        return None
+    # Prefer the latest valid causal zone; FVG wins only on an exact timestamp tie.
+    candidates.sort(key=lambda z: (z["index"], z["type"] == "FVG"), reverse=True)
+    return candidates[0]
+
+
 def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
     """Calculate EMA9/15/50, ATR14 and per-UTC-day OHLC4 session VWAP."""
     x = _clean_closed(frame, None, 900)
@@ -102,6 +163,10 @@ class Setup:
     rejection_low: Optional[float] = None
     confirmation_ts: Optional[int] = None
     causal_level: Optional[float] = None
+    causal_zone_low: Optional[float] = None
+    causal_zone_high: Optional[float] = None
+    causal_zone_type: Optional[str] = None
+    causal_zone_ts: Optional[int] = None
     last_candle_ts: Optional[int] = None
     updated_at: float = 0.0
     reason: str = ""
@@ -195,12 +260,23 @@ class UnifiedEMAVWAPPullbackEngine:
                     same_event = old and old.crossover_ts == int(x.timestamp.iloc[i]) and old.direction == cross_dir
                     if not same_event and (old is None or old.crossover_ts != int(x.timestamp.iloc[i])):
                         if valid_side:
-                            old = Setup(symbol=str(symbol), status="WAITING_FOR_PULLBACK", direction=cross_dir,
-                                        crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
-                                        crossover_price=cross_price, ema9=float(e9.iloc[i]), ema15=float(e15.iloc[i]),
-                                        vwap=cross_vwap, atr14=float(vals["atr14"]), causal_level=cross_price,
-                                        last_candle_ts=int(x.timestamp.iloc[i]), updated_at=now_ms/1000,
-                                        reason="confirmed_closed_ema9_ema15_cross_vwap_valid")
+                            zone = _find_causal_zone(x, i, cross_dir, float(vals["atr14"]))
+                            if zone is not None:
+                                old = Setup(symbol=str(symbol), status="WAITING_FOR_PULLBACK", direction=cross_dir,
+                                            crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
+                                            crossover_price=cross_price, ema9=float(e9.iloc[i]), ema15=float(e15.iloc[i]),
+                                            vwap=cross_vwap, atr14=float(vals["atr14"]),
+                                            causal_level=(zone["low"] + zone["high"]) / 2.0,
+                                            causal_zone_low=zone["low"], causal_zone_high=zone["high"],
+                                            causal_zone_type=zone["type"], causal_zone_ts=zone["timestamp"],
+                                            last_candle_ts=int(x.timestamp.iloc[i]), updated_at=now_ms/1000,
+                                            reason="closed_cross_vwap_aligned_causal_" + zone["type"].lower())
+                            else:
+                                old = Setup(symbol=str(symbol), status="INVALIDATED", direction=cross_dir,
+                                            crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
+                                            crossover_price=cross_price, vwap=cross_vwap,
+                                            last_candle_ts=int(x.timestamp.iloc[i]), updated_at=now_ms/1000,
+                                            reason="no_valid_causal_ob_or_fvg", expiration_reason="NO_CAUSAL_ZONE")
                         else:
                             old = Setup(symbol=str(symbol), status="INVALIDATED", direction=cross_dir,
                                         crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
@@ -240,21 +316,23 @@ class UnifiedEMAVWAPPullbackEngine:
                     else:
                         old.status, old.reason = "WAITING_FOR_CONFIRMATION", "confirmation_candle_not_yet_valid"
                 elif old.pullback_type is None:
-                    level9, level15, level50 = float(e9.iloc[j]), float(e15.iloc[j]), float(vals["ema50"])
                     low, high = float(x.low.iloc[j]), float(x.high.iloc[j])
-                    near = lambda level, multiple: low <= level + multiple*atr and high >= level - multiple*atr
-                    if near(level9, .25) or near(level15, .25):
-                        old.pullback_type, old.status = "MICRO", "WAITING_FOR_REJECTION"
-                    elif near(float(old.causal_level), .20):
-                        old.pullback_type, old.status = "RETEST", "WAITING_FOR_REJECTION"
-                    elif near(level50, .30):
-                        old.pullback_type, old.status = "MACRO_EMA50", "WAITING_FOR_REJECTION"
+                    zone_low, zone_high = old.causal_zone_low, old.causal_zone_high
+                    if not (_finite(zone_low) and _finite(zone_high) and float(zone_low) < float(zone_high)):
+                        old.status, old.reason, old.expiration_reason = "INVALIDATED", "causal_zone_missing_or_invalid", "NO_CAUSAL_ZONE"
                     else:
-                        old.status = "WAITING_FOR_PULLBACK"
-                    if old.pullback_type:
-                        old.pullback_ts = latest_ts
-                        old.causal_level = float(old.causal_level or price)
-                        old.reason = "qualified_" + old.pullback_type.lower() + "_pullback"
+                        # A pullback must actually revisit the causal OB/FVG; EMA touches
+                        # alone are not a substitute for a structural zone retest.
+                        buffer = 0.10 * atr
+                        touched = low <= float(zone_high) + buffer and high >= float(zone_low) - buffer
+                        if touched:
+                            old.pullback_type = str(old.causal_zone_type or "CAUSAL_ZONE")
+                            old.status = "WAITING_FOR_REJECTION"
+                            old.pullback_ts = latest_ts
+                            old.reason = "causal_" + old.pullback_type.lower() + "_retest"
+                        else:
+                            old.status = "WAITING_FOR_PULLBACK"
+                            old.reason = "waiting_for_causal_zone_retest"
                 else:
                     o,h,l,c = map(float, (x.open.iloc[j], x.high.iloc[j], x.low.iloc[j], x.close.iloc[j]))
                     rng = max(h-l, 1e-12)
@@ -277,12 +355,17 @@ class UnifiedEMAVWAPPullbackEngine:
                 return {"allowed": False, "reason": "strategy_setup_missing"}
             if s.status != "ENTRY_READY":
                 return {"allowed": False, "reason": "strategy_not_entry_ready", "status": s.status}
-            if not all(_finite(v) for v in (current_price, tp1, s.atr14, s.causal_level)) or float(s.atr14) <= 0:
-                s.status, s.reason = "WAITING_FOR_CONFIRMATION", "tp1_or_atr_unknown"
+            if (not all(_finite(v) for v in (current_price, tp1, s.atr14, s.causal_level,
+                                                     s.causal_zone_low, s.causal_zone_high))
+                    or float(s.atr14) <= 0 or float(s.causal_zone_low) >= float(s.causal_zone_high)
+                    or not s.causal_zone_type):
+                s.status, s.reason = "WAITING_FOR_CONFIRMATION", "tp1_atr_or_causal_zone_unknown"
                 self._persist(s)
                 return {"allowed": False, "reason": s.reason}
             side = s.direction
-            extension = (float(current_price)-float(s.causal_level))/float(s.atr14) if side == "BUY" else (float(s.causal_level)-float(current_price))/float(s.atr14)
+            zone_edge = float(s.causal_zone_high) if side == "BUY" else float(s.causal_zone_low)
+            extension = max(0.0, (float(current_price)-zone_edge)/float(s.atr14) if side == "BUY"
+                            else (zone_edge-float(current_price))/float(s.atr14))
             ahead = float(tp1) > float(current_price) if side == "BUY" else float(tp1) < float(current_price)
             space = (float(tp1)-float(current_price))/float(s.atr14) if side == "BUY" else (float(current_price)-float(tp1))/float(s.atr14)
             if extension > MAX_EXTENSION_ATR:
