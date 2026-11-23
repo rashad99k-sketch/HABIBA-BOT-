@@ -194,6 +194,51 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     return .25, "selective_micro_scalp_cost_and_room_verified"
 
 
+def plan_trend_targets(side: str, entry_price: float, atr: float,
+                         opposing_liquidity_levels: Iterable[float] = (),
+                         target1_atr: float = 1.0, target2_price_move_pct: float = 2.0,
+                         min_target2_atr: float = 1.5,
+                         pool_buffer_atr: float = 0.10) -> Tuple[float, float, str]:
+    """Plan 50/50 TP1/TP2 from volatility and opposing liquidity.
+
+    TP1 is the nearer of 1 ATR and a credible nearby opposing pool; TP2 is the
+    lesser of the requested 2% price expansion and a farther opposing pool.
+    The caller must supply directionally filtered liquidity levels.
+    """
+    direction = str(side or "").upper()
+    entry = _number(entry_price, 0.0) or 0.0
+    volatility = _number(atr, 0.0) or 0.0
+    if direction not in {"BUY", "SELL"} or entry <= 0 or volatility <= 0:
+        return 0.0, 0.0, "invalid_side_entry_or_atr"
+    def distance(level: float) -> float:
+        return level-entry if direction == "BUY" else entry-level
+    levels = []
+    for raw in opposing_liquidity_levels or ():
+        level = _number(raw)
+        if level is not None and distance(level) > 0:
+            levels.append((distance(level), level))
+    levels.sort(key=lambda item: item[0])
+    tp1_dist = max(0.0, target1_atr) * volatility
+    if levels and levels[0][0] < tp1_dist:
+        tp1_dist = levels[0][0] - min(pool_buffer_atr*volatility, levels[0][0]*0.20)
+    if tp1_dist <= 0:
+        return 0.0, 0.0, "tp1_blocked_by_opposing_liquidity"
+    tp1 = entry + tp1_dist if direction == "BUY" else entry - tp1_dist
+    target2_move = max(0.0, target2_price_move_pct)/100.0*entry
+    target2_dist = max(target2_move, min_target2_atr*volatility)
+    if levels:
+        farther = [item for item in levels if item[0] >= min_target2_atr*volatility]
+        if farther:
+            pool_dist = farther[0][0] - min(pool_buffer_atr*volatility, farther[0][0]*0.20)
+            target2_dist = min(target2_dist, pool_dist)
+        else:
+            target2_dist = 0.0
+    if target2_dist <= tp1_dist:
+        return round(tp1, 12), 0.0, "tp2_unavailable_before_opposing_liquidity"
+    tp2 = entry + target2_dist if direction == "BUY" else entry - target2_dist
+    return round(tp1, 12), round(tp2, 12), "tp1_tp2_capped_by_opposing_liquidity"
+
+
 def range_target_price(side: str, entry_price: float, target_move_pct: float) -> float:
     side = str(side or "").upper()
     entry = _number(entry_price, 0.0) or 0.0
