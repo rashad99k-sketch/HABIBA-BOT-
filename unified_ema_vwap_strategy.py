@@ -375,15 +375,15 @@ class UnifiedEMAVWAPPullbackEngine:
                     )
                     if extension > MAX_EXTENSION_ATR:
                         old.status, old.reason, old.expiration_reason = "NO_CHASE", "price_left_causal_zone_by_more_than_1_5_atr", "ENTRY_WINDOW_MISSED"
-                    elif shallow_touch:
+                    elif shallow_touch and not structure_retest:
                         old.pullback_type, old.entry_path, old.pullback_ts = "MICRO_PULLBACK", "MICRO_PULLBACK", latest_ts
                         old.status, old.reason = "WAITING_FOR_REJECTION", "micro_pullback_at_causal_zone_waiting_for_rejection"
+                    elif structure_retest:
+                        old.pullback_type, old.entry_path, old.pullback_ts = "RETEST", "RETEST", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "causal_zone_edge_retest_waiting_for_rejection"
                     elif deep_touch:
                         old.pullback_type, old.entry_path, old.pullback_ts = "PULLBACK", "PULLBACK", latest_ts
                         old.status, old.reason = "WAITING_FOR_REJECTION", "deep_causal_zone_pullback_waiting_for_rejection"
-                    elif structure_retest:
-                        old.pullback_type, old.entry_path, old.pullback_ts = "RETEST", "RETEST", latest_ts
-                        old.status, old.reason = "WAITING_FOR_REJECTION", "broken_level_retest_waiting_for_rejection"
                     else:
                         old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_micro_pullback_pullback_or_retest"
                 elif old.pullback_type is not None and old.rejection_ts is None:
