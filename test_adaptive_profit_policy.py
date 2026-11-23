@@ -84,3 +84,27 @@ def test_trailing_uses_trend_evidence_not_adx_alone():
     weak = adaptive_trail_multiplier(1.5, .5, 40, 20, 0, "TREND_RIDE", 0, True, 20)
     strong = adaptive_trail_multiplier(1.5, .8, 15, 20, 0, "TREND_RIDE", 0, True, 80)
     assert strong > weak
+
+from ggp_profit_brain import plan_trend_targets
+
+
+def test_trend_targets_are_capped_before_opposing_liquidity():
+    tp1, tp2, reason = plan_trend_targets("BUY", 100.0, 1.0, [101.2, 103.0], 1.0, 3.0, 1.5)
+    assert tp1 < 101.2
+    assert tp2 <= 103.0
+    assert tp2 > tp1
+    assert "liquidity" in reason
+
+
+def test_trend_target2_is_blocked_when_no_farther_liquidity_exists():
+    tp1, tp2, _ = plan_trend_targets("BUY", 100.0, 1.0, [101.0], 1.0, 3.0, 1.5)
+    assert tp1 > 100.0
+    assert tp2 == 0.0
+
+
+def test_trend_targets_are_directional_for_short_positions():
+    tp1, tp2, _ = plan_trend_targets("SELL", 100.0, 1.0, [99.0, 97.0], 1.0, 3.0, 1.5)
+    assert tp1 < 100.0
+    assert tp2 < tp1
+
+
