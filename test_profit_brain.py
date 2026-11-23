@@ -11,11 +11,14 @@ def test_unknown_or_missing_data_does_not_trigger_full_close_range_mode():
     assert "not_proven" in reason
 
 
-def test_confirmed_trend_selects_trend_ride():
+def test_confirmed_trend_requires_multiple_independent_evidence_groups():
     mode, _, _ = classify_profit_mode({
         "side": "BUY", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
         "adx": 30, "adx_slope": 1, "continuation_probability": 0.82,
         "di_plus": 32, "di_minus": 12, "momentum_strength": 78,
+        "ema9_slope_atr": 0.30, "vwap_slope_atr": 0.25,
+        "structure_score": 82, "volume_ratio": 1.25,
+        "atr_expansion_ratio": 1.10, "candle_follow_through": True,
     })
     assert mode == TREND_MODE
 
@@ -28,7 +31,7 @@ def test_range_scalp_requires_multiple_weak_market_evidence():
         "momentum_strength": 20,
     })
     assert mode == RANGE_MODE
-    assert "low_relative_volume" in evidence
+    assert "relative_volume_low" in evidence
 
 
 def test_low_volume_alone_does_not_activate_range_scalp():
@@ -41,12 +44,12 @@ def test_low_volume_alone_does_not_activate_range_scalp():
     assert mode == STANDARD_MODE
 
 
-def test_range_target_is_conservative_when_thin_or_weak():
+def test_range_target_is_blocked_without_cost_and_opposing_liquidity_data():
     target, _ = select_range_target_pct({
         "side": "BUY", "adx": 14, "continuation_probability": 0.30,
         "volume_ratio": 0.50, "thin_liquidity": True,
     })
-    assert target == 0.5
+    assert target == 0.0
 
 
 def test_range_target_price_and_hit_are_directional():
@@ -58,7 +61,7 @@ def test_range_target_price_and_hit_are_directional():
 
 
 def test_tp2_reassessment_closes_only_when_far_and_weak_or_structure_lost():
-    decision, _ = tp2_reassessment("BUY", 100, 110, 2, 0.30, 17, -1, True)
+    decision, _ = tp2_reassessment("BUY", 100, 110, 2, 0.30, 17, -1, True, adverse_divergence=True)
     assert decision == "CLOSE"
     decision, _ = tp2_reassessment("SELL", 100, 90, 2, 0.82, 30, 1, True)
     assert decision == "HOLD"

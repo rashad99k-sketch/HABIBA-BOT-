@@ -91,33 +91,52 @@ def test_buy_and_sell_crosses_are_confirmed_on_closed_candles(tmp_path):
     for side in ("BUY", "SELL"):
         f = cross_frame(side)
         engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / f"{side}.json"))
-        from unified_ema_vwap_strategy import _find_causal_zone, indicators
+        from unified_ema_vwap_strategy import _find_causal_zone, indicators, indicator_series
         vals = indicators(f)
-        cross_idx = int(np.where(np.diff(np.sign(
-            f.close.ewm(span=9, adjust=False).mean() -
-            f.close.ewm(span=15, adjust=False).mean())) != 0)[0][-1] + 1)
+        series = indicator_series(f)
+        ema9, vwap = series["ema9"], series["vwap_series"]
+        cross_idx = int(np.where(np.diff(np.sign(ema9 - vwap)) != 0)[0][-1] + 1)
         assert _find_causal_zone(f, cross_idx, side, vals["atr14"]) is None
         result = engine.evaluate(side, f, now_ms=int(f.timestamp.iloc[-1] + 900_000))
         assert result["direction"] == side
         assert result["crossover_ts"] is not None
-        # A mathematically valid cross without a causal OB/FVG must not become
-        # an executable watchlist setup.
         assert result["status"] == "INVALIDATED"
         assert result["expiration_reason"] == "NO_CAUSAL_ZONE"
 
 
 def test_cross_on_unclosed_bar_is_never_discovered(tmp_path):
-    f = cross_frame("BUY")
-    close = np.r_[np.linspace(120, 100, 60), np.linspace(99.8, 95, 9), 120.0]
-    f["open"] = close; f["close"] = close; f["high"] = close + .2; f["low"] = close - .2
-    # The only EMA cross is on the latest bar, which remains unclosed at now_ms.
+    # Keep all already-closed bars inside one UTC session. The final, still-forming
+    # spike is deliberately large enough to create the EMA9/VWAP cross by itself.
+    midnight = int(pd.Timestamp.now(tz="UTC").floor("D").timestamp() * 1000)
+    close = np.r_[np.linspace(120, 100, 60), np.linspace(99.8, 95, 9), 160.0]
+    start = midnight - 70 * 900_000
+    ts = start + np.arange(len(close)) * 900_000
+    f = pd.DataFrame({"timestamp": ts, "open": close, "high": close + .2,
+                      "low": close - .2, "close": close, "volume": np.ones(len(close)) * 10})
+    from unified_ema_vwap_strategy import indicator_series
+    series = indicator_series(f)
+    gaps = series["ema9"] - series["vwap_series"]
+    assert gaps.iloc[-2] <= 0 < gaps.iloc[-1]  # Cross exists only on the forming candle.
     now = int(f.timestamp.iloc[-1] + 900_000 - 1)
     result = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "forming.json")).evaluate("BUY", f, now_ms=now)
     assert result["crossover_ts"] is None
 
 
 def test_vwap_misaligned_buy_cross_is_not_flipped_to_sell(tmp_path):
-    f = cross_frame("BUY", reset_session=False)
+    # A high-volume down candle pulls Session VWAP below EMA9 while its close
+    # remains below VWAP: this is a real BUY-side EMA/VWAP cross but is misaligned.
+    midnight = int(pd.Timestamp.now(tz="UTC").floor("D").timestamp() * 1000)
+    close = np.r_[np.linspace(130, 120, 60), 110.0]
+    volume = np.r_[np.ones(60) * 10, 10_000.0]
+    start = midnight - 61 * 900_000
+    ts = start + np.arange(len(close)) * 900_000
+    f = pd.DataFrame({"timestamp": ts, "open": close, "high": close + .2,
+                      "low": close - .2, "close": close, "volume": volume})
+    from unified_ema_vwap_strategy import indicator_series
+    series = indicator_series(f)
+    gaps = series["ema9"] - series["vwap_series"]
+    assert gaps.iloc[-2] <= 0 < gaps.iloc[-1]
+    assert close[-1] < series["vwap_series"].iloc[-1]
     result = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "misaligned.json")).evaluate(
         "MISALIGNED", f, now_ms=int(f.timestamp.iloc[-1] + 900_000))
     assert result["status"] == "INVALIDATED"

@@ -1,4 +1,4 @@
-"""Persistent, execution-free EMA9/EMA15 + session VWAP pullback strategy.
+"""Persistent, execution-free EMA9/Session-VWAP crossover pullback strategy.
 
 All calculations consume closed OHLCV bars. Session VWAP uses OHLC4 and actual
 provided volume, resetting at 00:00 UTC (explicit calendar-day session convention
@@ -117,8 +117,8 @@ def _find_causal_zone(frame: pd.DataFrame, cross_index: int, side: str, atr: flo
     return candidates[0]
 
 
-def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
-    """Calculate EMA9/15/50, ATR14 and per-UTC-day OHLC4 session VWAP."""
+def indicator_series(frame: pd.DataFrame) -> Dict[str, Any]:
+    """Closed-bar EMA9/15/50, ATR14 and UTC session OHLC4 VWAP series."""
     x = _clean_closed(frame, None, 900)
     if len(x) < 51:
         return {"valid": False, "reason": "need_at_least_51_closed_candles"}
@@ -126,27 +126,34 @@ def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
     ema9 = c.ewm(span=9, adjust=False, min_periods=9).mean()
     ema15 = c.ewm(span=15, adjust=False, min_periods=15).mean()
     ema50 = c.ewm(span=50, adjust=False, min_periods=50).mean()
-    prev = c.shift(1)
-    tr = pd.concat([x.high - x.low, (x.high - prev).abs(), (x.low - prev).abs()], axis=1).max(axis=1)
+    previous = c.shift(1)
+    tr = pd.concat([x.high-x.low, (x.high-previous).abs(), (x.low-previous).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14, min_periods=14).mean()
-    # A well-defined 24/7 market session: calendar day in UTC. Never mix sessions.
     utc_day = pd.to_datetime(x.timestamp, unit="ms", utc=True).dt.strftime("%Y-%m-%d")
-    typical = (x.high + x.low + x.close) / 3.0
-    # Requirement specifies OHLC-4, not the conventional HLC-3 typical price.
-    typical = (x.open + x.high + x.low + x.close) / 4.0
-    pv = typical * x.volume
-    cum_v = x.volume.groupby(utc_day).cumsum()
-    cum_pv = pv.groupby(utc_day).cumsum()
-    vwap = cum_pv / cum_v.replace(0, np.nan)
-    idx = len(x) - 1
-    values = {"ema9": float(ema9.iloc[idx]), "ema15": float(ema15.iloc[idx]),
-              "ema50": float(ema50.iloc[idx]), "atr14": float(atr.iloc[idx]),
+    ohlc4 = (x.open+x.high+x.low+x.close)/4.0
+    volume = x.volume.groupby(utc_day).cumsum()
+    pv = (ohlc4*x.volume).groupby(utc_day).cumsum()
+    vwap = pv/volume.replace(0, np.nan)
+    return {"valid": True, "ema9": ema9, "ema15": ema15, "ema50": ema50,
+            "atr14": atr, "vwap_series": vwap, "utc_session": utc_day}
+
+
+def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
+    """Calculate closed-candle EMA9/15/50, ATR14 and UTC OHLC4 Session VWAP."""
+    values = indicator_series(frame)
+    if not values.get("valid"):
+        return values
+    idx = len(frame)-1
+    e9, e15, e50 = (values[k] for k in ("ema9", "ema15", "ema50"))
+    atr, vwap = values["atr14"], values["vwap_series"]
+    result = {"ema9": float(e9.iloc[idx]), "ema15": float(e15.iloc[idx]),
+              "ema50": float(e50.iloc[idx]), "atr14": float(atr.iloc[idx]),
               "vwap": float(vwap.iloc[idx]) if pd.notna(vwap.iloc[idx]) else None,
-              "price": float(c.iloc[idx]), "candle_ts": int(x.timestamp.iloc[idx]),
-              "session": str(utc_day.iloc[idx]), "timezone": "UTC"}
-    values["valid"] = all(_finite(values[k]) for k in ("ema9", "ema15", "ema50", "atr14", "price")) and values["atr14"] > 0 and values["vwap"] is not None
-    values["reason"] = "" if values["valid"] else ("zero_session_volume" if values["vwap"] is None else "invalid_indicator")
-    return values
+              "price": float(frame.close.iloc[idx]), "candle_ts": int(frame.timestamp.iloc[idx]),
+              "session": str(values["utc_session"].iloc[idx]), "timezone": "UTC"}
+    result["valid"] = all(_finite(result[k]) for k in ("ema9","ema15","ema50","atr14","price")) and result["atr14"] > 0 and result["vwap"] is not None
+    result["reason"] = "" if result["valid"] else ("zero_session_volume" if result["vwap"] is None else "invalid_indicator")
+    return result
 
 
 @dataclass
@@ -159,6 +166,7 @@ class Setup:
     crossover_price: Optional[float] = None
     ema9: Optional[float] = None
     ema15: Optional[float] = None
+    entry_path: Optional[str] = None
     vwap: Optional[float] = None
     atr14: Optional[float] = None
     pullback_type: Optional[str] = None
@@ -177,6 +185,7 @@ class Setup:
     reason: str = ""
     entry_status: str = "NOT_READY"
     expiration_reason: Optional[str] = None
+    trend_evidence: Optional[Dict[str, Any]] = None
 
 
 class UnifiedEMAVWAPPullbackEngine:
@@ -220,6 +229,90 @@ class UnifiedEMAVWAPPullbackEngine:
             except TypeError:
                 return None
 
+    def authorize(self, symbol: str, price: float, tp1: float) -> Dict[str, Any]:
+        """Consume a completed setup only after validating its causal zone and target space.
+
+        Authorization is a strategy decision, not an exchange order. The GGP execution
+        service remains responsible for sizing, order placement, fills and protection.
+        """
+        with self._lock:
+            setup = self.get(symbol)
+            def reject(reason: str, status: Optional[str] = None) -> Dict[str, Any]:
+                return {"allowed": False, "reason": reason,
+                        "status": status or (setup.status if setup else "UNKNOWN")}
+            if setup is None or setup.status != "ENTRY_READY":
+                return reject("setup_not_entry_ready")
+            if not all(_finite(v) for v in (price, tp1, setup.atr14)):
+                return reject("invalid_price_or_atr")
+            atr = float(setup.atr14)
+            entry = float(price)
+            target = float(tp1)
+            if atr <= 0:
+                return reject("invalid_atr")
+            if (not _finite(setup.causal_zone_low) or not _finite(setup.causal_zone_high)
+                    or float(setup.causal_zone_low) >= float(setup.causal_zone_high)
+                    or setup.causal_zone_type not in {"FVG", "ORDER_BLOCK"}):
+                return reject("tp1_atr_or_causal_zone_unknown")
+            if (setup.rejection_ts is None or setup.confirmation_ts is None
+                    or int(setup.confirmation_ts) <= int(setup.rejection_ts)):
+                return reject("rejection_confirmation_lifecycle_incomplete")
+            if setup.direction == "BUY":
+                if target <= entry:
+                    return reject("tp1_not_forward_of_entry")
+                extension = max(0.0, (entry - float(setup.causal_zone_high)) / atr)
+            elif setup.direction == "SELL":
+                if target >= entry:
+                    return reject("tp1_not_forward_of_entry")
+                extension = max(0.0, (float(setup.causal_zone_low) - entry) / atr)
+            else:
+                return reject("invalid_setup_direction")
+            if extension > MAX_EXTENSION_ATR:
+                setup.status = "NO_CHASE"
+                setup.entry_status = "BLOCKED"
+                setup.reason = "entry_price_too_far_from_causal_zone"
+                setup.expiration_reason = "ENTRY_WINDOW_MISSED"
+                self._persist(setup)
+                return reject("entry_window_missed_no_chase", "NO_CHASE")
+            # TP1 must provide real forward space; a target inside the entry/zone
+            # boundary is not a valid execution handoff.
+            if setup.direction == "BUY" and target <= float(setup.causal_zone_high):
+                return reject("tp1_atr_or_causal_zone_unknown")
+            if setup.direction == "SELL" and target >= float(setup.causal_zone_low):
+                return reject("tp1_atr_or_causal_zone_unknown")
+            setup.entry_status = "AUTHORIZED"
+            setup.reason = "strategy_authorized_closed_candle_confirmation"
+            self._persist(setup)
+            return {"allowed": True, "reason": "authorized",
+                    "status": setup.status, "symbol": setup.symbol,
+                    "side": setup.direction, "entry_price": entry, "tp1": target}
+
+    def mark_executing(self, symbol: str) -> bool:
+        """Move an authorized setup into the single in-flight execution state."""
+        with self._lock:
+            setup = self.get(symbol)
+            if (setup is None or setup.status != "ENTRY_READY"
+                    or setup.entry_status != "AUTHORIZED"
+                    or setup.rejection_ts is None or setup.confirmation_ts is None
+                    or int(setup.confirmation_ts) <= int(setup.rejection_ts)):
+                return False
+            setup.status = "ENTRY_EXECUTING"
+            setup.entry_status = "ENTRY_EXECUTING"
+            setup.reason = "authorized_handoff_consumed_by_execution"
+            self._persist(setup)
+            return True
+
+    def mark_open(self, symbol: str) -> bool:
+        """Mark a setup open only after the existing execution path confirms success."""
+        with self._lock:
+            setup = self.get(symbol)
+            if setup is None or setup.status != "ENTRY_EXECUTING":
+                return False
+            setup.status = "TRADE_OPEN"
+            setup.entry_status = "TRADE_OPEN"
+            setup.reason = "execution_confirmed_trade_open"
+            self._persist(setup)
+            return True
+
     def all(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             return {k: dict(v) for k, v in self._items.items()}
@@ -240,12 +333,12 @@ class UnifiedEMAVWAPPullbackEngine:
                 s.status, s.reason = "WAITING_FOR_CONFIRMATION", vals.get("reason") or "vwap_unknown"
                 s.updated_at = now_ms / 1000
                 return self._persist(s)
-            closes = x.close
-            e9 = closes.ewm(span=9, adjust=False, min_periods=9).mean()
-            e15 = closes.ewm(span=15, adjust=False, min_periods=15).mean()
+            series = indicator_series(x)
+            e9, e15 = series["ema9"], series["ema15"]
+            vwap_series = series["vwap_series"]
             latest_ts = int(x.timestamp.iloc[-1])
 
-            # Never replace a live lifecycle with a newly observed cross.
+            # Never replace an active lifecycle with a newer cross before it resolves.
             active_statuses = {"WAITING_FOR_PULLBACK", "WAITING_FOR_REJECTION",
                                "WAITING_FOR_CONFIRMATION", "ENTRY_READY",
                                "ENTRY_EXECUTING", "TRADE_OPEN"}
@@ -255,56 +348,80 @@ class UnifiedEMAVWAPPullbackEngine:
                 first_cross = max(1, len(x) - MAX_CROSS_AGE - 1)
                 cross_events = []
                 for k in range(first_cross, len(x)):
-                    if e9.iloc[k-1] <= e15.iloc[k-1] and e9.iloc[k] > e15.iloc[k]:
-                        cross_events.append((k, "BUY"))
-                    elif e9.iloc[k-1] >= e15.iloc[k-1] and e9.iloc[k] < e15.iloc[k]:
-                        cross_events.append((k, "SELL"))
+                    prev_gap = float(e9.iloc[k-1] - vwap_series.iloc[k-1])
+                    current_gap = float(e9.iloc[k] - vwap_series.iloc[k])
+                    if not all(_finite(v) for v in (prev_gap, current_gap)):
+                        continue
+                    if prev_gap <= 0 and current_gap > 0:
+                        candidate_side = "BUY"
+                    elif prev_gap >= 0 and current_gap < 0:
+                        candidate_side = "SELL"
+                    else:
+                        continue
+                    candidate_price = float(x.close.iloc[k])
+                    candidate_vwap = float(vwap_series.iloc[k])
+                    candidate_ema = float(e9.iloc[k])
+                    candidate_aligned = (
+                        candidate_price > candidate_vwap and candidate_ema > candidate_vwap
+                        if candidate_side == "BUY" else
+                        candidate_price < candidate_vwap and candidate_ema < candidate_vwap
+                    )
+                    # A daily-session VWAP reset can create a transient EMA/VWAP
+                    # crossing while price remains on the opposite side. Ignore
+                    # that reset-induced mismatch during the first eight bars of
+                    # the UTC session; genuine same-session mismatches remain
+                    # visible as INVALIDATED diagnostics.
+                    session_age = k
+                    while (session_age > 0
+                           and series["utc_session"].iloc[session_age - 1]
+                           == series["utc_session"].iloc[k]):
+                        session_age -= 1
+                    if not candidate_aligned and (k - session_age) <= MAX_CROSS_AGE:
+                        continue
+                    cross_events.append((k, candidate_side))
                 if cross_events:
                     i, cross_dir = cross_events[-1]
-                    if float(x.volume.iloc[i]) > 0:
-                        utc = pd.to_datetime(x.timestamp, unit="ms", utc=True).dt.strftime("%Y-%m-%d")
-                        ohlc4 = (x.open + x.high + x.low + x.close) / 4.0
-                        pv = (ohlc4 * x.volume).groupby(utc).cumsum()
-                        cv = x.volume.groupby(utc).cumsum()
-                        cross_vwap = float(pv.iloc[i] / cv.iloc[i]) if cv.iloc[i] > 0 else None
-                        cross_price = float(x.close.iloc[i])
-                        valid_side = cross_vwap is not None and (
-                            (cross_dir == "BUY" and cross_price > cross_vwap) or
-                            (cross_dir == "SELL" and cross_price < cross_vwap))
-                        same_event = bool(old and old.crossover_ts == int(x.timestamp.iloc[i])
-                                          and old.direction == cross_dir)
-                        if not same_event:
-                            if valid_side:
-                                zone = _find_causal_zone(x, i, cross_dir, float(vals["atr14"]))
-                                if zone is not None:
-                                    old = Setup(symbol=str(symbol), status="WAITING_FOR_PULLBACK",
-                                                direction=cross_dir, crossover_ts=int(x.timestamp.iloc[i]),
-                                                crossover_index=i, crossover_price=cross_price,
-                                                ema9=float(e9.iloc[i]), ema15=float(e15.iloc[i]),
-                                                vwap=cross_vwap, atr14=float(vals["atr14"]),
-                                                causal_level=(zone["low"] + zone["high"]) / 2.0,
-                                                causal_zone_low=zone["low"], causal_zone_high=zone["high"],
-                                                causal_zone_type=zone["type"], causal_zone_ts=zone["timestamp"],
-                                                last_candle_ts=int(x.timestamp.iloc[i]), updated_at=now_ms/1000,
-                                                reason="closed_cross_vwap_aligned_causal_" + zone["type"].lower())
-                                else:
-                                    old = Setup(symbol=str(symbol), status="INVALIDATED", direction=cross_dir,
-                                                crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
-                                                crossover_price=cross_price, vwap=cross_vwap,
-                                                last_candle_ts=latest_ts, updated_at=now_ms/1000,
-                                                reason="no_valid_causal_ob_or_fvg",
-                                                expiration_reason="NO_CAUSAL_ZONE")
+                    cross_vwap = float(vwap_series.iloc[i])
+                    cross_price = float(x.close.iloc[i])
+                    valid_side = (
+                        cross_vwap > 0 and
+                        ((cross_dir == "BUY" and cross_price > cross_vwap and float(e9.iloc[i]) > cross_vwap)
+                         or (cross_dir == "SELL" and cross_price < cross_vwap and float(e9.iloc[i]) < cross_vwap))
+                    )
+                    same_event = bool(old and old.crossover_ts == int(x.timestamp.iloc[i])
+                                      and old.direction == cross_dir)
+                    if not same_event:
+                        if valid_side:
+                            zone = _find_causal_zone(x, i, cross_dir, float(vals["atr14"]))
+                            if zone is not None:
+                                old = Setup(symbol=str(symbol), status="WAITING_FOR_PULLBACK",
+                                            direction=cross_dir, crossover_ts=int(x.timestamp.iloc[i]),
+                                            crossover_index=i, crossover_price=cross_price,
+                                            ema9=float(e9.iloc[i]), ema15=float(e15.iloc[i]),
+                                            vwap=cross_vwap, atr14=float(vals["atr14"]),
+                                            causal_level=(zone["low"] + zone["high"]) / 2.0,
+                                            causal_zone_low=zone["low"], causal_zone_high=zone["high"],
+                                            causal_zone_type=zone["type"], causal_zone_ts=zone["timestamp"],
+                                            last_candle_ts=int(x.timestamp.iloc[i]), updated_at=now_ms/1000,
+                                            reason="closed_ema9_vwap_cross_causal_" + zone["type"].lower())
                             else:
                                 old = Setup(symbol=str(symbol), status="INVALIDATED", direction=cross_dir,
                                             crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
                                             crossover_price=cross_price, vwap=cross_vwap,
                                             last_candle_ts=latest_ts, updated_at=now_ms/1000,
-                                            reason="crossover_vwap_misaligned",
-                                            expiration_reason="VWAP_MISALIGNED")
+                                            reason="no_valid_causal_ob_or_fvg",
+                                            expiration_reason="NO_CAUSAL_ZONE")
+                        else:
+                            old = Setup(symbol=str(symbol), status="INVALIDATED", direction=cross_dir,
+                                        crossover_ts=int(x.timestamp.iloc[i]), crossover_index=i,
+                                        crossover_price=cross_price, vwap=cross_vwap,
+                                        last_candle_ts=latest_ts, updated_at=now_ms/1000,
+                                        reason="ema9_vwap_cross_not_price_aligned",
+                                        expiration_reason="VWAP_MISALIGNED")
 
             if old is None:
                 s = Setup(str(symbol), status="DISCOVERED", last_candle_ts=latest_ts,
-                          updated_at=now_ms/1000, reason="no_new_closed_ema9_ema15_cross")
+                          updated_at=now_ms/1000, reason="no_new_closed_ema9_vwap_cross")
                 return self._persist(s)
             if old.last_candle_ts == latest_ts:
                 return self._persist(old)
@@ -313,16 +430,16 @@ class UnifiedEMAVWAPPullbackEngine:
                 old.last_candle_ts = latest_ts
                 old.updated_at = now_ms/1000
                 return self._persist(old)
+            side = old.direction
+            j = len(x)-1
+            price, atr = float(x.close.iloc[j]), float(vals["atr14"])
+            vwap = float(vals["vwap"])
             bars = int((x.timestamp > old.crossover_ts).sum())
             if bars > MAX_CROSS_AGE:
                 old.status, old.reason, old.expiration_reason = "EXPIRED", "entry_window_expired", "ENTRY_WINDOW_EXPIRED"
             else:
-                side = old.direction
-                j = len(x)-1
-                price, atr = float(x.close.iloc[j]), float(vals["atr14"])
-                vwap = float(vals["vwap"])
-                aligned = (price > vwap and float(e9.iloc[j]) > float(e15.iloc[j])) if side == "BUY" else (price < vwap and float(e9.iloc[j]) < float(e15.iloc[j]))
-                invalid = (price < vwap or float(e9.iloc[j]) <= float(e15.iloc[j])) if side == "BUY" else (price > vwap or float(e9.iloc[j]) >= float(e15.iloc[j]))
+                aligned = (price > vwap and float(e9.iloc[j]) > vwap) if side == "BUY" else (price < vwap and float(e9.iloc[j]) < vwap)
+                invalid = (price < vwap or float(e9.iloc[j]) <= vwap) if side == "BUY" else (price > vwap or float(e9.iloc[j]) >= vwap)
                 if invalid:
                     old.status, old.reason, old.expiration_reason = "INVALIDATED", "thesis_lost_ema_or_vwap", "THESIS_INVALIDATED"
                 elif old.rejection_ts is not None and latest_ts > old.rejection_ts:
@@ -337,16 +454,45 @@ class UnifiedEMAVWAPPullbackEngine:
                     low, high = float(x.low.iloc[j]), float(x.high.iloc[j])
                     zone_low = float(old.causal_zone_low) - 0.10 * atr
                     zone_high = float(old.causal_zone_high) + 0.10 * atr
-                    touches = high >= zone_low and low <= zone_high
+                    touches_zone = high >= zone_low and low <= zone_high
+                    # Three named paths, each still requiring the same valid causal zone.
+                    # MICRO is a shallow first revisit near the zone edge; PULLBACK is
+                    # a deeper traversal; RETEST is a revisit of the broken structure level.
+                    distance_to_zone = (
+                        max(0.0, low - zone_high) if side == "BUY"
+                        else max(0.0, zone_low - high)
+                    )
                     extension = max(0.0, (price - float(old.causal_zone_high))/atr if side == "BUY"
                                     else (float(old.causal_zone_low) - price)/atr)
+                    # Retest is valid only when price revisits the causal zone
+                    # or its confirmed edge; the raw crossover price is not a zone.
+                    zone_mid = (float(old.causal_zone_low) + float(old.causal_zone_high)) / 2.0
+                    structure_retest = bool(
+                        touches_zone and (
+                            abs(low - float(old.causal_zone_high)) <= 0.15 * atr
+                            or abs(high - float(old.causal_zone_low)) <= 0.15 * atr
+                            or abs(price - zone_mid) <= 0.15 * atr
+                        )
+                    )
+                    shallow_touch = (
+                        touches_zone and abs(price - zone_mid) <= 0.20 * atr
+                    )
+                    deep_touch = (
+                        touches_zone and not shallow_touch and not structure_retest
+                    )
                     if extension > MAX_EXTENSION_ATR:
                         old.status, old.reason, old.expiration_reason = "NO_CHASE", "price_left_causal_zone_by_more_than_1_5_atr", "ENTRY_WINDOW_MISSED"
-                    elif touches:
-                        old.pullback_type, old.pullback_ts = ("MICRO" if abs(price - float(old.causal_level))/atr < 0.25 else "RETEST"), latest_ts
-                        old.status, old.reason = "WAITING_FOR_REJECTION", "causal_zone_retested_waiting_for_rejection"
+                    elif shallow_touch and not structure_retest:
+                        old.pullback_type, old.entry_path, old.pullback_ts = "MICRO_PULLBACK", "MICRO_PULLBACK", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "micro_pullback_at_causal_zone_waiting_for_rejection"
+                    elif structure_retest:
+                        old.pullback_type, old.entry_path, old.pullback_ts = "RETEST", "RETEST", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "causal_zone_edge_retest_waiting_for_rejection"
+                    elif deep_touch:
+                        old.pullback_type, old.entry_path, old.pullback_ts = "PULLBACK", "PULLBACK", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "deep_causal_zone_pullback_waiting_for_rejection"
                     else:
-                        old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_causal_zone_pullback"
+                        old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_micro_pullback_pullback_or_retest"
                 elif old.pullback_type is not None and old.rejection_ts is None:
                     # The rejection is a distinct, fully closed candle after the retest.
                     o, h, l, c = map(float, (x.open.iloc[j], x.high.iloc[j], x.low.iloc[j], x.close.iloc[j]))
@@ -362,124 +508,29 @@ class UnifiedEMAVWAPPullbackEngine:
                         old.status, old.reason = "WAITING_FOR_CONFIRMATION", "rejection_candle_recorded_confirmation_must_be_later"
                     else:
                         old.status, old.reason = "WAITING_FOR_REJECTION", "valid_rejection_candle_not_seen"
+            # Observe the original causal zone and trend evidence on each new closed bar.
+            zone_ok = (_finite(old.causal_zone_low) and _finite(old.causal_zone_high)
+                       and float(old.causal_zone_low) < float(old.causal_zone_high))
+            zone_intact = bool(zone_ok and (
+                float(x.close.iloc[-1]) >= float(old.causal_zone_low) if side == "BUY"
+                else float(x.close.iloc[-1]) <= float(old.causal_zone_high)))
+            avg_volume = float(x.volume.iloc[-21:-1].mean()) if len(x) >= 22 else 0.0
+            volume_ratio = float(x.volume.iloc[-1]) / avg_volume if avg_volume > 0 else None
+            ema9_slope_atr = ((float(e9.iloc[-1]) - float(e9.iloc[-5])) / atr) if atr > 0 and len(e9) >= 5 else None
+            vwap_slope_atr = ((float(vwap_series.iloc[-1]) - float(vwap_series.iloc[-5])) / atr) if atr > 0 and len(vwap_series) >= 5 else None
+            old.trend_evidence = {
+                "zone_intact": zone_intact,
+                "zone_status": "INTACT" if zone_intact else "WEAKENED_OR_INVALIDATED",
+                "ema9_slope_atr": ema9_slope_atr,
+                "vwap_slope_atr": vwap_slope_atr,
+                "volume_ratio": volume_ratio,
+                "price_vs_vwap": "ABOVE" if price > vwap else "BELOW" if price < vwap else "AT",
+                "ema15_alignment": bool(float(e9.iloc[-1]) > float(e15.iloc[-1]) if side == "BUY" else float(e9.iloc[-1]) < float(e15.iloc[-1])),
+                "last_closed_candle_ts": latest_ts,
+            }
             old.ema9, old.ema15, old.ema50, old.vwap, old.atr14 = float(e9.iloc[-1]), float(e15.iloc[-1]), float(vals["ema50"]), float(vals["vwap"]), float(vals["atr14"])
             old.last_candle_ts, old.updated_at = latest_ts, now_ms/1000
             return self._persist(old)
-
-            if old is None:
-                s = Setup(str(symbol), status="DISCOVERED", last_candle_ts=int(x.timestamp.iloc[-1]),
-                          updated_at=now_ms/1000, reason="no_new_closed_ema9_ema15_cross")
-                return self._persist(s)
-            # Only advance once for each newly closed candle.
-            latest_ts = int(x.timestamp.iloc[-1])
-            if old.last_candle_ts == latest_ts:
-                return self._persist(old)
-            if not old.crossover_ts or old.status in ("INVALIDATED", "EXPIRED", "NO_CHASE", "ENTRY_EXECUTING", "TRADE_OPEN"):
-                old.last_candle_ts = latest_ts
-                old.updated_at = now_ms/1000
-                return self._persist(old)
-            bars = int((x.timestamp > old.crossover_ts).sum())
-            if bars > MAX_CROSS_AGE:
-                old.status, old.reason, old.expiration_reason = "EXPIRED", "entry_window_expired", "ENTRY_WINDOW_EXPIRED"
-            else:
-                side = old.direction
-                j = len(x)-1
-                price, atr = float(x.close.iloc[j]), float(vals["atr14"])
-                vwap = float(vals["vwap"])
-                aligned = (price > vwap and float(e9.iloc[j]) > float(e15.iloc[j])) if side == "BUY" else (price < vwap and float(e9.iloc[j]) < float(e15.iloc[j]))
-                invalid = (price < vwap or float(e9.iloc[j]) <= float(e15.iloc[j])) if side == "BUY" else (price > vwap or float(e9.iloc[j]) >= float(e15.iloc[j]))
-                if invalid:
-                    old.status, old.reason, old.expiration_reason = "INVALIDATED", "thesis_lost_ema_or_vwap", "THESIS_INVALIDATED"
-                elif old.rejection_ts is not None and latest_ts > old.rejection_ts:
-                    reject_high, reject_low = float(old.rejection_high), float(old.rejection_low)
-                    confirmed = price > reject_high if side == "BUY" else price < reject_low
-                    if confirmed and aligned:
-                        old.confirmation_ts = latest_ts
-                        old.status, old.reason = "ENTRY_READY", "separate_closed_confirmation_candle"
-                    else:
-                        old.status, old.reason = "WAITING_FOR_CONFIRMATION", "confirmation_candle_not_yet_valid"
-                elif old.pullback_type is None:
-                    low, high = float(x.low.iloc[j]), float(x.high.iloc[j])
-                    zone_low, zone_high = old.causal_zone_low, old.causal_zone_high
-                    if not (_finite(zone_low) and _finite(zone_high) and float(zone_low) < float(zone_high)):
-                        old.status, old.reason, old.expiration_reason = "INVALIDATED", "causal_zone_missing_or_invalid", "NO_CAUSAL_ZONE"
-                    else:
-                        # A pullback must actually revisit the causal OB/FVG; EMA touches
-                        # alone are not a substitute for a structural zone retest.
-                        buffer = 0.10 * atr
-                        touched = low <= float(zone_high) + buffer and high >= float(zone_low) - buffer
-                        if touched:
-                            old.pullback_type = str(old.causal_zone_type or "CAUSAL_ZONE")
-                            old.status = "WAITING_FOR_REJECTION"
-                            old.pullback_ts = latest_ts
-                            old.reason = "causal_" + old.pullback_type.lower() + "_retest"
-                        else:
-                            old.status = "WAITING_FOR_PULLBACK"
-                            old.reason = "waiting_for_causal_zone_retest"
-                else:
-                    o,h,l,c = map(float, (x.open.iloc[j], x.high.iloc[j], x.low.iloc[j], x.close.iloc[j]))
-                    rng = max(h-l, 1e-12)
-                    lower_wick, upper_wick = min(o,c)-l, h-max(o,c)
-                    rejected = (c > o and lower_wick/rng >= .25 and c >= l+.60*rng) if side == "BUY" else (c < o and upper_wick/rng >= .25 and c <= h-.60*rng)
-                    if rejected and aligned:
-                        old.rejection_ts, old.rejection_high, old.rejection_low = latest_ts, h, l
-                        old.status, old.reason = "WAITING_FOR_CONFIRMATION", "rejection_candle_recorded_confirmation_must_be_later"
-                    else:
-                        old.status, old.reason = "WAITING_FOR_REJECTION", "valid_rejection_candle_not_seen"
-            old.ema9, old.ema15, old.ema50, old.vwap, old.atr14 = float(e9.iloc[-1]), float(e15.iloc[-1]), float(vals["ema50"]), float(vals["vwap"]), float(vals["atr14"])
-            old.last_candle_ts, old.updated_at = latest_ts, now_ms/1000
-            return self._persist(old)
-
-    def authorize(self, symbol: str, current_price: float, tp1: float, *, minimum_space_atr: float = .35) -> Dict[str, Any]:
-        """Final forward-space/no-chase check; TP1 must come from existing GGP target engine."""
-        with self._lock:
-            s = self.get(symbol)
-            if s is None:
-                return {"allowed": False, "reason": "strategy_setup_missing"}
-            if s.status != "ENTRY_READY":
-                return {"allowed": False, "reason": "strategy_not_entry_ready", "status": s.status}
-            if (not all(_finite(v) for v in (current_price, tp1, s.atr14, s.causal_level,
-                                                     s.causal_zone_low, s.causal_zone_high))
-                    or float(s.atr14) <= 0 or float(s.causal_zone_low) >= float(s.causal_zone_high)
-                    or not s.causal_zone_type):
-                s.status, s.reason = "WAITING_FOR_CONFIRMATION", "tp1_atr_or_causal_zone_unknown"
-                self._persist(s)
-                return {"allowed": False, "reason": s.reason}
-            side = s.direction
-            zone_edge = float(s.causal_zone_high) if side == "BUY" else float(s.causal_zone_low)
-            extension = max(0.0, (float(current_price)-zone_edge)/float(s.atr14) if side == "BUY"
-                            else (zone_edge-float(current_price))/float(s.atr14))
-            ahead = float(tp1) > float(current_price) if side == "BUY" else float(tp1) < float(current_price)
-            space = (float(tp1)-float(current_price))/float(s.atr14) if side == "BUY" else (float(current_price)-float(tp1))/float(s.atr14)
-            if extension > MAX_EXTENSION_ATR:
-                s.status, s.reason, s.entry_status = "NO_CHASE", "extension_exceeds_1_5_atr", "NO_CHASE"
-            elif not ahead or space < minimum_space_atr:
-                s.status, s.reason, s.entry_status = "INVALIDATED", "tp1_not_forward_or_insufficient_space", "REJECTED"
-            else:
-                s.reason, s.entry_status = "entry_authorized_by_ema_vwap_strategy", "ENTRY_AUTHORIZED"
-            s.updated_at = time.time()
-            self._persist(s)
-            return {"allowed": s.entry_status == "ENTRY_AUTHORIZED", "reason": s.reason,
-                    "extension_atr": extension, "tp1_space_atr": space, "status": s.status}
-
-    def mark_executing(self, symbol: str) -> bool:
-        """Consume a prior authorization exactly once before handing off to execution."""
-        with self._lock:
-            s = self.get(symbol)
-            if not s or s.status != "ENTRY_READY" or s.entry_status != "ENTRY_AUTHORIZED":
-                return False
-            if not s.rejection_ts or not s.confirmation_ts or s.confirmation_ts <= s.rejection_ts:
-                return False
-            s.status, s.entry_status, s.updated_at = "ENTRY_EXECUTING", "ENTRY_EXECUTING", time.time()
-            self._persist(s)
-            return True
-
-    def mark_open(self, symbol: str) -> None:
-        with self._lock:
-            s = self.get(symbol)
-            if s:
-                s.status, s.entry_status, s.updated_at = "TRADE_OPEN", "TRADE_OPEN", time.time()
-                self._persist(s)
 
     def _persist(self, s: Setup) -> Dict[str, Any]:
         updated = asdict(s)
