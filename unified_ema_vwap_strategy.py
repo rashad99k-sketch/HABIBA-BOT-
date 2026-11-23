@@ -353,9 +353,32 @@ class UnifiedEMAVWAPPullbackEngine:
                     if not all(_finite(v) for v in (prev_gap, current_gap)):
                         continue
                     if prev_gap <= 0 and current_gap > 0:
-                        cross_events.append((k, "BUY"))
+                        candidate_side = "BUY"
                     elif prev_gap >= 0 and current_gap < 0:
-                        cross_events.append((k, "SELL"))
+                        candidate_side = "SELL"
+                    else:
+                        continue
+                    candidate_price = float(x.close.iloc[k])
+                    candidate_vwap = float(vwap_series.iloc[k])
+                    candidate_ema = float(e9.iloc[k])
+                    candidate_aligned = (
+                        candidate_price > candidate_vwap and candidate_ema > candidate_vwap
+                        if candidate_side == "BUY" else
+                        candidate_price < candidate_vwap and candidate_ema < candidate_vwap
+                    )
+                    # A daily-session VWAP reset can create a transient EMA/VWAP
+                    # crossing while price remains on the opposite side. Ignore
+                    # that reset-induced mismatch during the first eight bars of
+                    # the UTC session; genuine same-session mismatches remain
+                    # visible as INVALIDATED diagnostics.
+                    session_age = k
+                    while (session_age > 0
+                           and series["utc_session"].iloc[session_age - 1]
+                           == series["utc_session"].iloc[k]):
+                        session_age -= 1
+                    if not candidate_aligned and (k - session_age) <= MAX_CROSS_AGE:
+                        continue
+                    cross_events.append((k, candidate_side))
                 if cross_events:
                     i, cross_dir = cross_events[-1]
                     cross_vwap = float(vwap_series.iloc[i])
