@@ -5150,29 +5150,21 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
         if institutional_ctx:
             setup = str(institutional_ctx.get("setup_type", "")).upper()
-            evidence = [str(x).lower() for x in institutional_ctx.get("evidence", [])]
-            if setup in ("REVERSAL_ENGINE", "LIQUIDITY_SWEEP_REVERSAL"):
-                required = ("prior_liquidity_pool", "sweep", "reclaim", "closed_mss", "directional_trigger")
-                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
-            elif setup == "FAILED_AUCTION_REVERSAL":
-                required = ("failed_auction", "outside_acceptance_failed", "reclaim", "closed_mss", "directional_trigger")
-                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
-            elif setup in ("TREND_CONTINUATION_ENGINE", "TREND_CONTINUATION_RETEST"):
-                has_bos = any("bos" in ev for ev in evidence)
-                has_displacement = any("displacement" in ev for ev in evidence)
-                has_retest = any(token in ev for ev in evidence for token in ("retest:", "pullback:", "micro_pullback:"))
-                has_trigger = any("post_retest_trigger" in ev for ev in evidence)
-                valid = has_bos and has_displacement and has_retest and has_trigger
-            else:
-                valid = False
+            zone_type = str(institutional_ctx.get("causal_zone_type") or "").upper()
+            zone_low = safe_float(institutional_ctx.get("causal_zone_low"), None)
+            zone_high = safe_float(institutional_ctx.get("causal_zone_high"), None)
+            valid = (institutional_ctx.get("ema_vwap_authorized") is True
+                     and zone_type in ("FVG", "ORDER_BLOCK")
+                     and zone_low is not None and zone_high is not None
+                     and math.isfinite(zone_low) and math.isfinite(zone_high)
+                     and 0 < zone_low < zone_high)
             if not valid:
-                log_execution(f"[ENTRY] Institutional authorization incomplete for {setup}; LIVE blocked", "ERROR")
+                log_execution("[ENTRY] LIVE blocked: EMA/VWAP authorization or causal OB/FVG proof missing", "ERROR")
                 return False
             if df is None:
-                log_execution("[ENTRY] No closed-candle data for authorized institutional setup; LIVE blocked", "ERROR")
+                log_execution("[ENTRY] No fresh closed-candle data for authorized EMA/VWAP setup; LIVE blocked", "ERROR")
                 return False
-            # ADX, EMA and VWAP remain contextual evidence. They are not universal entry gates.
-            log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} treated as context, not a hard cross gate", "INFO")
+            log_execution(f"[ENTRY] EMA/VWAP + causal {zone_type} authorization accepted; institutional models remain contextual", "INFO")
         else:
             # Legacy/manual entry path keeps its existing stricter safeguards.
             if not (25 <= adx_val <= 38):
@@ -8188,6 +8180,11 @@ def data():
 
 @app.route("/trade", methods=["POST"])
 def manual_trade():
+    # Manual dashboard entries are intentionally disabled: every opening order
+    # must consume a one-time authorization from the closed-candle EMA/VWAP
+    # pullback lifecycle. Manual close remains available below.
+    return jsonify({"error": "Manual entry disabled; wait for an EMA9/EMA15 + VWAP pullback/retest confirmation from the strategy engine.",
+                    "code": "EMA_VWAP_AUTHORITY_REQUIRED"}), 409
     if RECOVERY_BLOCK_ENTRIES or STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
         return jsonify({"error": "Entry blocked until existing exchange/recovery state is reconciled"}), 409
     data = request.json or {}
@@ -9110,14 +9107,24 @@ def smart_opportunity_selection():
         return False
 
     watchlist = MEMORY.get("watchlist", {})
-    ready = [(sym, item) for sym, item in watchlist.items()
-             if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
+    # EMA/VWAP closed-candle lifecycle is the sole entry decision authority.
+    # Institutional analysis supplies structural context and risk levels only.
+    ready = []
+    for sym, item in watchlist.items():
+        if not isinstance(item, dict):
+            continue
+        strategy_state = item.get("ema_vwap_strategy") or {}
+        if strategy_state.get("status") == "ENTRY_READY" and strategy_state.get("direction") in ("BUY", "SELL"):
+            ready.append((sym, item))
     ready.sort(key=lambda pair: float(pair[1].get("score", pair[1].get("discovery_score", 0)) or 0), reverse=True)
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
-            side = str(item.get("side", "")).upper()
+            strategy_snapshot = item.get("ema_vwap_strategy") or {}
+            side = str(strategy_snapshot.get("direction") or "").upper()
             if side not in ("BUY", "SELL"):
+                item["entry_status"] = "BLOCKED"
+                item["rejection_reason"] = "ema_vwap_direction_unavailable"
                 continue
             exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
             df = _integration_fetch_frame(exchange_sym)
@@ -9132,29 +9139,19 @@ def smart_opportunity_selection():
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "insufficient_fresh_closed_ohlcv"
                 continue
-            # Re-evaluate BUY and SELL independently immediately before authorization.
-            # RF/V2 direction is only a tie-break hint and can never suppress the other side.
+            # Evaluate both institutional sides independently for structural context.
+            # Neither side result can override or veto the EMA/VWAP direction.
             fresh = roro_analyze_symbol_both(
                 exchange_sym, closed_df,
                 now_ms=int(time.time() * 1000),
-                side_hints=item.get("side_hints") or [side],
+                side_hints=["BUY", "SELL"],
             )
-            fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
+            fresh.update(_enrich_with_existing_gpp_engines(closed_df, side, fresh))
             item.update(fresh)
             item["source"] = item.get("source") or "unified_watchlist"
-            if item.get("decision_state") != "ENTRY_READY":
-                continue
-            side = str(item.get("side", "")).upper()
-            if side not in ("BUY", "SELL"):
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "no_unambiguous_authorized_side"
-                continue
+            item["side"] = side
             event_id = str(item.get("event_id") or "")
-            if not event_id:
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "missing_event_id"
-                continue
-            if INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
+            if event_id and INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "duplicate_event_persisted"
                 continue
@@ -9165,16 +9162,28 @@ def smart_opportunity_selection():
                 continue
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
-            setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
-            if not ("REVERSAL" in setup or "CONTINUATION" in setup):
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "unsupported_setup_type"
-                continue
+            setup = str(item.get("decision_setup_type") or item.get("setup_type") or "EMA_VWAP_CAUSAL_ZONE").upper()
             classification = "REVERSAL" if "REVERSAL" in setup else "TREND"
-            sl = item.get("structural_stop")
-            if sl is None or not np.isfinite(float(sl)) or float(sl) <= 0:
+            # Stop is anchored to the same causal zone that produced the retest.
+            # An institutional stop may be reused only when it is beyond that zone.
+            setup_obj = EMA_VWAP_ENTRY_ENGINE.get(canonical)
+            if not setup_obj or not all(np.isfinite(float(v)) for v in (
+                    setup_obj.causal_zone_low, setup_obj.causal_zone_high, atr_value)):
                 item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "structural_stop_missing"
+                item["rejection_reason"] = "causal_zone_missing_for_stop"
+                continue
+            zone_low, zone_high = float(setup_obj.causal_zone_low), float(setup_obj.causal_zone_high)
+            buffer = 0.15 * float(atr_value)
+            proposed_sl = zone_low - buffer if side == "BUY" else zone_high + buffer
+            institutional_sl = item.get("structural_stop")
+            if institutional_sl is not None and np.isfinite(float(institutional_sl)):
+                candidate_sl = float(institutional_sl)
+                if (side == "BUY" and candidate_sl < zone_low) or (side == "SELL" and candidate_sl > zone_high):
+                    proposed_sl = candidate_sl
+            sl = proposed_sl
+            if not np.isfinite(sl) or sl <= 0 or (side == "BUY" and sl >= price) or (side == "SELL" and sl <= price):
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "causal_zone_stop_geometry_invalid"
                 continue
             _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
             if not (tp1 and tp2 and np.isfinite(float(tp1)) and np.isfinite(float(tp2))):
@@ -9194,7 +9203,11 @@ def smart_opportunity_selection():
             evidence = list(item.get("evidence") or [])
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
-                "event_id": item.get("event_id"),
+                "event_id": event_id or None,
+                "causal_zone_type": setup_obj.causal_zone_type,
+                "causal_zone_low": zone_low,
+                "causal_zone_high": zone_high,
+                "causal_zone_ts": setup_obj.causal_zone_ts,
                 "evidence": evidence,
                 "structural_stop": float(sl),
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
@@ -9235,7 +9248,8 @@ def smart_opportunity_selection():
                 trade_id = str(STATE.get("trade_id") or "")
                 if INSTITUTIONAL_TRADE_JOURNAL and trade_id:
                     INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
-                RORO_ENTRY_AUTHORITY.consume(event_id)
+                if event_id:
+                    RORO_ENTRY_AUTHORITY.consume(event_id)
                 log_execution(f"[INSTITUTIONAL_ENTRY] {setup} {side} {exchange_sym} event={event_id}", "SUCCESS")
                 return True
         except Exception as exc:

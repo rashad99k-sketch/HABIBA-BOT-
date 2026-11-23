@@ -36,7 +36,7 @@ def _size(balance, entry, stop_pct, side="BUY", classification="TREND",
 
 # 1) Available Balance = 100 -> Target Margin = 20
 def test_balance_100_target_margin_20():
-    r = _size(100.0, 0.06, 0.05, risk_pct=1.0)  # tiny stop so allocation binds
+    r = _size(100.0, 0.06, 0.05, risk_pct=10.0)  # 10% allocated-margin risk budget permits the allocation ceiling
     assert r.allocation_pct == pytest.approx(TRADE_ALLOCATION_PCT)
     assert r.target_margin == pytest.approx(20.0)
 
@@ -50,7 +50,7 @@ def test_leverage_20_target_notional_400():
 
 # 3) DOGE @ 0.06 -> raw quantity 6666.666666 (allocation binding, not risk)
 def test_doge_raw_quantity_6666_666666():
-    r = _size(100.0, 0.06, 0.05, risk_pct=1.0)
+    r = _size(100.0, 0.06, 0.05, risk_pct=10.0)
     # raw quantity from the allocation target (before risk gate would reduce it)
     raw = r.target_notional / 0.06
     assert raw == pytest.approx(6666.666666, rel=1e-9)
@@ -60,7 +60,7 @@ def test_doge_raw_quantity_6666_666666():
 
 # 4) Available Balance = 33.35 -> Target Margin = 6.67
 def test_balance_33_35_target_margin_6_67():
-    r = _size(33.35, 0.06, 0.05, risk_pct=1.0)
+    r = _size(33.35, 0.06, 0.05, risk_pct=10.0)
     assert r.target_margin == pytest.approx(6.67, abs=1e-9)
 
 
@@ -73,8 +73,8 @@ def test_doge_33_35_raw_quantity_2223_333333():
 
 # 6 & 7) BUY and SELL use the same size equation
 def test_buy_and_sell_use_same_size_equation():
-    buy = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=1.0)
-    sell = _size(100.0, 0.06, 0.05, side="SELL", risk_pct=1.0)
+    buy = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=10.0)
+    sell = _size(100.0, 0.06, 0.05, side="SELL", risk_pct=10.0)
     assert buy.quantity == pytest.approx(sell.quantity)
     assert buy.final_notional == pytest.approx(sell.final_notional)
     assert buy.target_margin == pytest.approx(sell.target_margin)
@@ -137,7 +137,7 @@ def test_stale_balance_cache_not_reused():
 
 # 13) Contract size and precision are applied correctly
 def test_contract_size_and_precision_applied():
-    r = _size(100.0, 0.06, 0.05, contract_size=10.0, risk_pct=1.0)
+    r = _size(100.0, 0.06, 0.05, contract_size=10.0, risk_pct=10.0)
     # quantity is in contracts: notional = quantity * contract_size * entry
     assert r.quantity * r.contract_size * 0.06 == pytest.approx(r.final_notional)
     assert r.final_notional == pytest.approx(r.target_notional)
@@ -169,98 +169,51 @@ def test_quantity_matches_notional_definition():
 
 # Mandatory DOGE examples, allocation-binding (tight stop) case
 def test_doge_example_100_buy_allocation_binding():
-    r = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=1.0)
+    r = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=10.0)
     assert r.target_margin == pytest.approx(20.0)
     assert r.target_notional == pytest.approx(400.0)
     assert r.quantity == pytest.approx(6666.666666, rel=1e-6)
 
 
 def test_doge_example_33_35_sell_allocation_binding():
-    r = _size(33.35, 0.06, 0.05, side="SELL", risk_pct=1.0)
+    r = _size(33.35, 0.06, 0.05, side="SELL", risk_pct=10.0)
     assert r.target_margin == pytest.approx(6.67, abs=1e-9)
     assert r.target_notional == pytest.approx(133.40, abs=1e-9)
     assert r.quantity == pytest.approx(2223.333333, rel=1e-6)
 
 
 # --------------------------------------------------------------------------- #
-# Integration: the REAL execute_entry sizing path emits [POSITION_SIZING_AUDIT]
-# proving the 20% allocation reached the order, and BUY/SELL use the same size.
+# Entry authority regression: direct legacy calls cannot bypass EMA/VWAP.
 # --------------------------------------------------------------------------- #
-def _run_execute_entry(monkeypatch, *, side, balance, price=0.06, stop_pct=0.05):
-    """Drive ggpbot.execute_entry in PAPER mode and return captured logs + STATE."""
-    import numpy as np
-    import pandas as pd
+def test_execute_entry_blocks_without_one_time_ema_vwap_authorization(monkeypatch):
     import ggpbot
 
     logs = []
     monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
     monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
-    ggpbot.paper["balance"] = balance
-    ggpbot.paper["position"] = None
-    for key in ("open", "in_position"):
-        if key in ggpbot.STATE:
-            ggpbot.STATE[key] = False
-    ggpbot.STATE["open"] = False
-    ggpbot.TRADE_STATE["in_position"] = False
-    ggpbot._ACTIVE_TRADE = False
+    monkeypatch.setattr(ggpbot, "log_execution", lambda msg, level="INFO", *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", None)
 
-    # Realistic OHLCV frame so ADX/DI/structure engines have data.
-    n = 120
-    ts = [1_700_000_000_000 + i * 900_000 for i in range(n)]
-    base = np.linspace(0.055, price, n)
-    frame = pd.DataFrame({
-        "timestamp": ts, "open": base * 0.999, "high": base * 1.004,
-        "low": base * 0.996, "close": base, "volume": np.full(n, 1000.0),
-    })
-    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: frame)
-    monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: price)
-    monkeypatch.setattr(ggpbot, "update_position_dashboard", lambda *a, **k: None)
-    monkeypatch.setattr(ggpbot, "tg_entry", lambda *a, **k: None)
-    monkeypatch.setattr(ggpbot, "_live_manager", type("M", (), {"start_trade": lambda *a, **k: None})())
-
-    real_log = ggpbot.log_execution
-
-    def capture(msg, level="INFO", *a, **k):
-        logs.append(str(msg))
-        return real_log(msg, level, *a, **k)
-    monkeypatch.setattr(ggpbot, "log_execution", capture)
-
-    stop = price * (1 - stop_pct / 100.0) if side == "BUY" else price * (1 + stop_pct / 100.0)
-    tp1 = price * (1 + 0.008) if side == "BUY" else price * (1 - 0.008)
-    tp2 = price * (1 + 0.02) if side == "BUY" else price * (1 - 0.02)
-    ok = ggpbot.execute_entry(side, "DOGE/USDT", price, stop, tp1, tp2, 80,
-                              "test", 0.001, "TREND", "TEST", "TREND")
-    return ok, logs, ggpbot.STATE
+    state_before = dict(ggpbot.STATE)
+    result = ggpbot.execute_entry("BUY", "DOGE/USDT", 0.06, 0.0599, 0.0605, 0.0612,
+                                  80, "legacy direct call", 0.001, "TREND", "TEST", "TREND")
+    assert result is False
+    assert any("EMA_VWAP_ENTRY_GATE" in message and "BLOCKED" in message for message in logs)
+    assert ggpbot.STATE == state_before
 
 
-def test_execute_entry_audit_proves_20pct_reached_the_order(monkeypatch):
-    ok, logs, state = _run_execute_entry(monkeypatch, side="BUY", balance=100.0)
-    audit = [m for m in logs if "POSITION_SIZING_AUDIT" in m]
-    assert audit, "the position sizing audit block must be emitted"
-    block = audit[-1]
-    assert "BingX Available Balance: 100.0000 USDT" in block
-    assert "Allocation Percentage: 20%" in block
-    assert "Target Margin: 20.0000 USDT" in block
-    assert "Leverage: 20x" in block
-    assert "Target Notional: 400.0000 USDT" in block
-    assert "Binding Constraint: ALLOCATION" in block
-    assert "Final Status: PASS" in block
-    assert ok is True
+def test_execute_entry_blocks_unauthorized_sell_symmetrically(monkeypatch):
+    import ggpbot
 
+    logs = []
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda msg, level="INFO", *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", None)
 
-def test_execute_entry_buy_and_sell_same_quantity(monkeypatch):
-    ok_b, logs_b, state_b = _run_execute_entry(monkeypatch, side="BUY", balance=100.0)
-    qty_b = state_b.get("qty")
-    ok_s, logs_s, state_s = _run_execute_entry(monkeypatch, side="SELL", balance=100.0)
-    qty_s = state_s.get("qty")
-    assert ok_b and ok_s
-    assert qty_b and qty_s
-    assert qty_b == pytest.approx(qty_s, rel=1e-9), "direction must not change the size"
-
-
-def test_execute_entry_risk_gate_logged_not_silent(monkeypatch):
-    # Wide stop: the risk gate binds and the reduction must be logged explicitly.
-    ok, logs, state = _run_execute_entry(monkeypatch, side="BUY", balance=33.35, stop_pct=2.4)
-    assert any("SIZING_RISK_GATE" in m for m in logs), "a risk-gate reduction must be logged"
-    audit = [m for m in logs if "POSITION_SIZING_AUDIT" in m]
-    assert audit and "Binding Constraint: RISK_GATE" in audit[-1]
+    state_before = dict(ggpbot.STATE)
+    result = ggpbot.execute_entry("SELL", "DOGE/USDT", 0.06, 0.0601, 0.0595, 0.0588,
+                                  80, "legacy direct call", 0.001, "TREND", "TEST", "TREND")
+    assert result is False
+    assert any("EMA_VWAP_ENTRY_GATE" in message and "BLOCKED" in message for message in logs)
+    assert ggpbot.STATE == state_before

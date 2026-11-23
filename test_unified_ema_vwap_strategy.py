@@ -54,12 +54,12 @@ def test_authorization_requires_ready_and_tp1_forward_space(tmp_path):
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "watch.json"))
     assert engine.authorize("X", 101, 103)["allowed"] is False
     engine._persist(Setup(symbol="X", status="ENTRY_READY", direction="BUY", atr14=1,
-                           causal_level=100, rejection_ts=1, confirmation_ts=2))
+                           causal_level=100, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG", causal_zone_ts=1, rejection_ts=1, confirmation_ts=2))
     assert engine.authorize("X", 101, 103)["allowed"] is True
     other = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "other.json"))
     other._persist(Setup(symbol="Y", status="ENTRY_READY", direction="BUY", atr14=1,
-                         causal_level=100, rejection_ts=1, confirmation_ts=2))
-    decision = other.authorize("Y", 102, 103)
+                         causal_level=100, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG", causal_zone_ts=1, rejection_ts=1, confirmation_ts=2))
+    decision = other.authorize("Y", 102.1, 103)
     assert decision["allowed"] is False and decision["status"] == "NO_CHASE"
 
 
@@ -67,7 +67,7 @@ def test_same_closed_candle_does_not_advance_setup_twice(tmp_path):
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "watch.json"))
     f = frame(70); ts = int(f.timestamp.iloc[-1])
     engine._persist(Setup(symbol="X", status="WAITING_FOR_PULLBACK", direction="BUY",
-                          crossover_ts=ts - 900_000, last_candle_ts=ts, atr14=1, causal_level=100))
+                          crossover_ts=ts - 900_000, last_candle_ts=ts, atr14=1, causal_level=100, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG"))
     first = engine.evaluate("X", f, now_ms=ts + 900_000)
     second = engine.evaluate("X", f, now_ms=ts + 900_000)
     assert first["last_candle_ts"] == second["last_candle_ts"] == ts
@@ -91,10 +91,19 @@ def test_buy_and_sell_crosses_are_confirmed_on_closed_candles(tmp_path):
     for side in ("BUY", "SELL"):
         f = cross_frame(side)
         engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / f"{side}.json"))
+        from unified_ema_vwap_strategy import _find_causal_zone, indicators
+        vals = indicators(f)
+        cross_idx = int(np.where(np.diff(np.sign(
+            f.close.ewm(span=9, adjust=False).mean() -
+            f.close.ewm(span=15, adjust=False).mean())) != 0)[0][-1] + 1)
+        assert _find_causal_zone(f, cross_idx, side, vals["atr14"]) is None
         result = engine.evaluate(side, f, now_ms=int(f.timestamp.iloc[-1] + 900_000))
         assert result["direction"] == side
-        assert result["status"] in {"WAITING_FOR_PULLBACK", "WAITING_FOR_REJECTION"}
         assert result["crossover_ts"] is not None
+        # A mathematically valid cross without a causal OB/FVG must not become
+        # an executable watchlist setup.
+        assert result["status"] == "INVALIDATED"
+        assert result["expiration_reason"] == "NO_CAUSAL_ZONE"
 
 
 def test_cross_on_unclosed_bar_is_never_discovered(tmp_path):
@@ -124,7 +133,7 @@ def test_rejection_and_confirmation_must_be_separate_closed_candles(tmp_path):
     f.loc[69, ["open", "high", "low", "close"]] = [109.8, 110.0, 108.8, 109.95]
     engine._persist(Setup(symbol="SEQ", status="WAITING_FOR_REJECTION", direction="BUY",
                           crossover_ts=ts - 4 * 900_000, pullback_type="MICRO",
-                          last_candle_ts=ts - 900_000, atr14=1, causal_level=109.0))
+                          last_candle_ts=ts - 900_000, atr14=1, causal_level=109.0, causal_zone_low=108.8, causal_zone_high=109.2, causal_zone_type="ORDER_BLOCK", causal_zone_ts=ts - 2*900_000))
     rejection = engine.evaluate("SEQ", f, now_ms=ts + 900_000)
     assert rejection["status"] == "WAITING_FOR_CONFIRMATION"
     assert rejection["rejection_ts"] == ts
@@ -145,7 +154,7 @@ def test_setup_expires_after_eight_closed_bars(tmp_path):
     cross_ts = int(f.timestamp.iloc[-10])
     engine._persist(Setup(symbol="OLD", status="WAITING_FOR_PULLBACK", direction="BUY",
                           crossover_ts=cross_ts, last_candle_ts=last - 900_000,
-                          atr14=1, causal_level=100))
+                          atr14=1, causal_level=100, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG"))
     expired = engine.evaluate("OLD", f, now_ms=last + 900_000)
     assert expired["status"] == "EXPIRED"
     assert expired["expiration_reason"] == "ENTRY_WINDOW_EXPIRED"
@@ -154,7 +163,7 @@ def test_setup_expires_after_eight_closed_bars(tmp_path):
 def test_mark_executing_requires_successful_strategy_authorization(tmp_path):
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "handoff.json"))
     engine._persist(Setup(symbol="BTC/USDT", status="ENTRY_READY", direction="BUY",
-                          atr14=1.0, causal_level=100.0, rejection_ts=10,
+                          atr14=1.0, causal_level=100.0, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG", rejection_ts=10,
                           confirmation_ts=20, entry_status="NOT_READY"))
     assert engine.mark_executing("BTC/USDT") is False
     assert engine.get("BTC/USDT").status == "ENTRY_READY"
@@ -169,7 +178,7 @@ def test_execution_handoff_requires_authorized_symbol_side_and_price(tmp_path):
 
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "handoff-guard.json"))
     engine._persist(Setup(symbol="BTC/USDT", status="ENTRY_READY", direction="BUY",
-                          atr14=1.0, causal_level=100.0, rejection_ts=10,
+                          atr14=1.0, causal_level=100.0, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG", rejection_ts=10,
                           confirmation_ts=20))
     assert engine.authorize("BTC/USDT", 101.0, 103.0)["allowed"] is True
     assert engine.mark_executing("BTC/USDT") is True
@@ -180,3 +189,34 @@ def test_execution_handoff_requires_authorized_symbol_side_and_price(tmp_path):
     assert not execution_handoff_allowed(engine, "BTC/USDT", "SELL", 101.0, 103.0, context)
     assert not execution_handoff_allowed(engine, "BTC/USDT", "BUY", 102.0, 103.0, context)
     assert not execution_handoff_allowed(engine, "BTC/USDT", "BUY", 101.0, 103.0, {})
+
+def test_causal_fvg_detection_uses_only_closed_pre_entry_structure():
+    from unified_ema_vwap_strategy import _find_causal_zone
+    rows = []
+    base_ts = 1_800_000_000_000
+    for i in range(8):
+        price = 100.0 + i * 0.1
+        rows.append({"timestamp": base_ts + i*900_000, "open": price, "high": price+0.2,
+                     "low": price-0.2, "close": price+0.05, "volume": 10.0})
+    # Bullish three-candle imbalance at index 6: current low > high two bars earlier.
+    rows[4].update({"open":100.4,"high":100.5,"low":100.2,"close":100.3})
+    rows[5].update({"open":100.6,"high":100.9,"low":100.55,"close":100.8})
+    rows[6].update({"open":101.0,"high":101.5,"low":101.1,"close":101.4})
+    frame_ = pd.DataFrame(rows)
+    zone = _find_causal_zone(frame_, 6, "BUY", 1.0)
+    assert zone is not None
+    assert zone["type"] == "FVG"
+    assert zone["low"] == 100.5
+    assert zone["high"] == 101.1
+    assert zone["timestamp"] == int(frame_.timestamp.iloc[6])
+
+
+def test_causal_zone_is_required_for_entry_authorization(tmp_path):
+    engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "zone-required.json"))
+    engine._persist(Setup(symbol="NOZONE", status="ENTRY_READY", direction="BUY",
+                          atr14=1.0, causal_level=100.0, rejection_ts=10, confirmation_ts=20))
+    result = engine.authorize("NOZONE", 101.0, 103.0)
+    assert result["allowed"] is False
+    assert result["reason"] == "tp1_atr_or_causal_zone_unknown"
+
+

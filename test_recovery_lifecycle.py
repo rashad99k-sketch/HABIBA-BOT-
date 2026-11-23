@@ -531,77 +531,49 @@ def test_accepted_close_that_leaves_position_open_is_not_verified(tmp_path, monk
 # --------------------------------------------------------------------------- #
 # 14: native SL modification failure must keep protection honest
 # --------------------------------------------------------------------------- #
-def test_native_sl_move_failure_retains_previous_protection(tmp_path, monkeypatch):
-    # cancelReplace is unavailable and the cancel fails, so the OLD stop survives.
-    # The runner must stay protected at the previous level and must NOT enter a
-    # false Hold or claim a move that never happened.
+def test_native_sl_is_immutable_after_entry_even_when_exchange_supports_replace(tmp_path, monkeypatch):
     journal, trade_id = _seed_journal(tmp_path)
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
-    ex = MockExchange(hedged=True, position=_long_position(), open_orders=[_native_stop()],
+    ex = MockExchange(hedged=True, position=_long_position(), open_orders=[_native_stop(order_id="111")])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
+                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
+                         "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
+                         "native_sl_order_id": "111", "native_sl_verified": True,
+                         "native_sl_original_price": 95.0, "native_sl_status": "VERIFIED"})
+    assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
+                                               reason="BREAKEVEN") is False
+    assert ex.cancel_replace_calls == []
+    assert ex.cancel_calls == []
+    assert ex.create_calls == []
+    assert any(str(order.get("id")) == "111" and float(order.get("stopPrice")) == 95.0
+               for order in ex.open_orders)
+    assert ggpbot.STATE["native_sl_verified"] is True
+    assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+    assert ggpbot.STATE["recovery_hold"] is False
+    row = journal.get(trade_id)
+    assert row["native_sl_order_id"] == "111"
+    assert row["native_sl_verified"] == 1
+
+
+def test_native_sl_immutable_policy_never_enters_false_recovery_hold(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    ex = MockExchange(hedged=True, position=_long_position(),
+                      open_orders=[_native_stop(order_id="111")],
                       cancel_replace=False, fail_cancel=True)
     monkeypatch.setattr(ggpbot, "ex", ex)
     ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
                          "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
                          "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
                          "native_sl_order_id": "111", "native_sl_verified": True,
-                         "native_sl_original_price": 95.0})
+                         "native_sl_original_price": 95.0, "native_sl_status": "VERIFIED"})
     assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
                                                reason="BREAKEVEN") is False
-    # Previous protection retained: still verified, not in Hold, stop unchanged.
+    assert ex.cancel_calls == [] and ex.create_calls == []
     assert ggpbot.STATE["native_sl_verified"] is True
-    assert ggpbot.STATE["native_sl_status"] == "VERIFIED_AT_PREVIOUS_LEVEL"
     assert ggpbot.STATE["recovery_hold"] is False
     assert ggpbot.STATE["native_sl_order_id"] == "111"
-
-
-def test_native_sl_move_failure_holds_only_when_protection_is_truly_lost(tmp_path, monkeypatch):
-    # cancelReplace unavailable, cancel SUCCEEDS (old stop gone), and the replacement
-    # cannot be placed -> no stop is active at any level -> real Hold.
-    journal, trade_id = _seed_journal(tmp_path)
-    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
-
-    class CancelOkNoReplace(MockExchange):
-        def __init__(self, **kw):
-            super().__init__(**kw)
-            self.block_stop_creation = False
-
-        def create_order(self, symbol, kind, side, amount, price=None, params=None):
-            if kind == "STOP_MARKET":
-                self.create_calls.append((symbol, kind, side, amount, params or {}))
-                raise RuntimeError("exchange rejected the replacement stop")
-            return super().create_order(symbol, kind, side, amount, price, params)
-
-    ex = CancelOkNoReplace(hedged=True, position=_long_position(),
-                           open_orders=[_native_stop(order_id="111")], cancel_replace=False)
-    monkeypatch.setattr(ggpbot, "ex", ex)
-    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
-                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
-                         "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
-                         "native_sl_order_id": "111", "native_sl_verified": True,
-                         "native_sl_original_price": 95.0})
-    assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
-                                               reason="BREAKEVEN") is False
-    assert ggpbot.STATE["recovery_hold"] is True
-    assert ggpbot.STATE["native_sl_verified"] is False
-    assert "native_sl_move_failed" in str(ggpbot.STATE["recovery_reason"])
-
-
-def test_native_sl_move_success_updates_state_and_journal(tmp_path, monkeypatch):
-    journal, trade_id = _seed_journal(tmp_path)
-    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
-    ex = MockExchange(hedged=True, position=_long_position(), open_orders=[_native_stop()])
-    monkeypatch.setattr(ggpbot, "ex", ex)
-    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
-                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
-                         "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
-                         "native_sl_order_id": "111", "native_sl_verified": True})
-    assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0, reason="BREAKEVEN") is True
-    assert ggpbot.STATE["native_sl_verified"] is True
-    assert ggpbot.STATE["native_sl_order_id"] == "sl-replaced"
-    assert ex.cancel_replace_calls, "the atomic cancel/replace path must be used when available"
-    row = journal.get(trade_id)
-    assert row["native_sl_order_id"] == "sl-replaced"
-    assert row["native_sl_verified"] == 1
 
 
 # --------------------------------------------------------------------------- #
