@@ -3570,7 +3570,11 @@ class LiveTradeManager:
                 safe_float(STATE.get("adx_live"), 20.0),
                 safe_float(STATE.get("adx_slope"), 0.0), structure_aligned,
                 max_atr_distance=safe_float(os.getenv("TP2_MAX_ATR_DISTANCE", "3.0"), 3.0),
-                min_continuation=safe_float(os.getenv("TP2_MIN_CONTINUATION", "0.45"), 0.45))
+                min_continuation=safe_float(os.getenv("TP2_MIN_CONTINUATION", "0.45"), 0.45),
+                adverse_divergence=bool(STATE.get("adverse_divergence", False)),
+                zone_intact=bool(STATE.get("entry_zone_intact", True)),
+                opposing_liquidity_blocked=bool(STATE.get("opposing_liquidity_near", False)),
+                volume_ratio=safe_float(STATE.get("volume_ratio"), 0.0))
         context = {
             "symbol": symbol, "side": side, "entry": entry, "current_price": mark_price,
             "atr": atr, "roe": roe,
@@ -3599,6 +3603,9 @@ class LiveTradeManager:
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
+            "zone_intact": bool(STATE.get("entry_zone_intact", True)),
+            "adverse_divergence": bool(STATE.get("adverse_divergence", False)),
+            "opposing_liquidity_near": bool(STATE.get("opposing_liquidity_near", False)),
             "trend_evidence_score": safe_float(STATE.get("trend_evidence_score"), 0.0),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
