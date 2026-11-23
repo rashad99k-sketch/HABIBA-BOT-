@@ -345,16 +345,39 @@ class UnifiedEMAVWAPPullbackEngine:
                     low, high = float(x.low.iloc[j]), float(x.high.iloc[j])
                     zone_low = float(old.causal_zone_low) - 0.10 * atr
                     zone_high = float(old.causal_zone_high) + 0.10 * atr
-                    touches = high >= zone_low and low <= zone_high
+                    touches_zone = high >= zone_low and low <= zone_high
+                    # Three named paths, each still requiring the same valid causal zone.
+                    # MICRO is a shallow first revisit near the zone edge; PULLBACK is
+                    # a deeper traversal; RETEST is a revisit of the broken structure level.
+                    distance_to_zone = (
+                        max(0.0, low - zone_high) if side == "BUY"
+                        else max(0.0, zone_low - high)
+                    )
                     extension = max(0.0, (price - float(old.causal_zone_high))/atr if side == "BUY"
                                     else (float(old.causal_zone_low) - price)/atr)
+                    prior_structure = float(old.crossover_price or old.causal_level or price)
+                    structure_retest = (
+                        low <= prior_structure + 0.10 * atr and high >= prior_structure - 0.10 * atr
+                    )
+                    shallow_touch = (
+                        touches_zone and abs(price - float(old.causal_level)) <= 0.35 * atr
+                    )
+                    deep_touch = (
+                        touches_zone and abs(price - float(old.causal_level)) > 0.35 * atr
+                    )
                     if extension > MAX_EXTENSION_ATR:
                         old.status, old.reason, old.expiration_reason = "NO_CHASE", "price_left_causal_zone_by_more_than_1_5_atr", "ENTRY_WINDOW_MISSED"
-                    elif touches:
-                        old.pullback_type, old.pullback_ts = ("MICRO" if abs(price - float(old.causal_level))/atr < 0.25 else "RETEST"), latest_ts
-                        old.status, old.reason = "WAITING_FOR_REJECTION", "causal_zone_retested_waiting_for_rejection"
+                    elif shallow_touch:
+                        old.pullback_type, old.pullback_ts = "MICRO_PULLBACK", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "micro_pullback_at_causal_zone_waiting_for_rejection"
+                    elif deep_touch:
+                        old.pullback_type, old.pullback_ts = "PULLBACK", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "deep_causal_zone_pullback_waiting_for_rejection"
+                    elif structure_retest:
+                        old.pullback_type, old.pullback_ts = "RETEST", latest_ts
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "broken_level_retest_waiting_for_rejection"
                     else:
-                        old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_causal_zone_pullback"
+                        old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_micro_pullback_pullback_or_retest"
                 elif old.pullback_type is not None and old.rejection_ts is None:
                     # The rejection is a distinct, fully closed candle after the retest.
                     o, h, l, c = map(float, (x.open.iloc[j], x.high.iloc[j], x.low.iloc[j], x.close.iloc[j]))
