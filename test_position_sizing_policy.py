@@ -194,11 +194,12 @@ def test_execute_entry_blocks_without_one_time_ema_vwap_authorization(monkeypatc
     monkeypatch.setattr(ggpbot, "log_execution", lambda msg, level="INFO", *a, **k: logs.append(str(msg)))
     monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", None)
 
+    state_before = dict(ggpbot.STATE)
     result = ggpbot.execute_entry("BUY", "DOGE/USDT", 0.06, 0.0599, 0.0605, 0.0612,
                                   80, "legacy direct call", 0.001, "TREND", "TEST", "TREND")
     assert result is False
     assert any("EMA_VWAP_ENTRY_GATE" in message and "BLOCKED" in message for message in logs)
-    assert ggpbot.STATE.get("open") is not True
+    assert ggpbot.STATE == state_before
 
 
 def test_execute_entry_blocks_unauthorized_sell_symmetrically(monkeypatch):
@@ -210,8 +211,9 @@ def test_execute_entry_blocks_unauthorized_sell_symmetrically(monkeypatch):
     monkeypatch.setattr(ggpbot, "log_execution", lambda msg, level="INFO", *a, **k: logs.append(str(msg)))
     monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", None)
 
+    state_before = dict(ggpbot.STATE)
     result = ggpbot.execute_entry("SELL", "DOGE/USDT", 0.06, 0.0601, 0.0595, 0.0588,
                                   80, "legacy direct call", 0.001, "TREND", "TEST", "TREND")
     assert result is False
     assert any("EMA_VWAP_ENTRY_GATE" in message and "BLOCKED" in message for message in logs)
-    assert ggpbot.STATE.get("open") is not True
+    assert ggpbot.STATE == state_before
