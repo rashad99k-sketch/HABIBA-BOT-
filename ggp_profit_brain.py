@@ -215,25 +215,29 @@ def target_reached(side: str, current_price: float, target_price: float) -> bool
 
 
 def tp2_reassessment(side: str, current_price: float, tp2_price: float, atr: float,
-                     continuation_probability: float, adx: float, adx_slope: float,
-                     structure_aligned: bool, max_atr_distance: float = 3.0,
-                     min_continuation: float = 0.45) -> Tuple[str, str]:
-    side = str(side or "").upper()
+                     continuation_probability: float, adx: float = 0.0, adx_slope: float = 0.0,
+                     structure_aligned: bool = False, max_atr_distance: float = 3.0,
+                     min_continuation: float = 0.45, *, adverse_divergence: bool = False,
+                     opposing_liquidity_blocked: bool = False) -> Tuple[str, str]:
+    """Reassess the runner from continuation and structure, not an ADX cutoff.
+
+    The ADX arguments remain for compatibility with callers, but have no
+    decision weight. A remote TP2 is not cancelled merely because ADX is low.
+    """
+    direction = str(side or "").upper()
     current = _number(current_price, 0.0) or 0.0
     target = _number(tp2_price, 0.0) or 0.0
-    atr_value = _number(atr, 0.0) or 0.0
+    volatility = _number(atr, 0.0) or 0.0
     continuation = _number(continuation_probability, 0.0) or 0.0
-    adx_value = _number(adx, 0.0) or 0.0
-    slope = _number(adx_slope, 0.0) or 0.0
-    if side not in {"BUY", "SELL"} or current <= 0 or target <= 0 or atr_value <= 0:
+    if direction not in {"BUY", "SELL"} or current <= 0 or target <= 0 or volatility <= 0:
         return "HOLD", "insufficient_tp2_evidence"
-    distance = target - current if side == "BUY" else current - target
+    distance = target-current if direction == "BUY" else current-target
     if distance <= 0:
         return "HOLD", "target_reached"
-    remote = distance / atr_value > max_atr_distance
-    weakening = continuation < min_continuation or (adx_value < 18 and slope <= 0)
+    remote = distance/volatility > max_atr_distance
+    weakening = continuation < min_continuation or adverse_divergence or opposing_liquidity_blocked
     if remote and weakening:
-        return "CLOSE", "tp2_remote_and_continuation_weak"
+        return "CLOSE", "tp2_remote_and_multi_evidence_continuation_weak"
     if remote and not structure_aligned:
         return "CLOSE", "tp2_remote_and_structure_lost"
     return "HOLD", "runner_structure_and_continuation_acceptable"
