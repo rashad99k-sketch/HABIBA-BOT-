@@ -3356,6 +3356,9 @@ class LiveTradeManager:
                 "volume_ratio": volume_ratio,
                 "momentum_strength": momentum.get("momentum_health"),
                 "spread_pct": STATE.get("entry_spread_pct"),
+                "opposing_liquidity_distance_pct": opposing_liquidity_distance_pct,
+                "entry_quality_score": entry_quality_score,
+                "estimated_round_trip_cost_pct": estimated_round_trip_cost_pct,
                 "liquidity_quality": STATE.get("liquidity_quality", "UNKNOWN"),
                 "orderbook_depth_usdt": STATE.get("orderbook_depth_usdt"),
                 "min_orderbook_depth_usdt": STATE.get("min_orderbook_depth_usdt", 0),
@@ -3368,6 +3371,14 @@ class LiveTradeManager:
                 "opposing_liquidity_near": opposing_liquidity_near,
                 "trend_expansion": bool(momentum.get("trend_expansion", False)),
             }
+            STATE["entry_zone_intact"] = bool((mode_context.get("structure_score") or 0) >= 50 and not mode_context.get("structure_broken", False))
+            STATE["adverse_divergence"] = bool(
+                mode_context.get("momentum_strength") is not None
+                and mode_context.get("momentum_strength") < 35
+                and mode_context.get("continuation_probability", 0.5) < 0.45
+            )
+            STATE["opposing_liquidity_near"] = bool(opposing_liquidity_near)
+            STATE["opposing_liquidity_distance_pct"] = opposing_liquidity_distance_pct
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
             current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
             last_mode_ts = safe_float(STATE.get("profit_mode_last_candle_ts"), 0.0)
