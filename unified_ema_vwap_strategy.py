@@ -88,11 +88,13 @@ def _find_causal_zone(frame: pd.DataFrame, cross_index: int, side: str, atr: flo
         if side == "BUY":
             broke = float(cross.close) > float(prior.high.max())
             opposing = [i for i in range(max(0, cross_index - 5), cross_index)
-                        if float(frame.open.iloc[i]) > float(frame.close.iloc[i])]
+                        if float(frame.open.iloc[i]) > float(frame.close.iloc[i])
+                        and abs(float(frame.open.iloc[i]) - float(frame.close.iloc[i])) >= 0.20 * atr]
         else:
             broke = float(cross.close) < float(prior.low.min())
             opposing = [i for i in range(max(0, cross_index - 5), cross_index)
-                        if float(frame.open.iloc[i]) < float(frame.close.iloc[i])]
+                        if float(frame.open.iloc[i]) < float(frame.close.iloc[i])
+                        and abs(float(frame.open.iloc[i]) - float(frame.close.iloc[i])) >= 0.20 * atr]
         if broke and body >= 0.8 * atr and opposing:
             i = opposing[-1]
             candle = frame.iloc[i]
