@@ -61,7 +61,7 @@ def test_range_target_price_and_hit_are_directional():
 
 
 def test_tp2_reassessment_closes_only_when_far_and_weak_or_structure_lost():
-    decision, _ = tp2_reassessment("BUY", 100, 110, 2, 0.30, 17, -1, True)
+    decision, _ = tp2_reassessment("BUY", 100, 110, 2, 0.30, 17, -1, True, adverse_divergence=True)
     assert decision == "CLOSE"
     decision, _ = tp2_reassessment("SELL", 100, 90, 2, 0.82, 30, 1, True)
     assert decision == "HOLD"

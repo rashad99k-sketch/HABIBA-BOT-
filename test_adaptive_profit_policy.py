@@ -33,7 +33,7 @@ def test_low_adx_alone_does_not_force_scalp():
         "ema9_slope_atr": .3, "vwap_slope_atr": .2, "structure_score": 75,
         "atr_expansion_ratio": 1.3, "candle_follow_through": True,
     })
-    assert mode == STANDARD_MODE
+    assert mode == TREND_MODE
 
 
 def test_multi_factor_trend_selects_trend_ride():

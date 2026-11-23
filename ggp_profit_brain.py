@@ -162,7 +162,7 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     if (not trend_count >= 6 and
         ((range_regime and weak_count >= 3) or (thin and weak_count >= 3) or weak_count >= 5)):
         return RANGE_MODE, "multi_factor_weak_or_range_market_confirmed", tuple(k for k,v in weak.items() if v)
-    return STANDARD_MODE, "evidence_inconclusive_keep_two_stage_50_50", tuple(k for k,v in weak.items() if v) or ("insufficient_evidence",)
+    return STANDARD_MODE, "evidence_not_proven_keep_two_stage_50_50", tuple(k for k,v in weak.items() if v) or ("insufficient_evidence",)
 
 
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
