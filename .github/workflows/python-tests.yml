@@ -2,9 +2,9 @@ name: Python safety and regression tests
 
 on:
   push:
-    branches: [main, "fix/**"]
+    branches: [main, "fix/**", "feat/**"]
   pull_request:
-    branches: [main, "chore/professional-repository-extraction"]
+    branches: [main, "chore/professional-repository-extraction", "fix/**"]
   workflow_dispatch:
 
 permissions:
