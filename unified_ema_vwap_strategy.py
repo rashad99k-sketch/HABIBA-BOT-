@@ -117,8 +117,8 @@ def _find_causal_zone(frame: pd.DataFrame, cross_index: int, side: str, atr: flo
     return candidates[0]
 
 
-def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
-    """Calculate EMA9/15/50, ATR14 and per-UTC-day OHLC4 session VWAP."""
+def indicator_series(frame: pd.DataFrame) -> Dict[str, Any]:
+    """Closed-bar EMA9/15/50, ATR14 and UTC session OHLC4 VWAP series."""
     x = _clean_closed(frame, None, 900)
     if len(x) < 51:
         return {"valid": False, "reason": "need_at_least_51_closed_candles"}
@@ -126,27 +126,34 @@ def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
     ema9 = c.ewm(span=9, adjust=False, min_periods=9).mean()
     ema15 = c.ewm(span=15, adjust=False, min_periods=15).mean()
     ema50 = c.ewm(span=50, adjust=False, min_periods=50).mean()
-    prev = c.shift(1)
-    tr = pd.concat([x.high - x.low, (x.high - prev).abs(), (x.low - prev).abs()], axis=1).max(axis=1)
+    previous = c.shift(1)
+    tr = pd.concat([x.high-x.low, (x.high-previous).abs(), (x.low-previous).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14, min_periods=14).mean()
-    # A well-defined 24/7 market session: calendar day in UTC. Never mix sessions.
     utc_day = pd.to_datetime(x.timestamp, unit="ms", utc=True).dt.strftime("%Y-%m-%d")
-    typical = (x.high + x.low + x.close) / 3.0
-    # Requirement specifies OHLC-4, not the conventional HLC-3 typical price.
-    typical = (x.open + x.high + x.low + x.close) / 4.0
-    pv = typical * x.volume
-    cum_v = x.volume.groupby(utc_day).cumsum()
-    cum_pv = pv.groupby(utc_day).cumsum()
-    vwap = cum_pv / cum_v.replace(0, np.nan)
-    idx = len(x) - 1
-    values = {"ema9": float(ema9.iloc[idx]), "ema15": float(ema15.iloc[idx]),
-              "ema50": float(ema50.iloc[idx]), "atr14": float(atr.iloc[idx]),
+    ohlc4 = (x.open+x.high+x.low+x.close)/4.0
+    volume = x.volume.groupby(utc_day).cumsum()
+    pv = (ohlc4*x.volume).groupby(utc_day).cumsum()
+    vwap = pv/volume.replace(0, np.nan)
+    return {"valid": True, "ema9": ema9, "ema15": ema15, "ema50": ema50,
+            "atr14": atr, "vwap_series": vwap, "utc_session": utc_day}
+
+
+def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
+    """Calculate closed-candle EMA9/15/50, ATR14 and UTC OHLC4 Session VWAP."""
+    values = indicator_series(frame)
+    if not values.get("valid"):
+        return values
+    idx = len(frame)-1
+    e9, e15, e50 = (values[k] for k in ("ema9", "ema15", "ema50"))
+    atr, vwap = values["atr14"], values["vwap_series"]
+    result = {"ema9": float(e9.iloc[idx]), "ema15": float(e15.iloc[idx]),
+              "ema50": float(e50.iloc[idx]), "atr14": float(atr.iloc[idx]),
               "vwap": float(vwap.iloc[idx]) if pd.notna(vwap.iloc[idx]) else None,
-              "price": float(c.iloc[idx]), "candle_ts": int(x.timestamp.iloc[idx]),
-              "session": str(utc_day.iloc[idx]), "timezone": "UTC"}
-    values["valid"] = all(_finite(values[k]) for k in ("ema9", "ema15", "ema50", "atr14", "price")) and values["atr14"] > 0 and values["vwap"] is not None
-    values["reason"] = "" if values["valid"] else ("zero_session_volume" if values["vwap"] is None else "invalid_indicator")
-    return values
+              "price": float(frame.close.iloc[idx]), "candle_ts": int(frame.timestamp.iloc[idx]),
+              "session": str(values["utc_session"].iloc[idx]), "timezone": "UTC"}
+    result["valid"] = all(_finite(result[k]) for k in ("ema9","ema15","ema50","atr14","price")) and result["atr14"] > 0 and result["vwap"] is not None
+    result["reason"] = "" if result["valid"] else ("zero_session_volume" if result["vwap"] is None else "invalid_indicator")
+    return result
 
 
 @dataclass
