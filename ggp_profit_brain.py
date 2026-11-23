@@ -332,4 +332,42 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     return 0.25, "selective_micro_scalp_cost_and_room_verified"
 
 
+def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
+    """Choose 0.25/0.50/1.00% price movement using costs, entry quality and opposing liquidity."""
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    if side not in {"BUY", "SELL"}:
+        return 0.0, "invalid_side"
+    costs = _number(ctx.get("estimated_round_trip_cost_pct"))
+    space = _number(ctx.get("opposing_liquidity_distance_pct"))
+    if costs is None or space is None:
+        return 0.0, "cost_or_opposing_liquidity_data_unavailable"
+    minimum_net = _number(ctx.get("minimum_net_profit_pct"), 0.10) or 0.10
+    quality = _number(ctx.get("entry_quality_score"), 0.0) or 0.0
+    momentum = _number(ctx.get("momentum_strength"))
+    continuation = _number(ctx.get("continuation_probability"))
+    volume = _number(ctx.get("volume_ratio"))
+    plus, minus = _number(ctx.get("di_plus")), _number(ctx.get("di_minus"))
+    di_ok = _side_aligned(side, plus, minus)
+    adverse = _bool(ctx, "adverse_rejection") or _bool(ctx, "adverse_divergence")
+    thin = _bool(ctx, "thin_liquidity") or str(ctx.get("liquidity_quality") or "").upper() in {"THIN", "LOW", "ILLIQUID", "POOR"}
+    available = [target for target in RANGE_PROFIT_TARGETS_PCT
+                 if target - costs >= minimum_net and space >= target * 1.10]
+    if not available:
+        return 0.0, "no_target_has_verified_net_edge_and_forward_liquidity_room"
+    max_target = max(available)
+    strong = (quality >= 75 and momentum is not None and momentum >= 60
+              and continuation is not None and continuation >= 0.65
+              and volume is not None and volume >= 1.15 and di_ok
+              and not adverse and not thin)
+    medium = (quality >= 55 and momentum is not None and momentum >= 42
+              and continuation is not None and continuation >= 0.50
+              and not adverse and not thin)
+    if max_target >= 1.0 and strong:
+        return 1.0, "strong_entry_momentum_volume_and_forward_liquidity"
+    if max_target >= 0.50 and medium:
+        return 0.50, "moderate_entry_quality_and_forward_liquidity"
+    return 0.25, "selective_micro_scalp_cost_and_room_verified"
+
+
 
