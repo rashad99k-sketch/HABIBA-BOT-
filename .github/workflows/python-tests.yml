@@ -42,5 +42,7 @@ jobs:
         run: python -m pytest -q test_unified_ema_vwap_strategy.py::test_buy_and_sell_crosses_are_confirmed_on_closed_candles
       - name: Targeted rejection-confirmation lifecycle regression
         run: python -m pytest -q test_unified_ema_vwap_strategy.py::test_rejection_and_confirmation_must_be_separate_closed_candles
+      - name: Adaptive profit policy regressions
+        run: python -m pytest -q test_profit_brain.py test_adaptive_profit_policy.py
       - name: Full regression suite
         run: python -m pytest -q
