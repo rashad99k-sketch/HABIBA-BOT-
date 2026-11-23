@@ -9294,6 +9294,37 @@ def smart_opportunity_selection():
                 item["rejection_reason"] = "causal_zone_stop_geometry_invalid"
                 continue
             _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
+            # Use chart-derived directional liquidity to refine trend targets only.
+            # The causal-zone structural SL is never changed by target planning.
+            target_liquidity_levels = []
+            try:
+                liquidity_pools = build_liquidity_pools(closed_df)
+                if isinstance(liquidity_pools, dict):
+                    key = "high_pools" if side == "BUY" else "low_pools"
+                    for raw_level in liquidity_pools.get(key, []) or []:
+                        level = float(raw_level)
+                        if np.isfinite(level) and ((side == "BUY" and level > price) or (side == "SELL" and level < price)):
+                            target_liquidity_levels.append(level)
+            except Exception as target_pool_exc:
+                log_execution(f"[TARGET_LIQUIDITY] {canonical}: {type(target_pool_exc).__name__}", "WARN")
+            if classification in {"TREND", "EARLY_TREND"} and target_liquidity_levels:
+                try:
+                    from ggp_profit_brain import plan_trend_targets
+                    planned_tp1, planned_tp2, plan_reason = plan_trend_targets(
+                        side, price, float(atr_value), target_liquidity_levels,
+                        target1_atr=1.0, target2_price_move_pct=2.0,
+                        min_target2_atr=1.5, pool_buffer_atr=0.10)
+                    directionally_valid = (
+                        planned_tp1 > price and planned_tp2 > planned_tp1 if side == "BUY"
+                        else planned_tp1 < price and planned_tp2 < planned_tp1
+                    )
+                    if directionally_valid:
+                        tp1, tp2 = planned_tp1, planned_tp2
+                        item["profit_target_plan"] = plan_reason
+                    else:
+                        item["profit_target_plan"] = "existing_compute_sl_tp_fallback:" + plan_reason
+                except Exception as target_plan_exc:
+                    item["profit_target_plan"] = f"existing_compute_sl_tp_fallback:{type(target_plan_exc).__name__}"
             if not (tp1 and tp2 and np.isfinite(float(tp1)) and np.isfinite(float(tp2))):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "profit_targets_invalid"
