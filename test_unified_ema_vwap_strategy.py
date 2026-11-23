@@ -59,7 +59,7 @@ def test_authorization_requires_ready_and_tp1_forward_space(tmp_path):
     other = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "other.json"))
     other._persist(Setup(symbol="Y", status="ENTRY_READY", direction="BUY", atr14=1,
                          causal_level=100, causal_zone_low=99.5, causal_zone_high=100.5, causal_zone_type="FVG", causal_zone_ts=1, rejection_ts=1, confirmation_ts=2))
-    decision = other.authorize("Y", 102, 103)
+    decision = other.authorize("Y", 102.1, 103)
     assert decision["allowed"] is False and decision["status"] == "NO_CHASE"
 
 
