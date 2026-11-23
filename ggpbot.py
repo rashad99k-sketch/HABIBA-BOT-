@@ -8291,7 +8291,7 @@ def manual_trade():
     # Manual dashboard entries are intentionally disabled: every opening order
     # must consume a one-time authorization from the closed-candle EMA/VWAP
     # pullback lifecycle. Manual close remains available below.
-    return jsonify({"error": "Manual entry disabled; wait for an EMA9/EMA15 + VWAP pullback/retest confirmation from the strategy engine.",
+    return jsonify({"error": "Manual entry disabled; wait for a closed-candle EMA9/Session-VWAP crossover and causal-zone pullback/rejection/confirmation from the strategy engine.",
                     "code": "EMA_VWAP_AUTHORITY_REQUIRED"}), 409
     if RECOVERY_BLOCK_ENTRIES or STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
         return jsonify({"error": "Entry blocked until existing exchange/recovery state is reconciled"}), 409
