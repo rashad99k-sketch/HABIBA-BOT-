@@ -63,10 +63,15 @@ def _find_causal_zone(frame: pd.DataFrame, cross_index: int, side: str, atr: flo
     start = max(2, cross_index - 12)
     candidates = []
     for i in range(start, cross_index + 1):
-        a, c = frame.iloc[i - 2], frame.iloc[i]
-        if side == "BUY" and float(c.low) > float(a.high):
+        a, b, c = frame.iloc[i - 2], frame.iloc[i - 1], frame.iloc[i]
+        middle_range = max(float(b.high) - float(b.low), 1e-12)
+        middle_body = abs(float(b.close) - float(b.open))
+        middle_body_ratio = middle_body / middle_range
+        if (side == "BUY" and float(c.low) > float(a.high)
+                and float(b.close) > float(b.open) and middle_body_ratio >= 0.50):
             lo, hi, kind = float(a.high), float(c.low), "FVG"
-        elif side == "SELL" and float(c.high) < float(a.low):
+        elif (side == "SELL" and float(c.high) < float(a.low)
+                and float(b.close) < float(b.open) and middle_body_ratio >= 0.50):
             lo, hi, kind = float(c.high), float(a.low), "FVG"
         else:
             continue
@@ -342,6 +347,21 @@ class UnifiedEMAVWAPPullbackEngine:
                         old.status, old.reason = "WAITING_FOR_REJECTION", "causal_zone_retested_waiting_for_rejection"
                     else:
                         old.status, old.reason = "WAITING_FOR_PULLBACK", "waiting_for_causal_zone_pullback"
+                elif old.pullback_type is not None and old.rejection_ts is None:
+                    # The rejection is a distinct, fully closed candle after the retest.
+                    o, h, l, c = map(float, (x.open.iloc[j], x.high.iloc[j], x.low.iloc[j], x.close.iloc[j]))
+                    candle_range = max(h - l, 1e-12)
+                    lower_wick, upper_wick = min(o, c) - l, h - max(o, c)
+                    rejected = (
+                        c > o and lower_wick / candle_range >= 0.25 and c >= l + 0.60 * candle_range
+                        if side == "BUY" else
+                        c < o and upper_wick / candle_range >= 0.25 and c <= h - 0.60 * candle_range
+                    )
+                    if rejected and aligned and latest_ts > int(old.pullback_ts or old.crossover_ts):
+                        old.rejection_ts, old.rejection_high, old.rejection_low = latest_ts, h, l
+                        old.status, old.reason = "WAITING_FOR_CONFIRMATION", "rejection_candle_recorded_confirmation_must_be_later"
+                    else:
+                        old.status, old.reason = "WAITING_FOR_REJECTION", "valid_rejection_candle_not_seen"
             old.ema9, old.ema15, old.ema50, old.vwap, old.atr14 = float(e9.iloc[-1]), float(e15.iloc[-1]), float(vals["ema50"]), float(vals["vwap"]), float(vals["atr14"])
             old.last_candle_ts, old.updated_at = latest_ts, now_ms/1000
             return self._persist(old)
