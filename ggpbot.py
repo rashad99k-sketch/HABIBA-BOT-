@@ -2494,6 +2494,7 @@ class TradeManagementBoard:
                 str(ctx.get("ema_state") or "UNKNOWN"),
                 safe_float(ctx.get("peak_drawdown_roe", 0.0)),
                 tp1_verified=True,
+                trend_evidence_score=safe_float(ctx.get("trend_evidence_score"), 0.0),
             )
             favourable = safe_float(ctx.get("max_price"), entry) if side == "BUY" else safe_float(ctx.get("min_price"), entry)
             new_stop = favourable - trail_mult * atr if side == "BUY" else favourable + trail_mult * atr
@@ -3597,7 +3598,7 @@ class LiveTradeManager:
             "range_target_price": STATE.get("range_target_price", 0),
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
-            "profit_mode_reason": STATE.get("profit_mode_reason", ""),
+            "profit_mode_reason": STATE.get("profit_mode_reason", ""),\n            "trend_evidence_score": safe_float(STATE.get("trend_evidence_score"), 0.0),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
