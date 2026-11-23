@@ -9115,14 +9115,24 @@ def smart_opportunity_selection():
         return False
 
     watchlist = MEMORY.get("watchlist", {})
-    ready = [(sym, item) for sym, item in watchlist.items()
-             if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
+    # EMA/VWAP closed-candle lifecycle is the sole entry decision authority.
+    # Institutional analysis supplies structural context and risk levels only.
+    ready = []
+    for sym, item in watchlist.items():
+        if not isinstance(item, dict):
+            continue
+        strategy_state = item.get("ema_vwap_strategy") or {}
+        if strategy_state.get("status") == "ENTRY_READY" and strategy_state.get("direction") in ("BUY", "SELL"):
+            ready.append((sym, item))
     ready.sort(key=lambda pair: float(pair[1].get("score", pair[1].get("discovery_score", 0)) or 0), reverse=True)
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
-            side = str(item.get("side", "")).upper()
+            strategy_snapshot = item.get("ema_vwap_strategy") or {}
+            side = str(strategy_snapshot.get("direction") or "").upper()
             if side not in ("BUY", "SELL"):
+                item["entry_status"] = "BLOCKED"
+                item["rejection_reason"] = "ema_vwap_direction_unavailable"
                 continue
             exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
             df = _integration_fetch_frame(exchange_sym)
@@ -9142,17 +9152,17 @@ def smart_opportunity_selection():
             fresh = roro_analyze_symbol_both(
                 exchange_sym, closed_df,
                 now_ms=int(time.time() * 1000),
-                side_hints=item.get("side_hints") or [side],
+                side_hints=[side],
             )
-            fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
+            fresh.update(_enrich_with_existing_gpp_engines(closed_df, side, fresh))
             item.update(fresh)
             item["source"] = item.get("source") or "unified_watchlist"
-            if item.get("decision_state") != "ENTRY_READY":
-                continue
-            side = str(item.get("side", "")).upper()
-            if side not in ("BUY", "SELL"):
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "no_unambiguous_authorized_side"
+            # Legacy decision_state is deliberately not an entry gate. The fresh
+            # institutional pass must agree with EMA/VWAP direction and provide
+            # auditable structural context; the EMA/VWAP engine authorizes timing.
+            if str(item.get("side", "")).upper() != side:
+                item["entry_status"] = "BLOCKED"
+                item["rejection_reason"] = "institutional_context_direction_mismatch"
                 continue
             event_id = str(item.get("event_id") or "")
             if not event_id:
