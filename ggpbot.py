@@ -3278,8 +3278,75 @@ class LiveTradeManager:
             STATE["continuation_reasons"] = continuation_eval.reasons
             STATE["continuation_pressure"] = cont_pressure_score
 
-            # Unified profit-mode policy: range scalp is allowed only with multiple
-            # independent weakness/thin-liquidity observations. Missing data is NOT range.
+            # Unified profit-mode policy: ADX is supporting evidence, never a regime switch.
+            # All slopes and structure evidence below come from completed OHLCV candles.
+            ema9_slope_atr = vwap_slope_atr = atr_expansion_ratio = None
+            structure_score = None
+            candle_follow_through = False
+            opposing_liquidity_near = False
+            opposing_liquidity_distance_pct = None
+            entry_quality_score = None
+            estimated_round_trip_cost_pct = safe_float(STATE.get("estimated_round_trip_cost_pct"), None)
+            pools = []
+            try:
+                closed = df_live.tail(120).copy()
+                atr_series = compute_atr(closed, 14)
+                atr_now = safe_float(atr_series.iloc[-1], 0.0)
+                atr_base = safe_float(atr_series.iloc[-21:-1].median(), 0.0) if len(atr_series) >= 22 else 0.0
+                if atr_now > 0 and atr_base > 0:
+                    atr_expansion_ratio = atr_now / atr_base
+                ema9_series = ema(closed["close"], 9)
+                if atr_now > 0 and len(ema9_series) >= 5:
+                    ema9_slope_atr = (safe_float(ema9_series.iloc[-1]) - safe_float(ema9_series.iloc[-5])) / atr_now
+                try:
+                    from roro_confluence import compute_session_vwap
+                    vwap_series = compute_session_vwap(
+                        closed[["timestamp", "open", "high", "low", "close", "volume"]].copy(),
+                        timeframe_seconds=900, now_ms=int(time.time() * 1000))
+                    if vwap_series is not None:
+                        valid_vwap = vwap_series.dropna()
+                        if len(valid_vwap) >= 5 and atr_now > 0:
+                            vwap_slope_atr = (safe_float(valid_vwap.iloc[-1]) - safe_float(valid_vwap.iloc[-5])) / atr_now
+                except Exception as vwap_exc:
+                    log_execution(f"[PROFIT_EVIDENCE] session VWAP unavailable: {type(vwap_exc).__name__}", "WARN")
+                bos_up, bos_down = detect_bos(closed, lookback=5)
+                directional_bos = bool((side == "BUY" and bos_up) or (side == "SELL" and bos_down))
+                _ema20 = ema(closed["close"], 20).iloc[-1]
+                _ema50 = ema(closed["close"], 50).iloc[-1]
+                _close = safe_float(closed["close"].iloc[-1])
+                ema_structure = bool(
+                    (_ema20 > _ema50 and _close > _ema20) if side == "BUY"
+                    else (_ema20 < _ema50 and _close < _ema20))
+                structure_score = 70.0 if ema_structure and structure_aligned else (50.0 if ema_structure else 20.0)
+                last_bar = closed.iloc[-1]
+                bar_range = max(safe_float(last_bar["high"]) - safe_float(last_bar["low"]), 1e-12)
+                body = abs(safe_float(last_bar["close"]) - safe_float(last_bar["open"]))
+                directional_candle = (
+                    safe_float(last_bar["close"]) > safe_float(last_bar["open"]) if side == "BUY"
+                    else safe_float(last_bar["close"]) < safe_float(last_bar["open"]))
+                candle_follow_through = directional_bos or bool(directional_candle and body/bar_range >= 0.55)
+                recent = closed.tail(61).reset_index(drop=True)
+                for i in range(2, len(recent)-2):
+                    if side == "BUY":
+                        level = safe_float(recent.high.iloc[i], 0.0)
+                        if level > mark_price and level >= max(safe_float(v, 0.0) for v in recent.high.iloc[i-2:i+3]):
+                            pools.append(level)
+                    else:
+                        level = safe_float(recent.low.iloc[i], 0.0)
+                        if 0 < level < mark_price and level <= min(safe_float(v, float("inf")) for v in recent.low.iloc[i-2:i+3]):
+                            pools.append(level)
+                if pools and entry > 0:
+                    nearest_pool = min(pools, key=lambda x: abs(x-entry))
+                    opposing_liquidity_distance_pct = abs(nearest_pool-entry) / entry * 100.0
+                    opposing_liquidity_near = opposing_liquidity_distance_pct <= 0.75
+                    entry_quality_score = max(0.0, min(100.0,
+                        30.0 * safe_float(continuation_eval.continuation_probability, 0.5) * 100.0 / 100.0
+                        + 25.0 * safe_float(momentum.get("momentum_health"), 50.0)
+                        + 20.0 * min(100.0, max(0.0, volume_ratio * 50.0))
+                        + 25.0 * structure_score))
+            except Exception as evidence_exc:
+                log_execution(f"[PROFIT_EVIDENCE] partial evidence unavailable: {type(evidence_exc).__name__}", "WARN")
+
             mode_context = {
                 "side": side, "regime": regime, "trade_state": trade_state,
                 "adx": adx_now, "adx_slope": adx_slope,
@@ -3292,6 +3359,12 @@ class LiveTradeManager:
                 "orderbook_depth_usdt": STATE.get("orderbook_depth_usdt"),
                 "min_orderbook_depth_usdt": STATE.get("min_orderbook_depth_usdt", 0),
                 "structure_broken": bool(STATE.get("structure_broken", False)),
+                "ema9_slope_atr": ema9_slope_atr,
+                "vwap_slope_atr": vwap_slope_atr,
+                "atr_expansion_ratio": atr_expansion_ratio,
+                "structure_score": structure_score,
+                "candle_follow_through": candle_follow_through,
+                "opposing_liquidity_near": opposing_liquidity_near,
                 "trend_expansion": bool(momentum.get("trend_expansion", False)),
             }
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
@@ -3313,36 +3386,51 @@ class LiveTradeManager:
                     else:
                         STATE["profit_mode_candidate"] = candidate_mode
                         STATE["profit_mode_candidate_count"] = 1
-                    # Require two completed candles before changing an established mode.
+                    # Require two distinct closed candles before switching established mode.
                     if STATE["profit_mode_candidate_count"] >= 2:
                         current_mode = candidate_mode
                         STATE["profit_mode"] = current_mode
                         STATE["profit_mode_candidate_count"] = 0
                 STATE["profit_mode_reason"] = candidate_reason
                 STATE["profit_mode_evidence"] = list(candidate_evidence)
+                trend_votes = [
+                    ema9_slope_atr is not None and vwap_slope_atr is not None and
+                    (ema9_slope_atr > 0 and vwap_slope_atr > 0 if side == "BUY" else ema9_slope_atr < 0 and vwap_slope_atr < 0),
+                    structure_score is not None and structure_score >= 60,
+                    continuation_eval.continuation_probability >= 0.62,
+                    safe_float(momentum.get("momentum_health"), 0.0) >= 55,
+                    volume_ratio >= 1.0,
+                    atr_expansion_ratio is not None and atr_expansion_ratio >= 1.05,
+                    bool((plus_di > minus_di) if side == "BUY" else (minus_di > plus_di)),
+                    candle_follow_through,
+                ]
+                STATE["trend_evidence_score"] = 100.0 * sum(bool(x) for x in trend_votes) / len(trend_votes)
                 if current_mode == RANGE_MODE and not safe_float(STATE.get("range_target_price"), 0.0):
-                    # Range exits are anchored to the nearest opposing swing-liquidity
-                    # pool, not a hard-coded 0.5/1/2% price move. Use completed bars only.
-                    swing_levels = []
-                    try:
-                        recent = df_live.tail(61).reset_index(drop=True)
-                        for i in range(2, len(recent) - 2):
-                            hi = safe_float(recent.iloc[i].get("high"), 0.0)
-                            lo = safe_float(recent.iloc[i].get("low"), 0.0)
-                            if hi > 0 and hi >= max(safe_float(x, 0.0) for x in recent["high"].iloc[i-2:i+3]):
-                                swing_levels.append(hi)
-                            if lo > 0 and lo <= min(safe_float(x, float("inf")) for x in recent["low"].iloc[i-2:i+3]):
-                                swing_levels.append(lo)
-                    except Exception:
-                        swing_levels = []
-                    adaptive_target, target_reason = adaptive_range_target_price(
-                        side, entry, atr, swing_levels)
-                    STATE["range_target_price"] = adaptive_target
-                    STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
-                    STATE["range_target_reason"] = target_reason
+                    target_pct, target_reason = select_range_target_pct({
+                        **mode_context,
+                        "entry_quality_score": entry_quality_score,
+                        "estimated_round_trip_cost_pct": estimated_round_trip_cost_pct,
+                        "opposing_liquidity_distance_pct": opposing_liquidity_distance_pct,
+                    })
+                    if target_pct > 0:
+                        target_price = range_target_price(side, entry, target_pct)
+                        if pools:
+                            nearest = min(pools, key=lambda x: abs(x-entry))
+                            buffer = max(atr * 0.10, 0.0)
+                            target_price = min(target_price, nearest-buffer) if side == "BUY" else max(target_price, nearest+buffer)
+                        if target_price > 0 and ((side == "BUY" and target_price > entry) or (side == "SELL" and target_price < entry)):
+                            STATE["range_target_price"] = target_price
+                            STATE["range_target_move_pct"] = abs(target_price-entry) / entry * 100.0
+                            STATE["range_target_reason"] = target_reason
+                    if not safe_float(STATE.get("range_target_price"), 0.0):
+                        current_mode = STANDARD_MODE
+                        STATE["profit_mode"] = STANDARD_MODE
+                        STATE["profit_mode_reason"] = "scalp_target_edge_unproven_fallback_two_stage"
+                        STATE["profit_mode_evidence"] = list(candidate_evidence) + ["scalp_target_edge_unproven"]
                 elif current_mode != RANGE_MODE:
                     STATE["range_target_price"] = 0.0
                     STATE["range_target_move_pct"] = 0.0
+                    STATE["range_target_reason"] = ""
                 log_execution(f"[PROFIT_MODE] {symbol} mode={current_mode} candidate={candidate_mode} reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
 
             # Thesis failure check
