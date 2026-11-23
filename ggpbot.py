@@ -3340,11 +3340,19 @@ class LiveTradeManager:
                     nearest_pool = min(pools, key=lambda x: abs(x-entry))
                     opposing_liquidity_distance_pct = abs(nearest_pool-entry) / entry * 100.0
                     opposing_liquidity_near = opposing_liquidity_distance_pct <= 0.75
-                    entry_quality_score = max(0.0, min(100.0,
-                        30.0 * safe_float(continuation_eval.continuation_probability, 0.5) * 100.0 / 100.0
-                        + 25.0 * safe_float(momentum.get("momentum_health"), 50.0)
-                        + 20.0 * min(100.0, max(0.0, volume_ratio * 50.0))
-                        + 25.0 * structure_score))
+                    _continuation_quality = max(0.0, min(100.0, safe_float(continuation_eval.continuation_probability, 0.5) * 100.0))
+                    _momentum_quality = max(0.0, min(100.0, safe_float(momentum.get("momentum_health"), 50.0)))
+                    _volume_quality = max(0.0, min(100.0, volume_ratio * 50.0))
+                    _structure_quality = max(0.0, min(100.0, structure_score))
+                    # Weighted average: 30% continuation, 25% momentum,
+                    # 20% relative volume and 25% structure. Every component
+                    # is normalized to 0..100 before applying its weight.
+                    entry_quality_score = (
+                        0.30 * _continuation_quality
+                        + 0.25 * _momentum_quality
+                        + 0.20 * _volume_quality
+                        + 0.25 * _structure_quality
+                    )
             except Exception as evidence_exc:
                 log_execution(f"[PROFIT_EVIDENCE] partial evidence unavailable: {type(evidence_exc).__name__}", "WARN")
 
