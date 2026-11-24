@@ -5602,31 +5602,47 @@ def dynamic_spread_tolerance(symbol):
 _SCANNER_FRAME_CACHE = {}
 _SCANNER_FRAME_LAST_VALID = {}
 _SCANNER_FRAME_CACHE_LOCK = threading.RLock()
+# Per-symbol in-flight locks coalesce simultaneous Scanner/Watchlist cache misses.
+# The keyspace is bounded by the configured scanner and watchlist universes.
+_SCANNER_FRAME_FETCH_LOCKS = {}
 _SCANNER_FRAME_CACHE_TTL = _env_float_range("SCANNER_FRAME_CACHE_TTL", 90.0, 15.0, 180.0)
 _SCANNER_FRAME_LAST_VALID_MAX = max(100, SCANNER_UNIVERSE_MAX + 20)
 
 def _scanner_frame_key(symbol):
-    canonicalizer = globals().get("roro_canonical_symbol")
-    return str(canonicalizer(symbol) if callable(canonicalizer) else
-               str(symbol or "").upper().replace("/", "-").split(":")[0].strip())
-
-def _get_scanner_frame(symbol, limit=150):
-    """Fetch one shared frame per canonical symbol; preserve last known-good data."""
-    key, now = _scanner_frame_key(symbol), time.monotonic()
+    canonicalizer =def _get_scanner_frame(symbol, limit=150):
+    """Fetch one shared frame per canonical symbol; coalesce concurrent misses."""
+    key = _scanner_frame_key(symbol)
+    now = time.monotonic()
     with _SCANNER_FRAME_CACHE_LOCK:
         item = _SCANNER_FRAME_CACHE.get(key)
         if item and now - item[0] < _SCANNER_FRAME_CACHE_TTL:
             return item[1].copy()
-    exchange_symbol = (globals().get("roro_exchange_symbol") or (lambda value: value))(symbol)
-    frame = get_ohlcv_safe(exchange_symbol, limit)
-    if frame is not None and validate_dataframe(frame, min(51, limit)):
-        stamp, snapshot = time.monotonic(), frame.copy()
+        fetch_lock = _SCANNER_FRAME_FETCH_LOCKS.setdefault(key, threading.Lock())
+
+    # Different symbols can fetch concurrently, but workers requesting the
+    # same symbol share one in-flight exchange request and its resulting snapshot.
+    with fetch_lock:
+        now = time.monotonic()
         with _SCANNER_FRAME_CACHE_LOCK:
-            _SCANNER_FRAME_CACHE[key] = (stamp, snapshot)
-            _SCANNER_FRAME_LAST_VALID[key] = (stamp, snapshot)
-            while len(_SCANNER_FRAME_LAST_VALID) > _SCANNER_FRAME_LAST_VALID_MAX:
-                oldest_key = min(_SCANNER_FRAME_LAST_VALID, key=lambda k: _SCANNER_FRAME_LAST_VALID[k][0])
-                _SCANNER_FRAME_LAST_VALID.pop(oldest_key, None)
+            item = _SCANNER_FRAME_CACHE.get(key)
+            if item and now - item[0] < _SCANNER_FRAME_CACHE_TTL:
+                return item[1].copy()
+
+        exchange_symbol = (globals().get("roro_exchange_symbol") or (lambda value: value))(symbol)
+        frame = get_ohlcv_safe(exchange_symbol, limit)
+        if frame is not None and validate_dataframe(frame, min(51, limit)):
+            stamp, snapshot = time.monotonic(), frame.copy()
+            with _SCANNER_FRAME_CACHE_LOCK:
+                _SCANNER_FRAME_CACHE[key] = (stamp, snapshot)
+                _SCANNER_FRAME_LAST_VALID[key] = (stamp, snapshot)
+                while len(_SCANNER_FRAME_LAST_VALID) > _SCANNER_FRAME_LAST_VALID_MAX:
+                    oldest_key = min(_SCANNER_FRAME_LAST_VALID, key=lambda k: _SCANNER_FRAME_LAST_VALID[k][0])
+                    _SCANNER_FRAME_LAST_VALID.pop(oldest_key, None)
+            return snapshot.copy()
+        with _SCANNER_FRAME_CACHE_LOCK:
+            previous = _SCANNER_FRAME_LAST_VALID.get(key)
+            return previous[1].copy() if previous else None
+est_key, None)
         return snapshot.copy()
     with _SCANNER_FRAME_CACHE_LOCK:
         previous = _SCANNER_FRAME_LAST_VALID.get(key)
