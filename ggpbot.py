@@ -9486,7 +9486,7 @@ def smart_opportunity_selection():
                 item["strategy_status"] = "ENTRY_EXECUTING"
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
                                    float(item.get("score", 0) or 0), reason, float(atr_value),
-                                   trade_type=classification, entry_type="RORO_INSTITUTIONAL",
+                                   trade_type="AUTO", entry_type="EMA9_EMA15_CROSS",
                                    classification=sizing_class)
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
