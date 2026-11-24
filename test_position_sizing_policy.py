@@ -196,9 +196,18 @@ def _run_execute_entry(monkeypatch, *, side, balance, price=0.06, stop_pct=0.05)
     logs = []
     monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
     monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
+    # This helper isolates the sizing/order path. Reset persisted drawdown state
+    # so a prior test's paper balance cannot block these orders.
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STATE", {
+        "until": 0.0, "triggered_at": 0.0, "trigger_balance": None,
+        "utc_day": None, "peak_balance": None, "trigger_count": 0,
+    })
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STORE_READY", True)
+    monkeypatch.setitem(ggpbot.MEMORY, "position_status", "FLAT")
     ggpbot.paper["balance"] = balance
     ggpbot.paper["position"] = None
-    for key in ("open", "in_position"):
+    for key in ("open", "in_position", "execution_unresolved", "close_reconciliation_required",
+                "recovery_hold"):
         if key in ggpbot.STATE:
             ggpbot.STATE[key] = False
     ggpbot.STATE["open"] = False
@@ -278,6 +287,23 @@ def test_execute_entry_risk_gate_logged_not_silent(monkeypatch):
     assert any("SIZING_RISK_GATE" in m for m in logs), "a risk-gate reduction must be logged"
     audit = [m for m in logs if "POSITION_SIZING_AUDIT" in m]
     assert audit and "Binding Constraint: RISK_GATE" in audit[-1]
+
+
+def test_open_position_prevents_second_portfolio_allocation(monkeypatch):
+    """A second simultaneous trade cannot stack another 20%/30% allocation."""
+    import ggpbot
+
+    monkeypatch.setitem(ggpbot.STATE, "open", True)
+    monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", True)
+    reads = []
+    monkeypatch.setattr(
+        ggpbot, "refresh_unified_institutional_watchlist",
+        lambda: reads.append("watchlist_refresh"),
+    )
+    monkeypatch.setattr(ggpbot, "execute_entry", lambda *a, **k: reads.append("entry"))
+
+    assert ggpbot.smart_opportunity_selection() is False
+    assert reads == []
 
 
 def test_compounding_recalculates_margin_and_risk_from_fresh_available_balance():

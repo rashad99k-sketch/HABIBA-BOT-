@@ -11,15 +11,110 @@ from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-# Price-move percentages (not leveraged ROE percentages).
-# At 20x these correspond approximately to 5%, 10%, 20% and 60% ROE,
-# before fees, funding and slippage.
+# PROFIT CONVENTION (explicit and authoritative):
+# RANGE_PROFIT_TARGETS_PCT, TREND_TP1_MOVE_PCT and TREND_TP2_MOVE_PCT are
+# UNLEVERAGED PRICE-MOVE percentages from the verified entry price. They are
+# NOT account allocations and NOT exchange ROE percentages.
+#
+#   target_price = entry * (1 +/- move_pct / 100)
+#   gross_roe_pct = move_pct * leverage          (20x => 5/10/20/40/60%)
+#   gross_pnl = (target_price - entry) * qty     (BUY; sign inverted for SELL)
+#
+# Gross ROE/PnL is never reported as net. The helpers below expose the
+# conservative fee/slippage conversion used for audit records; realized PnL
+# stays authoritative from the exchange in the execution layer.
 RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
 TREND_TP1_MOVE_PCT = 2.00
 TREND_TP2_MOVE_PCT = 3.00
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
+POLICY_LEVERAGE = 20
+# Conservative planning assumptions as percentages of traded notional per side.
+ESTIMATED_TAKER_FEE_PCT = 0.05
+ESTIMATED_SLIPPAGE_PCT = 0.02
+
+
+def profit_target_convention() -> Dict[str, Any]:
+    """Return the documented target/PnL convention used by the single brain."""
+    return {
+        "basis": "UNLEVERAGED_PRICE_MOVE_PCT_FROM_VERIFIED_ENTRY",
+        "range_targets_price_move_pct": list(RANGE_PROFIT_TARGETS_PCT),
+        "trend_tp1_price_move_pct": TREND_TP1_MOVE_PCT,
+        "trend_tp2_price_move_pct": TREND_TP2_MOVE_PCT,
+        "leverage": POLICY_LEVERAGE,
+        "gross_roe_multiplier": POLICY_LEVERAGE,
+        "gross_roe_pct": {
+            "0.25": 0.25 * POLICY_LEVERAGE,
+            "0.50": 0.50 * POLICY_LEVERAGE,
+            "1.00": 1.00 * POLICY_LEVERAGE,
+            "2.00": TREND_TP1_MOVE_PCT * POLICY_LEVERAGE,
+            "3.00": TREND_TP2_MOVE_PCT * POLICY_LEVERAGE,
+        },
+        "estimated_taker_fee_pct_each_side": ESTIMATED_TAKER_FEE_PCT,
+        "estimated_slippage_pct_each_side": ESTIMATED_SLIPPAGE_PCT,
+        "net_pnl_is_estimate": True,
+        "realized_pnl_authority": "EXCHANGE_REPORTED_REALIZED_PNL",
+    }
+
+
+def exchange_pnl_at_move(
+    *, side: str, entry_price: float, quantity: float, move_pct: float,
+    leverage: int = POLICY_LEVERAGE, contract_size: float = 1.0,
+    taker_fee_pct: float = ESTIMATED_TAKER_FEE_PCT,
+    slippage_pct: float = ESTIMATED_SLIPPAGE_PCT,
+) -> Dict[str, Any]:
+    """Convert a price-move target into gross and fee/slippage-adjusted PnL.
+
+    This is a pre-trade planning estimate. It must never be labelled as actual
+    exchange realized PnL; that remains exchange-reported in the execution path.
+    """
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    entry = float(entry_price)
+    qty = float(quantity)
+    move = float(move_pct)
+    contracts = float(contract_size)
+    lev = int(leverage)
+    if not all(map(isfinite, (entry, qty, move, contracts))) or min(entry, qty, contracts) <= 0:
+        raise ValueError("entry_price, quantity and contract_size must be finite and positive")
+    if lev <= 0:
+        raise ValueError("leverage must be positive")
+    if not isfinite(move) or move < 0:
+        raise ValueError("move_pct must be finite and non-negative")
+    if not isfinite(taker_fee_pct) or not isfinite(slippage_pct):
+        raise ValueError("cost assumptions must be finite")
+    fee_rate = max(0.0, float(taker_fee_pct)) / 100.0
+    slip_rate = max(0.0, float(slippage_pct)) / 100.0
+    signed_move = move / 100.0 if direction == "BUY" else -move / 100.0
+    target_price = entry * (1.0 + signed_move)
+    notional = entry * qty * contracts
+    margin = notional / lev if lev > 0 else 0.0
+    gross_pnl = (target_price - entry) * qty * contracts if direction == "BUY" else (entry - target_price) * qty * contracts
+    entry_fee = notional * fee_rate
+    exit_fee = target_price * qty * contracts * fee_rate
+    slippage_cost = (notional + target_price * qty * contracts) * slip_rate
+    total_costs = entry_fee + exit_fee + slippage_cost
+    net_pnl = gross_pnl - total_costs
+    return {
+        "side": direction,
+        "entry_price": entry,
+        "quantity": qty,
+        "contract_size": contracts,
+        "price_move_pct": move,
+        "target_price": target_price,
+        "leverage": lev,
+        "gross_roe_pct": move * lev,
+        "gross_pnl": gross_pnl,
+        "estimated_entry_fee": entry_fee,
+        "estimated_exit_fee": exit_fee,
+        "estimated_slippage_cost": slippage_cost,
+        "estimated_total_costs": total_costs,
+        "estimated_net_pnl": net_pnl,
+        "estimated_net_roe_pct": (net_pnl / margin * 100.0) if margin > 0 else 0.0,
+        "basis": "PRE_TRADE_ESTIMATE_NOT_REALIZED_PNL",
+    }
 
 
 def _number(value: Any, default: Optional[float] = None) -> Optional[float]:

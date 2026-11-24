@@ -2671,7 +2671,8 @@ from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
                               tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
-                              trend_target_prices, RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              trend_target_prices, profit_target_convention,
+                              RANGE_MODE, TREND_MODE, STANDARD_MODE)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -6713,13 +6714,25 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     else:
         gate_result["durable_event_id"] = ""
     cross_event_id = str(institutional_entry_ctx.get("cross_event_id") or "").strip()
+    if not cross_event_id and not PAPER_MODE and MODE_LIVE:
+        log_execution(
+            f"[CROSS_EVENT] BLOCKED LIVE {symbol} {side}: entry requires a durable confirmed cross event",
+            "ERROR",
+        )
+        return False
     if cross_event_id:
         if not _cross_event_is_usable(cross_event_id, side):
             log_execution(
                 f"[CROSS_EVENT] BLOCKED {symbol} {side}: cross event {cross_event_id} "
-                "is no longer active", "WARN",
+                "is not active or has no confirmed closed rejection breakout", "WARN",
             )
             return False
+        # Delayed breakout entries intentionally outlive the 2-candle fresh-cross
+        # gate. Bind execution back to the ORIGINAL cross identity and let the
+        # durable rejection lifecycle authorize this specific closed breakout.
+        _hydrate_cross_lifecycle_context(
+            institutional_entry_ctx, cross_event_id, gate_result, side, symbol, gate_tf,
+        )
         if gate_result.get("durable_event_id") and cross_event_id != gate_result["durable_event_id"]:
             log_execution(
                 f"[CROSS_EVENT] BLOCKED {symbol} {side}: watchlist event {cross_event_id} "
@@ -6841,9 +6854,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         # Real available balance from BingX Futures ("free" USDT), with source and
         # fetch timestamp so freshness is provable. A stale/unreadable balance must
         # block the entry rather than silently produce a tiny position.
-        # Sniper V2 targets 20% of TOTAL wallet balance. Free balance is
-        # checked separately as an exchange feasibility gate. Other strategies
-        # keep their existing free-margin sizing path unchanged.
+        # Every strategy uses the same authoritative sizing engine on available
+        # (free) USDT margin. Sniper V2 additionally verifies wallet total is
+        # readable before using free margin; no second allocation is computed.
         if institutional_entry_ctx.get("sniper_v2") is True:
             if institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
@@ -6994,6 +7007,76 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 f"Size reduced by design, not silently.",
                 "WARN"
             )
+        # Freeze one immutable decision before any order is submitted. No later
+        # stage is permitted to resize the quantity; precision only rounds it.
+        fee_rate = ESTIMATED_TAKER_FEE_PCT / 100.0
+        slippage_rate = ESTIMATED_SLIPPAGE_PCT / 100.0
+        reduction_reason = (
+            "STRUCTURAL_STOP_RISK_GATE" if sizing.binding_constraint == "RISK_GATE"
+            else "NONE_ALLOCATION_CEILING"
+        )
+        if qty < sizing.quantity - 1e-12:
+            reduction_reason += "+EXCHANGE_PRECISION_ROUND_DOWN"
+        sizing_decision = {
+            **sizing.as_dict(),
+            "schema_version": SIZING_DECISION_SCHEMA_VERSION,
+            "trade_id": trade_id,
+            "symbol": str(symbol),
+            "canonical_symbol": sym,
+            "side": side,
+            "balance_basis": "AVAILABLE_FREE",
+            "balance_source": str(balance_source),
+            "balance_timestamp": float(balance_ts),
+            "available_balance": balance,
+            "requested_classification": str(classification or "").upper(),
+            "strong_tier_authorized": bool(strong_tier_authorized),
+            "leverage": LEVERAGE,
+            "target_allocation_pct": margin_percent,
+            "entry_price": reference_price,
+            "structural_stop": structural_stop,
+            "stop_distance": sizing.stop_distance,
+            "risk_budget_usdt": sizing.max_risk_usdt,
+            "max_qty_before_precision": sizing.quantity,
+            "final_exchange_qty": qty,
+            "estimated_margin": expected_margin,
+            "estimated_sl_loss": estimated_stop_loss,
+            "estimated_fees": {
+                "taker_fee_pct_each_side": ESTIMATED_TAKER_FEE_PCT,
+                "entry_fee_usdt": notional * fee_rate,
+                "exit_fee_usdt": notional * fee_rate,
+                "round_trip_fee_usdt": 2.0 * notional * fee_rate,
+                "source": "CONSERVATIVE_PLANNING_ASSUMPTION_NOT_EXCHANGE_QUOTE",
+            },
+            "estimated_slippage": {
+                "slippage_pct_each_side": ESTIMATED_SLIPPAGE_PCT,
+                "round_trip_usdt": 2.0 * notional * slippage_rate,
+                "source": "CONSERVATIVE_PLANNING_ASSUMPTION_NOT_ACTUAL_FILL",
+            },
+            "reduction_reason": reduction_reason,
+            "structural_reduction_count": 1 if sizing.binding_constraint == "RISK_GATE" else 0,
+            "downstream_reduction_count": 0,
+            "cross_event_id": str(cross_event_id or gate_event_id or ""),
+            "entry_event_id": str(entry_event_id or ""),
+            "profit_target_convention": profit_target_convention(),
+        }
+        STATE["sizing_decision"] = dict(sizing_decision)
+        institutional_entry_ctx["sizing_decision"] = dict(sizing_decision)
+        if gate_journal is not None:
+            try:
+                persisted_decision = gate_journal.persist_sizing_decision(trade_id, sizing_decision)
+            except Exception as decision_exc:
+                persisted_decision = False
+                log_execution(
+                    f"[SIZING_DECISION] CRITICAL persist failed for {trade_id}: "
+                    f"{type(decision_exc).__name__}: {decision_exc}", "ERROR",
+                )
+            if not persisted_decision:
+                if not PAPER_MODE and MODE_LIVE:
+                    log_execution(
+                        f"[SIZING_DECISION] BLOCKED LIVE entry {trade_id}: durable decision unavailable", "ERROR",
+                    )
+                    return False
+                STATE["sizing_decision_persistence_failed"] = True
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
@@ -7423,6 +7506,16 @@ def _get_scanner_frame(symbol, limit=150):
 # execution gate below can create these durable, unique Watchlist opportunities.
 CONFIRMED_CROSS_EVENT_SOURCE = "CLOSED_CANDLE_EMA9_VWAP_CROSS"
 CONFIRMED_CROSS_EVENT_TTL_SEC = 4.0 * 3600.0
+CROSS_LIFECYCLE_SCHEMA = "CROSS_REJECTION_V1"
+try:
+    CROSS_REJECTION_MAX_CHASE_ATR = max(0.25, min(3.0, float(os.getenv("CROSS_REJECTION_MAX_CHASE_ATR", "1.5"))))
+except (TypeError, ValueError, OverflowError):
+    CROSS_REJECTION_MAX_CHASE_ATR = 1.5
+SIZING_DECISION_SCHEMA_VERSION = 1
+# Conservative planning assumptions for audit records only. They never resize a
+# position and are never presented as measured exchange fills or net PnL.
+ESTIMATED_TAKER_FEE_PCT = 0.05
+ESTIMATED_SLIPPAGE_PCT = 0.02
 
 
 def _confirmed_cross_event_id(symbol, timeframe, gate_result):
@@ -7436,6 +7529,37 @@ def _confirmed_cross_event_id(symbol, timeframe, gate_result):
     return f"{event_symbol}:{timeframe}:{raw_signal_id}"
 
 
+def _advance_cross_event_lifecycles(rows):
+    """Advance active cross events using closed candles only, never a live bar."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    evaluator = globals().get("_evaluate_post_cross_rejection_breakout")
+    if journal is None or not callable(evaluator):
+        return 0
+    advanced = 0
+    for row in list(rows or []):
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("lifecycle_schema") or "") != CROSS_LIFECYCLE_SCHEMA:
+            continue
+        try:
+            frame = _get_scanner_frame(row.get("exchange_symbol") or row.get("symbol"))
+            lifecycle = evaluator(
+                frame, str(row.get("side") or ""), row,
+                ema_fn=ema, timeframe_seconds=_roro_timeframe_seconds(row.get("timeframe") or INTERVAL),
+                now_ms=int(time.time() * 1000), max_chase_atr=CROSS_REJECTION_MAX_CHASE_ATR,
+            )
+            if lifecycle.get("entry_ready") and str(lifecycle.get("phase") or "") != "BREAKOUT_CONFIRMED":
+                lifecycle["entry_ready"] = False
+            if journal.update_cross_event_lifecycle(row.get("event_id"), lifecycle):
+                advanced += 1
+        except Exception as exc:
+            log_execution(
+                f"[CROSS_EVENT] lifecycle advance failed for {row.get('event_id')}: "
+                f"{type(exc).__name__}: {exc}", "ERROR",
+                debounce_key=f"cross_lifecycle:{row.get('event_id')}", debounce_sec=10,
+            )
+    return advanced
+
+
 def _sync_confirmed_cross_events():
     """Reload active cross events from the journal into the Watchlist feed."""
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
@@ -7444,8 +7568,25 @@ def _sync_confirmed_cross_events():
         try:
             journal.expire_cross_events()
             rows = journal.list_cross_events(statuses=("ACTIVE",))
+            if _advance_cross_event_lifecycles(rows):
+                rows = journal.list_cross_events(statuses=("ACTIVE",))
         except Exception as exc:
             log_execution(f"[CROSS_EVENT] sync failed: {type(exc).__name__}: {exc}", "ERROR")
+    lifecycle_projection = {}
+    for row in rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+            lifecycle_projection[str(row.get("event_id") or "")] = {
+                "cross_event_phase": str(metadata.get("phase") or "WAITING_FOR_PULLBACK"),
+                "cross_event_lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "cross_event_entry_ready": bool(metadata.get("entry_ready") is True),
+                "cross_event_rejection_high": metadata.get("rejection_high"),
+                "cross_event_rejection_low": metadata.get("rejection_low"),
+                "cross_event_rejection_timestamp": metadata.get("rejection_candle_timestamp"),
+                "cross_event_breakout_timestamp": metadata.get("breakout_candle_timestamp"),
+                "cross_event_breakout_close": metadata.get("breakout_close"),
+                "cross_event_chase_atr": metadata.get("chase_atr"),
+            }
     MEMORY["confirmed_cross_events"] = [{
         "symbol": str(row.get("symbol") or ""),
         "exchange_symbol": str(row.get("exchange_symbol") or row.get("symbol") or ""),
@@ -7458,6 +7599,7 @@ def _sync_confirmed_cross_events():
         "cross_event_timeframe": str(row.get("timeframe") or INTERVAL),
         "cross_event_detected_ts": float(row.get("detected_ts") or 0.0),
         "cross_event_expires_ts": float(row.get("expires_ts") or 0.0),
+        **lifecycle_projection.get(str(row.get("event_id") or ""), {}),
         "discovery_source": "confirmed_cross_event",
         "role": "CONFIRMED_CROSS_EVENT",
         "score": 100.0,
@@ -7468,16 +7610,16 @@ def _sync_confirmed_cross_events():
     return rows
 
 
-def _invalidate_superseded_cross_events(symbol, direction, journal):
+def _invalidate_superseded_cross_events(symbol, direction, journal, keep_event_id=None):
     key = roro_canonical_symbol(symbol)
-    expected = str(direction or "").upper()
+    keep = str(keep_event_id or "").strip()
     for event in journal.list_cross_events(statuses=("ACTIVE",)):
-        if str(event.get("symbol") or "") != key:
+        event_id = str(event.get("event_id") or "")
+        if str(event.get("symbol") or "") != key or event_id == keep:
             continue
-        if str(event.get("direction") or "").upper() == expected:
-            continue
+        reason = "opposite_confirmed_cross" if str(event.get("direction") or "").upper() != str(direction or "").upper() else "superseded_confirmed_cross"
         try:
-            journal.invalidate_cross_event(event.get("event_id"), "opposite_confirmed_cross")
+            journal.invalidate_cross_event(event_id, reason)
         except Exception as exc:
             log_execution(
                 f"[CROSS_EVENT] invalidate failed for {event.get('event_id')}: "
@@ -7523,6 +7665,11 @@ def _detect_confirmed_cross_events(symbols):
                 "source": CONFIRMED_CROSS_EVENT_SOURCE,
                 "detection_method": "validate_dual_ema_vwap_entry_gate",
                 "lookback_candles": 2,
+                "lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "phase": "WAITING_FOR_PULLBACK",
+                "entry_ready": False,
+                "cross_price": float(frame["close"].iloc[-1]),
+                "max_chase_atr": CROSS_REJECTION_MAX_CHASE_ATR,
             })
             try:
                 inserted = journal.record_cross_event(
@@ -7546,7 +7693,7 @@ def _detect_confirmed_cross_events(symbols):
                 continue
             if inserted:
                 created += 1
-                _invalidate_superseded_cross_events(symbol, direction, journal)
+                _invalidate_superseded_cross_events(symbol, direction, journal, keep_event_id=event_id)
                 log_execution(
                     f"[CROSS_EVENT] CONFIRMED {event_id} side={side} "
                     f"candle={gate.get('signal_candle_timestamp')}", "INFO",
@@ -7570,7 +7717,74 @@ def _cross_event_is_usable(event_id, side=None):
         return False
     if side and str(row.get("side") or "").upper() != str(side).upper():
         return False
-    return float(row.get("expires_ts") or 0.0) > time.time()
+    if float(row.get("expires_ts") or 0.0) <= time.time():
+        return False
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+        return (
+            str(metadata.get("phase") or "").upper() == "BREAKOUT_CONFIRMED"
+            and metadata.get("entry_ready") is True
+        )
+    return True
+
+
+def _get_confirmed_cross_event(event_id):
+    event_id = str(event_id or "").strip()
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not event_id or journal is None:
+        return None
+    try:
+        return journal.get_cross_event(event_id)
+    except Exception:
+        return None
+
+
+def _hydrate_cross_lifecycle_context(ctx, event_id, gate_result, side, symbol, timeframe):
+    """Bind an execution to the original cross event and its rejection breakout.
+
+    The fresh-cross gate may legitimately be stale by the time a delayed
+    pullback/rejection/breakout occurs. In that case the durable lifecycle is
+    authoritative, but only when it explicitly says BREAKOUT_CONFIRMED.
+    """
+    row = _get_confirmed_cross_event(event_id)
+    if not row:
+        return False
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    if str(metadata.get("lifecycle_schema") or "") != CROSS_LIFECYCLE_SCHEMA:
+        return False
+    context = ctx if isinstance(ctx, dict) else {}
+    context.update({
+        "cross_event_phase": str(metadata.get("phase") or "WAITING_FOR_PULLBACK"),
+        "cross_event_lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+        "cross_event_entry_ready": bool(metadata.get("entry_ready") is True),
+        "cross_event_rejection_high": metadata.get("rejection_high"),
+        "cross_event_rejection_low": metadata.get("rejection_low"),
+        "cross_event_rejection_timestamp": metadata.get("rejection_candle_timestamp"),
+        "cross_event_breakout_timestamp": metadata.get("breakout_candle_timestamp"),
+        "cross_event_breakout_close": metadata.get("breakout_close"),
+        "cross_event_chase_atr": metadata.get("chase_atr"),
+        "cross_event_max_chase_atr": metadata.get("max_chase_atr"),
+        "cross_event_cross_price": metadata.get("cross_price"),
+        "cross_event_cross_atr": metadata.get("cross_atr"),
+    })
+    gate = gate_result if isinstance(gate_result, dict) else {}
+    gate["durable_event_id"] = str(row.get("event_id") or event_id)
+    gate["signal_candle_timestamp"] = int(row.get("signal_candle_timestamp") or 0)
+    original_signal_id = str(metadata.get("signal_candle_id") or "")
+    if not original_signal_id:
+        original_direction = "BUY" if str(side).upper() == "BUY" else "SELL"
+        original_signal_id = f"{original_direction}:{int(row.get('signal_candle_timestamp') or 0)}"
+    gate["signal_candle_id"] = original_signal_id
+    recomputed_event_id = _confirmed_cross_event_id(symbol, timeframe, gate)
+    if recomputed_event_id:
+        gate["durable_event_id"] = recomputed_event_id
+    gate["lifecycle_phase"] = context["cross_event_phase"]
+    gate["lifecycle_entry_ready"] = context["cross_event_entry_ready"]
+    if context["cross_event_entry_ready"] and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED":
+        gate["ready"] = True
+        gate["authorization_state"] = "POST_CROSS_REJECTION_BREAKOUT_VALID"
+        gate["reason"] = "closed_rejection_high_low_breakout_confirmed"
+    return True
 
 
 def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, atr_val=None):
@@ -7619,6 +7833,21 @@ def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, at
         "cross_event_status": str(_first(source.get("cross_event_status"), "ACTIVE")),
         "cross_signal_candle_id": str(gate.get("signal_candle_id") or ""),
         "durable_event_id": str(gate.get("durable_event_id") or ""),
+        "rejection_candle": {
+            "phase": str(_first(source.get("cross_event_phase"), gate.get("lifecycle_phase"), "WAITING_FOR_PULLBACK")),
+            "lifecycle_schema": str(_first(source.get("cross_event_lifecycle_schema"), CROSS_LIFECYCLE_SCHEMA)),
+            "entry_ready": bool(_first(source.get("cross_event_entry_ready"), gate.get("lifecycle_entry_ready"), False)),
+            "rejection_timestamp": _first(source.get("cross_event_rejection_timestamp"), gate.get("rejection_candle_timestamp")),
+            "rejection_high": _number(_first(source.get("cross_event_rejection_high"), gate.get("rejection_high"))),
+            "rejection_low": _number(_first(source.get("cross_event_rejection_low"), gate.get("rejection_low"))),
+            "breakout_timestamp": _first(source.get("cross_event_breakout_timestamp"), gate.get("breakout_candle_timestamp")),
+            "breakout_close": _number(_first(source.get("cross_event_breakout_close"), gate.get("breakout_close"))),
+            "chase_atr": _number(_first(source.get("cross_event_chase_atr"), gate.get("chase_atr"))),
+            "max_chase_atr": _number(source.get("cross_event_max_chase_atr"), CROSS_REJECTION_MAX_CHASE_ATR),
+        },
+        "actual_entry_price": None,
+        "actual_filled_qty": None,
+        "profit_target_convention": profit_target_convention(),
         "entry_zone": {
             "low": _number(source.get("entry_zone_low"), 0.0),
             "high": _number(source.get("entry_zone_high"), 0.0),
@@ -12125,6 +12354,7 @@ from ggp_institutional_bridge import (
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
                              validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             evaluate_post_cross_rejection_breakout as _evaluate_post_cross_rejection_breakout,
                              timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
@@ -12650,7 +12880,7 @@ def smart_opportunity_selection():
             cross_event_id = str(item.get("cross_event_id") or "")
             if cross_event_id and not _cross_event_is_usable(cross_event_id, side):
                 item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "confirmed_cross_event_not_active"
+                item["rejection_reason"] = "confirmed_cross_event_not_breakout_confirmed"
                 continue
             atr_value = compute_atr(closed_df).iloc[-1]
             if not np.isfinite(atr_value) or atr_value <= 0:
@@ -12760,6 +12990,15 @@ def smart_opportunity_selection():
                 "cross_event_source": item.get("cross_event_source"),
                 "cross_event_direction": item.get("cross_event_direction"),
                 "cross_event_timestamp": item.get("cross_event_timestamp"),
+                "cross_event_phase": item.get("cross_event_phase"),
+                "cross_event_lifecycle_schema": item.get("cross_event_lifecycle_schema"),
+                "cross_event_entry_ready": item.get("cross_event_entry_ready"),
+                "cross_event_rejection_high": item.get("cross_event_rejection_high"),
+                "cross_event_rejection_low": item.get("cross_event_rejection_low"),
+                "cross_event_rejection_timestamp": item.get("cross_event_rejection_timestamp"),
+                "cross_event_breakout_timestamp": item.get("cross_event_breakout_timestamp"),
+                "cross_event_breakout_close": item.get("cross_event_breakout_close"),
+                "cross_event_chase_atr": item.get("cross_event_chase_atr"),
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
                                         if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
@@ -14558,7 +14797,20 @@ def execute_entry(*args, **kwargs):
             ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
             _persist_trade_journal_start(ctx.get("setup_type"))
             trade_id = str(STATE.get("trade_id") or "")
-            entry_context = ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {}
+            entry_context = dict(ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {})
+            sizing_decision = dict(STATE.get("sizing_decision") or ctx.get("sizing_decision") or {})
+            # The handoff is frozen after fill verification: planned values come
+            # from the immutable sizing decision, actual values from the exchange
+            # result (or the verified PAPER fill).
+            entry_context.update({
+                "requested_entry_price": sizing_decision.get("entry_price"),
+                "requested_qty": sizing_decision.get("final_exchange_qty")
+                or sizing_decision.get("final_qty"),
+                "actual_entry_price": STATE.get("entry"),
+                "actual_filled_qty": STATE.get("initial_qty") or STATE.get("qty"),
+                "fill_source": "EXCHANGE_VERIFIED_FILL" if not PAPER_MODE else "PAPER_VERIFIED_FILL",
+            })
+            STATE["entry_context_snapshot"] = dict(entry_context)
             if journal is not None and entry_context:
                 try:
                     if not journal.persist_entry_context(trade_id, entry_context):

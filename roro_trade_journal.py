@@ -308,6 +308,68 @@ class TradeJournal:
             db.execute("COMMIT")
             return changed
 
+    _CROSS_LIFECYCLE_RANK = {
+        "WAITING_FOR_PULLBACK": 0,
+        "PULLBACK_CONFIRMED": 1,
+        "REJECTION_RECORDED": 2,
+        "BREAKOUT_CONFIRMED": 3,
+    }
+
+    def update_cross_event_lifecycle(self, event_id: str, lifecycle: Dict[str, Any]) -> bool:
+        """Advance a cross event's post-cross state without ever rewinding it.
+
+        The state machine is additive: it only merges lifecycle fields into the
+        existing metadata JSON. A lower-ranked phase is ignored so a late stale
+        frame cannot turn a confirmed breakout back into a waiting event.
+        """
+        if not event_id or not isinstance(lifecycle, dict):
+            return False
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status, metadata_json FROM confirmed_cross_events WHERE event_id=?",
+                (str(event_id),),
+            ).fetchone()
+            if not row or str(row[0]).upper() != "ACTIVE":
+                db.execute("ROLLBACK")
+                return False
+            try:
+                metadata = json.loads(row[1] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            old_phase = str(metadata.get("phase") or "WAITING_FOR_PULLBACK").upper()
+            new_phase = str(lifecycle.get("phase") or old_phase).upper()
+            if self._CROSS_LIFECYCLE_RANK.get(new_phase, -1) < self._CROSS_LIFECYCLE_RANK.get(old_phase, -1):
+                db.execute("ROLLBACK")
+                return False
+            lifecycle = dict(lifecycle)
+            # First confirmation is immutable: a later evaluation that lost the
+            # breakout candle cannot revoke an already-authorized entry.
+            if metadata.get("entry_ready") is True:
+                lifecycle["entry_ready"] = True
+                lifecycle["phase"] = "BREAKOUT_CONFIRMED"
+                new_phase = "BREAKOUT_CONFIRMED"
+            candidate = dict(metadata)
+            candidate.update(lifecycle)
+            candidate["phase"] = new_phase
+            previous = dict(metadata)
+            candidate.pop("lifecycle_updated_ts", None)
+            previous.pop("lifecycle_updated_ts", None)
+            if candidate == previous:
+                db.execute("ROLLBACK")
+                return False
+            candidate["lifecycle_updated_ts"] = time.time()
+            metadata = candidate
+            db.execute(
+                "UPDATE confirmed_cross_events SET metadata_json=?, updated_ts=? "
+                "WHERE event_id=? AND status='ACTIVE'",
+                (json.dumps(metadata, sort_keys=True, default=str, separators=(",", ":")),
+                 time.time(), str(event_id)),
+            )
+            changed = db.execute("SELECT changes()").fetchone()[0] == 1
+            db.execute("COMMIT")
+            return changed
+
     def expire_cross_events(self, now: Optional[float] = None) -> int:
         cutoff = float(now if now is not None else time.time())
         with self._db() as db:
@@ -330,6 +392,16 @@ class TradeJournal:
         if not trade_id or not isinstance(context, dict):
             return False
         return self.event(trade_id, f"entry-context:{trade_id}", "ENTRY_CONTEXT", context)
+
+    def persist_sizing_decision(self, trade_id: str, decision: Dict[str, Any]) -> bool:
+        """Persist the one authoritative sizing decision before an order is sent.
+
+        The event key is unique per trade, so a downstream path cannot write a
+        second, silently reduced decision for the same trade.
+        """
+        if not trade_id or not isinstance(decision, dict):
+            return False
+        return self.event(trade_id, f"sizing-decision:{trade_id}", "POSITION_SIZING_DECISION", decision)
 
     def persist_entry_pending(self, *, trade_id: str, client_order_id: str, symbol: str,
                               side: str, position_mode: str, position_side: str,

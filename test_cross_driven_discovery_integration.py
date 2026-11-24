@@ -22,7 +22,9 @@ from ggp_profit_brain import (
     RANGE_MODE, STANDARD_MODE, TREND_MODE, classify_profit_mode,
 )
 from ggpbot import TradeDecisionType
-from roro_confluence import validate_dual_ema_vwap_entry_gate
+from roro_confluence import (
+    evaluate_post_cross_rejection_breakout, validate_dual_ema_vwap_entry_gate,
+)
 from roro_trade_journal import TradeJournal
 
 
@@ -30,14 +32,21 @@ SYMBOL = "BTC/USDT:USDT"
 CANONICAL = "BTC"
 TF_MS = 900_000
 START_MS = 1_795_132_800_000  # 2026-11-20 00:00 UTC
-NOW_MS = START_MS + 79 * TF_MS + TF_MS + 1_000
+CROSS_IDX = 79
+BASE_BARS = 80
+NOW_MS = START_MS + BASE_BARS * TF_MS + 1_000
 NOW_SEC = NOW_MS / 1000.0
+LIFECYCLE_NOW_MS = START_MS + (BASE_BARS + 3) * TF_MS + 1_000
+
+
+def _ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 
 def _cross_frame(side="BUY"):
     """A real closed-candle EMA9/Session-VWAP cross with 80 valid bars."""
-    n = 80
-    closes = 99.0 - 0.01 * np.arange(n)
+    n = BASE_BARS
+    closes = 99.0 + (-0.01 if side == "BUY" else 0.01) * np.arange(n)
     closes[-1] = closes[-2] + (4.0 if side == "BUY" else -4.0)
     opens = np.concatenate([closes[:-1], [closes[-2]]])
     return pd.DataFrame({
@@ -50,11 +59,65 @@ def _cross_frame(side="BUY"):
     })
 
 
-def _gate(frame, side="BUY"):
+def _lifecycle_frame(side="BUY"):
+    """Cross frame plus a closed pullback, rejection wick and later breakout."""
+    frame = _cross_frame(side)
+    if side == "BUY":
+        extra = [
+            (101.5, 100.8, 101.7, 98.60),
+            (100.8, 101.1, 101.3, 98.70),
+            (101.1, 102.0, 102.2, 100.9),
+        ]
+    else:
+        extra = [
+            (96.5, 97.2, 100.3, 96.3),
+            (98.0, 97.6, 100.25, 97.4),
+            (97.6, 96.9, 97.8, 96.7),
+        ]
+    rows = []
+    for offset, (open_price, close_price, high, low) in enumerate(extra):
+        rows.append({
+            "timestamp": START_MS + (BASE_BARS + offset) * TF_MS,
+            "open": open_price, "high": high, "low": low,
+            "close": close_price, "volume": 1000.0,
+        })
+    return pd.concat([frame, pd.DataFrame(rows)], ignore_index=True)
+
+
+def _gate(frame, side="BUY", now_ms=None):
     return validate_dual_ema_vwap_entry_gate(
-        frame, side, lambda series, period: series.ewm(span=period, adjust=False).mean(),
-        timeframe_seconds=900, now_ms=NOW_MS, lookback_candles=2,
+        frame, side, _ema,
+        timeframe_seconds=900, now_ms=NOW_MS if now_ms is None else now_ms,
+        lookback_candles=2,
     )
+
+
+def _lifecycle_event(side="BUY", *, phase="WAITING_FOR_PULLBACK"):
+    frame = _cross_frame(side)
+    gate = _gate(frame, side)
+    assert gate["ready"] is True
+    event_id = ggpbot._confirmed_cross_event_id(SYMBOL, str(ggpbot.INTERVAL), gate)
+    direction = "BULLISH" if side == "BUY" else "BEARISH"
+    return {
+        "event_id": event_id,
+        "symbol": CANONICAL,
+        "exchange_symbol": SYMBOL,
+        "side": side,
+        "direction": direction,
+        "source": ggpbot.CONFIRMED_CROSS_EVENT_SOURCE,
+        "timeframe": str(ggpbot.INTERVAL),
+        "signal_candle_timestamp": int(gate["signal_candle_timestamp"]),
+        "closed_candle_timestamp": int(gate["latest_closed_timestamp"]),
+        "expires_ts": time.time() + 14_400.0,
+        "metadata": {
+            **gate,
+            "lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA,
+            "phase": phase,
+            "entry_ready": False,
+            "cross_price": float(frame["close"].iloc[-1]),
+            "max_chase_atr": ggpbot.CROSS_REJECTION_MAX_CHASE_ATR,
+        },
+    }
 
 
 def _payload(event_id="BTC:15m:BUY:1795203900000", expires_ts=None):
@@ -166,6 +229,127 @@ def test_cross_event_journal_lifecycle_survives_restart(tmp_path):
     assert len(entry_context_events) == 1
     assert entry_context_events[0][0] == "entry-context:trade-1"
     assert json.loads(entry_context_events[0][2]) == context
+
+
+# --------------------------------------------------------------------------- #
+# 1b) Post-cross lifecycle: pullback -> rejection candle -> later breakout.
+# --------------------------------------------------------------------------- #
+def _evaluate(event, frame, *, now_ms=LIFECYCLE_NOW_MS, max_chase_atr=1.5):
+    return evaluate_post_cross_rejection_breakout(
+        frame, event["side"], event, ema_fn=_ema, timeframe_seconds=900,
+        now_ms=now_ms, max_chase_atr=max_chase_atr,
+    )
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_post_cross_rejection_breakout_buy_and_sell(side):
+    event = _lifecycle_event(side)
+    result = _evaluate(event, _lifecycle_frame(side))
+    assert result["reason"] == "closed_rejection_high_low_breakout_confirmed"
+    assert result["phase"] == "BREAKOUT_CONFIRMED"
+    assert result["entry_ready"] is True
+    assert result["authorization_state"] == "POST_CROSS_REJECTION_BREAKOUT_VALID"
+    assert result["pullback_candle_timestamp"] > event["signal_candle_timestamp"]
+    assert result["rejection_candle_timestamp"] > result["pullback_candle_timestamp"]
+    assert result["breakout_candle_timestamp"] > result["rejection_candle_timestamp"]
+    assert result["rejection_high"] > result["rejection_low"]
+    assert result["chase_atr"] <= ggpbot.CROSS_REJECTION_MAX_CHASE_ATR
+    if side == "BUY":
+        assert result["breakout_close"] > result["rejection_high"]
+        assert result["ema9"] > result["vwap"]
+    else:
+        assert result["breakout_close"] < result["rejection_low"]
+        assert result["ema9"] < result["vwap"]
+
+
+def test_cross_lifecycle_is_durable_and_never_rewinds(tmp_path):
+    journal = TradeJournal(str(tmp_path / "lifecycle.sqlite3"))
+    event = _lifecycle_event("BUY")
+    event["expires_ts"] = LIFECYCLE_NOW_MS / 1000.0 + 3600.0
+    assert journal.record_cross_event(**event) is True
+    row = journal.get_cross_event(event["event_id"])
+
+    first = _evaluate(row, _lifecycle_frame("BUY"))
+    assert first["phase"] in {"REJECTION_RECORDED", "BREAKOUT_CONFIRMED"}
+    assert journal.update_cross_event_lifecycle(event["event_id"], first) is True
+    # Repeated identical evaluations must not generate redundant journal writes.
+    assert journal.update_cross_event_lifecycle(event["event_id"], first) is False
+
+    confirmed = journal.get_cross_event(event["event_id"])
+    assert confirmed["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
+    assert confirmed["metadata"]["entry_ready"] is True
+
+    # A stale lower phase and a later frame that lost the breakout cannot revoke it.
+    assert journal.update_cross_event_lifecycle(event["event_id"], {
+        "phase": "WAITING_FOR_PULLBACK", "entry_ready": False,
+    }) is False
+    retained = journal.get_cross_event(event["event_id"])
+    assert retained["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
+    assert retained["metadata"]["entry_ready"] is True
+    assert _evaluate(retained, _lifecycle_frame("BUY"))["entry_ready"] is True
+
+
+def test_selection_rejects_cross_event_before_breakout_confirmed(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "selection.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    event = _lifecycle_event("BUY")
+    assert journal.record_cross_event(**event) is True
+
+    monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
+    monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", lambda: None)
+    monkeypatch.setattr(ggpbot.time, "time", lambda: LIFECYCLE_NOW_MS / 1000.0)
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda *a, **k: _lifecycle_frame("BUY"))
+    monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: 102.0)
+    monkeypatch.setattr(ggpbot, "roro_analyze_symbol_both", lambda *a, **k: {
+        "decision_state": "ENTRY_READY", "side": "BUY",
+    })
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *a, **k: {})
+    monkeypatch.setitem(ggpbot.STATE, "open", False)
+    monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
+    monkeypatch.setitem(ggpbot.MEMORY, "position_status", "FLAT")
+    monkeypatch.setitem(ggpbot.MEMORY, "_unified_watchlist_refresh_ok", True)
+    if hasattr(ggpbot, "RECOVERY_BLOCK_ENTRIES"):
+        monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    item = {
+        "decision_state": "ENTRY_READY", "side": "BUY", "symbol": CANONICAL,
+        "exchange_symbol": SYMBOL, "event_id": "institution:pending",
+        "cross_event_id": event["event_id"], "score": 100.0,
+    }
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {CANONICAL: item})
+    executed = []
+    monkeypatch.setattr(ggpbot, "execute_entry", lambda *a, **k: executed.append((a, k)))
+
+    assert ggpbot.smart_opportunity_selection() is False
+    assert executed == []
+    assert item["decision_state"] == "REJECTED"
+    assert item["rejection_reason"] == "confirmed_cross_event_not_breakout_confirmed"
+
+
+def test_post_cross_entry_requires_closed_rejection_and_later_breakout():
+    event = _lifecycle_event("SELL")
+    frame = _cross_frame("SELL")
+
+    # A cross plus a direct breakout without a closed pullback/rejection is not
+    # an entry; ranking-only directional context cannot substitute.
+    direct = frame.copy()
+    last = direct.iloc[-1].copy()
+    direct = pd.concat([direct, pd.DataFrame([last])], ignore_index=True)
+    direct.iloc[-1, direct.columns.get_loc("close")] = 90.0
+    direct.iloc[-1, direct.columns.get_loc("low")] = 89.8
+    direct.iloc[-1, direct.columns.get_loc("timestamp")] = START_MS + BASE_BARS * TF_MS
+    assert _evaluate(event, direct)["entry_ready"] is False
+
+    # A breakout candle that has not closed cannot authorize an entry.
+    unfinished = _lifecycle_frame("SELL")
+    unfinished.iloc[-1, unfinished.columns.get_loc("timestamp")] = START_MS + (BASE_BARS + 3) * TF_MS
+    blocked = _evaluate(event, unfinished)
+    assert blocked["entry_ready"] is False
+    assert blocked["phase"] != "BREAKOUT_CONFIRMED"
+
+    # Chasing beyond the ATR cap is rejected even with a structurally valid breakout.
+    chased = _evaluate(event, _lifecycle_frame("SELL"), max_chase_atr=0.25)
+    assert chased["entry_ready"] is False
+    assert chased["reason"] == "breakout_exceeds_atr_chase_limit"
 
 
 # --------------------------------------------------------------------------- #
@@ -403,10 +587,12 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     gate = _gate(frame, "BUY")
     assert gate["ready"] is True
 
-    monkeypatch.setattr(ggpbot.time, "time", lambda: NOW_SEC)
+    clock = [NOW_SEC]
+    frames = {"current": frame}
+    monkeypatch.setattr(ggpbot.time, "time", lambda: clock[0])
     journal = TradeJournal(str(tmp_path / "e2e.sqlite3"))
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
-    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frames["current"])
     monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
     monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
     monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [])
@@ -420,8 +606,8 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
     monkeypatch.setitem(ggpbot.paper, "balance", 1000.0)
     monkeypatch.setitem(ggpbot.paper, "position", None)
-    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: frame)
-    monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: float(frame["close"].iloc[-1]))
+    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: frames["current"])
+    monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: float(frames["current"]["close"].iloc[-1]))
     monkeypatch.setattr(ggpbot, "update_position_dashboard", lambda *a, **k: None)
     monkeypatch.setattr(ggpbot, "tg_entry", lambda *a, **k: None)
     monkeypatch.setattr(ggpbot, "_live_manager", type(
@@ -450,10 +636,23 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
         "ENTRY_READY", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_RETEST", "REJECTED"
     }
 
-    # 3. A verified institutional authorization is replayed through the real
-    #    execution gate. The cross identity, frame and zones come from the
-    #    Watchlist item; no scanner row can substitute for them.
-    price = float(frame["close"].iloc[-1])
+    # 3. Later closed candles supply the pullback/rejection and the strictly
+    #    later breakout. The gate is now stale by design, so only the durable
+    #    lifecycle may authorize this delayed entry.
+    lifecycle_frame = _lifecycle_frame("BUY")
+    frames["current"] = lifecycle_frame
+    clock[0] = LIFECYCLE_NOW_MS / 1000.0
+    ggpbot._sync_confirmed_cross_events()
+    event = journal.get_cross_event(event["event_id"])
+    assert event["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
+    assert event["metadata"]["entry_ready"] is True
+    assert event["metadata"]["rejection_high"] > event["metadata"]["rejection_low"]
+    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is True
+
+    # A verified institutional authorization is replayed through the real
+    # execution gate. The cross identity, frame and zones come from the
+    # Watchlist item; no scanner row can substitute for them.
+    price = float(lifecycle_frame["close"].iloc[-1])
     item.update({
         "decision_state": "ENTRY_READY", "side": "BUY",
         "event_id": f"institution:{event['event_id']}",
@@ -490,9 +689,9 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
         "cross_event_direction": item["cross_event_direction"],
         "cross_event_timestamp": item["cross_event_timestamp"],
         "exchange_symbol": SYMBOL, "candle_timeframe": str(ggpbot.INTERVAL),
-        "closed_candle_frame": frame.copy(),
+        "closed_candle_frame": lifecycle_frame.copy(),
         "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
-        "closed_candle_timestamp": int(frame["timestamp"].iloc[-1]),
+        "closed_candle_timestamp": int(lifecycle_frame["timestamp"].iloc[-1]),
     }
     monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", ctx)
 
@@ -521,11 +720,37 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     persisted_json = json.loads(context_events[0][0])
     assert persisted_json["cross_event_id"] == event["event_id"]
     assert persisted_json["cross_event_direction"] == "BULLISH"
-    di_plus, di_minus, adx, _ = ggpbot.get_di_components(frame)
+    di_plus, di_minus, adx, _ = ggpbot.get_di_components(lifecycle_frame)
     assert persisted_json["adx_di"]["adx"] == pytest.approx(adx)
     assert persisted_json["adx_di"]["di_plus"] == pytest.approx(di_plus)
     assert persisted_json["adx_di"]["di_minus"] == pytest.approx(di_minus)
     assert ggpbot.STATE["entry_context_snapshot"]["cross_event_id"] == event["event_id"]
+
+    rejection = persisted_json["rejection_candle"]
+    assert rejection["phase"] == "BREAKOUT_CONFIRMED"
+    assert rejection["entry_ready"] is True
+    assert rejection["rejection_high"] == pytest.approx(event["metadata"]["rejection_high"])
+    assert rejection["rejection_low"] == pytest.approx(event["metadata"]["rejection_low"])
+    assert rejection["breakout_timestamp"] == event["metadata"]["breakout_candle_timestamp"]
+    assert persisted_json["actual_entry_price"] == pytest.approx(price)
+    assert persisted_json["actual_filled_qty"] == pytest.approx(ggpbot.STATE["qty"])
+    assert persisted_json["profit_target_convention"]["basis"] == "UNLEVERAGED_PRICE_MOVE_PCT_FROM_VERIFIED_ENTRY"
+
+    with sqlite3.connect(journal.path if hasattr(journal, "path") else str(tmp_path / "e2e.sqlite3")) as db:
+        sizing_events = db.execute(
+            "SELECT payload FROM trade_events WHERE trade_id=? AND event_type='POSITION_SIZING_DECISION'",
+            (trade_id,),
+        ).fetchall()
+    assert len(sizing_events) == 1, "exactly one authoritative sizing decision per trade"
+    sizing_json = json.loads(sizing_events[0][0])
+    assert sizing_json["trade_id"] == trade_id
+    assert sizing_json["cross_event_id"] == event["event_id"]
+    assert sizing_json["balance_basis"] == "AVAILABLE_FREE"
+    assert sizing_json["target_allocation_pct"] == pytest.approx(0.20)
+    assert sizing_json["leverage"] == 20
+    assert sizing_json["final_exchange_qty"] == pytest.approx(ggpbot.STATE["qty"])
+    assert sizing_json["downstream_reduction_count"] == 0
+    assert sizing_json["structural_reduction_count"] <= 1
 
     # 4. The immutable snapshot classifies one profit mode and the same
     #    TradeManagementBoard owns TP1, protection and trail decisions.
