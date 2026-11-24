@@ -147,7 +147,10 @@ def test_vwap_misaligned_buy_cross_is_not_flipped_to_sell(tmp_path):
 def test_rejection_and_confirmation_must_be_separate_closed_candles(tmp_path):
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "lifecycle.json"))
     closes = np.linspace(100, 110, 70)
-    f = frame(70, close=closes)
+    # Keep the full fixture inside one UTC VWAP session so the test isolates
+    # rejection/confirmation sequencing instead of a session-reset edge case.
+    session_start = int(pd.Timestamp.now(tz="UTC").normalize().timestamp() * 1000)
+    f = frame(70, start=session_start, close=closes)
     ts = int(f.timestamp.iloc[-1])
     f.loc[69, ["open", "high", "low", "close"]] = [109.8, 110.0, 108.8, 109.95]
     engine._persist(Setup(symbol="SEQ", status="WAITING_FOR_REJECTION", direction="BUY",

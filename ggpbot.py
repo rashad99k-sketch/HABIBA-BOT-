@@ -2977,6 +2977,9 @@ class LiveTradeManager:
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        # A new trade must never inherit the previous trade's management throttle.
+        self.last_management_ts = 0.0
+        self.last_log_ts = 0.0
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -3931,6 +3934,11 @@ def sync_position_state(symbol=None):
         STATE["mark_price"] = snap.mark_price
         STATE["liquidation_price"] = snap.liquidation_price
 
+    # The normal LIVE reconciliation path already emits this event after
+    # applying the confirmed snapshot. Emit only for PAPER, whose synthetic
+    # snapshot otherwise has no reconcile event to activate its manager.
+    if PAPER_MODE:
+        _exchange_sync.event_bus.emit("reconciled", snap)
     return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
 
 def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
@@ -5567,6 +5575,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
         time.sleep(1)
         sync_position_state(symbol)
+        # Start the sole trade manager immediately after the exchange position
+        # and native stop have been reconciled. The manager retains its own
+        # fail-closed checks for UNKNOWN exposure/protection and market data.
+        if (STATE.get("open") and not STATE.get("recovery_hold")
+                and not STATE.get("execution_unresolved")
+                and (PAPER_MODE or STATE.get("native_sl_verified"))
+                and _live_manager.lifecycle_state == TradeLifecycleState.LIVE):
+            _live_manager.manage_live_trade()
         return True
     else:
         return False
@@ -9132,7 +9148,11 @@ def _refresh_ema_vwap_setups(watchlist):
         try:
             frame = _peek_scanner_frame(roro_exchange_symbol(exchange_sym))
             if frame is None:
+                item["institutional_decision_state"] = item.get("decision_state")
                 item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION", "reason": "awaiting_fresh_scanner_cache"}
+                item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
+                item["decision_state"] = "WAITING_FOR_CONFIRMATION"
+                item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
                 continue
             closed = roro_validate_closed_frame(
                 frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
@@ -9140,11 +9160,21 @@ def _refresh_ema_vwap_setups(watchlist):
             result = EMA_VWAP_ENTRY_ENGINE.evaluate(
                 str(canonical), closed, now_ms=int(time.time() * 1000)
             )
+            # Preserve the institutional engine's opinion for diagnostics, but
+            # expose only the EMA/VWAP lifecycle as the canonical entry state.
+            if "decision_state" in item:
+                item["institutional_decision_state"] = item.get("decision_state")
             item["ema_vwap_strategy"] = result
             item["strategy_status"] = result.get("status", "UNKNOWN")
+            item["decision_state"] = result.get("status", "UNKNOWN")
+            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
         except Exception as exc:
+            item["institutional_decision_state"] = item.get("decision_state")
             item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION",
                                            "reason": f"strategy_error:{type(exc).__name__}"}
+            item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
+            item["decision_state"] = "WAITING_FOR_CONFIRMATION"
+            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
 
 _last_unified_watchlist_refresh = 0.0
 def refresh_unified_institutional_watchlist(force=False):
@@ -9263,7 +9293,15 @@ def smart_opportunity_selection():
                 side_hints=["BUY", "SELL"],
             )
             fresh.update(_enrich_with_existing_gpp_engines(closed_df, side, fresh))
+            institutional_state = fresh.get("decision_state")
             item.update(fresh)
+            item["institutional_decision_state"] = institutional_state
+            # A fresh institutional ENTRY_READY must never overwrite a stale or
+            # invalidated EMA/VWAP setup. The strategy engine owns entry direction/state.
+            item["ema_vwap_strategy"] = strategy_snapshot
+            item["strategy_status"] = strategy_snapshot.get("status", "UNKNOWN")
+            item["decision_state"] = strategy_snapshot.get("status", "UNKNOWN")
+            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
             item["source"] = item.get("source") or "unified_watchlist"
             item["side"] = side
             event_id = str(item.get("event_id") or "")
@@ -9339,8 +9377,11 @@ def smart_opportunity_selection():
                 continue
             strategy_gate = EMA_VWAP_ENTRY_ENGINE.authorize(canonical, price, float(tp1))
             item["ema_vwap_strategy"] = {**(item.get("ema_vwap_strategy") or {}), **strategy_gate}
+            item["strategy_status"] = strategy_gate.get("status", "UNKNOWN")
+            item["decision_state"] = strategy_gate.get("status", "UNKNOWN")
+            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
             if not strategy_gate.get("allowed"):
-                item["decision_state"] = "WAITING_FOR_CONFIRMATION" if strategy_gate.get("status") != "NO_CHASE" else "NO_CHASE"
+                item["decision_state"] = strategy_gate.get("status") or "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "ema_vwap_strategy:" + str(strategy_gate.get("reason", "not_authorized"))
                 continue
             if EMA_VWAP_ENTRY_ENGINE.get(canonical) and EMA_VWAP_ENTRY_ENGINE.get(canonical).direction != side:
@@ -9383,8 +9424,11 @@ def smart_opportunity_selection():
                 # fill and native-stop checks remain inside the original GGP path.
                 if not EMA_VWAP_ENTRY_ENGINE.mark_executing(canonical):
                     item["decision_state"] = "WAITING_FOR_CONFIRMATION"
+                    item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
                     item["rejection_reason"] = "ema_vwap_authorization_not_consumable"
                     continue
+                item["decision_state"] = "ENTRY_EXECUTING"
+                item["strategy_status"] = "ENTRY_EXECUTING"
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
                                    float(item.get("score", 0) or 0), reason, float(atr_value),
                                    trade_type=classification, entry_type="RORO_INSTITUTIONAL",
@@ -9393,6 +9437,8 @@ def smart_opportunity_selection():
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
                 EMA_VWAP_ENTRY_ENGINE.mark_open(canonical)
+                item["decision_state"] = "TRADE_OPEN"
+                item["strategy_status"] = "TRADE_OPEN"
                 item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
                 item["entry_timestamp"] = time.time()
                 _persist_trade_journal_start(setup, item)
