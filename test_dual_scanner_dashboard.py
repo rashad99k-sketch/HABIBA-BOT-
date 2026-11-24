@@ -225,3 +225,45 @@ def test_scanner_snapshot_cache_uses_canonical_key_and_last_valid_fallback():
     peek_source = ast.get_source_segment(SOURCE, peek_fn)
     assert "include_stale" in peek_source
     assert "_SCANNER_FRAME_LAST_VALID" in peek_source
+
+
+
+def test_shared_scanner_cache_handles_49_symbols_without_watchlist_refetch():
+    import ast
+    import threading
+
+    functions = [_function(name) for name in ("_scanner_frame_key", "_get_scanner_frame", "_peek_scanner_frame")]
+    isolated = ast.Module(body=functions, type_ignores=[])
+    calls = []
+    now = [100.0]
+
+    class Clock:
+        @staticmethod
+        def monotonic():
+            return now[0]
+
+    def canonical(symbol):
+        return str(symbol).upper().replace(":USDT", "").replace("/", "-")
+
+    def fetch(symbol, limit):
+        calls.append(symbol)
+        return _sample_session_frame(60)[0]
+
+    namespace = {
+        "time": Clock, "threading": threading,
+        "_SCANNER_FRAME_CACHE": {}, "_SCANNER_FRAME_LAST_VALID": {},
+        "_SCANNER_FRAME_CACHE_LOCK": threading.RLock(),
+        "_SCANNER_FRAME_CACHE_TTL": 90.0, "_SCANNER_FRAME_LAST_VALID_MAX": 100,
+        "SCANNER_UNIVERSE_MAX": 80, "roro_canonical_symbol": canonical,
+        "roro_exchange_symbol": lambda value: value,
+        "get_ohlcv_safe": fetch, "validate_dataframe": lambda frame, minimum: len(frame) >= minimum,
+    }
+    exec(compile(isolated, "ggpbot.py", "exec"), namespace)
+    for index in range(49):
+        symbol = f"COIN{index:02d}/USDT:USDT"
+        assert namespace["_get_scanner_frame"](symbol, 60) is not None
+    assert len(calls) == 49
+    # Watchlist and strategy read the exact same canonical snapshot without a 50th request.
+    assert namespace["_peek_scanner_frame"]("COIN00-USDT", include_stale=True) is not None
+    assert len(calls) == 49
+    assert len(namespace["_SCANNER_FRAME_LAST_VALID"]) == 49
