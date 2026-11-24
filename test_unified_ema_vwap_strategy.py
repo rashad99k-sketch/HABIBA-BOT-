@@ -242,3 +242,26 @@ def test_causal_zone_is_required_for_entry_authorization(tmp_path):
     assert result["reason"] == "tp1_atr_or_causal_zone_unknown"
 
 
+
+
+
+def test_discovered_setup_persists_all_closed_candle_indicators(tmp_path):
+    flat = frame(70, close=np.full(70, 100.0))
+    engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "metrics.json"))
+    result = engine.evaluate("FLAT/USDT", flat, now_ms=int(flat.timestamp.iloc[-1] + 900_000))
+    assert result["status"] == "DISCOVERED"
+    for key in ("ema9", "ema15", "ema50", "vwap", "atr14", "price"):
+        assert result[key] is not None, key
+    assert result["closed_candles"] == 70
+    assert result["indicator_missing"] == []
+
+
+def test_waiting_setup_reports_missing_vwap_without_losing_other_indicators(tmp_path):
+    zero_volume = frame(70, close=np.full(70, 100.0), volume=np.zeros(70))
+    engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "missing-vwap.json"))
+    result = engine.evaluate("ZERO-VOLUME", zero_volume, now_ms=int(zero_volume.timestamp.iloc[-1] + 900_000))
+    assert result["status"] == "WAITING_FOR_CONFIRMATION"
+    assert result["ema9"] is not None and result["ema15"] is not None
+    assert result["atr14"] is not None
+    assert result["vwap"] is None
+    assert "vwap" in result["indicator_missing"]
