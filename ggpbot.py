@@ -89,6 +89,10 @@ from ggp_market_intelligence import (
 from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
 from location_authority import validate_location_zone
+from naiso_unified_decision import (classify_cross_state as _project_cross_state,
+                                    project_dashboard_sections as _project_dashboard_sections,
+                                    project_watchlist_row as _project_watchlist_row,
+                                    SCHEMA_VERSION as UNIFIED_DECISION_SCHEMA_VERSION)
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -7560,6 +7564,11 @@ def _advance_cross_event_lifecycles(rows):
     return advanced
 
 
+def _project_confirmed_cross_row(row):
+    """Add explicit cross state to an already durable journal row (read-only)."""
+    return _project_cross_state(row, now_ts=time.time())
+
+
 def _sync_confirmed_cross_events():
     """Reload active cross events from the journal into the Watchlist feed."""
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
@@ -7587,25 +7596,32 @@ def _sync_confirmed_cross_events():
                 "cross_event_breakout_close": metadata.get("breakout_close"),
                 "cross_event_chase_atr": metadata.get("chase_atr"),
             }
-    MEMORY["confirmed_cross_events"] = [{
-        "symbol": str(row.get("symbol") or ""),
-        "exchange_symbol": str(row.get("exchange_symbol") or row.get("symbol") or ""),
-        "side": str(row.get("side") or "").upper(),
-        "cross_event_id": str(row.get("event_id") or ""),
-        "cross_event_source": str(row.get("source") or CONFIRMED_CROSS_EVENT_SOURCE),
-        "cross_event_direction": str(row.get("direction") or "").upper(),
-        "cross_event_timestamp": int(row.get("signal_candle_timestamp") or 0),
-        "cross_event_status": str(row.get("status") or "ACTIVE").upper(),
-        "cross_event_timeframe": str(row.get("timeframe") or INTERVAL),
-        "cross_event_detected_ts": float(row.get("detected_ts") or 0.0),
-        "cross_event_expires_ts": float(row.get("expires_ts") or 0.0),
-        **lifecycle_projection.get(str(row.get("event_id") or ""), {}),
-        "discovery_source": "confirmed_cross_event",
-        "role": "CONFIRMED_CROSS_EVENT",
-        "score": 100.0,
-        "side_hint": str(row.get("side") or "").upper(),
-        "sources": ["confirmed_cross_event"],
-    } for row in rows if row.get("event_id") and row.get("exchange_symbol")]
+    MEMORY["confirmed_cross_events"] = []
+    for row in rows:
+        if not (row.get("event_id") and row.get("exchange_symbol")):
+            continue
+        cross_context = _project_confirmed_cross_row(row)
+        MEMORY["confirmed_cross_events"].append({
+            "symbol": str(row.get("symbol") or ""),
+            "exchange_symbol": str(row.get("exchange_symbol") or row.get("symbol") or ""),
+            "side": str(row.get("side") or "").upper(),
+            "cross_event_id": str(row.get("event_id") or ""),
+            "cross_event_source": str(row.get("source") or CONFIRMED_CROSS_EVENT_SOURCE),
+            "cross_event_direction": str(row.get("direction") or "").upper(),
+            "cross_event_timestamp": int(row.get("signal_candle_timestamp") or 0),
+            "cross_event_status": str(row.get("status") or "ACTIVE").upper(),
+            "cross_event_timeframe": str(row.get("timeframe") or INTERVAL),
+            "cross_event_detected_ts": float(row.get("detected_ts") or 0.0),
+            "cross_event_expires_ts": float(row.get("expires_ts") or 0.0),
+            **lifecycle_projection.get(str(row.get("event_id") or ""), {}),
+            "cross_state": cross_context["cross_state"],
+            "cross_context": cross_context,
+            "discovery_source": "confirmed_cross_event",
+            "role": "CONFIRMED_CROSS_EVENT",
+            "score": 100.0,
+            "side_hint": str(row.get("side") or "").upper(),
+            "sources": ["confirmed_cross_event"],
+        })
     MEMORY["confirmed_cross_events_last_sync"] = time.time()
     return rows
 
@@ -7666,6 +7682,7 @@ def _detect_confirmed_cross_events(symbols):
                 "detection_method": "validate_dual_ema_vwap_entry_gate",
                 "lookback_candles": 2,
                 "lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "cross_state": "CONFIRMED_BUY_CROSS" if side == "BUY" else "CONFIRMED_SELL_CROSS",
                 "phase": "WAITING_FOR_PULLBACK",
                 "entry_ready": False,
                 "cross_price": float(frame["close"].iloc[-1]),
@@ -7885,6 +7902,9 @@ def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, at
         "entry_behavior": str(_first(source.get("entry_behavior"), market_intel.get("entry_behavior"), "WAIT_FOR_STRUCTURE")),
         "entry_behavior_confidence": _number(source.get("entry_behavior_confidence"), 0.0),
         "evidence": list(source.get("evidence") or []),
+        "unified_decision_context": (source.get("unified_decision_context") or source.get("decision_context")
+                                     if isinstance(source.get("unified_decision_context"), dict)
+                                     or isinstance(source.get("decision_context"), dict) else None),
         "structural_stop": _number(source.get("structural_stop")),
         "closed_candle_timestamp": source.get("closed_candle_timestamp") or gate.get("latest_closed_timestamp") or 0,
         "frame_source": str(source.get("closed_candle_source") or gate.get("frame_source") or "UNKNOWN"),
@@ -9983,6 +10003,17 @@ def dashboard():
     </div>
     """
 
+    unified_panel_html = """
+    <div class="section smart-layer">
+      <div class="title">🧩 NAISO UNIFIED DECISION VIEW (PROJECTION ONLY · CLOSED CANDLES)</div>
+      <div id="uni-confirmed-crosses" class="card" style="font-size:12px;margin-bottom:8px;">Loading confirmed crosses...</div>
+      <div id="uni-watchlist-ranking" class="card" style="font-size:12px;margin-bottom:8px;">Loading watchlist/ranking...</div>
+      <div id="uni-institutional-analysis" class="card" style="font-size:12px;margin-bottom:8px;max-height:320px;overflow-y:auto;">Loading institutional analysis...</div>
+      <div id="uni-execution-readiness" class="card" style="font-size:12px;max-height:260px;overflow-y:auto;">Loading execution readiness...</div>
+      <small>Ranking rows are never cross events. SL UNKNOWN can never be presented as ready.</small>
+    </div>
+    """
+
     no_entry_feed_section_html = """
     <div class="section smart-layer"><div class="title">🚫 WHY NO ENTRY (Last 5)</div>
     <div id="no-entry-feed" class="card" style="font-size:12px;"></div>
@@ -10124,6 +10155,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="section smart-layer"><div class="title">📡 RF SIGNALS (Trigger Candidates)</div>
 <div id="rfSignals" class="card">{rf_html}</div>
 </div>
+{unified_panel_html}
 {watchlist_panel_html}
 <div class="section"><div class="title">📜 EXECUTION LOG</div><div id="logs" class="card log"></div></div>
 <div class="section"><div class="title">🚨 SYSTEM ERRORS</div><div id="errors" class="card err"></div></div>
@@ -10146,6 +10178,9 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <script>
 let lastFetch = 0;
 let cachedData = null;
+function uniEsc(value) {{
+    return String(value ?? "-").replace(/[&<>"']/g, ch => ({{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[ch]));
+}}
 async function fetchData() {{
     const now = Date.now();
     if (cachedData && (now - lastFetch) < 2000) {{
@@ -10323,7 +10358,7 @@ function updateUI(d) {{
               <small>Price: ${{priceText}} | Regime: ${{w.market_regime || "UNKNOWN"}} | Structure: ${{structure.pattern || structure.direction || "UNKNOWN"}} | Liquidity: ${{liq.event || "UNKNOWN"}} / ${{liq.direction || "UNKNOWN"}}</small>
               <br><small>OB: ${{ob.low ?? "?"}}–${{ob.high ?? "?"}} (${{w.order_block_state || "UNKNOWN"}}) | FVG: ${{fvg.lower ?? "?"}}–${{fvg.upper ?? "?"}} (${{fvg.status || "UNKNOWN"}})</small>
               <br><small>Volume ratio: ${{w.volume_ratio ?? "UNKNOWN"}} | Smart Money: ${{sm.institutional_bias_detailed || "UNKNOWN"}} | Momentum: ${{mom.flow_bias || "UNKNOWN"}} / ${{mom.continuation_strength ?? "?"}} | ADX: ${{adxdi.adx ?? "?"}} (${{adxdi.adx_state || "UNKNOWN"}}) | DI: ${{adxdi.di_dominant || "UNKNOWN"}}</small>
-              <br><small>Golden Zone: ${{golden.state || "UNKNOWN"}} | Confluence: ${{golden.score ?? "?"}}/100 | OB/FVG overlap: ${{golden.ob_fvg_overlap ? "YES" : "NO"}} | FVG fill: ${{fvg.fill_pct ?? "?"}}%</small>
+              <br><small>Golden Zone: ${{golden.state || "UNKNOWN"}} | Zone Confluence: ${{golden.score ?? "?"}}/100 (not entry-ready) | Decision: ${{w.projected_decision_state || state}} | OB/FVG overlap: ${{golden.ob_fvg_overlap ? "YES" : "NO"}} | FVG fill: ${{fvg.fill_pct ?? "?"}}%</small>
               <br><small>BUY hypothesis: ${{buyHyp.state || "NOT_ANALYZED"}} / ${{buyHyp.setup || "-"}} | SELL hypothesis: ${{sellHyp.state || "NOT_ANALYZED"}} / ${{sellHyp.setup || "-"}}</small>
               <br><small>Trend Engine: ${{instTrend.state || "UNKNOWN"}} / Health ${{instTrend.health ?? "?"}} | Trade State: ${{w.trade_state || "UNKNOWN"}}</small>
               <br><small>SL: ${{stopText}} | Data: ${{quality}} | Updated: ${{lastUpdate}}</small>
@@ -10334,6 +10369,51 @@ function updateUI(d) {{
     }} else {{
         document.getElementById("watchlist-panel").innerHTML = "No watchlist data";
     }}
+    const confirmedCrossRows = d.confirmed_crosses || [];
+    document.getElementById("uni-confirmed-crosses").innerHTML =
+        "<b>1) CONFIRMED CROSSES</b><br>" + (confirmedCrossRows.map(x => {{
+            const c = x.cross_context || {{}};
+            const mark = c.cross_state === "CONFIRMED_BUY_CROSS" ? "🟢" : c.cross_state === "CONFIRMED_SELL_CROSS" ? "🔴" : "⛔";
+            return `<div>${{mark}} ${{uniEsc(c.symbol || x.symbol)}} ${{uniEsc(c.cross_state)}} | durable=${{uniEsc(c.durable_event)}} | phase=${{uniEsc(c.cross_event_phase)}} | lifecycle=${{uniEsc(c.cross_lifecycle_status)}} | snapshot=${{uniEsc(c.source_snapshot_id)}}</div>`;
+        }}).join("") || "No durable confirmed cross events");
+    const rankingRows = d.watchlist_ranking || [];
+    document.getElementById("uni-watchlist-ranking").innerHTML =
+        "<b>2) WATCHLIST / RANKING</b><br>" + (rankingRows.map(x => {{
+            const c = x.cross_context || {{}};
+            return `<div>${{uniEsc(x.symbol)}} | ${{uniEsc(c.display_cross_state || c.cross_state)}} | ${{uniEsc(x.side)}} | role=${{uniEsc(c.role)}} | durable=${{uniEsc(c.durable_event)}} | authoritative=${{uniEsc(c.authoritative)}} | snapshot=${{uniEsc(x.source_snapshot_id)}} <small>(ranking only, never an event)</small></div>`;
+        }}).join("") || "No ranking-only cross observations");
+    const institutionalRows = d.institutional_analysis || [];
+    document.getElementById("uni-institutional-analysis").innerHTML =
+        "<b>3) INSTITUTIONAL ANALYSIS</b><br>" + (institutionalRows.map(x => {{
+            const dc = x.decision_context || {{}};
+            const tv = dc.timeframe_view || {{}};
+            const mc = dc.market_context || {{}};
+            const lc = dc.liquidity_context || {{}};
+            const sc = dc.structure_context || {{}};
+            const zc = dc.zone_context || {{}};
+            const mom = mc.momentum || {{}};
+            const conflict = tv.timeframe_conflict === "PRESENT" ? "⚠️ TIMEFRAME CONFLICT: " + (tv.conflict_reasons || []).join(", ") : "No timeframe conflict";
+            return `<div style="border-bottom:1px solid #26364a;padding:5px 0;">
+              <b>${{uniEsc(x.symbol)}} ${{uniEsc(x.side)}}</b> | state=<span style="color:${{dc.decision_state === "ENTRY_READY" ? "#2ecc71" : "#f1c40f"}}">${{uniEsc(dc.decision_state)}}</span> | stage=${{uniEsc(dc.setup_stage)}} | next=${{uniEsc(dc.required_next_event)}}
+              <br><small>Primary: ${{uniEsc(dc.primary_reason)}} | Secondary: ${{uniEsc((dc.secondary_reasons || []).join(", "))}} | Blocking: ${{uniEsc((dc.blocking_reasons || []).join(", "))}}</small>
+              <br><small>Regime: ${{uniEsc(tv.market_regime)}} | Trend: ${{uniEsc(tv.trend_direction)}} / ${{uniEsc(tv.trend_strength)}} | Trade State: ${{uniEsc(tv.trade_state)}} | Local Structure: ${{uniEsc(tv.local_structure)}} | HTF Bias: ${{uniEsc(tv.higher_timeframe_bias)}} | ${{uniEsc(conflict)}}</small>
+              <br><small>EMA50: ${{uniEsc(mc.ema50_direction)}} | VWAP: ${{uniEsc(mc.vwap_position)}} | ADX: ${{uniEsc(mc.adx)}} (DI+ ${{uniEsc(mc.di_plus)}} / DI- ${{uniEsc(mc.di_minus)}}, ${{uniEsc(mc.di_dominant)}}) | Momentum: ${{uniEsc(mom.flow_bias)}} / ${{uniEsc(mom.continuation_strength)}}</small>
+              <br><small>Liquidity: ${{uniEsc(lc.state)}} (${{uniEsc(lc.stage)}}) | Structure: ${{uniEsc(sc.confirmation_status)}} | Zone Quality: ${{uniEsc(zc.zone_quality_score)}}/100 | Context Quality: ${{uniEsc(zc.context_quality_score)}}/100 | Freshness: ${{uniEsc(dc.data_freshness)}}</small>
+              <br><small>OB: valid=${{uniEsc((zc.order_block || {{}}).valid)}} fresh=${{uniEsc((zc.order_block || {{}}).freshness)}} mit=${{uniEsc((zc.order_block || {{}}).mitigation_pct)}}% distATR=${{uniEsc((zc.order_block || {{}}).distance_atr)}} inside=${{uniEsc((zc.order_block || {{}}).inside_zone)}} | FVG: ${{uniEsc((zc.fvg || {{}}).lower)}}–${{uniEsc((zc.fvg || {{}}).upper)}} fill=${{uniEsc((zc.fvg || {{}}).fill_pct)}}% fresh=${{uniEsc((zc.fvg || {{}}).freshness)}} overlap=${{uniEsc((zc.fvg || {{}}).overlap_with_order_block)}} | Zone: ${{uniEsc((zc.supply_demand || {{}}).zone_type)}}/${{uniEsc((zc.supply_demand || {{}}).valid)}}</small>
+              <br><small>Snapshot: ${{uniEsc(dc.source_snapshot_id)}} | Event ts: ${{uniEsc(dc.event_timestamp)}}</small>
+            </div>`;
+        }}).join("") || "No institutional analysis rows");
+    const readinessRows = d.execution_readiness || [];
+    document.getElementById("uni-execution-readiness").innerHTML =
+        "<b>4) EXECUTION READINESS</b><br>" + (readinessRows.map(x => {{
+            const missing = (x.missing || []).join(", ");
+            const slText = x.sl_valid ? "VALID" : "STOP_INVALID_NOT_READY";
+            const color = x.conditions_complete ? "#2ecc71" : "#e74c3c";
+            return `<div style="border-bottom:1px solid #26364a;padding:4px 0;">
+              <b>${{uniEsc(x.symbol)}} ${{uniEsc(x.side)}}</b> | <span style="color:${{color}}">${{x.conditions_complete ? "✅ ENTRY_READY" : "⛔ NOT_READY"}}</span> | SL State: ${{slText}} | state=${{uniEsc(x.decision_state)}} | next=${{uniEsc(x.required_next_event)}}
+              <br><small>Missing: ${{uniEsc(missing || "none")}} | authority=${{uniEsc(x.authoritative_gate)}}</small>
+            </div>`;
+        }}).join("") || "No execution readiness rows");
     let noEntryHtml = "";
     if(d.no_entry_feed) {{
         d.no_entry_feed.forEach(item => {{
@@ -10562,6 +10642,11 @@ def data():
                 "smart_money_dominant": STATE["smart_money"].get("smart_money_dominant", False)
             }
 
+        unified_sections = _project_dashboard_sections(
+            watchlist_data,
+            MEMORY.get("confirmed_cross_events", []),
+            MEMORY.get("ema9_vwap_proximity_scanner", [])[:30],
+        )
         payload = {
             "balance": bal,
             "free_balance": free_bal,
@@ -10607,6 +10692,11 @@ def data():
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "naiso_health": naiso_health_snapshot(),
+            "unified_decision_schema": UNIFIED_DECISION_SCHEMA_VERSION,
+            "confirmed_crosses": unified_sections["confirmed_crosses"],
+            "watchlist_ranking": unified_sections["watchlist_ranking"],
+            "institutional_analysis": unified_sections["institutional_analysis"],
+            "execution_readiness": unified_sections["execution_readiness"],
             **live_data
         }
         safe_payload = safe_json(payload)
@@ -12618,6 +12708,9 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                         "data_quality": "CLOSED_CANDLES",
                         "role": "RANKING_ONLY_NOT_ENTRY_GATE",
                     }
+                    _ranking_cross = _project_cross_state(proximity_item, ranking_only=True)
+                    proximity_item["cross_state"] = _ranking_cross["cross_state"]
+                    proximity_item["cross_context"] = _ranking_cross
                     rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
                     rows = [x for x in rows if x.get("symbol") != symbol_key]
                     rows.append(proximity_item)
@@ -12676,6 +12769,20 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
         icons["momentum"] = "⚡" if momentum.get("trend_expansion") else "🟡" if momentum.get("momentum_decay") else "⚪"
         icons["trend"] = "📈" if trend.trend_state.value in ("BULLISH", "PROBATION_BULLISH") else "📉" if trend.trend_state.value in ("BEARISH", "PROBATION_BEARISH") else "⚪"
         analysis["icons"] = icons
+        # One read-only projection over fields already produced above. It never
+        # alters decision_state, entry_readiness, authority, SL/TP or sizing.
+        try:
+            projected = _project_watchlist_row({**analysis, **result}, now_ts=now_ms / 1000.0)
+            result["unified_decision_context"] = projected
+            result["cross_state"] = projected["cross_context"]["cross_state"]
+            result["projected_decision_state"] = projected["decision_context"]["decision_state"]
+            result["analysis_status"] = projected["decision_context"]["analysis_status"]
+            result["unified_entry_readiness"] = projected["entry_readiness"]
+            result["timeframe_view"] = projected["timeframe_view"]
+        except Exception as projection_exc:
+            result["unified_projection_diagnostics"] = {
+                "status": "PARTIAL", "reason": f"{type(projection_exc).__name__}",
+            }
     except Exception as exc:
         result["gpp_engine_diagnostics"] = {"status": "PARTIAL", "reason": f"{type(exc).__name__}:{str(exc)[:120]}"}
     return result
@@ -12986,6 +13093,9 @@ def smart_opportunity_selection():
                 "ema50": item.get("ema50"),
                 "vwap": item.get("vwap"),
                 "market_regime": item.get("market_regime"),
+                "unified_decision_context": (item.get("unified_decision_context") or item.get("decision_context")
+                                             if isinstance(item.get("unified_decision_context"), dict)
+                                             or isinstance(item.get("decision_context"), dict) else None),
                 "cross_event_id": str(item.get("cross_event_id") or ""),
                 "cross_event_source": item.get("cross_event_source"),
                 "cross_event_direction": item.get("cross_event_direction"),

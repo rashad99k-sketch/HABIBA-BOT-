@@ -21,6 +21,7 @@ from roro_opportunity_pipeline import validate_closed_frame, classify_regime, co
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
                                      build_support_resistance_zones, validate_order_block_zone)
+from naiso_unified_decision import project_decision_context
 
 
 REVERSAL = ReversalEngine()
@@ -353,6 +354,22 @@ def _decision_result(decision) -> Dict[str, Any]:
     return data
 
 
+def _with_projected_decision(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach one read-only decision projection; legacy engine fields stay unchanged."""
+    projection = project_decision_context(result)
+    result["decision_context"] = projection
+    result["projected_decision_state"] = projection["decision_state"]
+    result["analysis_status"] = projection["analysis_status"]
+    result["decision_stage"] = projection["setup_stage"]
+    result["required_next_event"] = projection["required_next_event"]
+    result["source_snapshot_id"] = projection["source_snapshot_id"]
+    result["snapshot_freshness"] = projection["data_freshness"]
+    result["zone_quality_score"] = projection["zone_quality_score"]
+    result["context_quality_score"] = projection["context_quality_score"]
+    result["entry_readiness_context"] = projection["entry_readiness"]
+    return result
+
+
 def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Merge all candidate feeds without losing valid CCXT symbols or direction."""
     merged: Dict[str, Dict[str, Any]] = {}
@@ -546,16 +563,18 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     x = _frame(df)
     closed = validate_closed_frame(x, now_ms=now_ms, timeframe_s=TIMEFRAME_SECONDS)
     if len(closed) < 55:
-        return {
+        return _with_projected_decision({
             "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol), "side": side,
             "decision_state": DecisionState.REJECTED.value,
             "decision_reason": "insufficient_closed_data", "rejection_reason": "insufficient_closed_data",
             "rejection_reasons": ["insufficient_closed_data"], "last_updated": time.time(),
             "data_quality": "INSUFFICIENT_CLOSED_CANDLES", "icons": {"status": "⚪"},
-        }
+        })
     side = str(side or "").upper()
     if side not in {"BUY", "SELL"}:
-        return {"symbol": canonical_symbol(symbol), "decision_state": "REJECTED", "rejection_reason": "invalid_side"}
+        return _with_projected_decision({
+            "symbol": canonical_symbol(symbol), "decision_state": "REJECTED", "rejection_reason": "invalid_side",
+        })
     context = _build_context(closed, side, now_ms=now_ms)
     rev = REVERSAL.analyze(symbol, side, closed, context=context)
     cont = CONTINUATION.analyze(symbol, side, closed, context=context)
@@ -645,7 +664,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _intelligence["price_pattern"] = classify_price_pattern(
         closed.to_dict("records"), atr=_atr(closed)
     )
-    return {
+    return _with_projected_decision({
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
         "regime_direction": reg.direction, "market_structure": context["structure"],
@@ -694,7 +713,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             "stop": "🛑" if decision.structural_stop else "⚪",
             "status": "✅" if decision.state == DecisionState.ENTRY_READY.value else "🟡" if decision.state.startswith("WAITING") or decision.state == "NO_CHASE" else "⚪",
         },
-    }
+    })
 
 
 def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] = None,
@@ -712,6 +731,7 @@ def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] 
                          "conflicting_directions": [row.get("side") for row in ready],
                          "structural_stop": None, "event_id": None,
                          "icons": {**(selected.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
+        selected = _with_projected_decision(selected)
     else:
         selected = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
     selected["side_hints"] = sorted(hints)
@@ -719,7 +739,9 @@ def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] 
     selected["side_analyses"] = {
         row.get("side"): {"state": row.get("decision_state"), "setup": row.get("decision_setup_type"),
                           "score": row.get("score"), "reason": row.get("decision_reason"),
-                          "event_id": row.get("event_id"), "structural_stop": row.get("structural_stop")}
+                          "event_id": row.get("event_id"), "structural_stop": row.get("structural_stop"),
+                          "projected_state": row.get("projected_decision_state"),
+                          "decision_context": row.get("decision_context")}
         for row in results
     }
     return selected
@@ -826,11 +848,13 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         else:
             fetch_error = "missing_or_invalid_market_data" if frame is None else None
         if frame is None:
-            best = {"symbol": key, "exchange_symbol": candidate["exchange_symbol"], "side": "UNKNOWN",
-                    "decision_state": "UNKNOWN", "entry_status": "UNKNOWN",
-                    "decision_reason": fetch_error or "market_data_unavailable",
-                    "rejection_reasons": [fetch_error or "market_data_unavailable"],
-                    "data_quality": "DATA_UNAVAILABLE", "last_update": time.time(), "icons": {"status": "⚪"}}
+            best = _with_projected_decision({
+                "symbol": key, "exchange_symbol": candidate["exchange_symbol"], "side": "UNKNOWN",
+                "decision_state": "UNKNOWN", "entry_status": "UNKNOWN",
+                "decision_reason": fetch_error or "market_data_unavailable",
+                "rejection_reasons": [fetch_error or "market_data_unavailable"],
+                "data_quality": "DATA_UNAVAILABLE", "last_update": time.time(), "icons": {"status": "⚪"},
+            })
         else:
             results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in ("BUY", "SELL")]
             for result in results:
@@ -862,7 +886,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 row.get("side"): {"state": row.get("decision_state"), "setup": row.get("decision_setup_type"),
                                   "score": row.get("score"), "reason": row.get("decision_reason"),
                                   "event_id": row.get("event_id"), "structural_stop": row.get("structural_stop"),
-                                  "trend_support": (row.get("institutional_trend") or {}).get("supporting_check")}
+                                  "trend_support": (row.get("institutional_trend") or {}).get("supporting_check"),
+                                  "projected_state": row.get("projected_decision_state"),
+                                  "decision_context": row.get("decision_context")}
                 for row in results
             }
         previous = out.get(key, {})
@@ -880,6 +906,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 best[cross_field] = candidate[cross_field]
         if best.get("cross_event_id"):
             best["cross_event_analysis_required"] = True
+        best = _with_projected_decision(best)
         best["analysis_priority_score"] = round(_decision_priority(best)[0] * 10
             + float(best.get("score", 0) or 0) * 0.25
             + float((best.get("golden_zone") or {}).get("score", 0) or 0) * 0.15, 2)
