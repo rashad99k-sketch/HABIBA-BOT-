@@ -3934,10 +3934,11 @@ def sync_position_state(symbol=None):
         STATE["mark_price"] = snap.mark_price
         STATE["liquidation_price"] = snap.liquidation_price
 
-    # Publish the confirmed exchange snapshot to the lifecycle owner. In the
-    # normal LIVE entry path this is what releases OPEN_PENDING_CONFIRMATION
-    # after native SL verification; fetch_live_snapshot alone does not emit it.
-    _exchange_sync.event_bus.emit("reconciled", snap)
+    # The normal LIVE reconciliation path already emits this event after
+    # applying the confirmed snapshot. Emit only for PAPER, whose synthetic
+    # snapshot otherwise has no reconcile event to activate its manager.
+    if PAPER_MODE:
+        _exchange_sync.event_bus.emit("reconciled", snap)
     return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
 
 def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
