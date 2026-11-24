@@ -9198,7 +9198,7 @@ def _refresh_ema_vwap_setups(watchlist):
                                     "source": "shared_scanner_cache", "missing": ["ohlcv_snapshot"]}}
                 item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-                item["decision_authority"] = "EMA9_EMA15_CROSS_VWAP_GATE"
+                item["decision_authority"] = "EMA9_VWAP_CROSS_GATE"
                 continue
             closed = roro_validate_closed_frame(
                 frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
@@ -9209,7 +9209,7 @@ def _refresh_ema_vwap_setups(watchlist):
                 "closed_candles": int(len(closed)),
                 "source": "shared_scanner_cache_last_valid" if not is_fresh else "shared_scanner_cache",
                 "fresh": bool(is_fresh),
-                "missing": [key for key in ("ema9", "ema15", "vwap", "atr14") if result.get(key) is None],
+                "missing": [key for key in ("ema9", "vwap", "atr14") if result.get(key) is None],
             }
             if not is_fresh and result.get("status") == "ENTRY_READY":
                 result["status"] = "WAITING_FOR_CONFIRMATION"
@@ -9221,14 +9221,14 @@ def _refresh_ema_vwap_setups(watchlist):
             item["ema_vwap_strategy"] = result
             item["strategy_status"] = result.get("status", "UNKNOWN")
             item["decision_state"] = result.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA9_EMA15_CROSS_VWAP_GATE"
+            item["decision_authority"] = "EMA9_VWAP_CROSS_GATE"
         except Exception as exc:
             item["institutional_decision_state"] = item.get("decision_state")
             item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION",
                                            "reason": f"strategy_error:{type(exc).__name__}"}
             item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
             item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-            item["decision_authority"] = "EMA9_EMA15_CROSS_VWAP_GATE"
+            item["decision_authority"] = "EMA9_VWAP_CROSS_GATE"
 
 _last_unified_watchlist_refresh = 0.0
 def refresh_unified_institutional_watchlist(force=False):
@@ -9350,7 +9350,7 @@ def smart_opportunity_selection():
             item["ema_vwap_strategy"] = strategy_snapshot
             item["strategy_status"] = strategy_snapshot.get("status", "UNKNOWN")
             item["decision_state"] = strategy_snapshot.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA9_EMA15_CROSS_VWAP_GATE"
+            item["decision_authority"] = "EMA9_VWAP_CROSS_GATE"
             item["source"] = item.get("source") or "unified_watchlist"
             item["side"] = side
             event_id = str(item.get("event_id") or "")
@@ -9365,7 +9365,7 @@ def smart_opportunity_selection():
                 continue
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
-            setup = "EMA9_EMA15_CROSS"
+            setup = "EMA9_VWAP_CROSS"
             classification = "TREND"
             # Prefer a valid causal-zone stop when one exists; direct crossover
             # entries without a zone use the existing ATR-based SL/TP calculator.
@@ -9486,7 +9486,7 @@ def smart_opportunity_selection():
                 item["strategy_status"] = "ENTRY_EXECUTING"
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
                                    float(item.get("score", 0) or 0), reason, float(atr_value),
-                                   trade_type="AUTO", entry_type="EMA9_EMA15_CROSS",
+                                   trade_type="AUTO", entry_type="EMA9_VWAP_CROSS",
                                    classification=sizing_class)
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
