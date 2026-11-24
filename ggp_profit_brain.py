@@ -165,6 +165,68 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     return STANDARD_MODE, "evidence_not_proven_keep_two_stage_50_50", tuple(k for k,v in weak.items() if v) or ("insufficient_evidence",)
 
 
+MANAGEMENT_REGIME_LABELS = ("SCALP", "TREND", "CONTINUATION", "HIGH MOMENTUM", "WEAK MOMENTUM")
+MANAGEMENT_AUTHORITY = "TradeManagementBoard / LiveTradeManager"
+
+
+def classify_management_regime(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Diagnostic-only regime label for the Unified Trade Management Brain.
+
+    This helper never authorizes an entry, changes sizing, sets ``profit_mode``,
+    or emits an order. The entry engine supplies evidence at handoff; the Brain
+    and its management board remain the sole routine exit authority.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    mode, mode_reason, mode_evidence = classify_profit_mode(ctx)
+    side = str(ctx.get("side") or "").upper()
+    continuation = _number(ctx.get("continuation_probability"))
+    momentum = _number(ctx.get("momentum_strength"))
+    volume = _number(ctx.get("volume_ratio"))
+    structure = _number(ctx.get("structure_score"))
+    vwap_slope = _number(ctx.get("vwap_slope_atr"))
+    ema_slope = _number(ctx.get("ema9_slope_atr"))
+    broken = _bool(ctx, "structure_broken")
+    adverse = _bool(ctx, "adverse_divergence")
+
+    if side not in {"BUY", "SELL"}:
+        label, reason = "WEAK MOMENTUM", "invalid_side_no_directional_regime"
+        evidence = ("invalid_side",)
+    elif mode == RANGE_MODE:
+        label, reason = "SCALP", "brain_selected_range_scalp_policy"
+        evidence = tuple(mode_evidence) + ("profit_mode:" + mode,)
+    elif mode == TREND_MODE and not broken and not adverse:
+        label, reason = "TREND", "brain_confirmed_multifactor_trend"
+        evidence = tuple(mode_evidence) + ("profit_mode:" + mode,)
+    elif (momentum is not None and momentum >= 70
+          or (momentum is not None and momentum >= 60 and volume is not None and volume >= 1.30)):
+        label, reason = "HIGH MOMENTUM", "brain_detected_expansive_momentum"
+        evidence = ("momentum_strong",)
+    elif (continuation is not None and continuation >= 0.62
+          and structure is not None and structure >= 55 and not broken):
+        label, reason = "CONTINUATION", "brain_detected_continuation_bias"
+        evidence = ("continuation_strong", "structure_supports_continuation")
+    elif (continuation is not None and continuation < 0.48
+          or momentum is not None and momentum < 35
+          or broken or adverse
+          or (vwap_slope is not None and ema_slope is not None
+              and (abs(vwap_slope) < 0.05 or abs(ema_slope) < 0.05 or vwap_slope * ema_slope < 0))):
+        label, reason = "WEAK MOMENTUM", "brain_detected_weak_or_opposed_momentum"
+        evidence = tuple(mode_evidence) + ("weak_momentum_evidence",)
+    else:
+        label, reason = "WEAK MOMENTUM", "insufficient_brain_evidence_keep_conservative"
+        evidence = tuple(mode_evidence) or ("insufficient_evidence",)
+
+    return {
+        "label": label,
+        "reason": reason,
+        "evidence": tuple(evidence),
+        "source_profit_mode": mode,
+        "source_profit_mode_reason": mode_reason,
+        "authoritative": False,
+        "authority": MANAGEMENT_AUTHORITY,
+    }
+
+
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     """Select 0.25/0.50/1.00% price move after cost and opposing liquidity tests."""
     ctx = context if isinstance(context, dict) else {}

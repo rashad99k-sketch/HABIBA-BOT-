@@ -1,7 +1,7 @@
 from ggp_profit_brain import (
-    RANGE_MODE, TREND_MODE, STANDARD_MODE,
-    classify_profit_mode, range_target_price, target_reached,
-    select_range_target_pct, tp2_reassessment,
+    MANAGEMENT_REGIME_LABELS, RANGE_MODE, TREND_MODE, STANDARD_MODE,
+    classify_management_regime, classify_profit_mode, range_target_price,
+    target_reached, select_range_target_pct, tp2_reassessment,
 )
 
 
@@ -119,3 +119,45 @@ def test_ema_context_classifies_aligned_uptrend():
     result = ema_trend_context(frame, "BUY")
     assert result["state"] == "TREND_RIDE"
     assert result["trend_aligned"] is True
+
+
+def test_management_regime_labels_are_exact_and_non_authoritative():
+    result = classify_management_regime({"side": "BUY"})
+    assert result["label"] in MANAGEMENT_REGIME_LABELS
+    assert result["authoritative"] is False
+    assert result["authority"] == "TradeManagementBoard / LiveTradeManager"
+
+
+def test_management_regime_uses_brain_evidence_not_entry_force():
+    scalp = classify_management_regime({
+        "side": "BUY", "regime": "CHOPPY", "trade_state": "RANGE_CHOP",
+        "adx": 15, "adx_slope": -1.0, "continuation_probability": 0.38,
+        "di_plus": 18, "di_minus": 17, "volume_ratio": 0.62,
+        "momentum_strength": 20,
+    })
+    trend = classify_management_regime({
+        "side": "BUY", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
+        "adx": 30, "adx_slope": 1, "continuation_probability": 0.82,
+        "di_plus": 32, "di_minus": 12, "momentum_strength": 78,
+        "ema9_slope_atr": 0.30, "vwap_slope_atr": 0.25,
+        "structure_score": 82, "volume_ratio": 1.25,
+        "atr_expansion_ratio": 1.10, "candle_follow_through": True,
+    })
+    momentum = classify_management_regime({
+        "side": "SELL", "regime": "UNKNOWN", "momentum_strength": 85,
+    })
+    continuation = classify_management_regime({
+        "side": "BUY", "regime": "UNKNOWN", "continuation_probability": 0.70,
+        "structure_score": 70, "momentum_strength": 50, "volume_ratio": 1.0,
+    })
+    weak = classify_management_regime({
+        "side": "BUY", "regime": "UNKNOWN", "momentum_strength": 10,
+        "continuation_probability": 0.20,
+    })
+    assert scalp["label"] == "SCALP"
+    assert trend["label"] == "TREND"
+    assert momentum["label"] == "HIGH MOMENTUM"
+    assert continuation["label"] == "CONTINUATION"
+    assert weak["label"] == "WEAK MOMENTUM"
+    assert all(item["authoritative"] is False
+               for item in (scalp, trend, momentum, continuation, weak))

@@ -2334,7 +2334,8 @@ class InstitutionalTradeBrain:
 
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
-from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached,
+from ggp_profit_brain import (classify_profit_mode, classify_management_regime,
+                              range_target_price, target_reached,
                               select_range_target_pct, tp2_reassessment, thesis_failure_action,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
@@ -4990,6 +4991,17 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
     side = str(side or "").upper()
     if side not in ("BUY", "SELL"):
         log_execution(f"[ENTRY] Invalid order side: {side!r}", "ERROR")
+        return None
+    # Defense in depth: the public execute_entry wrapper is the primary gate, but
+    # lower-level callers (for example legacy scaling) must not submit a second
+    # order without the one-time strategy authorization token.
+    order_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+    if (order_ctx.get("ema_vwap_authorized") is not True
+            or str(order_ctx.get("side") or "").upper() != side
+            or str(order_ctx.get("canonical_symbol") or "") != roro_canonical_symbol(sym)):
+        log_execution(
+            "[ENTRY_GUARD] open_position blocked: EXECUTION_REJECTED without matching EMA9/VWAP authorization",
+            "WARN")
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
@@ -9001,7 +9013,9 @@ from ggp_institutional_bridge import (
 )
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import ema9_vwap_proximity as _roro_ema9_vwap_proximity, timeframe_seconds as _roro_timeframe_seconds
-from unified_ema_vwap_strategy import UnifiedEMAVWAPPullbackEngine, execution_handoff_allowed
+from unified_ema_vwap_strategy import (
+    UnifiedEMAVWAPPullbackEngine, execution_handoff_allowed, emit_entry_diagnostic,
+)
 try:
     from roro_resource_manager import ResourceManager
     from roro_trade_journal import TradeJournal
@@ -9152,7 +9166,7 @@ def _refresh_ema_vwap_setups(watchlist):
                 item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION", "reason": "awaiting_fresh_scanner_cache"}
                 item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-                item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
+                item["decision_authority"] = ENTRY_STRATEGY_ID
                 continue
             closed = roro_validate_closed_frame(
                 frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
@@ -9166,15 +9180,16 @@ def _refresh_ema_vwap_setups(watchlist):
                 item["institutional_decision_state"] = item.get("decision_state")
             item["ema_vwap_strategy"] = result
             item["strategy_status"] = result.get("status", "UNKNOWN")
+            item["strategy_id"] = ENTRY_STRATEGY_ID
             item["decision_state"] = result.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
+            item["decision_authority"] = ENTRY_STRATEGY_ID
         except Exception as exc:
             item["institutional_decision_state"] = item.get("decision_state")
             item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION",
                                            "reason": f"strategy_error:{type(exc).__name__}"}
             item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
             item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
+            item["decision_authority"] = ENTRY_STRATEGY_ID
 
 _last_unified_watchlist_refresh = 0.0
 def refresh_unified_institutional_watchlist(force=False):
@@ -9240,6 +9255,185 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
 
 _INSTITUTIONAL_ENTRY_CONTEXT = None
 RECOVERY_BLOCK_ENTRIES = False
+ENTRY_STRATEGY_ID = "EMA9_VWAP_CROSS_CAUSAL_ZONE_V1"
+
+
+def _record_entry_diagnostic(tag, *, log_level="INFO", **fields):
+    """Emit the exact entry tag to both the operational log and diagnostics."""
+    message = tag + " " + " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    try:
+        log_execution(message, log_level)
+    except Exception:
+        pass
+    try:
+        emit_entry_diagnostic(tag, **fields)
+    except Exception:
+        pass
+    return message
+
+
+def _dispatch_confirmed_trade_handoff(symbol, side, planned_sl, tp1, tp2, context):
+    """Pass a confirmed position to the Brain once, without managing it here.
+
+    The original execution path remains the only order sender. This function is
+    called after that path has registered an open position and verified native
+    protection; it only validates the confirmed facts, classifies regime for
+    diagnostics, emits the exact tags, and records the bounded Brain event.
+    """
+    global _INSTITUTIONAL_ENTRY_CONTEXT
+    canonical = roro_canonical_symbol(symbol)
+    side = str(side or "").strip().upper()
+    ctx = dict(context or {})
+
+    def finite(value):
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def fail(code, reason):
+        _record_entry_diagnostic(
+            "[ENTRY_REJECTED]", log_level="WARN", symbol=canonical, side=side,
+            reason_code=code, reason=reason)
+        try:
+            EMA_VWAP_ENTRY_ENGINE.mark_rejected_execution(canonical, code, reason)
+        except Exception:
+            pass
+        return False
+
+    setup = EMA_VWAP_ENTRY_ENGINE.get(canonical)
+    if setup is None or setup.handoff_id or setup.status != "TRADE_OPEN":
+        return fail("TRADE_HANDOFF_FAILED", "setup_is_not_waiting_for_confirmed_handoff")
+    if (ctx.get("ema_vwap_authorized") is not True
+            or str(ctx.get("canonical_symbol") or "") != canonical
+            or str(ctx.get("side") or "").upper() != side
+            or str(ctx.get("strategy_id") or ENTRY_STRATEGY_ID) != ENTRY_STRATEGY_ID):
+        return fail("TRADE_HANDOFF_FAILED", "handoff_context_does_not_match_authorization")
+
+    if (not STATE.get("open") or STATE.get("recovery_hold")
+            or STATE.get("execution_unresolved")):
+        return fail("POSITION_NOT_CONFIRMED", "position_is_not_in_a_clean_confirmed_state")
+    if roro_canonical_symbol(STATE.get("current_symbol")) != canonical or str(STATE.get("side") or "").upper() != side:
+        return fail("POSITION_NOT_CONFIRMED", "registered_position_does_not_match_authorized_setup")
+
+    trade_id = str(STATE.get("trade_id") or "")
+    entry = safe_float(STATE.get("entry"), 0.0)
+    filled_qty = safe_float(STATE.get("initial_qty"), safe_float(STATE.get("qty"), 0.0))
+    native_sl = safe_float(STATE.get("native_sl_original_price"),
+                           safe_float(STATE.get("synthetic_sl"), safe_float(STATE.get("sl"), 0.0)))
+    tp1_value = safe_float(STATE.get("tp1_price"), safe_float(tp1, 0.0))
+    tp2_value = safe_float(STATE.get("tp2_price"), safe_float(tp2, 0.0))
+    if not trade_id or entry <= 0 or filled_qty <= 0 or native_sl <= 0:
+        return fail("POSITION_NOT_CONFIRMED", "missing_filled_position_identity_quantity_or_stop")
+    if not all(finite(v) for v in (entry, filled_qty, native_sl, planned_sl, tp1_value, tp2_value)):
+        return fail("POSITION_NOT_CONFIRMED", "non_finite_confirmed_position_values")
+    if (side == "BUY" and not (native_sl < entry < tp1_value < tp2_value)) or (
+            side == "SELL" and not (native_sl > entry > tp1_value > tp2_value)):
+        return fail("POSITION_NOT_CONFIRMED", "confirmed_position_geometry_is_invalid")
+
+    exchange_position_id = str(STATE.get("entry_exchange_order_id") or "")
+    if PAPER_MODE:
+        exchange_position_id = exchange_position_id or f"PAPER-{trade_id}"
+        confirmation_status = "PAPER_POSITION_CONFIRMED"
+    else:
+        if not exchange_position_id or str(STATE.get("entry_execution_state") or "") != "FILLED":
+            return fail("POSITION_NOT_CONFIRMED", "exchange_entry_identity_or_fill_state_missing")
+        if not STATE.get("native_sl_verified") or STATE.get("native_sl_status") != "VERIFIED":
+            return fail("POSITION_NOT_CONFIRMED", "exchange_native_stop_is_not_verified")
+        confirmation_status = "EXCHANGE_POSITION_CONFIRMED"
+
+    zone_boundaries = ctx.get("causal_zone_boundaries")
+    if not isinstance(zone_boundaries, dict):
+        zone_boundaries = {"low": ctx.get("causal_zone_low"), "high": ctx.get("causal_zone_high")}
+    if not all(finite(zone_boundaries.get(key)) for key in ("low", "high")):
+        return fail("TRADE_HANDOFF_FAILED", "zone_boundaries_are_missing_or_non_finite")
+
+    atr = safe_float(ctx.get("atr"), 0.0)
+    ema9 = safe_float(ctx.get("ema9"), 0.0)
+    vwap = safe_float(ctx.get("vwap"), 0.0)
+    if not all(finite(v) and float(v) > 0 for v in (atr, ema9, vwap)):
+        return fail("TRADE_HANDOFF_FAILED", "strategy_evidence_is_missing_or_non_finite")
+
+    regime = ctx.get("regime") or STATE.get("market_regime") or "UNKNOWN"
+    evidence = dict(ctx.get("entry_trend_evidence") or {})
+    brain_context = {
+        "side": side,
+        "regime": regime,
+        "continuation_probability": ctx.get("continuation_probability",
+                                            evidence.get("continuation_probability")),
+        "momentum_strength": ctx.get("momentum_strength"),
+        "volume_ratio": ctx.get("volume_ratio"),
+        "structure_score": ctx.get("structure_score"),
+        "structure_broken": ctx.get("structure_broken", False),
+        "adverse_divergence": ctx.get("adverse_divergence", False),
+        "adx": ctx.get("adx"),
+        "adx_slope": ctx.get("adx_slope"),
+        "di_plus": ctx.get("di_plus"),
+        "di_minus": ctx.get("di_minus"),
+        "vwap_slope_atr": evidence.get("vwap_slope_atr"),
+        "ema9_slope_atr": evidence.get("ema9_slope_atr"),
+    }
+    try:
+        classification = classify_management_regime(brain_context)
+    except Exception as exc:
+        return fail("TRADE_HANDOFF_FAILED", f"brain_classification_error:{type(exc).__name__}")
+
+    timestamp = int(setup.crossover_ts or ctx.get("entry_crossover_ts") or 0)
+    if timestamp <= 0:
+        return fail("TRADE_HANDOFF_FAILED", "missing_causal_cross_timestamp")
+    payload = {
+        "symbol": canonical,
+        "exchange_symbol": str(ctx.get("exchange_symbol") or normalize_symbol(canonical)),
+        "exchange_position_id": exchange_position_id,
+        "trade_id": trade_id,
+        "side": side,
+        "actual_entry": float(entry),
+        "filled_qty": float(filled_qty),
+        "initial_sl": float(native_sl),
+        "initial_tp1": float(tp1_value),
+        "initial_tp2": float(tp2_value),
+        "atr": float(atr),
+        "ema9": float(ema9),
+        "vwap": float(vwap),
+        "zone_type": str(ctx.get("causal_zone_type") or setup.causal_zone_type or "UNKNOWN"),
+        "ob_type": str(ctx.get("ob_type") or setup.order_block_type or "NONE"),
+        "zone_boundaries": {"low": float(zone_boundaries["low"]), "high": float(zone_boundaries["high"])},
+        "timestamp": timestamp,
+        "handoff_ts": time.time(),
+        "strategy_id": ENTRY_STRATEGY_ID,
+        "regime": str(regime),
+        "execution_confirmation_status": confirmation_status,
+        "management_authority": "TradeManagementBoard / LiveTradeManager",
+        "brain_regime_label": classification["label"],
+        "brain_regime_reason": classification["reason"],
+    }
+
+    handoff_id = f"{ENTRY_STRATEGY_ID}:{exchange_position_id}:{trade_id}"
+    if not EMA_VWAP_ENTRY_ENGINE.mark_handoff(canonical, handoff_id):
+        return False
+    _record_entry_diagnostic("[TRADE_CLASSIFIED]", symbol=canonical, side=side,
+                             brain_regime=classification["label"],
+                             reason=classification["reason"],
+                             authoritative=False,
+                             management_authority=classification["authority"])
+    _record_entry_diagnostic("[TRADE_HANDOFF]", symbol=canonical, side=side,
+                             exchange_position_id=exchange_position_id,
+                             strategy_id=ENTRY_STRATEGY_ID,
+                             execution_confirmation_status=confirmation_status,
+                             brain_regime=classification["label"])
+    try:
+        record_trade_management_event(
+            "TRADE_CLASSIFIED", "DIAGNOSTIC", symbol=canonical, side=side,
+            brain_regime=classification["label"], brain_reason=classification["reason"],
+            authoritative=False, management_authority=classification["authority"])
+        record_trade_management_event(
+            "TRADE_HANDOFF", confirmation_status,
+            dedupe_key=f"handoff:{canonical}:{trade_id}", dedupe_seconds=0,
+            **payload)
+    except Exception:
+        # Observational logging must never retroactively cancel a confirmed position.
+        pass
+    return True
 
 
 def smart_opportunity_selection():
@@ -9253,8 +9447,9 @@ def smart_opportunity_selection():
         return False
 
     watchlist = MEMORY.get("watchlist", {})
-    # EMA/VWAP closed-candle lifecycle is the sole entry decision authority.
-    # Institutional analysis supplies structural context and risk levels only.
+    # EMA9 x Session-VWAP cross inside a causal zone is the sole entry authority.
+    # Institutional analysis supplies structural context and risk levels only;
+    # it never supplies a pullback/retest/rejection entry gate.
     ready = []
     for sym, item in watchlist.items():
         if not isinstance(item, dict):
@@ -9301,7 +9496,7 @@ def smart_opportunity_selection():
             item["ema_vwap_strategy"] = strategy_snapshot
             item["strategy_status"] = strategy_snapshot.get("status", "UNKNOWN")
             item["decision_state"] = strategy_snapshot.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
+            item["decision_authority"] = ENTRY_STRATEGY_ID
             item["source"] = item.get("source") or "unified_watchlist"
             item["side"] = side
             event_id = str(item.get("event_id") or "")
@@ -9318,7 +9513,7 @@ def smart_opportunity_selection():
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
             setup = str(item.get("decision_setup_type") or item.get("setup_type") or "EMA_VWAP_CAUSAL_ZONE").upper()
             classification = "REVERSAL" if "REVERSAL" in setup else "TREND"
-            # Stop is anchored to the same causal zone that produced the retest.
+            # Stop is anchored to the same causal zone that produced the cross.
             # An institutional stop may be reused only when it is beyond that zone.
             setup_obj = EMA_VWAP_ENTRY_ENGINE.get(canonical)
             if not setup_obj or not all(np.isfinite(float(v)) for v in (
@@ -9375,15 +9570,24 @@ def smart_opportunity_selection():
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "profit_targets_invalid"
                 continue
-            strategy_gate = EMA_VWAP_ENTRY_ENGINE.authorize(canonical, price, float(tp1))
+            strategy_gate = EMA_VWAP_ENTRY_ENGINE.authorize(
+                canonical, price, float(tp1), side=side, now_ms=int(time.time() * 1000))
             item["ema_vwap_strategy"] = {**(item.get("ema_vwap_strategy") or {}), **strategy_gate}
             item["strategy_status"] = strategy_gate.get("status", "UNKNOWN")
             item["decision_state"] = strategy_gate.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
+            item["decision_authority"] = ENTRY_STRATEGY_ID
             if not strategy_gate.get("allowed"):
+                code = str(strategy_gate.get("reason_code") or strategy_gate.get("reason") or "ENTRY_NOT_AUTHORIZED")
                 item["decision_state"] = strategy_gate.get("status") or "WAITING_FOR_CONFIRMATION"
-                item["rejection_reason"] = "ema_vwap_strategy:" + str(strategy_gate.get("reason", "not_authorized"))
+                item["rejection_reason"] = "ema_vwap_strategy:" + code
+                _record_entry_diagnostic(
+                    "[ENTRY_REJECTED]", log_level="WARN", symbol=canonical,
+                    side=side, reason_code=code, reason=strategy_gate.get("message"))
                 continue
+            _record_entry_diagnostic(
+                "[ENTRY_AUTHORIZED]", symbol=canonical, side=side,
+                entry=price, tp1=float(tp1), zone_type=setup_obj.causal_zone_type,
+                zone_quality=setup_obj.zone_quality, strategy_id=ENTRY_STRATEGY_ID)
             if EMA_VWAP_ENTRY_ENGINE.get(canonical) and EMA_VWAP_ENTRY_ENGINE.get(canonical).direction != side:
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "ema_vwap_strategy_direction_mismatch"
@@ -9392,21 +9596,43 @@ def smart_opportunity_selection():
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "event_id": event_id or None,
+                "strategy_id": ENTRY_STRATEGY_ID,
                 "causal_zone_type": setup_obj.causal_zone_type,
+                "zone_label": setup_obj.zone_label,
+                "ob_type": setup_obj.order_block_type,
+                "zone_quality": setup_obj.zone_quality,
                 "causal_zone_low": zone_low,
                 "causal_zone_high": zone_high,
+                "causal_zone_boundaries": {"low": zone_low, "high": zone_high},
                 "causal_zone_ts": setup_obj.causal_zone_ts,
                 "evidence": evidence,
                 "structural_stop": float(sl),
+                "atr": float(atr_value),
+                "ema9": setup_obj.ema9,
+                "vwap": setup_obj.vwap,
+                "regime": item.get("market_regime") or item.get("regime") or "UNKNOWN",
+                # Diagnostic evidence only; the Brain classifies management after
+                # the platform position is confirmed.
+                "continuation_probability": item.get("continuation_probability"),
+                "momentum_strength": item.get("momentum_strength"),
+                "volume_ratio": item.get("volume_ratio"),
+                "structure_score": item.get("structure_score"),
+                "structure_broken": item.get("structure_broken", False),
+                "adverse_divergence": item.get("adverse_divergence", False),
+                "adx": item.get("adx"),
+                "adx_slope": item.get("adx_slope"),
+                "di_plus": item.get("di_plus"),
+                "di_minus": item.get("di_minus"),
+                # Pullback/rejection fields are observational history only.
                 "pullback_type": str(getattr(setup_obj, "entry_path", None) or getattr(setup_obj, "pullback_type", None) or "UNKNOWN"),
                 "entry_crossover_ts": setup_obj.crossover_ts,
                 "entry_rejection_ts": setup_obj.rejection_ts,
                 "entry_confirmation_ts": setup_obj.confirmation_ts,
-                "entry_zone_strength": (setup_obj.trend_evidence or {}).get("zone_status", "UNKNOWN"),
+                "entry_zone_strength": setup_obj.zone_quality or "UNKNOWN",
                 "entry_trend_evidence": dict(setup_obj.trend_evidence or {}),
                 "exchange_symbol": exchange_sym,
-                # This handoff token is created only after authorize() accepted the
-                # closed-bar EMA9/Session-VWAP cross + causal-zone pullback/rejection/confirmation.
+                # Token created only after authorize() accepted the closed-bar
+                # EMA9/Session-VWAP cross inside a causal demand/supply zone.
                 "ema_vwap_authorized": True,
                 "canonical_symbol": canonical,
                 "side": side,
@@ -9414,6 +9640,7 @@ def smart_opportunity_selection():
                 "tp1": float(tp1),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
+            authorized_context = dict(_INSTITUTIONAL_ENTRY_CONTEXT)
             try:
                 is_strong = is_strong_candidate(item)
                 sizing_class = "SNIPER" if is_strong else "TREND"
@@ -9435,20 +9662,33 @@ def smart_opportunity_selection():
                                    classification=sizing_class)
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
-            if ok:
-                EMA_VWAP_ENTRY_ENGINE.mark_open(canonical)
-                item["decision_state"] = "TRADE_OPEN"
-                item["strategy_status"] = "TRADE_OPEN"
-                item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
-                item["entry_timestamp"] = time.time()
-                _persist_trade_journal_start(setup, item)
-                trade_id = str(STATE.get("trade_id") or "")
-                if INSTITUTIONAL_TRADE_JOURNAL and trade_id:
-                    INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
-                if event_id:
-                    RORO_ENTRY_AUTHORITY.consume(event_id)
-                log_execution(f"[INSTITUTIONAL_ENTRY] {setup} {side} {exchange_sym} event={event_id}", "SUCCESS")
-                return True
+            if not ok:
+                EMA_VWAP_ENTRY_ENGINE.mark_rejected_execution(
+                    canonical, "EXECUTION_REJECTED", "original_execute_entry_returned_false")
+                _record_entry_diagnostic(
+                    "[ENTRY_REJECTED]", log_level="WARN", symbol=canonical,
+                    side=side, reason_code="EXECUTION_REJECTED", reason="original_execute_entry_returned_false")
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "EXECUTION_REJECTED"
+                continue
+            EMA_VWAP_ENTRY_ENGINE.mark_open(canonical)
+            item["decision_state"] = "TRADE_OPEN"
+            item["strategy_status"] = "TRADE_OPEN"
+            item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
+            item["entry_timestamp"] = time.time()
+            _persist_trade_journal_start(setup, item)
+            trade_id = str(STATE.get("trade_id") or "")
+            if INSTITUTIONAL_TRADE_JOURNAL and trade_id:
+                INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
+            if event_id:
+                RORO_ENTRY_AUTHORITY.consume(event_id)
+            # Handoff is dispatched only after the exchange/paper position is
+            # confirmed by the original execution path with SL/TP present.
+            handed_off = _dispatch_confirmed_trade_handoff(
+                canonical, side, float(sl), float(tp1), float(tp2), authorized_context)
+            item["trade_handoff"] = "CONFIRMED" if handed_off else "FAILED"
+            log_execution(f"[INSTITUTIONAL_ENTRY] {setup} {side} {exchange_sym} event={event_id}", "SUCCESS")
+            return True
         except Exception as exc:
             _INSTITUTIONAL_ENTRY_CONTEXT = None
             log_execution(f"[INSTITUTIONAL_ENTRY] candidate {canonical} failed: {type(exc).__name__}: {exc}", "ERROR")
@@ -10929,7 +11169,7 @@ _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
     # Final fail-closed authorization boundary. Every legacy scanner, radar,
     # early-entry and manual caller resolves here; none can bypass the unified
-    # closed-candle EMA/VWAP pullback lifecycle.
+    # closed-candle EMA9 x Session-VWAP causal-zone lifecycle.
     side = args[0] if len(args) > 0 else kwargs.get("side")
     symbol = args[1] if len(args) > 1 else kwargs.get("symbol")
     price = args[2] if len(args) > 2 else kwargs.get("price")
@@ -10948,6 +11188,9 @@ def execute_entry(*args, **kwargs):
             f"[EMA_VWAP_ENTRY_GATE] BLOCKED legacy_or_unconfirmed_entry side={side} symbol={symbol}",
             "WARN",
         )
+        _record_entry_diagnostic(
+            "[ENTRY_REJECTED]", log_level="WARN", symbol=symbol, side=side,
+            reason_code="EXECUTION_REJECTED", reason="legacy_or_unconfirmed_entry")
         return False
     result = _original_execute_entry_for_journal(*args, **kwargs)
     if result and STATE.get("open"):

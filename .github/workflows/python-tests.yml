@@ -38,10 +38,10 @@ jobs:
         run: python preflight.py
       - name: Compile
         run: python -m compileall -q .
-      - name: Targeted FVG regression
-        run: python -m pytest -q test_unified_ema_vwap_strategy.py::test_buy_and_sell_crosses_are_confirmed_on_closed_candles
-      - name: Targeted rejection-confirmation lifecycle regression
-        run: python -m pytest -q test_unified_ema_vwap_strategy.py::test_rejection_and_confirmation_must_be_separate_closed_candles
+      - name: Closed-candle EMA9/VWAP causal-zone regression
+        run: python -m pytest -q test_unified_ema_vwap_strategy.py::test_buy_cross_inside_demand_zone_is_ready test_unified_ema_vwap_strategy.py::test_sell_cross_inside_supply_zone_is_ready test_unified_ema_vwap_strategy.py::test_cross_on_unclosed_bar_is_never_promoted test_unified_ema_vwap_strategy.py::test_same_closed_candle_is_duplicate_safe
+      - name: Original execution and Brain handoff regression
+        run: python -m pytest -q test_ema9_vwap_execution_integration.py::test_final_execute_entry_calls_original_once_with_matching_authorization test_ema9_vwap_execution_integration.py::test_smart_selection_uses_original_execution_and_hands_off_confirmed_position_once test_ema9_vwap_execution_integration.py::test_exchange_rejection_blocks_handoff_and_marks_execution_rejected
       - name: Adaptive profit policy regressions
         run: python -m pytest -q test_profit_brain.py test_adaptive_profit_policy.py
       - name: Full regression suite
