@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 class TradeJournal:
@@ -62,6 +62,26 @@ class TradeJournal:
             CREATE TABLE IF NOT EXISTS runtime_state (
                 state_key TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_ts REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS confirmed_cross_events (
+                event_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                exchange_symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                source TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                signal_candle_timestamp INTEGER NOT NULL,
+                closed_candle_timestamp INTEGER NOT NULL,
+                detected_ts REAL NOT NULL,
+                expires_ts REAL NOT NULL,
+                status TEXT NOT NULL,
+                consumed_trade_id TEXT,
+                metadata_json TEXT,
+                created_ts REAL NOT NULL,
+                updated_ts REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_confirmed_cross_events_status
+                ON confirmed_cross_events(status, expires_ts);
             """)
             # Upgrade databases created by earlier releases without discarding rows.
             existing = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
@@ -162,6 +182,154 @@ class TradeJournal:
                 state_json=excluded.state_json, updated_ts=excluded.updated_ts""",
                 (str(state_key), payload, time.time()))
             db.execute("COMMIT")
+
+    # --- Confirmed closed-candle EMA9/Session VWAP cross events -------------
+    # These rows are independent of scanner cycles and trade rows. A row is
+    # created only by the strict execution gate and consumed at most once.
+    _CROSS_EVENT_COLUMNS = (
+        "event_id", "symbol", "exchange_symbol", "side", "direction", "source",
+        "timeframe", "signal_candle_timestamp", "closed_candle_timestamp",
+        "detected_ts", "expires_ts", "status", "consumed_trade_id",
+        "metadata_json", "created_ts", "updated_ts",
+    )
+
+    @staticmethod
+    def _cross_event_row(row: Any) -> Dict[str, Any]:
+        item = dict(zip(TradeJournal._CROSS_EVENT_COLUMNS, row))
+        try:
+            item["metadata"] = json.loads(item.pop("metadata_json", None) or "{}")
+        except (TypeError, ValueError):
+            item["metadata"] = {}
+        return item
+
+    def record_cross_event(
+        self,
+        *,
+        event_id: str,
+        symbol: str,
+        exchange_symbol: str,
+        side: str,
+        direction: str,
+        source: str,
+        timeframe: str,
+        signal_candle_timestamp: int,
+        closed_candle_timestamp: int,
+        expires_ts: float,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Insert a confirmed cross event once; duplicate identities are ignored."""
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return False
+        now = time.time()
+        payload = json.dumps(metadata or {}, sort_keys=True, default=str, separators=(",", ":"))
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """INSERT OR IGNORE INTO confirmed_cross_events(
+                       event_id, symbol, exchange_symbol, side, direction, source,
+                       timeframe, signal_candle_timestamp, closed_candle_timestamp,
+                       detected_ts, expires_ts, status, consumed_trade_id,
+                       metadata_json, created_ts, updated_ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,'ACTIVE',NULL,?,?,?)""",
+                (event_id, str(symbol), str(exchange_symbol), str(side), str(direction),
+                 str(source), str(timeframe), int(signal_candle_timestamp),
+                 int(closed_candle_timestamp), now, float(expires_ts), payload, now, now),
+            )
+            db.execute("COMMIT")
+            return cur.rowcount == 1
+
+    def get_cross_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM confirmed_cross_events WHERE event_id=?", (str(event_id),)
+            ).fetchone()
+        return self._cross_event_row(row) if row else None
+
+    def list_cross_events(
+        self, statuses: Optional[Iterable[str]] = None, *, include_expired: bool = False
+    ) -> List[Dict[str, Any]]:
+        allowed = [str(s).upper() for s in (statuses or ("ACTIVE",))]
+        if not allowed:
+            return []
+        params: List[Any] = list(allowed)
+        query = "SELECT * FROM confirmed_cross_events WHERE status IN (%s)" % ",".join("?" for _ in allowed)
+        if not include_expired:
+            query += " AND expires_ts>?"
+            params.append(time.time())
+        query += " ORDER BY detected_ts DESC"
+        with self._db() as db:
+            rows = db.execute(query, params).fetchall()
+        return [self._cross_event_row(row) for row in rows]
+
+    def consume_cross_event(self, event_id: str, trade_id: str) -> bool:
+        """Atomically mark an ACTIVE cross event as entered exactly once."""
+        if not event_id or not trade_id:
+            return False
+        now = time.time()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """UPDATE confirmed_cross_events
+                   SET status='ENTERED', consumed_trade_id=?, updated_ts=?
+                   WHERE event_id=? AND status='ACTIVE'""",
+                (str(trade_id), now, str(event_id)),
+            )
+            inserted = cur.rowcount == 1
+            if inserted:
+                self.event(str(trade_id), f"cross-event:{event_id}", "CROSS_EVENT_CONSUMED",
+                           {"event_id": str(event_id)}, db=db)
+            db.execute("COMMIT")
+            return inserted
+
+    def invalidate_cross_event(self, event_id: str, reason: str) -> bool:
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT metadata_json FROM confirmed_cross_events WHERE event_id=?",
+                (str(event_id),),
+            ).fetchone()
+            if not row:
+                db.execute("ROLLBACK")
+                return False
+            try:
+                metadata = json.loads(row[0] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            metadata["invalidation_reason"] = str(reason or "invalidated")
+            db.execute(
+                """UPDATE confirmed_cross_events
+                   SET status='INVALIDATED', metadata_json=?, updated_ts=?
+                   WHERE event_id=? AND status='ACTIVE'""",
+                (json.dumps(metadata, sort_keys=True, default=str, separators=(",", ":")),
+                 time.time(), str(event_id)),
+            )
+            changed = db.execute("SELECT changes()").fetchone()[0] == 1
+            db.execute("COMMIT")
+            return changed
+
+    def expire_cross_events(self, now: Optional[float] = None) -> int:
+        cutoff = float(now if now is not None else time.time())
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """UPDATE confirmed_cross_events SET status='EXPIRED', updated_ts=?
+                   WHERE status='ACTIVE' AND expires_ts<=?""",
+                (time.time(), cutoff),
+            )
+            count = int(cur.rowcount)
+            db.execute("COMMIT")
+            return count
+
+    def persist_entry_context(self, trade_id: str, context: Dict[str, Any]) -> bool:
+        """Store the immutable entry-time evidence as an audit event.
+
+        This deliberately does not call save_snapshot: the full management state
+        snapshot must remain the trade row's state_json authority.
+        """
+        if not trade_id or not isinstance(context, dict):
+            return False
+        return self.event(trade_id, f"entry-context:{trade_id}", "ENTRY_CONTEXT", context)
 
     def persist_entry_pending(self, *, trade_id: str, client_order_id: str, symbol: str,
                               side: str, position_mode: str, position_side: str,

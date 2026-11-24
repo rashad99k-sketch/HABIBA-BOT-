@@ -365,6 +365,7 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         ("radar_top5", memory.get("radar_top5", []), None),
         ("top_candidates", memory.get("top_candidates", []), None),
         ("candidates", memory.get("candidates", []), None),
+        ("confirmed_cross_events", memory.get("confirmed_cross_events", []), None),
         ("roro_watchlist", memory.get("roro_watchlist", {}), None),
     )
     for source, values, implied_side in sources:
@@ -777,6 +778,14 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
               and str(proximity.get("state") or "").upper() in {"NEAR_CROSS", "CONVERGING"}):
             vwap_cross_priority = max(vwap_cross_priority, 0.12)
         discovery_score = max(0.0, min(100.0, rank_number(item.get("score")))) / 100.0
+        # A confirmed, still-active closed-candle cross event is an independent
+        # watchlist opportunity. It is analyzed every cycle until it is entered,
+        # invalidated or expires; it is not merely a ranking hint.
+        confirmed_cross_event = bool(
+            item.get("cross_event_id")
+            and str(item.get("cross_event_status", "ACTIVE")).upper() == "ACTIVE"
+        )
+        confirmed_cross_priority = 10.0 if confirmed_cross_event else 0.0
         updated = rank_number(prior.get("last_update", prior.get("last_updated", 0)))
         freshness = max(0.0, 1.0 - max(0.0, time.time() - updated) / 1800.0) if updated else 0.0
         # Re-rank using actual structural confluence/proximity from the previous analysis,
@@ -784,7 +793,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         priority = (state_bonus + 0.9 * golden_score + 0.55 * ob_near
                     + 0.35 * liquidity_quality + 0.45 * analysis_priority
                     + 0.30 * discovery_score + 0.20 * freshness
-                    + vwap_cross_priority)
+                    + vwap_cross_priority + confirmed_cross_priority)
         return (priority, state_bonus, golden_score, float(item.get("score", 0) or 0), key)
     ordered = sorted(items.items(), key=candidate_rank, reverse=True)
     if not ordered:
@@ -792,10 +801,22 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         return out
     limit = min(max(1, int(max_items)), len(ordered))
     candidates = ordered[:limit]
-    cursor = int(memory.get("unified_watchlist_cursor", 0)) % len(candidates)
     count = min(max(1, int(batch_size)), len(candidates))
-    selected = [candidates[(cursor + i) % len(candidates)] for i in range(count)]
-    memory["unified_watchlist_cursor"] = (cursor + count) % len(candidates)
+    # Confirmed cross events are analyzed every cycle, independently of scanner
+    # rotation. Remaining slots continue the existing bounded rotation so RF/V2
+    # and other discovery sources stay supplementary but never starve.
+    forced = [pair for pair in candidates
+              if pair[1].get("cross_event_id")
+              and str(pair[1].get("cross_event_status", "ACTIVE")).upper() == "ACTIVE"][:count]
+    forced_keys = {key for key, _ in forced}
+    rotating = [pair for pair in candidates if pair[0] not in forced_keys]
+    slots = count - len(forced)
+    if rotating and slots > 0:
+        cursor = int(memory.get("unified_watchlist_cursor", 0)) % len(rotating)
+        selected = forced + [rotating[(cursor + i) % len(rotating)] for i in range(slots)]
+        memory["unified_watchlist_cursor"] = (cursor + slots) % len(rotating)
+    else:
+        selected = forced
     for key, candidate in selected:
         try:
             frame = fetch_frame(candidate["exchange_symbol"])
@@ -848,15 +869,38 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         best["first_seen"] = previous.get("first_seen", time.time())
         best["discovery_sources"] = list(candidate.get("sources", []))
         best["discovery_score"] = float(candidate.get("score", 0) or 0)
+        for cross_field in ("cross_event_id", "cross_event_source", "cross_event_direction",
+                            "cross_event_timestamp", "cross_event_status", "cross_event_timeframe"):
+            if candidate.get(cross_field) not in (None, "", "UNKNOWN"):
+                best[cross_field] = candidate[cross_field]
+        if best.get("cross_event_id"):
+            best["cross_event_analysis_required"] = True
         best["analysis_priority_score"] = round(_decision_priority(best)[0] * 10
             + float(best.get("score", 0) or 0) * 0.25
             + float((best.get("golden_zone") or {}).get("score", 0) or 0) * 0.15, 2)
         out[key] = {**previous, **best}
     now = time.time()
     protected = {"ENTRY_READY", "WAITING_FOR_RETEST", "WAITING_FOR_CONFIRMATION", "NO_CHASE"}
+    # Event status in the Watchlist is a projection of the durable journal feed.
+    # Once the journal marks an event ENTERED/INVALIDATED/EXPIRED and the feed is
+    # re-synced, a stale row must not keep forcing analysis or TTL protection.
+    active_cross_ids = {
+        str(item.get("cross_event_id"))
+        for item in items.values()
+        if item.get("cross_event_id")
+        and str(item.get("cross_event_status", "ACTIVE")).upper() == "ACTIVE"
+    }
     for key, value in list(out.items()):
         age = now - float(value.get("last_update", value.get("last_updated", now)) or now)
-        if age > 1800 and value.get("decision_state") not in protected:
+        if value.get("cross_event_id") and str(value.get("cross_event_id")) not in active_cross_ids:
+            value["cross_event_status"] = "INACTIVE"
+            value["cross_event_analysis_required"] = False
+        active_cross_event = bool(
+            value.get("cross_event_id")
+            and str(value.get("cross_event_status", "ACTIVE")).upper() == "ACTIVE"
+            and str(value.get("cross_event_id")) in active_cross_ids
+        )
+        if age > 1800 and value.get("decision_state") not in protected and not active_cross_event:
             out.pop(key, None)
     memory["unified_watchlist_last_update"] = now
     memory["unified_watchlist_last_batch_count"] = len(selected)

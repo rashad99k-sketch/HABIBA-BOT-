@@ -1,0 +1,554 @@
+"""End-to-end proof for durable cross discovery -> Watchlist -> entry context.
+
+All market data is deterministic and synthetic. No exchange credentials, live
+orders, network calls, or real account state are used. The strict gate, journal,
+watchlist registry, context builder, profit classifier and TradeManagementBoard
+are the real implementations; only synthetic data/exchange boundaries are
+controlled by the tests.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import ggpbot
+import ggp_institutional_bridge as bridge
+from ggp_profit_brain import (
+    RANGE_MODE, STANDARD_MODE, TREND_MODE, classify_profit_mode,
+)
+from ggpbot import TradeDecisionType
+from roro_confluence import validate_dual_ema_vwap_entry_gate
+from roro_trade_journal import TradeJournal
+
+
+SYMBOL = "BTC/USDT:USDT"
+CANONICAL = "BTC"
+TF_MS = 900_000
+START_MS = 1_795_132_800_000  # 2026-11-20 00:00 UTC
+NOW_MS = START_MS + 79 * TF_MS + TF_MS + 1_000
+NOW_SEC = NOW_MS / 1000.0
+
+
+def _cross_frame(side="BUY"):
+    """A real closed-candle EMA9/Session-VWAP cross with 80 valid bars."""
+    n = 80
+    closes = 99.0 - 0.01 * np.arange(n)
+    closes[-1] = closes[-2] + (4.0 if side == "BUY" else -4.0)
+    opens = np.concatenate([closes[:-1], [closes[-2]]])
+    return pd.DataFrame({
+        "timestamp": START_MS + np.arange(n) * TF_MS,
+        "open": opens,
+        "high": np.maximum(opens, closes) + 0.2,
+        "low": np.minimum(opens, closes) - 0.2,
+        "close": closes,
+        "volume": np.full(n, 1000.0),
+    })
+
+
+def _gate(frame, side="BUY"):
+    return validate_dual_ema_vwap_entry_gate(
+        frame, side, lambda series, period: series.ewm(span=period, adjust=False).mean(),
+        timeframe_seconds=900, now_ms=NOW_MS, lookback_candles=2,
+    )
+
+
+def _payload(event_id="BTC:15m:BUY:1795203900000", expires_ts=None):
+    return {
+        "event_id": event_id,
+        "symbol": CANONICAL,
+        "exchange_symbol": SYMBOL,
+        "side": "BUY",
+        "direction": "BULLISH",
+        "source": ggpbot.CONFIRMED_CROSS_EVENT_SOURCE,
+        "timeframe": str(ggpbot.INTERVAL),
+        "signal_candle_timestamp": START_MS + 79 * TF_MS,
+        "closed_candle_timestamp": START_MS + 79 * TF_MS,
+        "expires_ts": expires_ts if expires_ts is not None else time.time() + 14_400.0,
+        "metadata": {
+            "ready": True,
+            "authorization_state": "EMA9_TRIGGER_VALID",
+            "detection_method": "validate_dual_ema_vwap_entry_gate",
+            "lookback_candles": 2,
+        },
+    }
+
+
+def _record(journal, *, event_id=None, expires_ts=None, side="BUY"):
+    payload = _payload(event_id=event_id or f"{CANONICAL}:{ggpbot.INTERVAL}:BUY:{int(time.time() * 1000)}",
+                       expires_ts=expires_ts)
+    payload["side"] = side
+    payload["direction"] = "BULLISH" if side == "BUY" else "BEARISH"
+    assert journal.record_cross_event(**payload) is True
+    return payload
+
+
+def _watchlist_cross_item(event):
+    return {
+        "symbol": event["symbol"],
+        "exchange_symbol": event["exchange_symbol"],
+        "side": event["side"],
+        "cross_event_id": event["event_id"],
+        "cross_event_source": event["source"],
+        "cross_event_direction": event["direction"],
+        "cross_event_timestamp": event["signal_candle_timestamp"],
+        "cross_event_status": event["status"],
+        "cross_event_timeframe": event["timeframe"],
+        "discovery_source": "confirmed_cross_event",
+        "sources": ["confirmed_cross_event"],
+        "role": "CONFIRMED_CROSS_EVENT",
+        "score": 100.0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 1) Cross-event persistence is unique, restart-safe, and single-consumption.
+# --------------------------------------------------------------------------- #
+def test_cross_event_journal_lifecycle_survives_restart(tmp_path):
+    path = str(tmp_path / "cross-events.sqlite3")
+    journal = TradeJournal(path)
+    payload = _record(journal)
+
+    assert journal.record_cross_event(**payload) is False, "event identity must be unique"
+    restarted = TradeJournal(path)
+    row = restarted.get_cross_event(payload["event_id"])
+    assert row is not None
+    assert row["symbol"] == CANONICAL
+    assert row["exchange_symbol"] == SYMBOL
+    assert row["side"] == "BUY"
+    assert row["direction"] == "BULLISH"
+    assert row["source"] == ggpbot.CONFIRMED_CROSS_EVENT_SOURCE
+    assert row["timeframe"] == str(ggpbot.INTERVAL)
+    assert row["signal_candle_timestamp"] == payload["signal_candle_timestamp"]
+    assert row["metadata"]["detection_method"] == "validate_dual_ema_vwap_entry_gate"
+    assert row["metadata"]["lookback_candles"] == 2
+    assert [item["event_id"] for item in restarted.list_cross_events(("ACTIVE",))] == [payload["event_id"]]
+
+    assert restarted.consume_cross_event(payload["event_id"], "trade-1") is True
+    assert restarted.consume_cross_event(payload["event_id"], "trade-2") is False
+    consumed = TradeJournal(path).get_cross_event(payload["event_id"])
+    assert consumed["status"] == "ENTERED"
+    assert consumed["consumed_trade_id"] == "trade-1"
+
+    invalid = _record(journal, event_id=f"{CANONICAL}:{ggpbot.INTERVAL}:BUY:invalidate")
+    assert journal.invalidate_cross_event(invalid["event_id"], "opposite_confirmed_cross") is True
+    assert journal.get_cross_event(invalid["event_id"])["status"] == "INVALIDATED"
+    assert "opposite_confirmed_cross" in journal.get_cross_event(invalid["event_id"])["metadata"]["invalidation_reason"]
+
+    expired = _record(journal, event_id=f"{CANONICAL}:{ggpbot.INTERVAL}:BUY:expired",
+                      expires_ts=time.time() - 10.0)
+    assert journal.expire_cross_events() >= 1
+    expired_row = journal.get_cross_event(expired["event_id"])
+    assert expired_row["status"] == "EXPIRED"
+    assert [item["event_id"] for item in journal.list_cross_events(("ACTIVE",))] == []
+    assert expired["event_id"] in [
+        item["event_id"] for item in journal.list_cross_events(("ACTIVE", "EXPIRED"), include_expired=True)
+    ]
+
+    context = {
+        "schema_version": 1,
+        "cross_event_id": payload["event_id"],
+        "cross_event_direction": "BULLISH",
+        "entry_zone": {"low": 98.0, "high": 99.0, "quality": 70},
+        "adx_di": {"adx": 26.0, "di_plus": 30.0, "di_minus": 12.0},
+    }
+    assert journal.persist_entry_context("trade-1", context) is True
+    assert journal.persist_entry_context("trade-1", context) is False
+    with sqlite3.connect(path) as db:
+        rows = db.execute(
+            "SELECT event_key, event_type, payload FROM trade_events WHERE trade_id=?", ("trade-1",)
+        ).fetchall()
+    entry_context_events = [row for row in rows if row[1] == "ENTRY_CONTEXT"]
+    assert len(entry_context_events) == 1
+    assert entry_context_events[0][0] == "entry-context:trade-1"
+    assert json.loads(entry_context_events[0][2]) == context
+
+
+# --------------------------------------------------------------------------- #
+# 2) Scanner rows are ranking-only; only the strict gate creates cross events.
+# --------------------------------------------------------------------------- #
+def test_supplementary_scanner_rows_cannot_create_cross_events(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "scanner.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: None)
+    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [])
+
+    memory = {
+        "rf_watchlist": [{"symbol": SYMBOL, "side": "BUY", "score": 99, "ema9_vwap_proximity": {
+            "state": "NEAR_CROSS", "cross_any": "BULLISH", "cross_age_seconds": 10,
+            "timeframe_seconds": 900, "updated_at": NOW_SEC, "cross_fresh": True}}],
+        "scanner_v2_buy": [{"symbol": "ETHUSDT", "side": "BUY", "score": 80}],
+        "professional_scan_candidates": [{"symbol": "SOLUSDT", "side_hint": "SELL", "score": 95}],
+        "radar_top5": [{"symbol": "XRPUSDT", "score": 70}],
+        "watchlist": {},
+    }
+    merged = bridge.merge_candidates(memory)
+    assert set(merged) >= {"BTC", "ETH", "SOL", "XRP"}
+    assert all(not item.get("cross_event_id") for item in merged.values())
+    assert all(item.get("discovery_source") != "confirmed_cross_event" for item in merged.values())
+
+    assert ggpbot._detect_confirmed_cross_events([SYMBOL]) == 0
+    assert journal.list_cross_events(("ACTIVE",)) == []
+    assert ggpbot.MEMORY["confirmed_cross_events"] == []
+
+    # Real gate + real detector now create one durable event.
+    frame = _cross_frame("BUY")
+    gate = _gate(frame, "BUY")
+    assert gate["ready"] is True
+    assert gate["authorization_state"] == "EMA9_TRIGGER_VALID"
+    monkeypatch.setattr(ggpbot.time, "time", lambda: NOW_SEC)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame)
+
+    assert ggpbot._detect_confirmed_cross_events([SYMBOL]) == 1
+    rows = journal.list_cross_events(("ACTIVE",))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["side"] == "BUY"
+    assert row["direction"] == "BULLISH"
+    assert row["source"] == ggpbot.CONFIRMED_CROSS_EVENT_SOURCE
+    assert row["event_id"] == f"{SYMBOL}:{ggpbot.INTERVAL}:{gate['signal_candle_id']}"
+    assert row["metadata"]["detection_method"] == "validate_dual_ema_vwap_entry_gate"
+    assert row["metadata"]["lookback_candles"] == 2
+
+    feed = ggpbot.MEMORY["confirmed_cross_events"]
+    assert len(feed) == 1
+    assert feed[0]["cross_event_id"] == row["event_id"]
+    assert feed[0]["cross_event_status"] == "ACTIVE"
+    assert feed[0]["role"] == "CONFIRMED_CROSS_EVENT"
+    assert ggpbot._detect_confirmed_cross_events([SYMBOL]) == 0
+    assert len(journal.list_cross_events(("ACTIVE",))) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 3) Active cross events are forced into bounded Watchlist analysis every cycle.
+# --------------------------------------------------------------------------- #
+def test_active_cross_event_is_forced_into_each_watchlist_batch(monkeypatch):
+    seen = []
+
+    def fake_analyze(symbol, side, frame, now_ms=None):
+        seen.append((bridge.canonical_symbol(symbol), side))
+        return {
+            "symbol": bridge.canonical_symbol(symbol),
+            "exchange_symbol": symbol,
+            "side": side,
+            "decision_state": "WAITING_FOR_CONFIRMATION",
+            "entry_status": "WAITING_FOR_CONFIRMATION",
+            "decision_reason": "synthetic_analysis",
+            "rejection_reasons": [],
+            "score": 10.0,
+            "event_id": None,
+            "structural_stop": None,
+            "data_quality": "VALID_CLOSED_CANDLES",
+            "golden_zone": {"score": 10},
+            "evidence": [],
+            "last_update": time.time(),
+            "icons": {"status": "🟡"},
+        }
+
+    monkeypatch.setattr(bridge, "analyze_symbol", fake_analyze)
+    frame = _cross_frame("BUY")
+    event = _payload(expires_ts=time.time() + 3600.0)
+    memory = {
+        "confirmed_cross_events": [_watchlist_cross_item({**event, "status": "ACTIVE"})],
+        "scanner_v2_buy": [{"symbol": "ETHUSDT", "side": "BUY", "score": 5}],
+        "watchlist": {},
+    }
+
+    first = bridge.update_unified_watchlist(memory, lambda _: frame, max_items=10, batch_size=1)
+    second = bridge.update_unified_watchlist(memory, lambda _: frame, max_items=10, batch_size=1)
+    assert seen.count(("BTC", "BUY")) == 2
+    assert seen.count(("BTC", "SELL")) == 2
+    assert first["BTC"]["cross_event_id"] == event["event_id"]
+    assert second["BTC"]["cross_event_analysis_required"] is True
+    assert second["BTC"]["cross_event_direction"] == "BULLISH"
+    assert second["BTC"]["cross_event_status"] == "ACTIVE"
+
+    # Active cross rows are protected from the 1800s Watchlist TTL even if no
+    # fresh analysis is produced for them.
+    second["BTC"]["last_update"] = time.time() - 3600.0
+    third = bridge.update_unified_watchlist(memory, lambda _: frame, max_items=10, batch_size=1)
+    assert "BTC" in third
+
+    # Once the event is no longer active, it stops being forced and stale
+    # Watchlist metadata can no longer protect it from the normal TTL.
+    third["BTC"]["decision_state"] = "REJECTED"
+    third["BTC"]["last_update"] = time.time() - 3600.0
+    memory["confirmed_cross_events"] = []
+    fourth = bridge.update_unified_watchlist(memory, lambda _: frame, max_items=10, batch_size=10)
+    assert "BTC" not in fourth
+
+
+# --------------------------------------------------------------------------- #
+# 4) Persisted context is complete and feeds the one classifier + board path.
+# --------------------------------------------------------------------------- #
+def _full_entry_context(gate, event, *, trend=True):
+    frame = _cross_frame("BUY")
+    source = {
+        "cross_event_id": event["event_id"],
+        "cross_event_source": ggpbot.CONFIRMED_CROSS_EVENT_SOURCE,
+        "cross_event_direction": "BULLISH",
+        "cross_event_timestamp": event["signal_candle_timestamp"],
+        "event_id": event["event_id"],
+        "evidence": ["closed_ema9_vwap_cross", "fresh_institutional_zone"],
+        "structural_stop": 96.0,
+        "entry_zone_low": 98.50,
+        "entry_zone_high": 99.20,
+        "zone_quality": 72.0,
+        "zone_type": "DEMAND",
+        "order_block": {
+            "type": "ORDER_BLOCK", "status": "FRESH", "valid": True,
+            "low": 98.50, "high": 99.20, "strength": 8.0, "distance_atr": 0.30,
+        },
+        "liquidity": {"event": "SWEEP", "direction": "BULLISH", "level": 98.20, "confidence": 80},
+        "market_structure": {"confirmed": True, "mss": "BULLISH_CHOCH"},
+        "volume_ratio": 1.20,
+        "adx": 26.0,
+        "di_plus": 30.0,
+        "di_minus": 12.0,
+        "market_regime": "STRONG_TREND" if trend else "RANGE_CHOP",
+        "trading_mode": "TREND" if trend else "SCALP",
+        "entry_behavior": "ENTER_NOW" if trend else "WAIT_FOR_STRUCTURE",
+        "closed_candle_frame": frame,
+        "candle_timeframe": str(ggpbot.INTERVAL),
+        "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+    }
+    return ggpbot._build_persistent_entry_context(source, gate, "BUY", SYMBOL, "trade-ctx", 0.69)
+
+
+def test_persisted_entry_context_drives_classifier_and_single_board(tmp_path):
+    frame = _cross_frame("BUY")
+    gate = _gate(frame, "BUY")
+    journal = TradeJournal(str(tmp_path / "ctx.sqlite3"))
+    event = _payload(expires_ts=time.time() + 3600.0)
+    assert journal.record_cross_event(**event) is True
+
+    context = _full_entry_context(gate, event)
+    required = {
+        "trade_id", "symbol", "exchange_symbol", "side", "cross_event_id",
+        "cross_event_source", "cross_event_direction", "cross_event_timestamp",
+        "entry_zone", "order_block", "supply_demand_zone", "liquidity",
+        "market_structure", "relative_volume", "adx_di", "atr", "ema9", "ema50",
+        "vwap", "entry_regime", "closed_candle_timestamp", "frame_source",
+    }
+    assert required <= set(context)
+    assert context["cross_event_id"] == event["event_id"]
+    assert context["cross_event_direction"] == "BULLISH"
+    assert context["cross_event_source"] == ggpbot.CONFIRMED_CROSS_EVENT_SOURCE
+    assert context["order_block"]["freshness"] == "FRESH"
+    assert context["order_block"]["valid"] is True
+    assert context["adx_di"] == {"adx": 26.0, "di_plus": 30.0, "di_minus": 12.0}
+    assert context["ema9"] == pytest.approx(gate["ema9"])
+    assert context["vwap"] == pytest.approx(gate["vwap"])
+    assert journal.persist_entry_context("trade-ctx", context) is True
+
+    current = {
+        "side": "BUY", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
+        "adx": 28.0, "adx_slope": 1.2, "continuation_probability": 0.82,
+        "di_plus": 32.0, "di_minus": 10.0, "volume_ratio": 1.15,
+        "entry_context": context,
+    }
+    mode, reason, evidence = classify_profit_mode(current)
+    assert mode == TREND_MODE
+    assert "entry_confirmed_directional_cross" in evidence
+    assert "entry_context_trend_support" not in reason  # first confirmed-trend path is authoritative
+
+    weak = {
+        "side": "BUY", "regime": "CHOPPY", "trade_state": "RANGE_CHOP",
+        "adx": 15.0, "adx_slope": -1.0, "continuation_probability": 0.38,
+        "di_plus": 18.0, "di_minus": 17.0, "volume_ratio": 0.62,
+        "momentum_strength": 20.0, "entry_context": context,
+    }
+    assert classify_profit_mode(weak)[0] == STANDARD_MODE
+
+    board = ggpbot.TradeManagementBoard()
+    base = {
+        "symbol": "BTC", "side": "BUY", "entry": 99.0, "current_price": 105.0,
+        "atr": 0.70, "initial_qty": 1.0, "remaining_qty": 0.5,
+        "profit_mode": mode, "entry_context": context,
+        "indicator_decisions_allowed": False, "synthetic_sl": 0.0,
+        "trail_stop": 0.0, "trail_active": False, "tp1_hit": True,
+        "tp2_hit": False, "tp1_price": 100.0, "tp2_price": 110.0,
+        "be_done": True, "max_price": 105.5, "adx": 28.0,
+        "continuation_probability": 0.82,
+    }
+    trail = board.evaluate(base)
+    assert trail.action == TradeDecisionType.TRAIL
+    assert trail.params["new_stop"] > base["entry"]
+    assert board._decision_history[-1]["entry_cross_event_id"] == event["event_id"]
+
+    be = board.evaluate({**base, "be_done": False})
+    assert be.action == TradeDecisionType.BREAKEVEN
+    assert be.params["new_sl"] > base["entry"]
+
+    tp1 = board.evaluate({**base, "tp1_hit": False, "remaining_qty": 1.0,
+                          "current_price": 100.5, "tp1_price": 100.0})
+    assert tp1.action == TradeDecisionType.PARTIAL_CLOSE
+    assert tp1.params["ratio"] == pytest.approx(0.5)
+
+    scalp = board.evaluate({**base, "profit_mode": RANGE_MODE, "remaining_qty": 1.0,
+                            "tp1_hit": False, "range_target_price": 99.5,
+                            "current_price": 99.6})
+    assert scalp.action == TradeDecisionType.FULL_CLOSE
+
+
+# --------------------------------------------------------------------------- #
+# 5) Full durable path: confirmed cross -> Watchlist -> entry -> management.
+# --------------------------------------------------------------------------- #
+def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, monkeypatch):
+    frame = _cross_frame("BUY")
+    gate = _gate(frame, "BUY")
+    assert gate["ready"] is True
+
+    monkeypatch.setattr(ggpbot.time, "time", lambda: NOW_SEC)
+    journal = TradeJournal(str(tmp_path / "e2e.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame)
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
+    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [])
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
+    monkeypatch.setitem(ggpbot.MEMORY, "position_status", "FLAT")
+    monkeypatch.setitem(ggpbot.MEMORY, "_unified_watchlist_refresh_ok", True)
+    for key in ("open", "in_position", "execution_unresolved", "recovery_hold",
+                "entry_context_persistence_failed", "cross_event_persistence_failed"):
+        monkeypatch.setitem(ggpbot.STATE, key, False)
+    monkeypatch.setitem(ggpbot.STATE, "trade_id", "")
+    monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
+    monkeypatch.setitem(ggpbot.paper, "balance", 1000.0)
+    monkeypatch.setitem(ggpbot.paper, "position", None)
+    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: frame)
+    monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: float(frame["close"].iloc[-1]))
+    monkeypatch.setattr(ggpbot, "update_position_dashboard", lambda *a, **k: None)
+    monkeypatch.setattr(ggpbot, "tg_entry", lambda *a, **k: None)
+    monkeypatch.setattr(ggpbot, "_live_manager", type(
+        "PaperManager", (), {"start_trade": lambda *a, **k: None}
+    )())
+
+    # 1. Strict gate discovers the durable cross event.
+    assert ggpbot._detect_confirmed_cross_events([SYMBOL]) == 1
+    event = journal.list_cross_events(("ACTIVE",))[0]
+    assert event["event_id"] == f"{SYMBOL}:{ggpbot.INTERVAL}:{gate['signal_candle_id']}"
+
+    # 2. The persisted event is independently merged into the Watchlist and
+    #    receives real institutional analysis, even with RF/V2 rows present.
+    memory = ggpbot.MEMORY
+    memory["scanner_v2_buy"] = [{"symbol": "ETHUSDT", "side": "BUY", "score": 70}]
+    watchlist = bridge.update_unified_watchlist(
+        memory, lambda _: frame, max_items=20, batch_size=20,
+    )
+    item = watchlist[CANONICAL]
+    assert item["cross_event_id"] == event["event_id"]
+    assert item["cross_event_direction"] == "BULLISH"
+    assert item["cross_event_status"] == "ACTIVE"
+    assert item["cross_event_analysis_required"] is True
+    assert item["data_quality"] == "VALID_CLOSED_CANDLES"
+    assert item["side_analyses"]["BUY"]["state"] in {
+        "ENTRY_READY", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_RETEST", "REJECTED"
+    }
+
+    # 3. A verified institutional authorization is replayed through the real
+    #    execution gate. The cross identity, frame and zones come from the
+    #    Watchlist item; no scanner row can substitute for them.
+    price = float(frame["close"].iloc[-1])
+    item.update({
+        "decision_state": "ENTRY_READY", "side": "BUY",
+        "event_id": f"institution:{event['event_id']}",
+        "decision_setup_type": "TREND_CONTINUATION_ENGINE",
+        "structural_stop": price - 2.0,
+        "order_block": {"type": "ORDER_BLOCK", "status": "FRESH", "valid": True,
+                        "low": price - 0.5, "high": price + 0.2, "strength": 8.0,
+                        "distance_atr": 0.25},
+        "liquidity": {"event": "SWEEP", "direction": "BULLISH", "level": price - 0.8, "confidence": 80},
+        "market_structure": {"confirmed": True, "mss": "BULLISH_CHOCH"},
+        "golden_zone": {"score": 72, "state": "GOLDEN_CONFLUENCE"},
+        "zone_quality": 72.0, "zone_type": "DEMAND", "volume_ratio": 1.20,
+        "adx": 26.0, "adx_di": {"di_plus": 30.0, "di_minus": 12.0},
+        "ema9": gate["ema9"], "ema50": gate["ema50"], "vwap": gate["vwap"],
+        "market_regime": "STRONG_TREND", "trading_mode": "TREND",
+        "entry_behavior": "ENTER_NOW", "entry_zone_low": price - 0.5,
+        "entry_zone_high": price + 0.2, "atr": 0.69,
+        "evidence": ["closed_ema9_vwap_cross", "fresh_institutional_zone"],
+    })
+    ctx = {
+        "setup_type": item["decision_setup_type"], "event_id": item["event_id"],
+        "evidence": list(item["evidence"]), "structural_stop": item["structural_stop"],
+        "trading_mode": item["trading_mode"], "entry_behavior": item["entry_behavior"],
+        "entry_zone_low": item["entry_zone_low"], "entry_zone_high": item["entry_zone_high"],
+        "support_resistance": dict(item.get("support_resistance") or {}),
+        "order_block": dict(item["order_block"]), "fvg": dict(item.get("fvg") or {}),
+        "liquidity": dict(item["liquidity"]), "golden_zone": dict(item["golden_zone"]),
+        "market_intelligence": dict(item.get("market_intelligence") or {}),
+        "zone_quality": item["zone_quality"], "zone_type": item["zone_type"],
+        "market_structure": dict(item["market_structure"]), "volume_ratio": item["volume_ratio"],
+        "adx": item["adx"], "adx_di": dict(item["adx_di"]), "ema9": item["ema9"],
+        "ema50": item["ema50"], "vwap": item["vwap"], "market_regime": item["market_regime"],
+        "cross_event_id": item["cross_event_id"], "cross_event_source": item["cross_event_source"],
+        "cross_event_direction": item["cross_event_direction"],
+        "cross_event_timestamp": item["cross_event_timestamp"],
+        "exchange_symbol": SYMBOL, "candle_timeframe": str(ggpbot.INTERVAL),
+        "closed_candle_frame": frame.copy(),
+        "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+        "closed_candle_timestamp": int(frame["timestamp"].iloc[-1]),
+    }
+    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", ctx)
+
+    tp1 = price * 1.008
+    tp2 = price * 1.02
+    ok = ggpbot.execute_entry(
+        "BUY", SYMBOL, price, item["structural_stop"], tp1, tp2, 80,
+        "CROSS_DRIVEN_E2E", 0.69, "TREND", "TREND", "TREND",
+    )
+    assert ok is True
+    trade_id = str(ggpbot.STATE["trade_id"])
+    assert trade_id
+
+    entered = journal.get_cross_event(event["event_id"])
+    assert entered["status"] == "ENTERED"
+    assert entered["consumed_trade_id"] == trade_id
+    assert ggpbot.STATE["cross_event_persistence_failed"] is False
+    assert ggpbot.STATE["entry_context_persistence_failed"] is False
+
+    with sqlite3.connect(journal.path if hasattr(journal, "path") else str(tmp_path / "e2e.sqlite3")) as db:
+        context_events = db.execute(
+            "SELECT payload FROM trade_events WHERE trade_id=? AND event_type='ENTRY_CONTEXT'",
+            (trade_id,),
+        ).fetchall()
+    assert len(context_events) == 1
+    persisted_json = json.loads(context_events[0][0])
+    assert persisted_json["cross_event_id"] == event["event_id"]
+    assert persisted_json["cross_event_direction"] == "BULLISH"
+    di_plus, di_minus, adx, _ = ggpbot.get_di_components(frame)
+    assert persisted_json["adx_di"]["adx"] == pytest.approx(adx)
+    assert persisted_json["adx_di"]["di_plus"] == pytest.approx(di_plus)
+    assert persisted_json["adx_di"]["di_minus"] == pytest.approx(di_minus)
+    assert ggpbot.STATE["entry_context_snapshot"]["cross_event_id"] == event["event_id"]
+
+    # 4. The immutable snapshot classifies one profit mode and the same
+    #    TradeManagementBoard owns TP1, protection and trail decisions.
+    mode, _, evidence = classify_profit_mode({
+        "side": "BUY", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
+        "adx": 28.0, "adx_slope": 1.0, "continuation_probability": 0.82,
+        "di_plus": 32.0, "di_minus": 10.0, "volume_ratio": 1.15,
+        "entry_context": ggpbot.STATE["entry_context_snapshot"],
+    })
+    assert mode == TREND_MODE
+    assert "entry_confirmed_directional_cross" in evidence
+
+    board = ggpbot.TradeManagementBoard()
+    board_ctx = {
+        "symbol": CANONICAL, "side": "BUY", "entry": price,
+        "current_price": tp1 + 0.01, "atr": 0.69, "initial_qty": 1.0,
+        "remaining_qty": 1.0, "profit_mode": mode,
+        "entry_context": ggpbot.STATE["entry_context_snapshot"],
+        "indicator_decisions_allowed": False, "synthetic_sl": 0.0,
+        "trail_stop": 0.0, "trail_active": False, "tp1_hit": False,
+        "tp1_price": tp1, "tp2_price": tp2,
+    }
+    decision = board.evaluate(board_ctx)
+    assert decision.action == TradeDecisionType.PARTIAL_CLOSE
+    assert decision.params["ratio"] == pytest.approx(0.5)
+    assert board._decision_history[-1]["entry_cross_event_id"] == event["event_id"]
