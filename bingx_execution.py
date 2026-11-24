@@ -15,6 +15,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from ggp_position_sizing import extract_leverage_value
+from bingx_protection import normalize_exchange_symbol
 
 
 @dataclass(frozen=True)
@@ -285,11 +286,15 @@ class TradeExecutionService:
         fetch = getattr(self.exchange, "fetch_positions", None)
         if not callable(fetch):
             return None
+        normalized = normalize_exchange_symbol(symbol)
+        if not normalized:
+            # An empty base asset (for example ':USDT') is never sent to BingX.
+            return None
         try:
-            rows = fetch([symbol])
+            rows = self.api_call(fetch, [normalized])
         except TypeError:
             try:
-                rows = fetch([symbol], {})
+                rows = self.api_call(fetch, [normalized], {})
             except Exception:
                 return None
         except Exception:
@@ -895,9 +900,13 @@ class TradeExecutionService:
             return False, "precheck_invalid_quantity"
         if new_trigger_price <= 0:
             return False, "precheck_invalid_new_trigger_price"
-        # Position identity must be provable from the exchange.
+        normalized = normalize_exchange_symbol(symbol)
+        if not normalized:
+            return False, "precheck_invalid_symbol"
+        # Position identity must be provable from the exchange through the same
+        # central governor used by every other protective read.
         try:
-            rows = self.exchange.fetch_positions([symbol])
+            rows = self.api_call(self.exchange.fetch_positions, [normalized])
         except Exception as exc:
             return False, f"precheck_position_read_failed:{type(exc).__name__}"
         if not isinstance(rows, list):

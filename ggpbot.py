@@ -358,8 +358,26 @@ class TradeStateMachine:
         self.current_state = "RANGE_CHOP"
         self.last_state_change = 0
         self.state_confidence = 0.0
+        self.last_transition_reason = ""
+        self._update_lock = threading.RLock()
 
-    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None) -> str:
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None,
+               *, source: str = "UNSPECIFIED", symbol: str = "", candle_ts=None,
+               snapshot: dict = None) -> str:
+        """Advance one state machine instance with an attributed transition log.
+
+        The transition rules are unchanged. The lock and attribution prevent
+        concurrent watchlist/live updates from being logged as one unexplained
+        authoritative state change.
+        """
+        with self._update_lock:
+            return self._update_locked(
+                smart, momentum, adx, regime, side=side, source=source,
+                symbol=symbol, candle_ts=candle_ts, snapshot=snapshot)
+
+    def _update_locked(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None,
+                       *, source: str = "UNSPECIFIED", symbol: str = "", candle_ts=None,
+                       snapshot: dict = None) -> str:
         banker = smart.get("banker_pressure", 50)
         retail = smart.get("retailer_pressure", 50)
         dist_risk = smart.get("distribution_risk", 0)
@@ -413,9 +431,22 @@ class TradeStateMachine:
             new_state = self.current_state
 
         if new_state != self.current_state:
+            previous_state = self.current_state
             self.last_state_change = time.time()
             self.state_confidence = 0.5
-            log_execution(f"[STATE] {self.current_state} -> {new_state}", "INFO")
+            self.last_transition_reason = new_state
+            detail = snapshot if isinstance(snapshot, dict) else {
+                "adx": round(float(adx or 0), 2), "regime": regime,
+                "continuation_strength": round(float(cont_strength or 0), 2),
+                "momentum_decay": bool(decay), "distribution_risk": round(float(dist_risk or 0), 2),
+                "smart_opposed": bool(smart_opposed), "side": direction or "NONE",
+            }
+            log_execution(
+                f"[STATE] source={source} symbol={symbol or 'PORTFOLIO'} "
+                f"candle_ts={candle_ts if candle_ts is not None else '-'} "
+                f"{previous_state} -> {new_state} reason={new_state} detail={detail}",
+                "INFO", debounce_key=f"state_transition:{source}:{symbol}:{previous_state}:{new_state}",
+                debounce_sec=1)
         else:
             self.state_confidence = min(1.0, self.state_confidence + 0.05)
 
@@ -824,7 +855,7 @@ PAPER_MODE, MODE_LIVE, _MODE_REASON = resolve_trading_mode(os.environ)
 LIVE_REQUESTED = not PAPER_MODE
 print(f"[MODE] {'LIVE' if MODE_LIVE else 'PAPER'} | {_MODE_REASON}")
 
-DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
+DEFAULT_SYMBOL = (os.getenv("SYMBOL", "BTC/USDT") or "").strip() or "BTC/USDT"
 INTERVAL = os.getenv("INTERVAL", "15m")
 try:
     LEVERAGE = int(os.getenv("LEVERAGE", "20"))
@@ -897,9 +928,27 @@ ex = ccxt.bingx({
 })
 
 def normalize_symbol(symbol):
-    if not symbol.endswith(":USDT"):
-        return f"{symbol}:USDT"
-    return symbol
+    """Normalize to one USDT-margined swap symbol; invalid inputs return ''."""
+    from bingx_protection import normalize_exchange_symbol
+    return normalize_exchange_symbol(symbol)
+
+
+def resolve_position_symbol(symbol, exchange=None):
+    """Validate symbol metadata before any position read.
+
+    Returns ``(symbol, reason, diagnostics)``. An invalid or unconfirmed symbol
+    must stop the caller before ``fetch_positions`` is invoked.
+    """
+    from bingx_protection import validate_exchange_symbol
+    target = exchange if exchange is not None else globals().get("ex")
+    resolved, reason, diagnostics = validate_exchange_symbol(target, symbol)
+    if not resolved:
+        log_execution(
+            f"[SYMBOL_GUARD] {reason}: original={diagnostics.get('original_symbol')!r} "
+            f"final={diagnostics.get('normalized_symbol')!r} source={diagnostics.get('source')} "
+            f"market_type={diagnostics.get('market_type')}",
+            "ERROR", debounce_key=f"symbol_guard_{reason}", debounce_sec=30)
+    return resolved, reason, diagnostics
 
 def set_leverage(symbol, leverage, position_side=None):
     """Set and read back exactly 20x using the exchange's actual position mode."""
@@ -1205,10 +1254,14 @@ def get_orderbook_cached(symbol, limit=20):
 
 # ========== EXCHANGE POSITION SYNC ==========
 def fetch_position(symbol):
+    global LAST_POSITION_FETCH_STATUS
     if PAPER_MODE:
         return None
     try:
-        sym = normalize_symbol(symbol)
+        sym, reason, _diagnostics = resolve_position_symbol(symbol)
+        if not sym:
+            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+            return None
         if hasattr(ex, 'fetch_positions'):
             positions = safe_api_call(ex.fetch_positions, [sym])
         elif hasattr(ex, 'fetch_open_positions'):
@@ -1219,7 +1272,7 @@ def fetch_position(symbol):
             return None
         for pos in positions:
             pos_sym = pos.get('symbol', '')
-            if normalize_symbol(symbol) in pos_sym and float(pos.get('contracts', 0)) > 0:
+            if sym in pos_sym and float(pos.get('contracts', 0)) > 0:
                 return pos
         return None
     except Exception as e:
@@ -2468,8 +2521,10 @@ class InstitutionalTradeBrain:
         self.last_update = 0
         self.current_trade_state = "RANGE_CHOP"
 
-    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None):
-        self.current_trade_state = self.state_machine.update(smart, momentum, adx, regime, side=side)
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None,
+               **attribution):
+        self.current_trade_state = self.state_machine.update(
+            smart, momentum, adx, regime, side=side, **attribution)
         self.last_update = time.time()
         return self.current_trade_state
 
@@ -3844,7 +3899,20 @@ class LiveTradeManager:
                 }
 
             regime = self.regime_classifier.classify(df_live, ob)
-            trade_state = self.brain.update(smart_money, momentum, adx_now, regime, side=side)
+            state_candle_ts = safe_float(STATE.get("last_trade_state_candle_ts"), 0.0)
+            current_candle_ts = safe_float(closed_candle_ts, 0.0)
+            # The authoritative state machine advances once per closed candle,
+            # matching watchlist machines. This prevents repeated intra-candle
+            # RANGE_CHOP -> defensive chatter without changing any thresholds.
+            advance_state = (not current_candle_ts or current_candle_ts != state_candle_ts)
+            if advance_state:
+                trade_state = self.brain.update(
+                    smart_money, momentum, adx_now, regime, side=side,
+                    source="LIVE_TRADE_MANAGER", symbol=STATE.get("current_symbol") or symbol,
+                    candle_ts=current_candle_ts or None)
+                STATE["last_trade_state_candle_ts"] = current_candle_ts
+            else:
+                trade_state = self.brain.current_trade_state
             STATE["trade_state"] = trade_state
             _liq_snapshot = STATE.get("management_liquidity") or {}
             _trade_class, _trade_class_reasons = classify_dynamic_trade_classification(
@@ -4743,6 +4811,12 @@ class ExchangeReconciliationSupervisor:
             if watchdog is not None:
                 watchdog.beat("exchange_reconciliation", cycle=self.cycle_count)
             try:
+                # A close is already doing its own strictly verified exchange
+                # reconciliation. A periodic supervisor must not concurrently
+                # reinterpret a transient in-flight close as an external FLAT.
+                if globals().get("_CLOSE_ORDER_LOCK") is not None and _CLOSE_ORDER_LOCK.locked():
+                    self.last_result = "SKIPPED_CLOSE_IN_PROGRESS"
+                    continue
                 if not STATE.get("open"):
                     self.last_result = "FLAT"
                     continue
@@ -5979,7 +6053,11 @@ def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
     DASHBOARD_STATE["logs"].append(entry)
     if len(DASHBOARD_STATE["logs"]) > 200:
         DASHBOARD_STATE["logs"].pop(0)
-    print(colored)
+    try:
+        print(colored)
+    except UnicodeError:
+        # A console encoding failure must never abort a close/recovery path.
+        print(str(msg).encode("ascii", "backslashreplace").decode("ascii"))
     runtime_logger = _get_runtime_logger()
     if runtime_logger:
         try:
@@ -7148,18 +7226,30 @@ def _get_scanner_frame(symbol, limit=150):
     return frame
 
 def get_usdt_perp_symbols():
+    """Load and validate the USDT swap universe through the central governor."""
     try:
-        ex.load_markets()
-        markets = ex.markets
+        safe_api_call(ex.load_markets)
+        markets = getattr(ex, "markets", None) or {}
         symbols = []
-        for s in markets:
-            if "USDT" in s and markets[s].get('swap') and markets[s].get('active'):
-                clean = s.replace(":USDT", "")
-                symbols.append(clean)
-        return symbols[:200]
-    except Exception as e:
-        log_execution(f"Failed to load markets: {e}", "ERROR")
-        return [DEFAULT_SYMBOL]
+        for market_symbol, meta in markets.items():
+            meta = meta if isinstance(meta, dict) else {}
+            if not (meta.get('swap') and meta.get('active', True)):
+                continue
+            normalized = normalize_symbol(market_symbol)
+            if normalized and ("USDT" in str(market_symbol).upper()):
+                symbols.append(normalized)
+        MEMORY["market_universe"] = {
+            "state": "READY" if symbols else "BLOCKED",
+            "reason": "" if symbols else "NO_ACTIVE_USDT_SWAPS",
+            "count": len(symbols),
+        }
+        return symbols[:SCANNER_UNIVERSE_MAX]
+    except Exception as exc:
+        reason = f"MARKET_UNIVERSE_UNKNOWN:{type(exc).__name__}"
+        MEMORY["market_universe"] = {"state": "BLOCKED", "reason": reason, "count": 0}
+        log_execution(f"[MARKET_UNIVERSE] {reason}: {str(exc)[:180]}", "ERROR",
+                      debounce_key="market_universe_failed", debounce_sec=30)
+        return []
 
 def rf_proximity_score(rf, adx_val, vol_ok, rsi_val, atr_pct):
     dist = abs(rf["distance"]) if rf["distance"] else 1.0
@@ -10836,27 +10926,44 @@ SNIPER_MODE = True
 CANDIDATE_SCAN_INTERVAL = 15
 
 def sync_position_with_exchange(symbol):
+    """Return a position only when the exchange confirms it; preserve UNKNOWN."""
+    global LAST_POSITION_FETCH_STATUS
     try:
-        if hasattr(ex, 'fetch_positions'):
-            positions = safe_api_call(ex.fetch_positions, [normalize_symbol(symbol)])
-        elif hasattr(ex, 'fetch_open_positions'):
-            positions = safe_api_call(ex.fetch_open_positions, [normalize_symbol(symbol)])
-        else:
+        sym, reason, _diagnostics = resolve_position_symbol(symbol)
+        if not sym:
+            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return None
-        if not positions:
+        fetch = getattr(ex, 'fetch_positions', None)
+        if not callable(fetch):
+            fetch = getattr(ex, 'fetch_open_positions', None)
+        if not callable(fetch):
+            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+            return None
+        positions = safe_api_call(fetch, [sym])
+        if positions is None or not isinstance(positions, (list, tuple)):
+            LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return None
         for pos in positions:
-            pos_sym = pos.get('symbol', pos.get('info', {}).get('symbol', ''))
-            if normalize_symbol(symbol) in pos_sym and float(pos.get('contracts', 0)) > 0:
+            if not isinstance(pos, dict):
+                continue
+            info = pos.get('info') if isinstance(pos.get('info'), dict) else {}
+            pos_sym = str(pos.get('symbol') or info.get('symbol') or '')
+            if sym in pos_sym and float(pos.get('contracts', 0) or 0) > 0:
+                LAST_POSITION_FETCH_STATUS = "OPEN"
                 return pos
+        LAST_POSITION_FETCH_STATUS = "FLAT"
         return None
     except Exception as e:
+        LAST_POSITION_FETCH_STATUS = "UNKNOWN"
         log_execution(f"[SYNC] error: {e}", "ERROR")
         return None
 
 def get_realized_pnl(symbol, limit=100):
     try:
-        trades = safe_api_call(ex.fetch_my_trades, normalize_symbol(symbol), limit=limit)
+        sym, reason, _diagnostics = resolve_position_symbol(symbol)
+        if not sym:
+            return 0.0, 0.0
+        trades = safe_api_call(ex.fetch_my_trades, sym, limit=limit)
         if not trades:
             return 0.0, 0.0
         buy_value = 0.0
@@ -10880,31 +10987,47 @@ def get_realized_pnl(symbol, limit=100):
 
 def validate_position_state(local_pos, symbol):
     real_pos = sync_position_with_exchange(symbol)
-    if real_pos is None:
+    if LAST_POSITION_FETCH_STATUS == "UNKNOWN":
+        return None
+    if LAST_POSITION_FETCH_STATUS == "FLAT" or real_pos is None:
         return None
     return local_pos
 
 def sync_all_states():
+    """Sync local exposure without ever turning an API failure into FLAT."""
+    global RECOVERY_BLOCK_ENTRIES
     if PAPER_MODE:
         MEMORY["position_status"] = "OPEN" if STATE.get("open") else "CLOSED"
         MEMORY["total_pnl"] = PERF.get("total_pnl_usdt", 0.0)
         MEMORY["total_pnl_pct"] = PERF.get("total_pnl_pct", 0.0) * 100
         return
     symbol = STATE.get("current_symbol") if STATE.get("open") else (TRADE_STATE.get("symbol") if TRADE_STATE.get("in_position") else None)
+    target = symbol or DEFAULT_SYMBOL
+    real_pos = sync_position_with_exchange(target)
+    if LAST_POSITION_FETCH_STATUS == "UNKNOWN":
+        # An API failure is UNKNOWN, never a confirmed close. Keep entries and
+        # discovery blocked while open exposure remains under Recovery Hold.
+        MEMORY["position_status"] = "UNKNOWN"
+        MEMORY["recovery_status"] = "EXCHANGE_SYNC_UNKNOWN"
+        MEMORY["current_position"] = None
+        RECOVERY_BLOCK_ENTRIES = True
+        if STATE.get("open") or TRADE_STATE.get("in_position"):
+            STATE["recovery_hold"] = True
+            STATE["recovery_reason"] = "exchange_sync_unknown"
+        return
     if not symbol:
-        real_pos = sync_position_with_exchange(DEFAULT_SYMBOL)
         if real_pos is None:
             MEMORY["position_status"] = "CLOSED"
             MEMORY["current_position"] = None
         else:
             MEMORY["position_status"] = "OPEN"
             MEMORY["current_position"] = real_pos
+            RECOVERY_BLOCK_ENTRIES = True
         real_pnl, real_pnl_pct = get_realized_pnl(DEFAULT_SYMBOL)
         MEMORY["total_pnl"] = real_pnl
         MEMORY["total_pnl_pct"] = real_pnl_pct
         return
-    valid = validate_position_state(STATE, symbol)
-    if valid is None:
+    if real_pos is None:
         log_execution(f"[SYNC] Position on {symbol} closed externally – cleaning local state.", "WARN")
         with _TRADE_LOCK:
             STATE["open"] = False
@@ -10916,7 +11039,7 @@ def sync_all_states():
         MEMORY["tp"] = None
     else:
         MEMORY["position_status"] = "OPEN"
-        MEMORY["current_position"] = valid
+        MEMORY["current_position"] = real_pos
     real_pnl, real_pnl_pct = get_realized_pnl(symbol)
     MEMORY["total_pnl"] = real_pnl
     MEMORY["total_pnl_pct"] = real_pnl_pct
@@ -10930,23 +11053,33 @@ def main_loop_sniper():
     last_candidate_scan = 0
     last_flow_update = 0
     try:
-        ex.load_markets()
-        log_execution(f"Markets loaded", "INFO")
+        safe_api_call(ex.load_markets)
+        log_execution("Markets loaded", "INFO")
     except Exception as e:
+        # No market metadata means no validated symbol universe; do not allow
+        # discovery or entries to proceed on a stale/empty market list.
+        globals()["RECOVERY_BLOCK_ENTRIES"] = True
         log_execution(f"Failed to load markets: {e}", "ERROR")
     tg_start(get_balance_safe(), "LIVE" if MODE_LIVE else "PAPER")
-    if dispatch_scanner_task("global_discovery", run_global_discovery_scanner):
+    if dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat):
         last_scan = time.time()
         log_execution("[SCANNER_1] Initial bounded global discovery dispatched", "INFO")
-    updater_thread = threading.Thread(target=live_institutional_updater, daemon=True, name="live_institutional_updater")
-    updater_thread.start()
+    else:
+        log_execution("[SCANNER_1] Initial discovery dispatch refused; next due unchanged", "WARN")
+    try:
+        updater_thread = threading.Thread(target=live_institutional_updater, daemon=True,
+                                          name="live_institutional_updater")
+        updater_thread.start()
+    except Exception as exc:
+        log_execution(f"[THREAD_START] live_institutional_updater failed: {type(exc).__name__}: {exc}",
+                      "ERROR")
     while True:
         try:
             now = time.time()
-            watchdog = globals().get("NAISO_WATCHDOG")
-            if watchdog is not None:
-                watchdog.beat("main_loop", recovery_hold=bool(STATE.get("recovery_hold")))
+            _main_loop_progress("iteration_start",
+                                recovery_hold=bool(STATE.get("recovery_hold")))
             sync_all_states()
+            _main_loop_progress("exchange_sync_complete")
             cooldown_active_now = daily_loss_cooldown_active()
             if cooldown_active_now and not (STATE.get("open") or TRADE_STATE.get("in_position")):
                 # Keep the normal bounded TTL/resource cleanup alive while entry scanning is paused.
@@ -10964,21 +11097,18 @@ def main_loop_sniper():
                 if STATE.get("open"):
                     continue
             if TRADE_STATE["in_position"] or STATE["open"]:
-                if STATE.get("recovery_hold"):
-                    recovery_reason = str(STATE.get("recovery_reason") or MEMORY.get("recovery_status") or "management_state_incomplete")
-                    log_execution(f"[RECOVERY_HOLD] {recovery_reason} | exposure tracked; retrying journal/exchange reconciliation; no new entries or fabricated TP/SL actions", "ERROR",
-                                  debounce_key=f"recovery_hold_active:{recovery_reason}", debounce_sec=60)
-                    hourly_cleanup()
+                if not _main_loop_manage_open_position():
                     time.sleep(BASE_SLEEP)
                     continue
-                _live_manager.manage_live_trade()
             else:
                 if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
                     time.sleep(1)
                     continue
                 if now - last_scan >= GLOBAL_SCAN_INTERVAL:
-                    dispatch_scanner_task("global_discovery", run_global_discovery_scanner)
-                    last_scan = now
+                    if dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat):
+                        last_scan = now
+                    else:
+                        _main_loop_progress("discovery_dispatch_deferred", reason="CYCLE_ACTIVE")
                 # Scanner 2 is the rotating institutional/proximity Watchlist pass.
                 # smart_opportunity_selection() refreshes it at the configured batch interval,
                 # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
@@ -11007,14 +11137,50 @@ def main_loop_sniper():
             # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
             # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
             daily_loss_cooldown_active()
+            _main_loop_progress("snapshot")
             print_snapshot()
+            _main_loop_progress("cleanup")
             hourly_cleanup()
+            _main_loop_progress("iteration_complete")
             time.sleep(BASE_SLEEP)
         except Exception as e:
             log_execution(f"Main loop error: {traceback.format_exc()}", "ERROR")
             time.sleep(BASE_SLEEP)
 
 main_loop = main_loop_sniper
+
+
+_MAIN_LOOP_PROGRESS_SEQ = 0
+
+
+def _main_loop_progress(phase, **details):
+    """Report a real loop phase, not an artificial keepalive."""
+    global _MAIN_LOOP_PROGRESS_SEQ
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        return
+    _MAIN_LOOP_PROGRESS_SEQ += 1
+    payload = {"state": "RUNNING", "phase": phase, "progress_seq": _MAIN_LOOP_PROGRESS_SEQ}
+    payload.update(details)
+    watchdog.beat("main_loop", **payload)
+
+
+def _main_loop_manage_open_position():
+    """Open-trade management step; deliberately independent of discovery."""
+    if STATE.get("recovery_hold"):
+        reason = str(STATE.get("recovery_reason") or MEMORY.get("recovery_status")
+                     or "management_state_incomplete")
+        log_execution(
+            f"[RECOVERY_HOLD] {reason} | exposure tracked; retrying journal/exchange reconciliation; "
+            "no new entries or fabricated TP/SL actions",
+            "ERROR", debounce_key=f"recovery_hold_active:{reason}", debounce_sec=60)
+        hourly_cleanup()
+        _main_loop_progress("recovery_hold_sleep")
+        return False
+    _main_loop_progress("open_trade_management")
+    _live_manager.manage_live_trade()
+    _main_loop_progress("open_trade_management_complete")
+    return True
 
 
 _ENGINE_RECOVERY_GUARD = {"ts": 0.0, "symbol": None}
@@ -11059,24 +11225,32 @@ def _verify_engine_recovery(symbol=None):
     returns UNKNOWN-like failure, sets the recovery hold for an open exposure and
     never authorizes management or scanner work.
     """
-    sym = normalize_symbol(symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or "")
+    raw_symbol = symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or ""
+    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
     local_open = bool(STATE.get("open") or TRADE_STATE.get("in_position"))
     expected_side = str(STATE.get("side") or TRADE_STATE.get("side") or "").upper()
     expected_qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty")
                               or TRADE_STATE.get("qty"), 0.0)
     context = {
-        "symbol": sym, "local_open": local_open, "open_position_verified": False,
+        "symbol": sym or normalize_symbol(raw_symbol) or str(raw_symbol)[:80],
+        "local_open": local_open, "open_position_verified": False,
         "flat_verified": False, "orders_verified": False, "stop_verified": False,
-        "paper_mode": bool(PAPER_MODE),
+        "paper_mode": bool(PAPER_MODE), "symbol_diagnostics": symbol_diagnostics,
     }
     if PAPER_MODE:
         context.update({"open_position_verified": local_open, "flat_verified": not local_open,
                         "paper_only": True})
         return True, "PAPER_MODE_RECOVERY", context
-    if not sym or (local_open and (expected_side not in {"BUY", "SELL"} or expected_qty <= 0)):
+    if not sym:
+        reason = f"engine_recovery_{symbol_reason.lower()}"
+        if local_open:
+            _recovery_hold(reason, symbol=context["symbol"], trade_id=STATE.get("trade_id"),
+                           details={"symbol_diagnostics": symbol_diagnostics})
+        return False, reason, context
+    if local_open and (expected_side not in {"BUY", "SELL"} or expected_qty <= 0):
         reason = "engine_recovery_local_state_incomplete"
         if local_open:
-            _recovery_hold(reason, symbol=sym or "UNKNOWN", trade_id=STATE.get("trade_id"))
+            _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"))
         return False, reason, context
     try:
         positions = safe_api_call(ex.fetch_positions, [sym])
@@ -11149,35 +11323,117 @@ def _verify_engine_recovery(symbol=None):
     return True, "OPEN_POSITION_VERIFIED", context
 
 
+def _scanner_recovery_hard_blocked():
+    """Entry/recovery gates that no exchange read may override."""
+    if STATE.get("recovery_hold") or STATE.get("execution_unresolved"):
+        return "RECOVERY_HOLD"
+    if globals().get("RECOVERY_BLOCK_ENTRIES"):
+        return "RECOVERY_BLOCK_ENTRIES"
+    return ""
+
+
+def _scanner_recovery_blocked(context=None):
+    """Return a reason when exchange state is unresolved or an entry is blocked.
+
+    A stale initial UNKNOWN is not proof of a failed sync when the caller has a
+    fresh exchange-verified FLAT context. A real UNKNOWN read or a failed sync
+    still blocks; neither is ever treated as flat.
+    """
+    hard_block = _scanner_recovery_hard_blocked()
+    if hard_block:
+        return hard_block
+    fresh_flat = bool(isinstance(context, dict) and (
+        context.get("flat_verified") or
+        (context.get("paper_mode") and context.get("paper_only"))))
+    if fresh_flat:
+        return ""
+    if LAST_POSITION_FETCH_STATUS == "UNKNOWN":
+        return "POSITION_SYNC_UNKNOWN"
+    if str(MEMORY.get("position_status", "")).startswith("UNKNOWN"):
+        return "EXCHANGE_STATE_UNKNOWN"
+    return ""
+
+
+def _verify_scanner_recovery():
+    """Scanner recovery is flat-only, single-flight and exchange-verified."""
+    if _scanner_cycle_active("global_discovery"):
+        return False, "SCANNER_CYCLE_ACTIVE", {"scanner_running": True}
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return False, "OPEN_POSITION_SCANNER_PAUSED", {"open_position_verified": True}
+    hard_block = _scanner_recovery_hard_blocked()
+    if hard_block:
+        return False, hard_block, {}
+    verified, reason, context = _verify_engine_recovery()
+    if not verified or not context.get("flat_verified"):
+        return False, f"SCANNER_VERIFY_{reason}", context
+    blocked = _scanner_recovery_blocked(context)
+    if blocked:
+        return False, blocked, context
+    return True, "SCANNER_FLAT_VERIFIED", context
+
+
 def _resume_scanner_after_flat_verification(context=None):
     """Scanner restart is a separate flat-only path; it never manages a trade."""
     context = dict(context or {})
+    if _scanner_cycle_active("global_discovery"):
+        return False
     if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return False
+    if _scanner_recovery_blocked(context):
         return False
     if not (context.get("flat_verified") or (context.get("paper_mode") and context.get("paper_only"))):
         return False
-    return bool(dispatch_scanner_task("global_discovery", run_global_discovery_scanner))
+    return bool(dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat))
+
+
+def _wait_for_main_loop_progress(baseline, timeout_sec=2.0):
+    """Prove the foreground loop advanced before claiming it was restarted."""
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        # Direct/diagnostic calls are not watchdog-driven recovery; there is no
+        # liveness claim to validate in that context.
+        return True
+    component = getattr(watchdog, "_components", {}).get("main_loop")
+    if component is None or not getattr(component, "resume_requires_liveness", False):
+        # A watchdog without a liveness-gated main_loop registration is not
+        # claiming to have restarted the foreground loop.
+        return True
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while time.monotonic() < deadline:
+        if int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0)) > int(baseline):
+            return True
+        time.sleep(0.05)
+    return int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0)) > int(baseline)
 
 
 def _resume_main_loop_after_verification(context=None):
     """Resume verified open-trade management without opening a new trade."""
-    context = dict(context or {})
+    # Mutate the caller's verification context when possible: the watchdog reads
+    # liveness proof from the same dict after this callback returns.
+    context = context if isinstance(context, dict) else {}
     open_verified = bool(context.get("open_position_verified") or
                          (context.get("paper_mode") and context.get("paper_only")
                           and context.get("open_position")))
     if open_verified:
+        progress_baseline = int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0))
         symbol = str(context.get("symbol") or STATE.get("current_symbol") or "")
         now = time.time()
         with _ENGINE_RECOVERY_LOCK:
             recent = (symbol and _ENGINE_RECOVERY_GUARD["symbol"] == symbol and
                       now - float(_ENGINE_RECOVERY_GUARD["ts"]) < 60.0)
         if recent:
-            return not bool(STATE.get("recovery_hold"))
-        if not startup_trade_recovery():
-            return False
-        with _ENGINE_RECOVERY_LOCK:
-            _ENGINE_RECOVERY_GUARD.update({"ts": time.time(), "symbol": symbol})
-        return not bool(STATE.get("recovery_hold"))
+            resumed = not bool(STATE.get("recovery_hold"))
+        else:
+            if not startup_trade_recovery():
+                context["engine_resumed"] = False
+                return False
+            with _ENGINE_RECOVERY_LOCK:
+                _ENGINE_RECOVERY_GUARD.update({"ts": time.time(), "symbol": symbol})
+            resumed = not bool(STATE.get("recovery_hold"))
+        # Exchange verification alone does not prove the foreground loop is alive.
+        context["engine_resumed"] = bool(
+            resumed and _wait_for_main_loop_progress(progress_baseline))
+        return bool(context["engine_resumed"])
     return _resume_scanner_after_flat_verification(context)
 
 
@@ -11215,7 +11471,13 @@ def start_naiso_services():
     watchdog.register("main_loop", interval_sec=max(5.0, safe_float(BASE_SLEEP, 5.0)),
                       grace_sec=60.0, critical=True, restartable=True,
                       recovery_verifier=_verify_engine_recovery,
-                      restart_fn=_resume_main_loop_after_verification)
+                      restart_fn=_resume_main_loop_after_verification,
+                      lifecycle="BLOCKED", resume_requires_liveness=True)
+    # Startup exchange recovery runs before the first loop iteration. Classify it
+    # as a bounded startup phase instead of letting the watchdog call it a stall.
+    watchdog.beat("main_loop", state="BLOCKED", phase="startup_recovery",
+                  reason="STARTUP_RECOVERY",
+                  blocked_until=watchdog.monotonic() + 300.0)
     watchdog.register("exchange_reconciliation", interval_sec=15.0, grace_sec=60.0,
                       critical=True, restartable=True,
                       recovery_verifier=_non_trading_engine_verifier,
@@ -11229,7 +11491,11 @@ def start_naiso_services():
                       critical=False, restartable=True,
                       recovery_verifier=_non_trading_engine_verifier,
                       restart_fn=_resume_keep_alive_after_verification)
-    watchdog.start()
+    try:
+        watchdog.start()
+    except Exception as exc:
+        log_execution(f"[THREAD_START] NAISO watchdog failed: {type(exc).__name__}: {exc}", "ERROR")
+        return False
     log_execution("[NAISO_WATCHDOG] health monitoring started for core engines", "INFO")
     return True
 
@@ -11251,10 +11517,14 @@ def safe_main_loop():
         watchdog = globals().get("NAISO_WATCHDOG")
         if watchdog is not None:
             try:
-                watchdog.beat("main_loop", last_restart_reason=reason[:100])
+                watchdog.beat("main_loop", phase="supervisor_backoff",
+                              last_restart_reason=reason[:100])
             except Exception:
                 pass
-        delay = min(60.0, 5.0 * (2 ** min(consecutive_failures - 1, 4)))
+        # Keep the bounded backoff strictly below the watchdog grace window.
+        # A 60s cap plus jitter previously produced 66s silent gaps that were
+        # indistinguishable from a real main_loop stall.
+        delay = min(45.0, 5.0 * (2 ** min(consecutive_failures - 1, 4)))
         delay *= 1.0 + random.uniform(-0.10, 0.10)
         _NAISO_LOOP_RESTARTS.append({
             "ts": time.time(), "reason": reason, "backoff_sec": round(delay, 3),
@@ -11588,7 +11858,8 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
         if advance_state:
             state_machine.update(
                 smart, momentum, float(adx_state.get("value", 0) or 0),
-                str(analysis.get("market_regime", "UNKNOWN")), side=side
+                str(analysis.get("market_regime", "UNKNOWN")), side=side,
+                source="WATCHLIST_DISCOVERY", symbol=symbol_key, candle_ts=candle_ts
             )
             engine_last[symbol_key] = candle_ts
         result["trade_state"] = state_machine.current_state
@@ -11927,47 +12198,160 @@ def smart_opportunity_selection():
 unified_institutional_watchlist = refresh_unified_institutional_watchlist
 
 # Scanner workers are bounded by name: at most one execution of each scanner can run at a time.
+# They are scheduled workers (not continuous engines): IDLE is a real state with
+# an explicit next_due deadline, and RUNNING requires real progress beats.
 _SCANNER_TASKS_LOCK = threading.RLock()
 _SCANNER_TASK_LOCKS = {}
 _SCANNER_TASK_STATUS = {}
+_SCANNER_TASK_THREADS = {}
+_SCANNER_TASK_CYCLES = {}
+
+
+def _scanner_progress(name, phase, **extra):
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        return
+    details = {
+        "phase": phase,
+        "cycle_id": _SCANNER_TASK_CYCLES.get(name, 0),
+        "thread_name": f"ggp_{name}",
+    }
+    details.update(extra)
+    watchdog.beat(f"scanner:{name}", state="RUNNING", **details)
+
+
+def _scanner_cycle_active(name):
+    thread = _SCANNER_TASK_THREADS.get(name)
+    return bool(thread is not None and thread.is_alive())
+
+
+def _finish_scanner_task(name, state, *, reason="", error=None):
+    final_state = state if state in {"IDLE", "BLOCKED", "FAILED"} else "FAILED"
+    now = time.time()
+    previous = _SCANNER_TASK_STATUS.get(name) or {}
+    status = {
+        "state": final_state,
+        "cycle_id": previous.get("cycle_id", 0),
+        "last_attempt": previous.get("last_attempt", now),
+        "last_success": previous.get("last_success"),
+        "last_completed": now,
+        "next_due": None,
+        "reason": str(reason)[:160],
+        "last_error": str(error)[:240] if error else None,
+    }
+    if final_state == "IDLE":
+        status["last_success"] = now
+        status["next_due"] = now + float(GLOBAL_SCAN_INTERVAL)
+    else:
+        status["next_due"] = now + min(60.0, float(GLOBAL_SCAN_INTERVAL))
+    _SCANNER_TASK_STATUS[name] = status
+    MEMORY.setdefault("scanner_tasks", {})[name] = dict(status)
+
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        return
+    details = {"reason": status["reason"],
+               "phase": "cycle_complete" if final_state == "IDLE" else final_state}
+    if final_state == "IDLE":
+        details["idle_until"] = watchdog.monotonic() + float(GLOBAL_SCAN_INTERVAL)
+    elif final_state == "BLOCKED":
+        details["blocked_until"] = watchdog.monotonic() + min(60.0, float(GLOBAL_SCAN_INTERVAL))
+    watchdog.beat(f"scanner:{name}", state=final_state, **details)
+
 
 def dispatch_scanner_task(name, function, *args, **kwargs):
     with _SCANNER_TASKS_LOCK:
         lock = _SCANNER_TASK_LOCKS.setdefault(name, threading.Lock())
         if not lock.acquire(blocking=False):
             return False
-        _SCANNER_TASK_STATUS[name] = {"state": "RUNNING", "started_at": time.time(), "last_error": None}
+        previous = _SCANNER_TASK_STATUS.get(name) or {}
+        cycle_id = int(previous.get("cycle_id", 0)) + 1
+        _SCANNER_TASK_CYCLES[name] = cycle_id
+        now = time.time()
+        _SCANNER_TASK_STATUS[name] = {
+            "state": "RUNNING", "cycle_id": cycle_id, "last_attempt": now,
+            "last_success": previous.get("last_success"), "next_due": None,
+            "started_at": now, "last_error": None, "reason": "",
+        }
         MEMORY.setdefault("scanner_tasks", {})[name] = dict(_SCANNER_TASK_STATUS[name])
+
+    def runner():
+        finished = False
+        try:
+            _scanner_progress(name, "started", cycle_id=cycle_id)
+            if STATE.get("open") or TRADE_STATE.get("in_position"):
+                _finish_scanner_task(name, "BLOCKED", reason="OPEN_POSITION")
+                finished = True
+                return
+            function(*args, **kwargs)
+            _finish_scanner_task(name, "IDLE", reason="CYCLE_COMPLETE")
+            finished = True
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            log_execution(f"[SCANNER_TASK] {name} failed: {error}", "ERROR")
+            _finish_scanner_task(name, "FAILED", reason="EXCEPTION", error=error)
+            finished = True
+        finally:
+            if not finished:
+                _finish_scanner_task(name, "FAILED", reason="UNEXPECTED_EXIT",
+                                     error="worker exited without a result")
+            lock.release()
 
     watchdog = globals().get("NAISO_WATCHDOG")
     watchdog_name = f"scanner:{name}"
-    if watchdog is not None:
-        watchdog.register(watchdog_name, interval_sec=60.0, grace_sec=180.0,
-                          critical=False, restartable=False)
+    started = False
+    try:
+        if watchdog is not None:
+            watchdog.register(
+                watchdog_name, interval_sec=float(GLOBAL_SCAN_INTERVAL),
+                grace_sec=max(180.0, float(GLOBAL_SCAN_INTERVAL) * 0.25),
+                critical=False, restartable=True,
+                recovery_verifier=_verify_scanner_recovery,
+                restart_fn=_resume_scanner_after_flat_verification)
+            _scanner_progress(name, "dispatch", cycle_id=cycle_id)
+        thread = threading.Thread(target=runner, daemon=True, name=f"ggp_{name}")
+        _SCANNER_TASK_THREADS[name] = thread
+        thread.start()
+        started = True
+        return True
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {str(exc)[:180]}"
+        _finish_scanner_task(name, "FAILED", reason="START_FAILED", error=error)
+        if not started:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+        log_execution(f"[SCANNER_TASK] {name} could not start: {error}", "ERROR")
+        return False
 
-    def runner():
-        try:
-            if watchdog is not None:
-                watchdog.beat(watchdog_name, state="RUNNING")
-            if STATE.get("open") or TRADE_STATE.get("in_position"):
-                _SCANNER_TASK_STATUS[name] = {"state": "PAUSED_FOR_POSITION", "last_completed": time.time()}
-            else:
-                function(*args, **kwargs)
-                _SCANNER_TASK_STATUS[name] = {"state": "IDLE", "last_completed": time.time(), "last_error": None}
-        except Exception as exc:
-            _SCANNER_TASK_STATUS[name] = {
-                "state": "ERROR", "last_completed": time.time(),
-                "last_error": f"{type(exc).__name__}: {str(exc)[:180]}"
-            }
-            log_execution(f"[SCANNER_TASK] {name} failed: {_SCANNER_TASK_STATUS[name]['last_error']}", "ERROR")
-        finally:
-            if watchdog is not None:
-                watchdog.beat(watchdog_name, state=_SCANNER_TASK_STATUS[name]["state"])
-            MEMORY.setdefault("scanner_tasks", {})[name] = dict(_SCANNER_TASK_STATUS[name])
-            lock.release()
 
-    threading.Thread(target=runner, daemon=True, name=f"ggp_{name}").start()
-    return True
+def _run_global_discovery_scanner_with_heartbeat():
+    """Single-flight scheduled discovery cycle with real in-cycle progress beats.
+
+    A long scan can legitimately run past the watchdog grace window. The
+    heartbeat below reports phase progress from the worker itself; it does not
+    inflate a timeout or pretend an idle worker is running.
+    """
+    stop_heartbeat = threading.Event()
+
+    def _progress_heartbeat():
+        while not stop_heartbeat.wait(30.0):
+            _scanner_progress("global_discovery", "in_cycle", heartbeat=True)
+
+    _scanner_progress("global_discovery", "cycle_enter")
+    heartbeat = threading.Thread(target=_progress_heartbeat, daemon=True,
+                                 name="ggp_global_discovery_heartbeat")
+    try:
+        heartbeat.start()
+    except Exception as exc:
+        stop_heartbeat.set()
+        raise RuntimeError(f"DISCOVERY_HEARTBEAT_START_FAILED:{type(exc).__name__}: {exc}") from exc
+    try:
+        run_global_discovery_scanner()
+    finally:
+        stop_heartbeat.set()
+        heartbeat.join(timeout=1.0)
 
 
 def run_global_discovery_scanner():
@@ -11981,22 +12365,37 @@ def run_global_discovery_scanner():
     meta.update({"state": "RUNNING", "last_started": started, "symbols_scanned": 0,
                  "universe_limit": SCANNER_UNIVERSE_MAX})
     if STATE.get("open") or TRADE_STATE.get("in_position"):
-        meta.update({"state": "PAUSED_FOR_POSITION", "last_completed": time.time()})
+        meta.update({"state": "BLOCKED", "reason": "OPEN_POSITION", "last_completed": time.time()})
+        _scanner_progress("global_discovery", "blocked_open_position", state="BLOCKED",
+                          reason="OPEN_POSITION")
         return
+    blocked = _scanner_recovery_blocked() if "_scanner_recovery_blocked" in globals() else ""
+    if blocked:
+        meta.update({"state": "BLOCKED", "reason": blocked, "last_completed": time.time()})
+        _scanner_progress("global_discovery", "blocked_recovery", state="BLOCKED", reason=blocked)
+        return
+    _scanner_progress("global_discovery", "loading_market_universe")
     symbols = get_usdt_perp_symbols()[:SCANNER_UNIVERSE_MAX]
     with _SCANNER_FRAME_CACHE_LOCK:
         _SCANNER_FRAME_CACHE.clear()
     if not symbols:
-        meta.update({"state": "NO_SYMBOLS", "last_completed": time.time()})
+        meta.update({"state": "BLOCKED", "reason": "NO_SYMBOLS", "last_completed": time.time()})
+        _scanner_progress("global_discovery", "blocked_no_symbols", state="BLOCKED",
+                          reason="NO_SYMBOLS")
         return
 
     # V2 first fetches market data into the bounded per-symbol cache.
+    _scanner_progress("global_discovery", "scanner_v2", symbols=len(symbols))
     run_scanner_v2(symbols=symbols)
     if STATE.get("open") or TRADE_STATE.get("in_position"):
-        meta.update({"state": "YIELDED_TO_POSITION", "last_completed": time.time()})
+        meta.update({"state": "BLOCKED", "reason": "YIELDED_TO_POSITION",
+                     "last_completed": time.time()})
+        _scanner_progress("global_discovery", "yielded_to_position", state="BLOCKED",
+                          reason="YIELDED_TO_POSITION")
         return
 
     timeframe_seconds = _roro_timeframe_seconds(INTERVAL)
+    _scanner_progress("global_discovery", "professional_scan", symbols=len(symbols))
     pro_started = time.time()
     pro_candidates, pro_stats = _professional_lightweight_scan(
         symbols=symbols,
@@ -12022,10 +12421,13 @@ def run_global_discovery_scanner():
         "role": "DISCOVERY_ONLY_BOTH_SIDES_REANALYZED",
     }
     if STATE.get("open") or TRADE_STATE.get("in_position"):
-        meta.update({"state": "YIELDED_TO_POSITION", "last_completed": time.time(),
-                     "professional_candidates": len(pro_candidates)})
+        meta.update({"state": "BLOCKED", "reason": "YIELDED_TO_POSITION",
+                     "last_completed": time.time(), "professional_candidates": len(pro_candidates)})
+        _scanner_progress("global_discovery", "yielded_to_position", state="BLOCKED",
+                          reason="YIELDED_TO_POSITION")
         return
 
+    _scanner_progress("global_discovery", "rf_scan", symbols=len(symbols))
     rf_candidates = scan_market_rf(top_n=40, symbols=symbols)
     MEMORY["rf_watchlist"] = rf_candidates[:30]
     MEMORY["last_scan"] = time.time()
@@ -12148,7 +12550,16 @@ def fetch_position_tri_state(symbol=None):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
         if symbol:
-            result = safe_api_call(ex.fetch_positions, [normalize_symbol(symbol)])
+            resolved, reason, diagnostics = resolve_position_symbol(symbol)
+            if not resolved:
+                LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+                log_execution(
+                    f"[POS_SYNC] tri-state blocked by {reason}: "
+                    f"original={diagnostics.get('original_symbol')!r} "
+                    f"final={diagnostics.get('normalized_symbol')!r}",
+                    "ERROR", debounce_key=f"tri_state_symbol_{reason}", debounce_sec=30)
+                return "UNKNOWN", None
+            result = safe_api_call(ex.fetch_positions, [resolved])
         else:
             result = safe_api_call(ex.fetch_positions)
         if result is None or not isinstance(result, (list, tuple)):
@@ -13532,8 +13943,9 @@ def main_loop_sniper():
     try:
         if not PAPER_MODE:
             try:
-                ex.load_markets()
+                safe_api_call(ex.load_markets)
             except Exception as exc:
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
                 MEMORY["position_status"] = "UNKNOWN"
                 MEMORY["recovery_status"] = "MARKETS_UNAVAILABLE"
                 log_execution(f"[RECOVERY] Cannot load BingX markets before startup recovery: {exc}", "ERROR")
@@ -13546,6 +13958,8 @@ def main_loop_sniper():
         MEMORY["position_status"] = "UNKNOWN"
         MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
         log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
+    _main_loop_progress("startup_recovery_complete",
+                        recovery_hold=bool(STATE.get("recovery_hold")))
     return _original_main_loop_sniper()
 
 
@@ -13605,7 +14019,10 @@ if __name__ == "__main__":
     # Serve the local/hosted Dashboard independently while the trade supervisor
     # stays on the foreground thread. This avoids daemon-only process exit.
     start_dashboard_servers()
-    threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
+    try:
+        threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
+    except Exception as exc:
+        log_execution(f"[THREAD_START] keep_alive failed: {type(exc).__name__}: {exc}", "ERROR")
     start_naiso_services()
     try:
         safe_main_loop()
