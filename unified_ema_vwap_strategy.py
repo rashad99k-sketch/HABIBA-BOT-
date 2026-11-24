@@ -356,10 +356,9 @@ class UnifiedEMAVWAPPullbackEngine:
                 setup.updated_at = now_ms / 1000
                 return self._persist(setup)
             series = indicator_series(x)
-            vals = indicators(x)
-            if not series.get("valid") or not vals.get("valid"):
+            if not series.get("valid"):
                 setup = Setup(str(symbol), status="WAITING_FOR_CONFIRMATION",
-                              reason=vals.get("reason") or series.get("reason") or "invalid_indicators",
+                              reason=series.get("reason") or "invalid_indicators",
                               last_candle_ts=int(x.timestamp.iloc[-1]),
                               updated_at=now_ms / 1000, closed_candles=int(len(x)))
                 return self._persist(setup)
