@@ -252,6 +252,7 @@ def test_shared_scanner_cache_handles_49_symbols_without_watchlist_refetch():
     namespace = {
         "time": Clock, "threading": threading,
         "_SCANNER_FRAME_CACHE": {}, "_SCANNER_FRAME_LAST_VALID": {},
+        "_SCANNER_FRAME_FETCH_LOCKS": {},
         "_SCANNER_FRAME_CACHE_LOCK": threading.RLock(),
         "_SCANNER_FRAME_CACHE_TTL": 90.0, "_SCANNER_FRAME_LAST_VALID_MAX": 100,
         "SCANNER_UNIVERSE_MAX": 80, "roro_canonical_symbol": canonical,
