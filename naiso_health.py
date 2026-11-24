@@ -115,6 +115,14 @@ class ComponentHealth:
     status: str = "UNKNOWN"
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     recovery_verifier: Optional[Callable[[], tuple]] = None
+    lifecycle: str = "RUNNING"
+    last_progress: float = 0.0
+    idle_until: float = 0.0
+    blocked_until: float = 0.0
+    reason: str = ""
+    thread_name: str = ""
+    cycle_id: int = 0
+    resume_requires_liveness: bool = False
 
 
 class HealthWatchdog:
@@ -143,6 +151,10 @@ class HealthWatchdog:
         self._thread: Optional[threading.Thread] = None
         self._alarms: Dict[str, str] = {}
 
+    def monotonic(self) -> float:
+        """Expose the injected clock so callers can schedule real deadlines."""
+        return float(self._monotonic())
+
     def register(
         self,
         name: str,
@@ -153,6 +165,9 @@ class HealthWatchdog:
         restartable: bool = False,
         restart_fn: Optional[Callable[[], bool]] = None,
         recovery_verifier: Optional[Callable[[], tuple]] = None,
+        lifecycle: str = "RUNNING",
+        refresh: bool = True,
+        resume_requires_liveness: bool = False,
     ) -> None:
         key = str(name)
         grace = float(grace_sec if grace_sec is not None else max(3.0, float(interval_sec) * 2.0))
@@ -167,21 +182,82 @@ class HealthWatchdog:
                 component.critical = bool(critical)
                 component.restartable = bool(restartable)
             component.recovery_verifier = recovery_verifier
-            component.last_beat = float(self._monotonic())
-            component.has_beat = True
-            component.status = "HEALTHY"
+            component.resume_requires_liveness = bool(resume_requires_liveness)
+            if refresh:
+                now = float(self._monotonic())
+                component.last_beat = now
+                component.last_progress = now
+                component.has_beat = True
+                component.status = "HEALTHY"
+                component.lifecycle = str(lifecycle or "RUNNING")
+                component.idle_until = 0.0
+                component.blocked_until = 0.0
+                component.reason = ""
+            elif component.last_progress <= 0:
+                component.last_progress = float(self._monotonic())
             if restart_fn is not None:
                 self._restart_callbacks[key] = restart_fn
 
     def beat(self, name: str, **diagnostics: Any) -> None:
+        """Record a real progress point plus optional lifecycle metadata.
+
+        ``state`` is one of RUNNING/IDLE/BLOCKED/FAILED. ``idle_until`` and
+        ``blocked_until`` are absolute monotonic deadlines. ``progress=False``
+        records a status-only observation without advancing last_progress.
+        """
         with self._lock:
             component = self._components.get(str(name))
             if component is None:
                 self.register(name, interval_sec=self.check_interval_sec)
                 component = self._components[str(name)]
-            component.last_beat = float(self._monotonic())
-            component.has_beat = True
-            component.status = "HEALTHY"
+            now = float(self._monotonic())
+            is_progress = diagnostics.pop("progress", True) is not False
+            if is_progress:
+                component.last_beat = now
+                component.last_progress = now
+                component.has_beat = True
+                # Dedupe within one incident, not forever. Real progress after a
+                # stall/recovery re-arms the same component for a future event.
+                if component.status in {"STALLED", "STALLED_SAFE_HOLD", "RECOVERED",
+                                        "RESTART_FAILED", "FAILED", "RECOVERY_DEFERRED",
+                                        "IDLE_SAFE_HOLD"}:
+                    for alarm_key in (f"stalled:{component.name}", f"failed:{component.name}",
+                                      f"recovery_deferred:{component.name}",
+                                      f"restart_failed:{component.name}",
+                                      f"schedule_blocked:{component.name}",
+                                      f"schedule_failed:{component.name}"):
+                        self._alarms.pop(alarm_key, None)
+            state = diagnostics.pop("state", None)
+            if state is not None and str(state).upper() in {"RUNNING", "IDLE", "BLOCKED", "FAILED"}:
+                component.lifecycle = str(state).upper()
+                if component.lifecycle == "RUNNING":
+                    component.idle_until = 0.0
+                    component.blocked_until = 0.0
+            reason = diagnostics.pop("reason", None)
+            if reason is not None:
+                component.reason = str(reason)[:200]
+            idle_until = diagnostics.pop("idle_until", None)
+            if idle_until is not None:
+                component.idle_until = float(idle_until)
+            blocked_until = diagnostics.pop("blocked_until", None)
+            if blocked_until is not None:
+                component.blocked_until = float(blocked_until)
+            phase = diagnostics.pop("phase", None)
+            if phase is not None:
+                diagnostics["last_phase"] = phase
+            thread_name = diagnostics.pop("thread_name", None)
+            if thread_name is not None:
+                component.thread_name = str(thread_name)[:120]
+            cycle_id = diagnostics.pop("cycle_id", None)
+            if cycle_id is not None:
+                try:
+                    component.cycle_id = int(cycle_id)
+                except (TypeError, ValueError):
+                    pass
+            if component.lifecycle == "FAILED":
+                component.status = "FAILED"
+            elif is_progress:
+                component.status = "HEALTHY"
             if diagnostics:
                 component.diagnostics.update({k: str(v)[:120] for k, v in diagnostics.items()})
 
@@ -208,8 +284,14 @@ class HealthWatchdog:
                 self._alert("watchdog_error", "ERROR", f"{type(exc).__name__}: {exc}")
 
     def _alert(self, key: str, level: str, message: str) -> None:
+        """Alert once per event key, even when the message embeds a changing age.
+
+        Stall messages include an age that grows on every watchdog tick. Comparing
+        the full message caused the same stall to alert repeatedly and spam the
+        operator channel without representing a new event.
+        """
         with self._lock:
-            if self._alarms.get(key) == message:
+            if key in self._alarms:
                 return
             self._alarms[key] = message
         if callable(self.alert_fn):
@@ -221,9 +303,14 @@ class HealthWatchdog:
     def _stack_snapshot(self, component: ComponentHealth) -> Dict[str, Any]:
         stacks: Dict[str, str] = {}
         try:
+            short_name = component.name.split(":", 1)[-1]
             for thread_id, frame in sys._current_frames().items():
                 name = threading._active.get(thread_id)
-                if name is None or component.name not in name.name:
+                if name is None:
+                    continue
+                matches_component = (component.name in name.name or short_name in name.name)
+                matches_foreground = (component.name == "main_loop" and name.name == "MainThread")
+                if not matches_component and not matches_foreground:
                     continue
                 stacks[str(thread_id)] = "".join(traceback.format_stack(frame))[-2000:]
         except Exception as exc:
@@ -248,20 +335,122 @@ class HealthWatchdog:
         with self._lock:
             components = list(self._components.values())
         for component in components:
-            age = now - component.last_beat
-            stalled = component.has_beat and age > max(component.grace_sec, component.interval_sec)
-            if not stalled:
-                component.status = "HEALTHY"
-                report[component.name] = {"status": "HEALTHY", "age_sec": round(age, 3)}
+            lifecycle = component.lifecycle or "RUNNING"
+            progress_at = max(component.last_beat, component.last_progress or 0.0)
+            base_age = max(0.0, now - progress_at)
+            scheduled_due = None
+            if lifecycle == "IDLE":
+                scheduled_due = component.idle_until or (progress_at + component.interval_sec)
+                if now < scheduled_due:
+                    component.status = "IDLE"
+                    report[component.name] = {
+                        "status": "IDLE", "lifecycle": "IDLE", "age_sec": round(base_age, 3),
+                        "next_due_sec": round(max(0.0, scheduled_due - now), 3),
+                        "reason": component.reason,
+                    }
+                    continue
+            elif lifecycle == "BLOCKED":
+                scheduled_due = component.blocked_until or (progress_at + component.grace_sec)
+                if now < scheduled_due:
+                    component.status = "BLOCKED"
+                    report[component.name] = {
+                        "status": "BLOCKED", "lifecycle": "BLOCKED", "age_sec": round(base_age, 3),
+                        "next_due_sec": round(max(0.0, scheduled_due - now), 3),
+                        "reason": component.reason,
+                    }
+                    continue
+            if lifecycle == "IDLE" and scheduled_due is not None and now >= scheduled_due:
+                # A scheduled worker is allowed to wake exactly when due. This is
+                # not a stall/restart: it must not consume the restart budget or
+                # emit a false STALLED alert after a healthy 20-minute sleep.
+                verification_context: Dict[str, Any] = {}
+                verified = True
+                verify_reason = "SCHEDULED_DUE"
+                if callable(component.recovery_verifier):
+                    try:
+                        verified, verify_reason, raw_context = component.recovery_verifier()
+                        verification_context = dict(raw_context or {})
+                    except Exception as exc:
+                        verified, verify_reason = False, f"VERIFIER_EXCEPTION:{type(exc).__name__}"
+                if not verified:
+                    component.status = "IDLE_SAFE_HOLD"
+                    component.idle_until = now + min(60.0, component.interval_sec * 0.25)
+                    self._alert(f"schedule_blocked:{component.name}", "WARN",
+                                f"[WATCHDOG] scheduled restart of {component.name} deferred: {verify_reason}")
+                    report[component.name] = {"status": component.status, "lifecycle": "IDLE",
+                                              "age_sec": round(now - scheduled_due, 3),
+                                              "restart": "VERIFICATION_HOLD", "reason": str(verify_reason)}
+                    continue
+                if callable(self.safety_gate):
+                    allowed, reason = self.safety_gate()
+                    if not allowed and not (
+                        verification_context.get("flat_verified") and
+                        str(reason) in {"OPEN_POSITION", "OPEN_POSITION_VERIFIED"}
+                    ):
+                        component.status = "IDLE_SAFE_HOLD"
+                        component.idle_until = now + min(60.0, component.interval_sec * 0.25)
+                        self._alert(f"schedule_blocked:{component.name}", "WARN",
+                                    f"[WATCHDOG] scheduled restart of {component.name} deferred: {reason}")
+                        report[component.name] = {"status": component.status, "lifecycle": "IDLE",
+                                                  "age_sec": round(now - scheduled_due, 3),
+                                                  "restart": "SAFETY_GATE", "reason": str(reason)}
+                        continue
+                callback = self._restart_callbacks.get(component.name)
+                restarted = False
+                if callable(callback):
+                    try:
+                        restarted = self._invoke_restart(callback, verification_context)
+                    except Exception as exc:
+                        self._alert(f"schedule_failed:{component.name}", "ERROR",
+                                    f"[WATCHDOG] scheduled restart of {component.name} failed: "
+                                    f"{type(exc).__name__}: {exc}")
+                    if restarted:
+                        # The dispatched cycle is now the liveness source. Leave
+                        # IDLE, clear the stale wake deadline and let the new
+                        # cycle's beats govern the next check; otherwise every
+                        # subsequent tick would try to start another cycle.
+                        component.lifecycle = "RUNNING"
+                        component.idle_until = 0.0
+                        component.last_beat = now
+                        component.last_progress = now
+                        component.has_beat = True
+                        component.status = "RECOVERED"
+                        report[component.name] = {"status": component.status, "lifecycle": "RUNNING",
+                                                  "age_sec": round(now - scheduled_due, 3),
+                                                  "restart": "SCHEDULED"}
+                        continue
+                component.status = "IDLE_SAFE_HOLD"
+                component.idle_until = now + min(60.0, component.interval_sec * 0.25)
+                self._alert(f"schedule_failed:{component.name}", "ERROR",
+                            f"[WATCHDOG] scheduled restart of {component.name} unavailable")
+                report[component.name] = {"status": component.status, "lifecycle": "IDLE",
+                                          "age_sec": round(now - scheduled_due, 3),
+                                          "restart": "SCHEDULE_UNAVAILABLE"}
                 continue
-            component.status = "STALLED"
+            age = max(0.0, now - scheduled_due) if scheduled_due is not None else base_age
+            # RUNNING progress and scheduled due dates are judged against grace,
+            # not against a 20-minute scheduling interval. Using the larger
+            # interval here hid genuine in-cycle stalls for scheduled workers.
+            stall_window = component.grace_sec
+            stalled = component.has_beat and age > stall_window
+            if not stalled:
+                component.status = "FAILED" if lifecycle == "FAILED" else "HEALTHY"
+                report[component.name] = {"status": component.status, "lifecycle": lifecycle,
+                                          "age_sec": round(age, 3), "reason": component.reason}
+                continue
+            component.status = "FAILED" if lifecycle == "FAILED" else "STALLED"
             diagnostics = self._stack_snapshot(component)
             component.diagnostics.update(diagnostics)
-            self._alert(f"stalled:{component.name}", "CRITICAL",
-                        f"[WATCHDOG] {component.name} stalled for {age:.1f}s (critical={component.critical})")
+            if lifecycle == "FAILED":
+                self._alert(f"failed:{component.name}", "ERROR",
+                            f"[WATCHDOG] {component.name} failed: {component.reason or 'unknown error'}")
+            else:
+                self._alert(f"stalled:{component.name}", "CRITICAL",
+                            f"[WATCHDOG] {component.name} stalled for {age:.1f}s (critical={component.critical})")
             if not component.restartable or component.name not in self._restart_callbacks:
-                report[component.name] = {"status": "STALLED", "age_sec": round(age, 3),
-                                          "restart": "NOT_RESTARTABLE"}
+                report[component.name] = {"status": component.status, "lifecycle": lifecycle,
+                                          "age_sec": round(age, 3), "restart": "NOT_RESTARTABLE",
+                                          "reason": component.reason}
                 continue
             verification_context: Dict[str, Any] = {}
             verified_open_resume = False
@@ -314,6 +503,16 @@ class HealthWatchdog:
                 restarted = False
                 result = "RESTART_EXCEPTION"
                 detail = f"{type(exc).__name__}: {exc}"
+            liveness_confirmed = (
+                bool(verification_context.get("engine_resumed"))
+                if component.resume_requires_liveness else True)
+            if restarted and not liveness_confirmed:
+                # Foreground engines such as main_loop cannot be replaced by an
+                # extra thread. Recovery work may have completed, but the loop
+                # itself has not proved liveness; never refresh its heartbeat.
+                restarted = False
+                result = "RECOVERY_DEFERRED"
+                detail = "engine liveness not confirmed; no duplicate thread started"
             self.restart_policy.finish(record, result, detail)
             component.last_restart = float(self._monotonic())
             if restarted:
@@ -321,6 +520,10 @@ class HealthWatchdog:
                 component.status = "RECOVERED"
                 self._alert(f"recovered:{component.name}", "SUCCESS",
                             f"[WATCHDOG] {component.name} restarted after {age:.1f}s stall")
+            elif result == "RECOVERY_DEFERRED":
+                component.status = "STALLED_SAFE_HOLD"
+                self._alert(f"recovery_deferred:{component.name}", "WARN",
+                            f"[WATCHDOG] {component.name} recovery deferred: {detail}")
             else:
                 component.status = "RESTART_FAILED"
                 self._alert(f"restart_failed:{component.name}", "CRITICAL",
@@ -334,11 +537,18 @@ class HealthWatchdog:
             now = float(self._monotonic())
             rows = {}
             for name, component in sorted(self._components.items()):
+                progress_at = max(component.last_beat, component.last_progress or 0.0)
                 rows[name] = {
                     "status": component.status,
+                    "lifecycle": component.lifecycle,
                     "critical": component.critical,
                     "restartable": component.restartable,
-                    "age_sec": round(max(0.0, now - component.last_beat), 3),
+                    "age_sec": round(max(0.0, now - progress_at), 3),
+                    "reason": component.reason,
+                    "thread_name": component.thread_name,
+                    "cycle_id": component.cycle_id,
+                    "next_due_sec": (round(max(0.0, (component.idle_until or component.blocked_until) - now), 3)
+                                     if (component.idle_until or component.blocked_until) else None),
                     "last_restart_age_sec": (round(max(0.0, now - component.last_restart), 3)
                                              if component.last_restart else None),
                     "diagnostics": dict(component.diagnostics),
