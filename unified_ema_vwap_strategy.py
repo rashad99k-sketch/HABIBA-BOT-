@@ -166,6 +166,10 @@ class Setup:
     crossover_price: Optional[float] = None
     ema9: Optional[float] = None
     ema15: Optional[float] = None
+    ema50: Optional[float] = None
+    price: Optional[float] = None
+    closed_candles: int = 0
+    indicator_missing: Optional[list] = None
     entry_path: Optional[str] = None
     vwap: Optional[float] = None
     atr14: Optional[float] = None
@@ -325,15 +329,35 @@ class UnifiedEMAVWAPPullbackEngine:
             if len(x) < 51:
                 s = old or Setup(str(symbol))
                 s.status, s.reason = "WAITING_FOR_CONFIRMATION", "insufficient_valid_closed_ohlcv"
+                s.closed_candles = int(len(x))
+                s.indicator_missing = ["ema9", "ema15", "ema50", "atr14", "vwap"]
                 s.updated_at = now_ms / 1000
                 return self._persist(s)
             vals = indicators(x)
+            series = indicator_series(x)
+            if series.get("valid"):
+                last_i = len(x) - 1
+                s = old or Setup(str(symbol))
+                for field, key in (("ema9", "ema9"), ("ema15", "ema15"), ("ema50", "ema50")):
+                    value = series[key].iloc[last_i]
+                    setattr(s, field, float(value) if _finite(value) else None)
+                atr_value, vwap_value = series["atr14"].iloc[last_i], series["vwap_series"].iloc[last_i]
+                s.atr14 = float(atr_value) if _finite(atr_value) else None
+                s.vwap = float(vwap_value) if _finite(vwap_value) else None
+                s.price = float(x.close.iloc[last_i])
+                s.closed_candles = int(len(x))
+                s.last_candle_ts = int(x.timestamp.iloc[last_i])
+                s.indicator_missing = [name for name, value in (
+                    ("ema9", s.ema9), ("ema15", s.ema15), ("ema50", s.ema50),
+                    ("atr14", s.atr14), ("vwap", s.vwap)) if value is None]
             if not vals.get("valid") or vals.get("vwap") is None:
                 s = old or Setup(str(symbol))
                 s.status, s.reason = "WAITING_FOR_CONFIRMATION", vals.get("reason") or "vwap_unknown"
+                s.closed_candles = int(len(x))
+                if s.indicator_missing is None:
+                    s.indicator_missing = ["vwap"] if vals.get("reason") == "zero_session_volume" else ["indicators"]
                 s.updated_at = now_ms / 1000
                 return self._persist(s)
-            series = indicator_series(x)
             e9, e15 = series["ema9"], series["ema15"]
             vwap_series = series["vwap_series"]
             latest_ts = int(x.timestamp.iloc[-1])
@@ -421,7 +445,11 @@ class UnifiedEMAVWAPPullbackEngine:
 
             if old is None:
                 s = Setup(str(symbol), status="DISCOVERED", last_candle_ts=latest_ts,
-                          updated_at=now_ms/1000, reason="no_new_closed_ema9_vwap_cross")
+                          updated_at=now_ms/1000, reason="no_new_closed_ema9_vwap_cross",
+                          ema9=float(e9.iloc[-1]), ema15=float(e15.iloc[-1]),
+                          ema50=float(series["ema50"].iloc[-1]), vwap=float(vals["vwap"]),
+                          atr14=float(vals["atr14"]), price=float(x.close.iloc[-1]),
+                          closed_candles=int(len(x)), indicator_missing=[])
                 return self._persist(s)
             if old.last_candle_ts == latest_ts:
                 return self._persist(old)
@@ -529,6 +557,9 @@ class UnifiedEMAVWAPPullbackEngine:
                 "last_closed_candle_ts": latest_ts,
             }
             old.ema9, old.ema15, old.ema50, old.vwap, old.atr14 = float(e9.iloc[-1]), float(e15.iloc[-1]), float(vals["ema50"]), float(vals["vwap"]), float(vals["atr14"])
+            old.price = float(x.close.iloc[-1])
+            old.closed_candles = int(len(x))
+            old.indicator_missing = []
             old.last_candle_ts, old.updated_at = latest_ts, now_ms/1000
             return self._persist(old)
 
