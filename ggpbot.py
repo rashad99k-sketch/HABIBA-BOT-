@@ -5609,7 +5609,11 @@ _SCANNER_FRAME_CACHE_TTL = _env_float_range("SCANNER_FRAME_CACHE_TTL", 90.0, 15.
 _SCANNER_FRAME_LAST_VALID_MAX = max(100, SCANNER_UNIVERSE_MAX + 20)
 
 def _scanner_frame_key(symbol):
-    canonicalizer =def _get_scanner_frame(symbol, limit=150):
+    canonicalizer = globals().get("roro_canonical_symbol")
+    return str(canonicalizer(symbol) if callable(canonicalizer) else
+               str(symbol or "").upper().replace("/", "-").split(":")[0].strip())
+
+def _get_scanner_frame(symbol, limit=150):
     """Fetch one shared frame per canonical symbol; coalesce concurrent misses."""
     key = _scanner_frame_key(symbol)
     now = time.monotonic()
@@ -5642,11 +5646,6 @@ def _scanner_frame_key(symbol):
         with _SCANNER_FRAME_CACHE_LOCK:
             previous = _SCANNER_FRAME_LAST_VALID.get(key)
             return previous[1].copy() if previous else None
-est_key, None)
-        return snapshot.copy()
-    with _SCANNER_FRAME_CACHE_LOCK:
-        previous = _SCANNER_FRAME_LAST_VALID.get(key)
-        return previous[1].copy() if previous else None
 
 def get_usdt_perp_symbols():
     try:
