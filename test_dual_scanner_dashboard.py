@@ -267,3 +267,60 @@ def test_shared_scanner_cache_handles_49_symbols_without_watchlist_refetch():
     assert namespace["_peek_scanner_frame"]("COIN00-USDT", include_stale=True) is not None
     assert len(calls) == 49
     assert len(namespace["_SCANNER_FRAME_LAST_VALID"]) == 49
+
+
+def test_concurrent_scanner_workers_coalesce_same_symbol_ohlcv_fetch():
+    import ast
+    import threading
+
+    functions = [_function(name) for name in ("_scanner_frame_key", "_get_scanner_frame")]
+    isolated = ast.Module(body=functions, type_ignores=[])
+    calls = []
+    calls_lock = threading.Lock()
+    barrier = threading.Barrier(10)
+
+    def fetch(symbol, limit):
+        with calls_lock:
+            calls.append((symbol, limit))
+        time.sleep(0.05)
+        return _sample_session_frame(60)[0]
+
+    namespace = {
+        "time": time,
+        "threading": threading,
+        "_SCANNER_FRAME_CACHE": {},
+        "_SCANNER_FRAME_LAST_VALID": {},
+        "_SCANNER_FRAME_FETCH_LOCKS": {},
+        "_SCANNER_FRAME_CACHE_LOCK": threading.RLock(),
+        "_SCANNER_FRAME_CACHE_TTL": 90.0,
+        "_SCANNER_FRAME_LAST_VALID_MAX": 100,
+        "SCANNER_UNIVERSE_MAX": 80,
+        "roro_canonical_symbol": lambda value: str(value).upper().replace("/", "-").split(":")[0],
+        "roro_exchange_symbol": lambda value: value,
+        "get_ohlcv_safe": fetch,
+        "validate_dataframe": lambda frame, minimum: len(frame) >= minimum,
+    }
+    exec(compile(isolated, "ggpbot.py", "exec"), namespace)
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=3)
+            results.append(namespace["_get_scanner_frame"]("BTC/USDT:USDT", 60))
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=worker) for _ in range(10)]
+    for worker_thread in workers:
+        worker_thread.start()
+    for worker_thread in workers:
+        worker_thread.join(timeout=4)
+
+    assert not any(worker_thread.is_alive() for worker_thread in workers)
+    assert not errors
+    assert len(results) == 10
+    assert all(result is not None and len(result) == 60 for result in results)
+    assert calls == [("BTC/USDT:USDT", 60)]
+
