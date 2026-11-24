@@ -25,7 +25,7 @@ def test_final_execute_entry_wrapper_checks_strategy_before_order_execution():
                and node.value.value is False for node in ast.walk(wrapper))
 
 
-def test_watchlist_refresh_uses_direct_ema9_ema15_cross_engine():
+def test_watchlist_refresh_uses_direct_ema9_vwap_cross_engine():
     tree = ast.parse(Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8"))
     refresh = _functions(tree, "_refresh_ema_vwap_setups")[0]
     calls = [node.func.attr for node in ast.walk(refresh) if isinstance(node, ast.Call)
@@ -37,4 +37,4 @@ def test_watchlist_refresh_uses_direct_ema9_ema15_cross_engine():
 def test_direct_cross_entry_has_atr_stop_fallback_without_causal_zone():
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
     assert "ATR_FALLBACK_NO_CAUSAL_ZONE" in source
-    assert "EMA9_EMA15_CROSS_VWAP_GATE" in source
+    assert "EMA9_VWAP_CROSS_VWAP_GATE" in source
