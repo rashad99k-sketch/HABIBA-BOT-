@@ -7,6 +7,7 @@ restart callback to act within a bounded exponential-backoff budget.
 """
 from __future__ import annotations
 
+import inspect
 import random
 import sys
 import threading
@@ -113,6 +114,7 @@ class ComponentHealth:
     last_restart: float = 0.0
     status: str = "UNKNOWN"
     diagnostics: Dict[str, Any] = field(default_factory=dict)
+    recovery_verifier: Optional[Callable[[], tuple]] = None
 
 
 class HealthWatchdog:
@@ -150,6 +152,7 @@ class HealthWatchdog:
         critical: bool = True,
         restartable: bool = False,
         restart_fn: Optional[Callable[[], bool]] = None,
+        recovery_verifier: Optional[Callable[[], tuple]] = None,
     ) -> None:
         key = str(name)
         grace = float(grace_sec if grace_sec is not None else max(3.0, float(interval_sec) * 2.0))
@@ -163,6 +166,7 @@ class HealthWatchdog:
                 component.grace_sec = grace
                 component.critical = bool(critical)
                 component.restartable = bool(restartable)
+            component.recovery_verifier = recovery_verifier
             component.last_beat = float(self._monotonic())
             component.has_beat = True
             component.status = "HEALTHY"
@@ -226,6 +230,18 @@ class HealthWatchdog:
             stacks["error"] = f"{type(exc).__name__}: {exc}"
         return {"possible_stacks": stacks}
 
+    @staticmethod
+    def _invoke_restart(callback: Callable, context: Dict[str, Any]) -> bool:
+        """Pass verification context only to callbacks that accept it."""
+        try:
+            signature = inspect.signature(callback)
+            params = signature.parameters
+            accepts_context = ("context" in params or
+                               any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()))
+        except (TypeError, ValueError):
+            accepts_context = False
+        return bool(callback(context) if accepts_context else callback())
+
     def check(self) -> Dict[str, Any]:
         now = float(self._monotonic())
         report: Dict[str, Any] = {}
@@ -247,9 +263,32 @@ class HealthWatchdog:
                 report[component.name] = {"status": "STALLED", "age_sec": round(age, 3),
                                           "restart": "NOT_RESTARTABLE"}
                 continue
+            verification_context: Dict[str, Any] = {}
+            verified_open_resume = False
+            non_trading_resume = False
+            if callable(component.recovery_verifier):
+                try:
+                    verified, verify_reason, context = component.recovery_verifier()
+                    verification_context = dict(context or {})
+                except Exception as exc:
+                    verified, verify_reason, verification_context = False, f"VERIFIER_EXCEPTION:{type(exc).__name__}", {}
+                if not verified:
+                    component.status = "STALLED_SAFE_HOLD"
+                    component.diagnostics["last_verification"] = str(verify_reason)[:120]
+                    self._alert(f"verify_blocked:{component.name}", "WARN",
+                                f"[WATCHDOG] restart of {component.name} deferred by verification: {verify_reason}")
+                    report[component.name] = {"status": component.status, "age_sec": round(age, 3),
+                                              "restart": "VERIFICATION_HOLD", "reason": str(verify_reason)}
+                    continue
+                verified_open_resume = bool(verification_context.get("open_position_verified"))
+                non_trading_resume = bool(verification_context.get("non_trading_engine"))
             if callable(self.safety_gate):
                 allowed, reason = self.safety_gate()
-                if not allowed:
+                if not allowed and not (
+                    verified_open_resume and str(reason) in {"OPEN_POSITION", "OPEN_POSITION_VERIFIED"}
+                ) and not (
+                    non_trading_resume and str(reason) in {"OPEN_POSITION", "OPEN_POSITION_VERIFIED"}
+                ):
                     component.status = "STALLED_SAFE_HOLD"
                     self._alert(f"restart_blocked:{component.name}", "WARN",
                                 f"[WATCHDOG] restart of {component.name} deferred: {reason}")
@@ -268,7 +307,7 @@ class HealthWatchdog:
             record = self.restart_policy.begin(component.name, f"stalled_{age:.1f}s", delay)
             callback = self._restart_callbacks[component.name]
             try:
-                restarted = bool(callback())
+                restarted = self._invoke_restart(callback, verification_context)
                 result = "RESTARTED" if restarted else "RESTART_FAILED"
                 detail = ""
             except Exception as exc:

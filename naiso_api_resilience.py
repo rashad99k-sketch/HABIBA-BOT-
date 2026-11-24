@@ -27,6 +27,22 @@ ORDER_WRITE_METHODS = frozenset({
     "cancel_order", "cancel_all_orders", "swapV1PrivatePostTradeCancelReplace",
 })
 
+# These failures cannot be repaired by repeating the same request. Retrying them
+# wastes budget and may hide a configuration or authorization problem.
+NON_RETRYABLE_PATTERNS = (
+    "authentication", "unauthorized", "permission", "forbidden", "api-key",
+    "api key", "invalid symbol", "invalidsymbol", "symbol not found",
+    "unknown symbol", "invalid signature", "signature error", "timestamp",
+    "recvwindow", "configuration", "misconfigured", "invalid parameter",
+    "invalid order", "unsupported", "insufficient balance", "insufficient margin",
+)
+
+TRANSIENT_PATTERNS = (
+    "429", "100410", "rate limit", "too many request", "timeout", "timedout",
+    "connection", "network", "temporarily unavailable", "service unavailable",
+    "gateway", "internal server error", "500", "502", "503", "504",
+)
+
 
 class CircuitOpenError(RuntimeError):
     """Raised when an endpoint is temporarily fenced off after repeated failures."""
@@ -44,15 +60,22 @@ def classify_api_error(exc: BaseException, *, method: str = "") -> ApiFailureCla
     name = type(exc).__name__
     text = str(exc)
     lowered = text.lower()
+    detail = f"{name}: {text[:160]}"
     if method in ORDER_WRITE_METHODS:
-        return ApiFailureClass("ORDER_EXECUTION_UNKNOWN", False, f"{name}: {text[:160]}")
-    if "429" in text or "100410" in text or "rate limit" in lowered or "too many request" in lowered:
-        return ApiFailureClass("RATE_LIMITED", True, f"{name}: {text[:160]}")
+        return ApiFailureClass("ORDER_EXECUTION_UNKNOWN", False, detail)
+    if any(pattern in lowered for pattern in NON_RETRYABLE_PATTERNS):
+        return ApiFailureClass("NON_RETRYABLE_BUSINESS", False, detail)
+    if any(pattern in lowered for pattern in TRANSIENT_PATTERNS[:4]):
+        return ApiFailureClass("RATE_LIMITED", True, detail)
     if "timeout" in lowered or "timedout" in lowered or name in {"TimeoutError", "ReadTimeout", "ConnectTimeout"}:
-        return ApiFailureClass("TIMEOUT", True, f"{name}: {text[:160]}")
-    if "connection" in lowered or "network" in lowered or "temporarily unavailable" in lowered:
-        return ApiFailureClass("NETWORK", True, f"{name}: {text[:160]}")
-    return ApiFailureClass("API_FAILURE", True, f"{name}: {text[:160]}")
+        return ApiFailureClass("TIMEOUT", True, detail)
+    if any(pattern in lowered for pattern in ("connection", "network", "temporarily unavailable",
+                                              "service unavailable", "gateway")):
+        return ApiFailureClass("NETWORK", True, detail)
+    if any(pattern in lowered for pattern in TRANSIENT_PATTERNS[8:]):
+        return ApiFailureClass("SERVER_TRANSIENT", True, detail)
+    # Unknown application errors are not assumed safe to repeat.
+    return ApiFailureClass("API_FAILURE", False, detail)
 
 
 @dataclass
