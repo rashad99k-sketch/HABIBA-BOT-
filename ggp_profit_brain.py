@@ -30,6 +30,74 @@ def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _entry_context_evidence(context: Dict[str, Any], side: str) -> Dict[str, Any]:
+    """Normalize the immutable entry-time context for the one profit classifier.
+
+    Missing or ambiguous entry context never creates a positive classification.
+    It can only confirm the already-observed direction/thesis or stay neutral.
+    """
+    entry = context.get("entry_context") if isinstance(context, dict) else None
+    result: Dict[str, Any] = {
+        "available": False, "directional_cross": False, "opposing_cross": False,
+        "order_block_fresh": False, "zone_quality": None, "liquidity_aligned": False,
+        "structure_aligned": False, "relative_volume": None, "adx_di_known": False,
+        "adx_aligned": False, "ema_aligned": False, "regime_range": False,
+        "cross_direction": "",
+    }
+    if not isinstance(entry, dict) or not entry:
+        return result
+    result["available"] = True
+    expected = "BULLISH" if side == "BUY" else "BEARISH"
+    cross_direction = str(entry.get("cross_event_direction") or "").upper()
+    has_cross = bool(entry.get("cross_event_id") and cross_direction in {"BULLISH", "BEARISH"})
+    result["cross_direction"] = cross_direction if has_cross else ""
+    result["directional_cross"] = has_cross and cross_direction == expected
+    result["opposing_cross"] = has_cross and cross_direction != expected
+
+    zone = entry.get("entry_zone") if isinstance(entry.get("entry_zone"), dict) else {}
+    result["zone_quality"] = _number(zone.get("quality"))
+    ob = entry.get("order_block") if isinstance(entry.get("order_block"), dict) else {}
+    result["order_block_fresh"] = bool(
+        ob.get("valid") and str(ob.get("freshness") or "").upper() in {"FRESH", "UNTESTED", "VALID"}
+    )
+
+    liquidity = entry.get("liquidity") if isinstance(entry.get("liquidity"), dict) else {}
+    liquidity_direction = str(liquidity.get("direction") or "").upper()
+    liquidity_event = str(liquidity.get("event") or "").upper()
+    result["liquidity_aligned"] = bool(
+        liquidity_direction == expected
+        and liquidity_event not in {"", "UNKNOWN", "NONE"}
+    )
+
+    structure = entry.get("market_structure") if isinstance(entry.get("market_structure"), dict) else {}
+    mss = str(structure.get("mss") or "").upper()
+    result["structure_aligned"] = bool(
+        structure.get("confirmed")
+        and (
+            mss.startswith("BULLISH") if side == "BUY" else mss.startswith("BEARISH")
+        )
+    )
+
+    result["relative_volume"] = _number(entry.get("relative_volume"))
+    adx_di = entry.get("adx_di") if isinstance(entry.get("adx_di"), dict) else {}
+    entry_adx = _number(adx_di.get("adx"))
+    plus = _number(adx_di.get("di_plus"))
+    minus = _number(adx_di.get("di_minus"))
+    result["adx_di_known"] = entry_adx is not None and plus is not None and minus is not None
+    result["adx_aligned"] = bool(
+        result["adx_di_known"] and entry_adx >= 20.0
+        and ((side == "BUY" and plus > minus) or (side == "SELL" and minus > plus))
+    )
+    entry_ema = _number(entry.get("ema9"))
+    entry_vwap = _number(entry.get("vwap"))
+    result["ema_aligned"] = bool(
+        entry_ema is not None and entry_vwap is not None
+        and ((side == "BUY" and entry_ema > entry_vwap) or (side == "SELL" and entry_ema < entry_vwap))
+    )
+    entry_regime = str(entry.get("entry_regime") or "").upper()
+    result["regime_range"] = entry_regime in {"RANGE", "RANGE_CHOP", "CHOP", "CHOPPY", "COMPRESSION"}
+    return result
+
 
 def adaptive_trail_multiplier(base_multiplier: float, continuation_probability: float, adx: float,
                               distribution_risk: float, exit_warning: int, ema_state: str = "UNKNOWN",
@@ -129,6 +197,7 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     depth_usdt = _number(ctx.get("orderbook_depth_usdt"))
     liquidity_quality = str(ctx.get("liquidity_quality") or "UNKNOWN").upper()
     structure_broken = bool(ctx.get("structure_broken", False))
+    entry_evidence = _entry_context_evidence(ctx, side)
 
     di_known = plus is not None and minus is not None
     di_aligned = (plus > minus) if side == "BUY" and di_known else (minus > plus) if side == "SELL" and di_known else False
@@ -162,6 +231,20 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         evidence.append("thin_liquidity_evidence")
     if structure_broken:
         evidence.append("trend_structure_broken")
+    if entry_evidence["directional_cross"]:
+        evidence.append("entry_confirmed_directional_cross")
+    elif entry_evidence["opposing_cross"]:
+        evidence.append("entry_opposing_cross")
+    if entry_evidence["order_block_fresh"]:
+        evidence.append("entry_fresh_order_block")
+    if entry_evidence["liquidity_aligned"]:
+        evidence.append("entry_liquidity_context_aligned")
+    if entry_evidence["structure_aligned"]:
+        evidence.append("entry_market_structure_aligned")
+    if entry_evidence["relative_volume"] is not None and entry_evidence["relative_volume"] >= 1.0:
+        evidence.append("entry_relative_volume_confirmed")
+    if entry_evidence["adx_aligned"]:
+        evidence.append("entry_adx_di_aligned")
 
     # A fresh, direction-matched EMA9/VWAP or EMA50/VWAP cross is directional
     # evidence. It must not be mislabeled as a range scalp and fully closed at
@@ -187,10 +270,24 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         evidence.append("fresh_directional_ema_vwap_cross")
 
     # Trend riding requires several independent, side-aligned observations.
-    momentum_support = (momentum_strength is not None and momentum_strength >= 55.0) or bool(ctx.get("trend_expansion", False))
+    # The persisted entry context can supply causal/zone/volume support, but it
+    # cannot replace current regime, ADX, continuation or DI alignment.
+    entry_momentum_support = bool(
+        entry_evidence["directional_cross"]
+        and entry_evidence["ema_aligned"]
+        and (entry_evidence["order_block_fresh"] or (entry_evidence["zone_quality"] or 0.0) >= 50.0)
+        and (entry_evidence["relative_volume"] is None or entry_evidence["relative_volume"] >= 0.9)
+    )
+    momentum_support = (
+        (momentum_strength is not None and momentum_strength >= 55.0)
+        or bool(ctx.get("trend_expansion", False))
+        or entry_momentum_support
+    )
     regime_trend = regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or state in {"TREND_RIDE", "EXPANSION", "HEALTHY_PULLBACK"}
     confirmed_trend = (
         not structure_broken
+        and not entry_evidence["opposing_cross"]
+        and (not entry_evidence["adx_di_known"] or entry_evidence["adx_aligned"])
         and regime_trend
         and adx is not None and adx >= 22.0
         and adx_slope is not None and adx_slope >= -1.5
@@ -201,6 +298,23 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     if confirmed_trend:
         return TREND_MODE, "confirmed_directional_regime_and_continuation", tuple(evidence + ["directional_di_alignment"])
 
+    # A second, explicitly entry-context-driven trend path still requires live
+    # evidence to be non-weak and aligned. It never overrides a broken structure
+    # or an opposite-direction entry thesis.
+    entry_context_trend = bool(
+        entry_momentum_support
+        and not structure_broken
+        and not regime_range
+        and not entry_evidence["opposing_cross"]
+        and (not entry_evidence["adx_di_known"] or entry_evidence["adx_aligned"])
+        and (entry_evidence["liquidity_aligned"] or entry_evidence["structure_aligned"])
+        and adx is not None and not weak_adx
+        and continuation is not None and not weak_continuation
+        and di_aligned
+    )
+    if entry_context_trend:
+        return TREND_MODE, "entry_context_and_current_evidence_confirm_trend_ride", tuple(evidence + ["entry_context_trend_support"])
+
     weakness_count = sum((weak_adx, weak_continuation, low_volume, di_tangled, weak_momentum, thin_liquidity, structure_broken))
     # RANGE_SCALP requires an identifiable range/weak regime plus more than one
     # supporting weakness, OR explicit thin-liquidity evidence plus weak trend data.
@@ -209,13 +323,26 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         weak_adx and weak_continuation and (low_volume or di_tangled or thin_liquidity)
     )
     thin_market_confirmed = thin_liquidity and (weak_adx or weak_continuation or low_volume) and weakness_count >= 2
-    if (range_confirmed or weak_market_confirmed or thin_market_confirmed) and not directional_vwap_cross:
+    # The immutable entry thesis also protects a confirmed directional cross from
+    # being reclassified as a one-shot scalp. Structural failure removes that veto.
+    entry_thesis_veto = bool(
+        entry_evidence["directional_cross"]
+        and not structure_broken
+        and (entry_evidence["order_block_fresh"] or (entry_evidence["zone_quality"] or 0.0) >= 50.0
+             or entry_evidence["liquidity_aligned"] or entry_evidence["structure_aligned"])
+    )
+    if ((range_confirmed or weak_market_confirmed or thin_market_confirmed)
+            and not directional_vwap_cross and not entry_thesis_veto):
         return RANGE_MODE, "confirmed_range_weak_market_or_thin_liquidity", tuple(evidence)
 
     # A fresh directional VWAP cross vetoes the one-shot scalp classification
     # until the market proves the new move has failed. Keep TP1/TP2 50/50.
+    # The persisted entry thesis provides the same protection after the original
+    # cross candle is no longer fresh.
     if directional_vwap_cross:
         return STANDARD_MODE, "fresh_directional_vwap_cross_keep_two_stage_50_50", tuple(evidence)
+    if entry_thesis_veto:
+        return STANDARD_MODE, "entry_confirmed_cross_keep_two_stage_50_50", tuple(evidence)
 
     # Crucial fail-safe: indicator/API gaps do not automatically force a short
     # scalp or a full-position exit. Keep the canonical 50/50 management model.
