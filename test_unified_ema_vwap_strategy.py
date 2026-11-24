@@ -351,3 +351,29 @@ def test_direct_cross_is_idempotent_on_same_closed_candle(monkeypatch, tmp_path)
     duplicate = engine.evaluate_direct_cross("TEST", data, now_ms=now)
     assert first["status"] == duplicate["status"] == "ENTRY_READY"
     assert first["crossover_ts"] == duplicate["crossover_ts"]
+
+
+def test_direct_cross_can_scan_same_symbol_again_after_position_closes(monkeypatch, tmp_path):
+    import unified_ema_vwap_strategy as module
+
+    data = _direct_cross_test_frame()
+    engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "after-close.json"))
+    engine._persist(Setup(
+        symbol="TEST", status="TRADE_OPEN", direction="BUY",
+        entry_path="DIRECT_EMA9_EMA15_CROSS",
+        crossover_ts=int(data.timestamp.iloc[-2]),
+        last_candle_ts=int(data.timestamp.iloc[-2]),
+    ))
+    monkeypatch.setattr(module, "indicator_series", lambda _frame: {
+        "valid": True,
+        "ema9": pd.Series(np.full(70, 101.0)),
+        "ema15": pd.Series(np.full(70, 100.0)),
+        "ema50": pd.Series(np.full(70, 99.0)),
+        "atr14": pd.Series(np.ones(70)),
+        "vwap_series": pd.Series(np.full(70, 100.0)),
+        "utc_session": pd.Series(["2026-11-24"] * 70),
+    })
+    monkeypatch.setattr(module, "indicators", lambda _frame: {"valid": True, "reason": ""})
+    result = engine.evaluate_direct_cross("TEST", data, now_ms=int(data.timestamp.iloc[-1] + 900_000))
+    assert result["status"] == "DISCOVERED"
+    assert result["reason"] == "no_new_closed_ema9_ema15_cross"
