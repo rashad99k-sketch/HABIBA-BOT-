@@ -135,6 +135,7 @@ class HealthWatchdog:
         alert_fn: Optional[Callable[[str, str], None]] = None,
         safety_gate: Optional[Callable[[], (bool, str)]] = None,
         check_interval_sec: float = 2.0,
+        verification_retry_sec: float = 30.0,
         monotonic_fn=None,
         sleep_fn=None,
     ) -> None:
@@ -142,6 +143,9 @@ class HealthWatchdog:
         self.alert_fn = alert_fn
         self.safety_gate = safety_gate
         self.check_interval_sec = max(0.2, float(check_interval_sec))
+        # Bounded backoff for *failed verification*, never for stall detection or
+        # grace windows. A real progress beat re-arms verification immediately.
+        self.verification_retry_sec = max(1.0, float(verification_retry_sec))
         self._monotonic = monotonic_fn or time.monotonic
         self._sleep = sleep_fn or time.sleep
         self._components: Dict[str, ComponentHealth] = {}
@@ -223,10 +227,14 @@ class HealthWatchdog:
                                         "IDLE_SAFE_HOLD"}:
                     for alarm_key in (f"stalled:{component.name}", f"failed:{component.name}",
                                       f"recovery_deferred:{component.name}",
+                                      f"verify_blocked:{component.name}",
                                       f"restart_failed:{component.name}",
                                       f"schedule_blocked:{component.name}",
                                       f"schedule_failed:{component.name}"):
                         self._alarms.pop(alarm_key, None)
+                    for key in ("verification_next_attempt", "verification_attempts",
+                                "verification_last_reason", "verification_progress_at"):
+                        component.diagnostics.pop(key, None)
             state = diagnostics.pop("state", None)
             if state is not None and str(state).upper() in {"RUNNING", "IDLE", "BLOCKED", "FAILED"}:
                 component.lifecycle = str(state).upper()
@@ -456,6 +464,28 @@ class HealthWatchdog:
             verified_open_resume = False
             non_trading_resume = False
             if callable(component.recovery_verifier):
+                diag = component.diagnostics
+                marker = float(diag.get("verification_progress_at", -1.0) or -1.0)
+                if marker != float(progress_at):
+                    # New real progress (or a different stall incident) re-arms
+                    # verification; a blocked verifier is never retried forever.
+                    for key in ("verification_next_attempt", "verification_attempts",
+                                "verification_last_reason", "verification_progress_at"):
+                        diag.pop(key, None)
+                next_attempt = float(diag.get("verification_next_attempt", 0.0) or 0.0)
+                if next_attempt > now:
+                    component.status = "STALLED_SAFE_HOLD"
+                    remaining = round(next_attempt - now, 3)
+                    report[component.name] = {
+                        "status": component.status, "age_sec": round(age, 3),
+                        "restart": "VERIFICATION_BACKOFF",
+                        "reason": str(diag.get("verification_last_reason") or ""),
+                        "next_verification_sec": remaining,
+                        "verification_attempts": int(diag.get("verification_attempts", 0) or 0),
+                        "caller": diag.get("verification_caller", ""),
+                        "component": diag.get("verification_component", component.name),
+                    }
+                    continue
                 try:
                     verified, verify_reason, context = component.recovery_verifier()
                     verification_context = dict(context or {})
@@ -463,11 +493,26 @@ class HealthWatchdog:
                     verified, verify_reason, verification_context = False, f"VERIFIER_EXCEPTION:{type(exc).__name__}", {}
                 if not verified:
                     component.status = "STALLED_SAFE_HOLD"
-                    component.diagnostics["last_verification"] = str(verify_reason)[:120]
+                    diag["last_verification"] = str(verify_reason)[:120]
+                    diag["verification_last_reason"] = str(verify_reason)[:120]
+                    diag["verification_attempts"] = int(diag.get("verification_attempts", 0) or 0) + 1
+                    diag["verification_next_attempt"] = now + self.verification_retry_sec
+                    diag["verification_progress_at"] = float(progress_at)
+                    for key in ("caller", "component", "verification_source", "symbol_source",
+                                "symbol_status"):
+                        if key in verification_context:
+                            diag[f"verification_{key}"] = str(verification_context[key])[:120]
                     self._alert(f"verify_blocked:{component.name}", "WARN",
                                 f"[WATCHDOG] restart of {component.name} deferred by verification: {verify_reason}")
-                    report[component.name] = {"status": component.status, "age_sec": round(age, 3),
-                                              "restart": "VERIFICATION_HOLD", "reason": str(verify_reason)}
+                    report[component.name] = {
+                        "status": component.status, "age_sec": round(age, 3),
+                        "restart": "VERIFICATION_HOLD", "reason": str(verify_reason),
+                        "next_verification_sec": round(self.verification_retry_sec, 3),
+                        "verification_attempts": int(diag["verification_attempts"]),
+                        "caller": verification_context.get("caller", "direct"),
+                        "component": verification_context.get("component", component.name),
+                        "symbol_status": verification_context.get("symbol_status", ""),
+                    }
                     continue
                 verified_open_resume = bool(verification_context.get("open_position_verified"))
                 non_trading_resume = bool(verification_context.get("non_trading_engine"))
