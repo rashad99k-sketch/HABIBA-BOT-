@@ -149,7 +149,9 @@ def test_rejection_and_confirmation_must_be_separate_closed_candles(tmp_path):
     closes = np.linspace(100, 110, 70)
     f = frame(70, close=closes)
     ts = int(f.timestamp.iloc[-1])
-    f.loc[69, ["open", "high", "low", "close"]] = [109.8, 110.0, 108.8, 109.95]
+    # Keep the rejection close and EMA9 above the same-session VWAP; the test
+    # is about candle sequencing, not a deliberately invalidated VWAP thesis.
+    f.loc[69, ["open", "high", "low", "close"]] = [109.8, 110.6, 108.8, 110.5]
     engine._persist(Setup(symbol="SEQ", status="WAITING_FOR_REJECTION", direction="BUY",
                           crossover_ts=ts - 4 * 900_000, pullback_type="MICRO",
                           last_candle_ts=ts - 900_000, atr14=1, causal_level=109.0, causal_zone_low=108.8, causal_zone_high=109.2, causal_zone_type="ORDER_BLOCK", causal_zone_ts=ts - 2*900_000))
