@@ -9147,7 +9147,11 @@ def _refresh_ema_vwap_setups(watchlist):
         try:
             frame = _peek_scanner_frame(roro_exchange_symbol(exchange_sym))
             if frame is None:
+                item["institutional_decision_state"] = item.get("decision_state")
                 item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION", "reason": "awaiting_fresh_scanner_cache"}
+                item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
+                item["decision_state"] = "WAITING_FOR_CONFIRMATION"
+                item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
                 continue
             closed = roro_validate_closed_frame(
                 frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
@@ -9164,8 +9168,12 @@ def _refresh_ema_vwap_setups(watchlist):
             item["decision_state"] = result.get("status", "UNKNOWN")
             item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
         except Exception as exc:
+            item["institutional_decision_state"] = item.get("decision_state")
             item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION",
                                            "reason": f"strategy_error:{type(exc).__name__}"}
+            item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
+            item["decision_state"] = "WAITING_FOR_CONFIRMATION"
+            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
 
 _last_unified_watchlist_refresh = 0.0
 def refresh_unified_institutional_watchlist(force=False):
