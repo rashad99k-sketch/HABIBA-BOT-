@@ -9159,11 +9159,13 @@ EMA_VWAP_ENTRY_ENGINE = UnifiedEMAVWAPPullbackEngine(
 
 def _refresh_ema_vwap_setups(watchlist):
     """Advance persistent strategy states using cached, confirmed OHLCV only."""
-    if not isinstance(watchlist, dict):
+    if not isinstance(watchlist, dict) or _position_management_mode():
         return
     # Bounded work; the existing watchlist rotation and scanner cadence remain intact.
     limit = max(1, int(INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS))
     for canonical, item in list(watchlist.items())[:limit]:
+        if _position_management_mode():
+            break
         if not isinstance(item, dict):
             continue
         exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
@@ -9216,6 +9218,9 @@ def _refresh_ema_vwap_setups(watchlist):
 _last_unified_watchlist_refresh = 0.0
 def refresh_unified_institutional_watchlist(force=False):
     global _last_unified_watchlist_refresh
+    if _position_management_mode():
+        MEMORY["runtime_mode"] = "POSITION_MANAGEMENT_ONLY"
+        return MEMORY.setdefault("watchlist", {})
     now = time.time()
     if not force and now - _last_unified_watchlist_refresh < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
         return MEMORY.setdefault("watchlist", {})
