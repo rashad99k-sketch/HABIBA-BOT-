@@ -131,4 +131,4 @@ Integration coverage adds: final wrapper dispatch, blocked legacy calls, lower-l
 - No live or paper runtime trading was attempted; all execution tests are mocked.
 - This branch is not proof of production readiness. Repository documentation already describes the broader integration as partial/not production-accepted.
 - `.env.example` retains `ENABLE_LIVE_TRADING=true`; review before any deployment.
-- PR creation is pending authentication: no `gh` CLI is installed and no `GH_TOKEN`/`GITHUB_TOKEN` is available. The branch has not been pushed or merged.
+- PR [#7](https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/7) is open from `feat/ema9-vwap-causal-zone-entry` into `main`. It has not been merged.
