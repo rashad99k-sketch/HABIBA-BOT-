@@ -41,6 +41,23 @@ class StopMoveResult:
         return self.outcome in {"MOVED", "RETAINED"}
 
 
+@dataclass(frozen=True)
+class StopEnsureResult:
+    """Tri-state result of an idempotent native-stop recovery repair.
+
+    VERIFIED_ADOPTED / PLACED_VERIFIED prove protection with a fresh exchange
+    read. HOLD never clears a recovery gate and never places a duplicate stop.
+    """
+    outcome: str
+    order_id: Optional[str] = None
+    reason: str = ""
+    verified_price: Optional[float] = None
+
+    @property
+    def verified(self) -> bool:
+        return self.outcome in {"VERIFIED_ADOPTED", "PLACED_VERIFIED"}
+
+
 class PositionMode(str, Enum):
     ONE_WAY = "ONE_WAY"
     HEDGE = "HEDGE"
@@ -230,11 +247,21 @@ def leverage_params(mode: PositionMode, position_side: str) -> Dict[str, str]:
 class TradeExecutionService:
     """Single order gateway with no blind MARKET retries and fail-closed verification."""
 
-    def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None):
+    def __init__(self, exchange: Any, journal: Any = None, logger: Optional[Callable[[str], None]] = None,
+                 api_caller: Optional[Callable] = None):
         self.exchange = exchange
         self.journal = journal
         self.logger = logger or (lambda _message: None)
         self.mode_adapter = BingXPositionModeAdapter(exchange, logger=self.logger)
+        # Runtime callers inject ggpbot.safe_api_call so every protective-order
+        # read/write obeys the same central rate limiter and API governor.
+        self._api_caller = api_caller
+
+    def api_call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        """Route an exchange call through the injected governor when present."""
+        if self._api_caller is None:
+            return func(*args, **kwargs)
+        return self._api_caller(func, *args, **kwargs)
 
     def _persist_pending(self, **fields: Any) -> None:
         if self.journal is not None and hasattr(self.journal, "persist_entry_pending"):
@@ -432,6 +459,158 @@ class TradeExecutionService:
             return order_id
         self.logger(f"native stop verification exhausted read-back attempts for order_id={order_id}")
         return None
+
+    def ensure_native_stop(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: float,
+        trigger_price: float,
+        mode: PositionMode,
+        position_side: str,
+        trigger_prices: Optional[list] = None,
+    ) -> StopEnsureResult:
+        """Idempotently restore protection from a journal-proven stop level.
+
+        Ordering is intentionally fail-closed:
+          1. Adopt an existing active stop only when it strictly matches the
+             journaled level and covers the exchange-confirmed quantity.
+          2. If any active stop exists at another level, HOLD instead of creating
+             a second protective order.
+          3. If the conditional-order query failed, HOLD: absence was not proven.
+          4. Only when queries succeeded and returned no active stop do we place
+             one, and only a fresh read-back can turn that into VERIFIED.
+        """
+        from bingx_protection import is_matching_native_stop_order, native_order_identifiers
+
+        close_side = "sell" if str(side).upper() == "BUY" else "buy"
+        qty = float(quantity)
+        price = float(trigger_price)
+        if qty <= 0 or not math.isfinite(price) or price <= 0:
+            return StopEnsureResult("HOLD", reason="INVALID_JOURNALLED_PROTECTION")
+        # Only journal-proven levels may be adopted. A new order is placed solely
+        # at the primary journal level and only after authoritative queries prove
+        # that no conditional stop exists in this scope.
+        candidate_prices = []
+        for value in (price, *(trigger_prices or [])):
+            number = float(value)
+            if math.isfinite(number) and number > 0 and number not in candidate_prices:
+                candidate_prices.append(number)
+        rows, query_succeeded, query_details = self._collect_native_stop_rows(
+            symbol=symbol, close_side=close_side.upper(), position_side=str(position_side).upper())
+        if not query_succeeded:
+            return StopEnsureResult("HOLD", reason="CONDITIONAL_QUERY_UNKNOWN")
+        rounding_delta = self._ensure_price_rounding_delta(symbol, price)
+        for expected_price in candidate_prices:
+            matching = [row for row in rows if is_matching_native_stop_order(
+                row, symbol=symbol, position_side=str(position_side).upper(),
+                close_side=close_side.upper(), trigger_price=expected_price,
+                required_qty=qty, price_tolerance_abs=rounding_delta)]
+            if len(matching) > 1:
+                return StopEnsureResult("HOLD", reason="DUPLICATE_STOP_DETECTED",
+                                        verified_price=expected_price)
+            if matching:
+                ids = native_order_identifiers(matching[0])
+                order_id = next(iter(ids)) if ids else None
+                return StopEnsureResult("VERIFIED_ADOPTED", order_id=order_id,
+                                        reason="EXISTING_STOP_VERIFIED", verified_price=expected_price)
+        if self._has_active_stop_for_scope(rows, symbol=symbol, close_side=close_side.upper(),
+                                           position_side=str(position_side).upper()):
+            return StopEnsureResult("HOLD", reason="ACTIVE_STOP_AT_UNPROVEN_LEVEL")
+        params = build_position_order_params(
+            mode, "SELL" if close_side == "sell" else "BUY", opening=False, closing=True,
+            reduce_only_required=(mode is PositionMode.ONE_WAY))
+        params.update({"stopPrice": price, "workingType": "MARK_PRICE"})
+        try:
+            # Writes go through the same central governor as reads. The governor
+            # never returns a timed-out write to a retry loop.
+            order = self.api_call(
+                self.exchange.create_order, symbol, "STOP_MARKET", close_side, qty, None, params)
+        except Exception as exc:
+            self.logger(f"ensure_native_stop placement uncertain: {type(exc).__name__}: {exc}")
+            return StopEnsureResult("HOLD", reason="ORDER_SUBMISSION_UNCERTAIN")
+        order_id = _order_id(order)
+        if not order_id:
+            return StopEnsureResult("HOLD", reason="ORDER_ID_UNAVAILABLE")
+        verified = self._ensure_readback_native_stop(
+            symbol=symbol, close_side=close_side.upper(), position_side=str(position_side).upper(),
+            trigger_price=price, quantity=qty)
+        if not verified:
+            return StopEnsureResult("HOLD", order_id=order_id, reason="PLACED_READBACK_UNVERIFIED")
+        return StopEnsureResult("PLACED_VERIFIED", order_id=verified,
+                                reason="NEW_STOP_VERIFIED", verified_price=price)
+
+    def _ensure_price_rounding_delta(self, symbol: str, price: float) -> float:
+        """Return only the exchange precision delta for one exact journal price."""
+        price_to_precision = getattr(self.exchange, "price_to_precision", None)
+        if not callable(price_to_precision):
+            return 0.0
+        try:
+            exchange_price = float(self.api_call(price_to_precision, symbol, price))
+            if exchange_price > 0:
+                return abs(float(price) - exchange_price) + 1e-12
+        except Exception as exc:
+            self.logger(f"ensure_native_stop precision read unavailable: {type(exc).__name__}: {exc}")
+        return 0.0
+
+    def _collect_native_stop_rows(self, *, symbol: str, close_side: str,
+                                  position_side: str):
+        """Return (rows, authoritative_ok, details) from BingX conditional endpoints.
+
+        An empty ``fetch_open_orders`` list is never proof that a conditional
+        stop is absent. Authoritative absence requires BOTH BingX conditional
+        order queries to succeed with explicit success envelopes.
+        """
+        from bingx_protection import fetch_native_stop_evidence
+        rows, authoritative_ok, details = fetch_native_stop_evidence(
+            self.exchange, symbol, api_call=self.api_call, logger=self.logger)
+        if not authoritative_ok:
+            self.logger(f"native stop evidence UNKNOWN: {details}")
+        return rows, authoritative_ok, details
+
+    def _ensure_readback_native_stop(self, *, symbol: str, close_side: str,
+                                     position_side: str, trigger_price: float,
+                                     quantity: float) -> Optional[str]:
+        """Read back an exact stop using the same authoritative conditional queries."""
+        from bingx_protection import is_matching_native_stop_order, native_order_identifiers
+        rows, authoritative_ok, _ = self._collect_native_stop_rows(
+            symbol=symbol, close_side=close_side.upper(), position_side=str(position_side).upper())
+        if not authoritative_ok:
+            return None
+        delta = self._ensure_price_rounding_delta(symbol, float(trigger_price))
+        matching = [row for row in rows if is_matching_native_stop_order(
+            row, symbol=symbol, position_side=str(position_side).upper(),
+            close_side=close_side.upper(), trigger_price=float(trigger_price),
+            required_qty=float(quantity), price_tolerance_abs=delta)]
+        if len(matching) != 1:
+            return None
+        ids = native_order_identifiers(matching[0])
+        return next(iter(ids)) if ids else None
+
+    @staticmethod
+    def _has_active_stop_for_scope(rows, *, symbol: str, close_side: str,
+                                   position_side: str) -> bool:
+        """True for any active conditional stop in this scope, regardless of price."""
+        from bingx_protection import _first_text, _values, _canonical_symbol
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            types = {str(v).strip().upper().replace("-", "_")
+                     for v in _values(row, ("type", "orderType", "origType"))}
+            if not (types & {"STOP_MARKET", "TRIGGER_MARKET"}):
+                continue
+            if _canonical_symbol(_first_text(row, ("symbol", "market", "contract"))) != _canonical_symbol(symbol):
+                continue
+            if str(_first_text(row, ("side", "orderSide")) or "").upper() != str(close_side).upper():
+                continue
+            actual_position_side = str(_first_text(row, ("positionSide", "posSide", "position_side")) or "").upper()
+            if actual_position_side and actual_position_side != str(position_side).upper():
+                continue
+            status = str(_first_text(row, ("status", "state", "orderStatus")) or "").upper().replace(" ", "_")
+            if status in {"NEW", "OPEN", "PENDING", "PARTIALLY_FILLED", "PARTIALLYFILLED", "WORKING"}:
+                return True
+        return False
 
     def _read_back_native_stop(self, *, symbol: str, close_side: str, position_side: str,
                                trigger_price: float, quantity: float) -> Optional[str]:

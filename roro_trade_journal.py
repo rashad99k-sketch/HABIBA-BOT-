@@ -104,6 +104,42 @@ class TradeJournal:
             "complete": int(busy) == 0 and int(checkpointed_frames) >= int(log_frames),
         }
 
+    def integrity_check(self) -> Dict[str, Any]:
+        """Read-only SQLite integrity check used by safe maintenance."""
+        try:
+            with self._db() as db:
+                row = db.execute("PRAGMA integrity_check").fetchone()
+            verdict = str(row[0]) if row else "NO_RESULT"
+            return {"ok": verdict.lower() == "ok", "result": verdict[:200]}
+        except Exception as exc:
+            return {"ok": False, "result": f"{type(exc).__name__}: {exc}"[:200]}
+
+    def size_bytes(self) -> Dict[str, int]:
+        """Report main/WAL/SHM sizes without modifying the database."""
+        from pathlib import Path as _Path
+        result = {}
+        for suffix in ("", "-wal", "-shm"):
+            path = _Path(self.path + suffix)
+            try:
+                result["main" if not suffix else suffix.lstrip("-")] = int(path.stat().st_size) if path.exists() else 0
+            except OSError:
+                result["main" if not suffix else suffix.lstrip("-")] = 0
+        return result
+
+    def prune_runtime_state(self, *, ttl_days: float, protected_keys: Iterable[str]) -> Dict[str, Any]:
+        """Delete only stale runtime helper keys. Never removes trade/audit rows."""
+        cutoff = time.time() - max(1.0, float(ttl_days)) * 86400.0
+        protected = {str(k) for k in protected_keys}
+        with self._db() as db:
+            candidates = [str(row[0]) for row in db.execute(
+                "SELECT state_key FROM runtime_state WHERE updated_ts<?", (cutoff,))]
+            removable = [key for key in candidates if key not in protected]
+            if removable:
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("DELETE FROM runtime_state WHERE state_key=?", [(key,) for key in removable])
+                db.execute("COMMIT")
+        return {"removed_runtime_keys": len(removable), "protected_keys": sorted(protected)}
+
     def get_runtime_state(self, state_key: str, default: Any = None) -> Any:
         """Read an independent runtime safety record without touching trade rows."""
         with self._db() as db:
