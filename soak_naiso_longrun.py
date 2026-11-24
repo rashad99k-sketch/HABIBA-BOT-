@@ -199,12 +199,63 @@ def soak_journal_protection():
                 "protected_key_preserved": True, "integrity": "ok"}
 
 
+def soak_engine_recovery():
+    """Long-run watchdog recovery with verified open/flat separation."""
+    clock = [0.0]
+    mode = {"open": True, "verified": True}
+    counts = {"management": 0, "scanner": 0, "holds": 0, "recovered": 0}
+
+    def verifier():
+        if not mode["verified"]:
+            return False, "EXCHANGE_STATE_UNKNOWN", {}
+        return True, "VERIFIED", {
+            "open_position_verified": mode["open"],
+            "flat_verified": not mode["open"],
+        }
+
+    def restart_fn(context):
+        if context.get("open_position_verified"):
+            counts["management"] += 1
+            assert not context.get("flat_verified")
+        else:
+            counts["scanner"] += 1
+            assert context.get("flat_verified") is True
+        return True
+
+    watchdog = HealthWatchdog(
+        restart_policy=RestartPolicy(max_attempts=3, window_sec=300.0,
+                                     monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None),
+        safety_gate=lambda: ((False, "OPEN_POSITION") if mode["open"] else (True, "READY")),
+        monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None)
+    watchdog.register("main_loop", interval_sec=1.0, grace_sec=1.0, critical=True,
+                      restartable=True, recovery_verifier=verifier, restart_fn=restart_fn)
+
+    for cycle in range(SL_CYCLES):
+        clock[0] = float(cycle * 10)
+        mode["open"] = bool(cycle % 2 == 0)
+        mode["verified"] = cycle % 13 != 0
+        watchdog.beat("main_loop")
+        clock[0] += 120.0
+        report = watchdog.check()["main_loop"]
+        if report["status"] == "RECOVERED":
+            counts["recovered"] += 1
+        elif report["status"] == "STALLED_SAFE_HOLD":
+            counts["holds"] += 1
+        assert report["status"] in {"RECOVERED", "STALLED_SAFE_HOLD", "RESTART_BUDGET_EXHAUSTED"}
+
+    assert counts["recovered"] > 0 and counts["holds"] > 0
+    assert counts["management"] > 0 and counts["scanner"] > 0
+    assert len(watchdog.restart_policy.records("main_loop", limit=SL_CYCLES)) <= RestartPolicy.MAX_RECORDS_PER_COMPONENT
+    return {**counts, "history_bounded": True}
+
+
 def main():
     results = {
         "api_resilience": soak_api_resilience(),
         "restart_policy": soak_restart_policy(),
         "maintenance": soak_maintenance(),
         "native_stop": soak_native_stop_idempotency(),
+        "engine_recovery": soak_engine_recovery(),
         "journal": soak_journal_protection(),
     }
     print("SOAK_OK deterministic offline long-run guards")

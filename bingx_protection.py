@@ -216,3 +216,103 @@ def native_stop_candidate_summary(order: Dict[str, Any]) -> Dict[str, Any]:
         "triggerPrice": _first_text(order, ("stopPrice", "triggerPrice", "stopLossPrice", "stop_price", "trigger_price")),
         "quantity": _first_text(order, ("origQty", "quantity", "qty", "amount", "orig_qty", "origQuantity")),
     }
+
+
+CONDITIONAL_ORDER_TYPES = ("STOP_MARKET", "TRIGGER_MARKET")
+
+
+def _raw_query_succeeded(payload: Any) -> bool:
+    """A raw API envelope is useful evidence only when its own status is success."""
+    if payload is None:
+        return False
+    obj = _as_dict(payload)
+    if obj is not None and "code" in obj and str(obj.get("code")).strip().lower() not in {"0", "200", "ok"}:
+        return False
+    if obj is not None and "success" in obj and obj.get("success") is False:
+        return False
+    if isinstance(payload, list):
+        return True
+    if obj is None:
+        return False
+    if "code" in obj or "success" in obj:
+        return True
+    return bool(extract_open_order_records(obj))
+
+
+def fetch_native_stop_evidence(exchange: Any, symbol: str, *, api_call=None, logger=None):
+    """Collect conditional-order evidence without treating an empty list as absence.
+
+    Returns ``(records, authoritative_ok, details)``. ``authoritative_ok`` is True
+    only when BOTH BingX conditional-order queries (STOP_MARKET and
+    TRIGGER_MARKET) succeeded. A unified ``fetch_open_orders`` response may add
+    matching records, but an empty or unavailable unified response never proves
+    that a conditional stop is absent.
+    """
+    call = api_call or (lambda func, *args, **kwargs: func(*args, **kwargs))
+
+    def _warn(message: str) -> None:
+        if callable(logger):
+            try:
+                logger(message)
+            except Exception:
+                pass
+
+    records: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    def _add_records(payload: Any) -> None:
+        # The same conditional order appears in multiple endpoints. Collapse it
+        # by native id so duplicate detection reflects real exchange orders.
+        for row in extract_open_order_records(payload):
+            identifiers = native_order_identifiers(row)
+            if identifiers and identifiers & seen_ids:
+                continue
+            seen_ids.update(identifiers)
+            records.append(row)
+
+    unified_seen = False
+    fetch_open = getattr(exchange, "fetch_open_orders", None)
+    if callable(fetch_open):
+        for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
+            try:
+                payload = call(fetch_open, *args)
+            except TypeError:
+                continue
+            except Exception as exc:
+                _warn(f"unified open-order query failed: {type(exc).__name__}: {exc}")
+                continue
+            if payload is not None:
+                unified_seen = True
+                _add_records(payload)
+
+    market_id = str(symbol)
+    market = getattr(exchange, "market", None)
+    if callable(market):
+        try:
+            market_payload = call(market, symbol)
+            if isinstance(market_payload, dict) and market_payload.get("id"):
+                market_id = str(market_payload["id"])
+        except Exception as exc:
+            _warn(f"market id query failed: {type(exc).__name__}: {exc}")
+
+    conditional_ok = {}
+    raw_method = getattr(exchange, "swapV2PrivateGetTradeOpenOrders", None)
+    if callable(raw_method):
+        for native_type in CONDITIONAL_ORDER_TYPES:
+            try:
+                payload = call(raw_method, {"symbol": market_id, "type": native_type})
+            except Exception as exc:
+                _warn(f"{native_type} conditional query failed: {type(exc).__name__}: {exc}")
+                continue
+            if _raw_query_succeeded(payload):
+                conditional_ok[native_type] = True
+                _add_records(payload)
+            else:
+                _warn(f"{native_type} conditional query returned an unsuccessful envelope")
+
+    authoritative_ok = all(conditional_ok.get(kind, False) for kind in CONDITIONAL_ORDER_TYPES)
+    return records, authoritative_ok, {
+        "unified_rows_seen": unified_seen,
+        "conditional_ok": conditional_ok,
+        "authoritative_ok": authoritative_ok,
+    }

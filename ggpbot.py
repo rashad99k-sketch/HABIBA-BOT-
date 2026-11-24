@@ -667,6 +667,16 @@ def safe_api_call(func, *args, **kwargs):
                     )
                 except Exception:
                     pass
+            if failure_kind is not None and not failure_kind.retryable:
+                try:
+                    log_execution(
+                        f"[API_NO_RETRY] {method_name} failed with non-retryable "
+                        f"{failure_kind.kind}: {str(e)[:180]}",
+                        "ERROR", debounce_key=f"api_no_retry_{method_name}", debounce_sec=30
+                    )
+                except Exception:
+                    pass
+                raise
             if attempt == attempts - 1:
                 raise
             if resilience is not None:
@@ -4711,9 +4721,15 @@ class ExchangeReconciliationSupervisor:
         }
 
     def start(self):
-        if not self._started:
-            self._started = True
-            self._thread.start()
+        """Start (or safely restart after a dead thread) exactly one supervisor."""
+        if self._thread is not None and self._thread.is_alive():
+            return False
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="ggp-exchange-reconciliation", daemon=True)
+        self._started = True
+        self.last_result = "STARTED"
+        self._thread.start()
+        return True
 
     def stop(self, timeout=5.0):
         self._stop.set()
@@ -11000,20 +11016,219 @@ def main_loop_sniper():
 
 main_loop = main_loop_sniper
 
+
+_ENGINE_RECOVERY_GUARD = {"ts": 0.0, "symbol": None}
+_ENGINE_RECOVERY_LOCK = threading.RLock()
+
+
+def _named_thread_alive(name):
+    return any(thread.name == name and thread.is_alive() for thread in threading.enumerate())
+
+
+def _exchange_position_matches_control_state(row, symbol, side=None, qty=None):
+    """Match one BingX position against the locally controlled trade identity."""
+    if not isinstance(row, dict):
+        return False
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    raw_symbol = row.get("symbol") or info.get("symbol")
+    if not raw_symbol or normalize_symbol(raw_symbol) != normalize_symbol(symbol):
+        return False
+    raw_position_side = str(row.get("positionSide") or row.get("posSide")
+                            or info.get("positionSide") or info.get("posSide") or "").upper()
+    raw_side = str(row.get("side") or info.get("side") or "").upper()
+    direction = raw_position_side if raw_position_side in {"LONG", "SHORT"} else (
+        raw_side if raw_side in {"LONG", "SHORT"} else "")
+    expected = "LONG" if str(side or "").upper() == "BUY" else (
+        "SHORT" if str(side or "").upper() == "SELL" else "")
+    if direction and expected and direction != expected:
+        return False
+    contracts = safe_float(row.get("contracts"),
+                           safe_float(info.get("positionAmt"), 0.0))
+    if abs(contracts) <= 0:
+        return False
+    expected_qty = safe_float(qty, 0.0)
+    if expected_qty > 0 and abs(abs(contracts) - expected_qty) > max(0.01, expected_qty * 0.005):
+        return False
+    return True
+
+
+def _verify_engine_recovery(symbol=None):
+    """Verify BingX position, conditional orders and native SL before resume.
+
+    Returns ``(verified, reason, context)``. Any failed or partial exchange read
+    returns UNKNOWN-like failure, sets the recovery hold for an open exposure and
+    never authorizes management or scanner work.
+    """
+    sym = normalize_symbol(symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or "")
+    local_open = bool(STATE.get("open") or TRADE_STATE.get("in_position"))
+    expected_side = str(STATE.get("side") or TRADE_STATE.get("side") or "").upper()
+    expected_qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty")
+                              or TRADE_STATE.get("qty"), 0.0)
+    context = {
+        "symbol": sym, "local_open": local_open, "open_position_verified": False,
+        "flat_verified": False, "orders_verified": False, "stop_verified": False,
+        "paper_mode": bool(PAPER_MODE),
+    }
+    if PAPER_MODE:
+        context.update({"open_position_verified": local_open, "flat_verified": not local_open,
+                        "paper_only": True})
+        return True, "PAPER_MODE_RECOVERY", context
+    if not sym or (local_open and (expected_side not in {"BUY", "SELL"} or expected_qty <= 0)):
+        reason = "engine_recovery_local_state_incomplete"
+        if local_open:
+            _recovery_hold(reason, symbol=sym or "UNKNOWN", trade_id=STATE.get("trade_id"))
+        return False, reason, context
+    try:
+        positions = safe_api_call(ex.fetch_positions, [sym])
+    except Exception as exc:
+        reason = f"engine_recovery_position_query_unknown:{type(exc).__name__}"
+        if local_open:
+            _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"))
+        return False, reason, context
+    if not isinstance(positions, list):
+        reason = "engine_recovery_position_query_invalid"
+        if local_open:
+            _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"))
+        return False, reason, context
+    matches = [row for row in positions if _exchange_position_matches_control_state(
+        row, sym, side=expected_side, qty=expected_qty)]
+    if not local_open:
+        if matches:
+            reason = "engine_recovery_unexpected_exchange_position"
+            _recovery_hold(reason, symbol=sym)
+            return False, reason, context
+        context["flat_verified"] = True
+        return True, "FLAT_VERIFIED", context
+    if len(matches) != 1:
+        reason = "engine_recovery_position_unverified"
+        _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"),
+                       details={"matched_positions": len(matches)})
+        return False, reason, context
+    try:
+        from bingx_protection import fetch_native_stop_evidence
+        records, authoritative_ok, query_details = fetch_native_stop_evidence(
+            ex, sym, api_call=safe_api_call,
+            logger=lambda message: log_execution(f"[ENGINE_RECOVERY] {message}", "WARN"))
+    except Exception as exc:
+        reason = f"engine_recovery_orders_query_unknown:{type(exc).__name__}"
+        _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"))
+        return False, reason, context
+    if not authoritative_ok:
+        reason = "engine_recovery_orders_unknown"
+        _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"),
+                       details={"query": query_details, "records": len(records)})
+        return False, reason, context
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    saved_state = {}
+    if journal is not None and STATE.get("trade_id"):
+        try:
+            row = journal.get(str(STATE["trade_id"])) or {}
+            saved_state = row.get("state") if isinstance(row.get("state"), dict) else {}
+        except Exception:
+            saved_state = {}
+    stop_prices = _journal_native_stop_prices(
+        saved_state, primary=safe_float(STATE.get("native_sl_last_verified_price"),
+                                        safe_float(STATE.get("native_sl_original_price"),
+                                                   safe_float(STATE.get("sl")))))
+    if not stop_prices:
+        reason = "engine_recovery_journal_sl_unproven"
+        _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"))
+        return False, reason, context
+    position_side = str(STATE.get("position_side") or saved_state.get("position_side") or "").upper()
+    status, order_id, matched_price = verify_native_stop_loss_detailed(
+        sym, expected_side, stop_prices[0], expected_qty, position_side=position_side,
+        trigger_prices=stop_prices[1:])
+    if status != "VERIFIED":
+        reason = f"engine_recovery_native_sl_{str(status).lower()}"
+        _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"),
+                       details={"expected_sl_levels": stop_prices})
+        return False, reason, context
+    context.update({"open_position_verified": True, "orders_verified": True,
+                    "stop_verified": True, "native_sl_order_id": order_id,
+                    "native_sl_price": matched_price})
+    return True, "OPEN_POSITION_VERIFIED", context
+
+
+def _resume_scanner_after_flat_verification(context=None):
+    """Scanner restart is a separate flat-only path; it never manages a trade."""
+    context = dict(context or {})
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return False
+    if not (context.get("flat_verified") or (context.get("paper_mode") and context.get("paper_only"))):
+        return False
+    return bool(dispatch_scanner_task("global_discovery", run_global_discovery_scanner))
+
+
+def _resume_main_loop_after_verification(context=None):
+    """Resume verified open-trade management without opening a new trade."""
+    context = dict(context or {})
+    open_verified = bool(context.get("open_position_verified") or
+                         (context.get("paper_mode") and context.get("paper_only")
+                          and context.get("open_position")))
+    if open_verified:
+        symbol = str(context.get("symbol") or STATE.get("current_symbol") or "")
+        now = time.time()
+        with _ENGINE_RECOVERY_LOCK:
+            recent = (symbol and _ENGINE_RECOVERY_GUARD["symbol"] == symbol and
+                      now - float(_ENGINE_RECOVERY_GUARD["ts"]) < 60.0)
+        if recent:
+            return not bool(STATE.get("recovery_hold"))
+        if not startup_trade_recovery():
+            return False
+        with _ENGINE_RECOVERY_LOCK:
+            _ENGINE_RECOVERY_GUARD.update({"ts": time.time(), "symbol": symbol})
+        return not bool(STATE.get("recovery_hold"))
+    return _resume_scanner_after_flat_verification(context)
+
+
+def _resume_exchange_reconciliation_after_verification(_context=None):
+    """Restart only the reconciliation monitor, never Scanner or trade startup."""
+    supervisor = globals().get("_reconciliation_supervisor")
+    return bool(supervisor is not None and supervisor.start())
+
+
+def _non_trading_engine_verifier():
+    """Non-order engines may resume while a position is open; they never trade."""
+    return True, "NON_TRADING_ENGINE", {"non_trading_engine": True}
+
+
+def _resume_institutional_updater_after_verification(_context=None):
+    if _named_thread_alive("live_institutional_updater"):
+        return False
+    threading.Thread(target=live_institutional_updater, daemon=True,
+                     name="live_institutional_updater").start()
+    return True
+
+
+def _resume_keep_alive_after_verification(_context=None):
+    if _named_thread_alive("keep_alive"):
+        return False
+    threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
+    return True
+
+
 def start_naiso_services():
-    """Register engines with the watchdog. Only called by the live supervisor."""
+    """Register engines with the watchdog and verified recovery callbacks."""
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return False
     watchdog.register("main_loop", interval_sec=max(5.0, safe_float(BASE_SLEEP, 5.0)),
-                      grace_sec=60.0, critical=True, restartable=False)
+                      grace_sec=60.0, critical=True, restartable=True,
+                      recovery_verifier=_verify_engine_recovery,
+                      restart_fn=_resume_main_loop_after_verification)
     watchdog.register("exchange_reconciliation", interval_sec=15.0, grace_sec=60.0,
-                      critical=True, restartable=False)
+                      critical=True, restartable=True,
+                      recovery_verifier=_non_trading_engine_verifier,
+                      restart_fn=_resume_exchange_reconciliation_after_verification)
     watchdog.register("institutional_updater", interval_sec=5.0, grace_sec=45.0,
-                      critical=False, restartable=False)
+                      critical=False, restartable=True,
+                      recovery_verifier=_non_trading_engine_verifier,
+                      restart_fn=_resume_institutional_updater_after_verification)
     watchdog.register("keep_alive", interval_sec=max(60.0, safe_float(KEEP_ALIVE_INTERVAL, 300.0)),
                       grace_sec=max(120.0, safe_float(KEEP_ALIVE_INTERVAL, 300.0) * 2.0),
-                      critical=False, restartable=False)
+                      critical=False, restartable=True,
+                      recovery_verifier=_non_trading_engine_verifier,
+                      restart_fn=_resume_keep_alive_after_verification)
     watchdog.start()
     log_execution("[NAISO_WATCHDOG] health monitoring started for core engines", "INFO")
     return True
@@ -12006,39 +12221,13 @@ def verify_native_stop_loss_detailed(symbol, side, trigger_price, required_qty, 
         log_execution(f"[NATIVE_SL] Position Side unavailable for {symbol}; refusing to guess BOTH", "ERROR")
         return "UNKNOWN", None, None
     try:
-        from bingx_protection import (extract_open_order_records, is_matching_native_stop_order,
+        from bingx_protection import (fetch_native_stop_evidence, is_matching_native_stop_order,
                                       native_stop_candidate_summary)
-        records = []
-        query_succeeded = False
-        fetch_open = getattr(ex, "fetch_open_orders", None)
-        if callable(fetch_open):
-            for args in ((normalize_symbol(symbol),),
-                         (normalize_symbol(symbol), None, None, {"type": "STOP_MARKET"})):
-                try:
-                    rows = safe_api_call(fetch_open, *args)
-                    if rows is not None:
-                        query_succeeded = True
-                        records.extend(extract_open_order_records(rows))
-                except TypeError:
-                    continue
-                except Exception as exc:
-                    log_execution(f"[NATIVE_SL] unified open-order query failed: {type(exc).__name__}: {exc}", "WARN")
-        # CCXT BingX implicit Swap endpoint fallback for conditional order visibility.
-        try:
-            market_id = (ex.market(normalize_symbol(symbol)) or {}).get("id") or normalize_symbol(symbol)
-        except Exception:
-            market_id = normalize_symbol(symbol)
-        for method_name in ("swapV2PrivateGetTradeOpenOrders",):
-            method = getattr(ex, method_name, None)
-            if callable(method):
-                for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
-                    try:
-                        raw = safe_api_call(method, {"symbol": market_id, "type": native_type})
-                        if raw is not None:
-                            query_succeeded = True
-                            records.extend(extract_open_order_records(raw))
-                    except Exception as exc:
-                        log_execution(f"[NATIVE_SL] {native_type} conditional query failed: {type(exc).__name__}: {exc}", "WARN")
+        # Conditional-order absence is UNKNOWN unless both BingX conditional
+        # endpoints succeed. A plain fetch_open_orders=[] is not evidence.
+        records, query_succeeded, query_details = fetch_native_stop_evidence(
+            ex, normalize_symbol(symbol), api_call=safe_api_call,
+            logger=lambda message: log_execution(f"[NATIVE_SL] {message}", "WARN"))
         close_side = "sell" if str(side).upper() == "BUY" else "buy"
         candidate_prices = []
         for value in [trigger_price, *(trigger_prices or [])]:
@@ -12687,11 +12876,12 @@ def _repair_native_sl_from_journal(symbol, side, quantity, *, prices, mode, posi
         from bingx_execution import PositionMode, TradeExecutionService
         service = TradeExecutionService(
             ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
-            logger=lambda message: log_execution(f"[NATIVE_SL_REPAIR] {message}", "INFO"))
+            logger=lambda message: log_execution(f"[NATIVE_SL_REPAIR] {message}", "INFO"),
+            api_caller=safe_api_call)
         result = service.ensure_native_stop(
             symbol=normalize_symbol(symbol), side=str(side).upper(), quantity=float(quantity),
             trigger_price=float(prices[0]), mode=PositionMode(str(mode).upper()),
-            position_side=str(position_side).upper())
+            position_side=str(position_side).upper(), trigger_prices=prices[1:])
     except Exception as exc:
         return False, f"REPAIR_EXCEPTION:{type(exc).__name__}", None
     if not result.verified:
