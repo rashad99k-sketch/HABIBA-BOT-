@@ -136,6 +136,9 @@ class HealthWatchdog:
         safety_gate: Optional[Callable[[], (bool, str)]] = None,
         check_interval_sec: float = 2.0,
         verification_retry_sec: float = 30.0,
+        verification_max_attempts: int = 3,
+        verification_hold_max_sec: float = 120.0,
+        thread_alive_fn=None,
         monotonic_fn=None,
         sleep_fn=None,
     ) -> None:
@@ -146,6 +149,10 @@ class HealthWatchdog:
         # Bounded backoff for *failed verification*, never for stall detection or
         # grace windows. A real progress beat re-arms verification immediately.
         self.verification_retry_sec = max(1.0, float(verification_retry_sec))
+        self.verification_max_attempts = max(1, int(verification_max_attempts))
+        self.verification_hold_max_sec = max(self.verification_retry_sec,
+                                             float(verification_hold_max_sec))
+        self._thread_alive = thread_alive_fn or self._default_thread_alive
         self._monotonic = monotonic_fn or time.monotonic
         self._sleep = sleep_fn or time.sleep
         self._components: Dict[str, ComponentHealth] = {}
@@ -158,6 +165,13 @@ class HealthWatchdog:
     def monotonic(self) -> float:
         """Expose the injected clock so callers can schedule real deadlines."""
         return float(self._monotonic())
+
+    @staticmethod
+    def _default_thread_alive(name: str) -> bool:
+        target = str(name or "")
+        if not target:
+            return True
+        return any(thread.name == target for thread in threading.enumerate())
 
     def register(
         self,
@@ -233,7 +247,8 @@ class HealthWatchdog:
                                       f"schedule_failed:{component.name}"):
                         self._alarms.pop(alarm_key, None)
                     for key in ("verification_next_attempt", "verification_attempts",
-                                "verification_last_reason", "verification_progress_at"):
+                                "verification_last_reason", "verification_progress_at",
+                                "verification_first_attempt_ts", "verification_exhausted"):
                         component.diagnostics.pop(key, None)
             state = diagnostics.pop("state", None)
             if state is not None and str(state).upper() in {"RUNNING", "IDLE", "BLOCKED", "FAILED"}:
@@ -358,15 +373,42 @@ class HealthWatchdog:
                     }
                     continue
             elif lifecycle == "BLOCKED":
-                scheduled_due = component.blocked_until or (progress_at + component.grace_sec)
+                # A BLOCKED deadline is a bounded status, not a liveness extension.
+                # It is hard-capped at the component's existing grace window from
+                # the last REAL progress beat, so it cannot hide a dead thread or
+                # a permanently hung call.
+                hard_deadline = progress_at + component.grace_sec
+                requested_deadline = float(component.blocked_until or hard_deadline)
+                scheduled_due = min(requested_deadline, hard_deadline)
+                if component.thread_name and not self._thread_alive(component.thread_name):
+                    component.status = "FAILED"
+                    self._alert(
+                        f"thread_dead:{component.name}", "ERROR",
+                        f"[WATCHDOG] {component.name} blocked phase lost its thread "
+                        f"{component.thread_name}; safety hold",
+                    )
+                    report[component.name] = {
+                        "status": component.status, "lifecycle": "BLOCKED",
+                        "age_sec": round(base_age, 3), "restart": "SAFETY_HOLD",
+                        "reason": "BLOCKED_THREAD_DEAD",
+                        "blocked_reason": component.reason,
+                        "thread_name": component.thread_name,
+                    }
+                    continue
                 if now < scheduled_due:
                     component.status = "BLOCKED"
                     report[component.name] = {
                         "status": "BLOCKED", "lifecycle": "BLOCKED", "age_sec": round(base_age, 3),
                         "next_due_sec": round(max(0.0, scheduled_due - now), 3),
+                        "hard_deadline_sec": round(max(0.0, hard_deadline - now), 3),
                         "reason": component.reason,
+                        "thread_name": component.thread_name,
                     }
                     continue
+                # Past the hard deadline, fall through with no scheduled_due so
+                # the normal grace-based stall path evaluates the REAL last
+                # progress timestamp instead of the status-only deadline.
+                scheduled_due = None
             if lifecycle == "IDLE" and scheduled_due is not None and now >= scheduled_due:
                 # A scheduled worker is allowed to wake exactly when due. This is
                 # not a stall/restart: it must not consume the restart budget or
@@ -465,13 +507,29 @@ class HealthWatchdog:
             non_trading_resume = False
             if callable(component.recovery_verifier):
                 diag = component.diagnostics
-                marker = float(diag.get("verification_progress_at", -1.0) or -1.0)
+                marker_raw = diag.get("verification_progress_at")
+                marker = -1.0 if marker_raw is None else float(marker_raw)
                 if marker != float(progress_at):
                     # New real progress (or a different stall incident) re-arms
                     # verification; a blocked verifier is never retried forever.
                     for key in ("verification_next_attempt", "verification_attempts",
-                                "verification_last_reason", "verification_progress_at"):
+                                "verification_last_reason", "verification_progress_at",
+                                "verification_first_attempt_ts", "verification_exhausted"):
                         diag.pop(key, None)
+                if diag.get("verification_exhausted"):
+                    component.status = "STALLED_SAFE_HOLD"
+                    first = float(diag.get("verification_first_attempt_ts", now))
+                    report[component.name] = {
+                        "status": component.status, "age_sec": round(age, 3),
+                        "restart": "VERIFICATION_EXHAUSTED",
+                        "reason": str(diag.get("verification_last_reason") or ""),
+                        "verification_attempts": int(diag.get("verification_attempts", 0) or 0),
+                        "verification_hold_sec": round(max(0.0, now - first), 3),
+                        "caller": diag.get("verification_caller", ""),
+                        "component": diag.get("verification_component", component.name),
+                        "symbol_status": diag.get("verification_symbol_status", ""),
+                    }
+                    continue
                 next_attempt = float(diag.get("verification_next_attempt", 0.0) or 0.0)
                 if next_attempt > now:
                     component.status = "STALLED_SAFE_HOLD"
@@ -496,23 +554,39 @@ class HealthWatchdog:
                     diag["last_verification"] = str(verify_reason)[:120]
                     diag["verification_last_reason"] = str(verify_reason)[:120]
                     diag["verification_attempts"] = int(diag.get("verification_attempts", 0) or 0) + 1
+                    diag.setdefault("verification_first_attempt_ts", now)
                     diag["verification_next_attempt"] = now + self.verification_retry_sec
                     diag["verification_progress_at"] = float(progress_at)
                     for key in ("caller", "component", "verification_source", "symbol_source",
                                 "symbol_status"):
                         if key in verification_context:
                             diag[f"verification_{key}"] = str(verification_context[key])[:120]
+                    attempts = int(diag["verification_attempts"])
+                    hold_sec = max(0.0, now - float(diag["verification_first_attempt_ts"]))
+                    exhausted = (attempts >= self.verification_max_attempts or
+                                 hold_sec >= self.verification_hold_max_sec)
+                    diag["verification_exhausted"] = exhausted
                     self._alert(f"verify_blocked:{component.name}", "WARN",
                                 f"[WATCHDOG] restart of {component.name} deferred by verification: {verify_reason}")
-                    report[component.name] = {
+                    verification_report = {
                         "status": component.status, "age_sec": round(age, 3),
-                        "restart": "VERIFICATION_HOLD", "reason": str(verify_reason),
+                        "restart": "VERIFICATION_EXHAUSTED" if exhausted else "VERIFICATION_HOLD",
+                        "reason": str(verify_reason),
                         "next_verification_sec": round(self.verification_retry_sec, 3),
-                        "verification_attempts": int(diag["verification_attempts"]),
+                        "verification_attempts": attempts,
+                        "verification_hold_sec": round(hold_sec, 3),
                         "caller": verification_context.get("caller", "direct"),
                         "component": verification_context.get("component", component.name),
                         "symbol_status": verification_context.get("symbol_status", ""),
                     }
+                    if exhausted:
+                        self._alert(
+                            f"verification_exhausted:{component.name}", "ERROR",
+                            f"[WATCHDOG] {component.name} recovery verification exhausted "
+                            f"after {attempts} attempts / {hold_sec:.1f}s: {verify_reason}; "
+                            f"keeping safety hold",
+                        )
+                    report[component.name] = verification_report
                     continue
                 verified_open_resume = bool(verification_context.get("open_position_verified"))
                 non_trading_resume = bool(verification_context.get("non_trading_engine"))

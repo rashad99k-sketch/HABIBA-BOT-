@@ -543,13 +543,21 @@ def test_startup_blocked_lifecycle_clears_on_real_loop_progress():
     watchdog.beat("main_loop", state="BLOCKED", reason="STARTUP_RECOVERY",
                   blocked_until=300.0)
 
-    clock[0] = 299.0
-    assert watchdog.check()["main_loop"]["status"] == "BLOCKED"
+    # A bounded BLOCKED status cannot extend liveness past the existing grace
+    # window from the last real beat; a long startup phase must still be judged.
+    clock[0] = 59.0
+    report = watchdog.check()["main_loop"]
+    assert report["status"] == "BLOCKED"
+    assert report["hard_deadline_sec"] <= 1.0
     assert alerts == []
 
-    clock[0] = 300.0
+    clock[0] = 61.0
+    assert watchdog.check()["main_loop"]["status"] == "STALLED"
+    alerts.clear()
+
+    clock[0] = 70.0
     watchdog.beat("main_loop", state="RUNNING", phase="startup_recovery_complete")
-    clock[0] = 360.0
+    clock[0] = 130.0
     report = watchdog.check()["main_loop"]
     assert report["status"] == "HEALTHY"
     assert alerts == []

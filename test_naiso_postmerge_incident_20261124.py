@@ -41,10 +41,12 @@ def _markets():
 
 
 class FakeExchange:
-    def __init__(self, positions=None, *, fail_positions=None):
-        self.markets = _markets()
+    def __init__(self, positions=None, *, fail_positions=None, markets=None, has=None):
+        self.markets = _markets() if markets is None else markets
         self.rows = list(positions or [])
         self.fail_positions = fail_positions
+        self.has = {"fetchPositions": True} if has is None else has
+        self.options = {"defaultType": "swap"}
         self.calls = []
 
     def market(self, symbol):
@@ -103,6 +105,16 @@ def _frame(n=150):
     })
 
 
+def _position_row(symbol=SYMBOL, amount="0", side="LONG", contract_type="PERPETUAL"):
+    return {
+        "symbol": symbol,
+        "contracts": amount,
+        "side": side,
+        "info": {"symbol": symbol, "positionAmt": str(amount),
+                 "positionSide": side, "contractType": contract_type},
+    }
+
+
 # --- Incident 1: empty symbol must be rejected before recovery dispatch --- #
 
 def test_no_argument_recovery_flat_without_symbol_uses_symbol_free_verification(runtime, monkeypatch):
@@ -151,6 +163,164 @@ def test_explicit_empty_symbol_still_reports_invalid_base_asset(runtime):
     assert "invalid_base_asset" in reason
     assert context["symbol_status"] == "INVALID"
     assert not any(c[0] == "fetch_positions" for c in runtime.calls)
+
+
+def test_installed_ccxt_fetch_positions_none_is_account_wide_swap_snapshot():
+    """CCXT 4.5.92 routes an unsymbolized read to the all-positions endpoint."""
+    import inspect
+
+    import ccxt
+
+    source = inspect.getsource(ccxt.bingx.fetch_positions)
+    assert "symbols: Strings = None" in source
+    assert "symbolsNormalized = self.market_symbols(symbols)" in source
+    assert "if symbolsNormalized is not None:" in source
+    assert "response = self.swapV2PrivateGetUserPositions(paramsSubType)" in source
+    assert "self.parse_positions(positions, symbolsNormalized)" in source
+
+
+def test_flat_account_snapshot_is_authoritative_for_supported_contract_types(runtime, monkeypatch):
+    runtime.rows = [
+        _position_row(SYMBOL, "0", "LONG", "PERPETUAL"),
+        _position_row("SOL/USDT:USDT", "0.0", "SHORT", "SWAP"),
+    ]
+    monkeypatch.setattr(ggpbot, "_recovery_hold",
+                        lambda *a, **k: pytest.fail("authoritative FLAT must not hold"))
+
+    verified, reason, context = ggpbot._verify_engine_recovery(
+        caller="watchdog_stalled", component="main_loop")
+
+    assert verified is True
+    assert reason == "FLAT_VERIFIED_NO_SYMBOL"
+    assert context["flat_verified"] is True
+    assert context["snapshot_reason"] == "FLAT_VERIFIED_ACCOUNT_WIDE"
+    assert context["snapshot_diagnostics"]["rows"] == 2
+    assert context["snapshot_diagnostics"]["supported_markets"] == 2
+    assert ("fetch_positions", None) in runtime.calls
+    assert not any(c[0] == "fetch_positions" and c[1] for c in runtime.calls)
+
+    status, positions = ggpbot.fetch_position_tri_state(
+        None, strict_account_snapshot=True)
+    assert status == "FLAT"
+    assert positions == []
+    assert ggpbot.LAST_POSITION_FETCH_STATUS == "FLAT"
+
+
+def test_account_snapshot_detects_real_open_position_without_inferring_symbol(runtime, monkeypatch):
+    runtime.rows = [
+        _position_row(SYMBOL, "0", "LONG"),
+        _position_row("SOL/USDT:USDT", "2", "SHORT", "SWAP"),
+    ]
+    holds = []
+    monkeypatch.setattr(ggpbot, "_recovery_hold", lambda *a, **k: holds.append((a, k)))
+
+    verified, reason, context = ggpbot._verify_engine_recovery()
+
+    assert verified is False
+    assert reason == "engine_recovery_unexpected_exchange_position"
+    assert context["flat_verified"] is False
+    assert context["snapshot_reason"] == "OPEN_POSITIONS_PRESENT"
+    assert context["snapshot_diagnostics"]["open_rows"] == 1
+    assert holds and holds[0][1]["details"]["symbol_status"] == "UNEXPECTED_EXCHANGE_SYMBOL"
+    assert ("fetch_positions", None) in runtime.calls
+    assert not any(c[0] == "fetch_positions" and c[1] for c in runtime.calls)
+
+    status, positions = ggpbot.fetch_position_tri_state(
+        None, strict_account_snapshot=True)
+    assert status == "OPEN"
+    assert len(positions) == 1
+    assert ggpbot.LAST_POSITION_FETCH_STATUS == "OPEN"
+
+
+@pytest.mark.parametrize("rows,reason", [
+    ([None], "MALFORMED_POSITION_ROW"),
+    ([_position_row("BTC/USDT")], "UNSUPPORTED_POSITION_SYMBOL"),
+    ([_position_row("BTC/USD:BTC")], "UNSUPPORTED_POSITION_SYMBOL"),
+    ([_position_row("DOGE/USDT:USDT")], "UNKNOWN_POSITION_SYMBOL"),
+    ([_position_row(SYMBOL, "0", "LONG", "SPOT")], "UNSUPPORTED_POSITION_CONTRACT_TYPE"),
+    ([_position_row(SYMBOL, "nan", "LONG")], "MALFORMED_POSITION_AMOUNT"),
+    ([_position_row(SYMBOL, "1", "")], "AMBIGUOUS_POSITION_SIDE"),
+    ([_position_row(SYMBOL, "1", "LONG"), _position_row(SYMBOL, "1", "LONG")],
+     "DUPLICATE_POSITION_ROW"),
+])
+def test_malformed_account_snapshot_is_never_flat(runtime, monkeypatch, rows, reason):
+    runtime.rows = rows
+    monkeypatch.setattr(ggpbot, "_recovery_hold", lambda *a, **k: None)
+
+    verified, verify_reason, context = ggpbot._verify_engine_recovery()
+
+    assert verified is False
+    assert reason in verify_reason
+    assert context["snapshot_reason"] == reason
+    assert context["flat_verified"] is False
+    assert ggpbot.STATE.get("recovery_hold") is not True
+
+    status, positions = ggpbot.fetch_position_tri_state(
+        None, strict_account_snapshot=True)
+    assert status == "UNKNOWN"
+    assert positions is None
+    assert ggpbot.LAST_POSITION_FETCH_STATUS == "UNKNOWN"
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("no_markets", "MARKET_METADATA_UNAVAILABLE"),
+    ("no_swap_markets", "NO_SUPPORTED_SWAP_MARKETS"),
+    ("unsupported", "FETCH_POSITIONS_UNSUPPORTED"),
+    ("standard", "UNSUPPORTED_POSITION_SCOPE_STANDARD"),
+    ("inverse", "UNSUPPORTED_POSITION_SCOPE_INVERSE"),
+])
+def test_unverifiable_account_snapshot_scope_is_unknown(runtime, monkeypatch, case, reason):
+    if case == "no_markets":
+        runtime.markets = {}
+    elif case == "no_swap_markets":
+        runtime.markets = {"BTC/USDT": {"symbol": "BTC/USDT", "type": "spot", "spot": True}}
+    elif case == "unsupported":
+        runtime.has = {"fetchPositions": False}
+    elif case == "standard":
+        runtime.options["fetchPositions"] = {"standard": True}
+    else:
+        runtime.options["fetchPositions"] = {"subType": "inverse"}
+    runtime.rows = [_position_row(SYMBOL, "0", "LONG")]
+    monkeypatch.setattr(ggpbot, "_recovery_hold", lambda *a, **k: None)
+
+    verified, verify_reason, context = ggpbot._verify_engine_recovery()
+
+    assert verified is False
+    assert reason in verify_reason
+    assert context["snapshot_reason"] == reason
+    assert context["flat_verified"] is False
+
+    status, positions = ggpbot.fetch_position_tri_state(
+        None, strict_account_snapshot=True)
+    assert status == "UNKNOWN"
+    assert positions is None
+
+
+def test_failed_or_non_list_account_snapshot_is_unknown(runtime, monkeypatch):
+    monkeypatch.setattr(ggpbot, "_recovery_hold", lambda *a, **k: None)
+
+    runtime.fail_positions = TimeoutError("account snapshot timed out")
+    verified, reason, context = ggpbot._verify_engine_recovery()
+    assert verified is False
+    assert reason == "engine_recovery_flat_query_unknown:TimeoutError"
+    assert context["flat_verified"] is False
+
+    status, positions = ggpbot.fetch_position_tri_state(
+        None, strict_account_snapshot=True)
+    assert status == "UNKNOWN"
+    assert positions is None
+
+    runtime.fail_positions = None
+    monkeypatch.setattr(runtime, "fetch_positions", lambda *_a, **_k: {"data": []})
+    verified, reason, context = ggpbot._verify_engine_recovery()
+    assert verified is False
+    assert reason == "engine_recovery_flat_query_unknown:NON_LIST_POSITION_SNAPSHOT"
+    assert context["flat_verified"] is False
+
+    status, positions = ggpbot.fetch_position_tri_state(
+        None, strict_account_snapshot=True)
+    assert status == "UNKNOWN"
+    assert positions is None
 
 
 def test_watchdog_does_not_repeat_failed_recovery_verification():
@@ -202,7 +372,8 @@ def test_flat_sync_emits_bounded_blocked_phase_then_completion(runtime, monkeypa
         ggpbot, "_main_loop_blocked_phase",
         lambda phase, reason, **details: blocked.append((phase, reason, details)),
     )
-    monkeypatch.setattr(ggpbot, "fetch_position_tri_state", lambda _symbols: ("FLAT", []))
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda _symbols, **_kwargs: ("FLAT", []))
     monkeypatch.setattr(ggpbot, "get_realized_pnl",
                         lambda *_a, **_k: pytest.fail("no inferred symbol for realized PnL"))
 
@@ -273,6 +444,191 @@ def test_progress_phase_sequence_is_monotonic():
         ggpbot.NAISO_WATCHDOG = original
     assert len(seen) == 2
     assert seen[1] == seen[0] + 1
+
+
+def test_status_only_beats_never_advance_liveness_or_sequence():
+    clock = [500.0]
+    watchdog = HealthWatchdog(
+        check_interval_sec=1.0, monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None,
+        safety_gate=lambda: (True, "READY"), thread_alive_fn=lambda _name: True)
+    watchdog.register("main_loop", interval_sec=1.0, grace_sec=10.0,
+                      restartable=False, critical=True)
+    watchdog.beat("main_loop", state="BLOCKED", phase="position_sync_start",
+                  reason="EXCHANGE_POSITION_SYNC", blocked_until=600.0,
+                  progress=False, thread_name="MainThread")
+    watchdog.beat("main_loop", state="RUNNING", phase="realized_pnl_failed",
+                  reason="EXCHANGE_REALIZED_PNL_FAILED", progress=False,
+                  thread_name="MainThread")
+
+    component = watchdog._components["main_loop"]
+    assert component.last_progress == 500.0
+    assert component.last_beat == 500.0
+    assert "progress_seq" not in component.diagnostics
+
+    clock[0] = 511.0
+    report = watchdog.check()["main_loop"]
+    assert report["status"] == "STALLED"
+    assert report["restart"] == "NOT_RESTARTABLE"
+    assert report["age_sec"] >= 10.0
+
+
+def test_blocked_deadline_is_capped_by_existing_grace_window():
+    clock = [100.0]
+    watchdog = HealthWatchdog(
+        check_interval_sec=1.0, monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None,
+        safety_gate=lambda: (True, "READY"), thread_alive_fn=lambda _name: True)
+    watchdog.register("main_loop", interval_sec=1.0, grace_sec=10.0, restartable=False)
+    watchdog.beat("main_loop", state="BLOCKED", phase="position_sync_start",
+                  reason="EXCHANGE_POSITION_SYNC", blocked_until=10_000.0,
+                  progress=False, thread_name="MainThread")
+
+    clock[0] = 105.0
+    report = watchdog.check()["main_loop"]
+    assert report["status"] == "BLOCKED"
+    assert report["next_due_sec"] <= 5.0
+    assert report["hard_deadline_sec"] <= 5.0
+
+    clock[0] = 111.0
+    report = watchdog.check()["main_loop"]
+    assert report["status"] == "STALLED"
+
+
+def test_blocked_phase_with_dead_thread_enters_safety_hold():
+    clock = [100.0]
+    restarts = []
+    alerts = []
+    watchdog = HealthWatchdog(
+        check_interval_sec=1.0, monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None,
+        alert_fn=lambda message, level: alerts.append((message, level)),
+        safety_gate=lambda: (True, "READY"), thread_alive_fn=lambda _name: False)
+    watchdog.register("main_loop", interval_sec=1.0, grace_sec=60.0,
+                      restartable=True, restart_fn=lambda *_a, **_k: restarts.append(1) or True)
+    watchdog.beat("main_loop", state="BLOCKED", phase="position_sync_start",
+                  reason="EXCHANGE_POSITION_SYNC", blocked_until=500.0,
+                  progress=False, thread_name="dead-main-loop")
+
+    report = watchdog.check()["main_loop"]
+
+    assert report["status"] == "FAILED"
+    assert report["restart"] == "SAFETY_HOLD"
+    assert report["reason"] == "BLOCKED_THREAD_DEAD"
+    assert report["thread_name"] == "dead-main-loop"
+    assert restarts == []
+    assert any("blocked phase lost its thread" in message for message, _level in alerts)
+
+
+def test_failed_verification_hold_is_bounded_and_cannot_loop_forever():
+    clock = [0.0]
+    calls = []
+    restarts = []
+    watchdog = HealthWatchdog(
+        check_interval_sec=1.0, verification_retry_sec=30.0,
+        verification_max_attempts=2, verification_hold_max_sec=120.0,
+        monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None,
+        safety_gate=lambda: (True, "READY"))
+
+    def verifier():
+        calls.append(clock[0])
+        return False, "engine_recovery_flat_query_unknown", {"caller": "watchdog_stalled"}
+
+    watchdog.register("main_loop", interval_sec=1.0, grace_sec=5.0,
+                      restartable=True, recovery_verifier=verifier,
+                      restart_fn=lambda *_a, **_k: restarts.append(clock[0]) or True)
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start")
+
+    clock[0] = 10.0
+    first = watchdog.check()["main_loop"]
+    clock[0] = 41.0
+    second = watchdog.check()["main_loop"]
+    clock[0] = 500.0
+    later = watchdog.check()["main_loop"]
+
+    assert calls == [10.0, 41.0]
+    assert first["restart"] == "VERIFICATION_HOLD"
+    assert second["status"] == later["status"] == "STALLED_SAFE_HOLD"
+    assert second["restart"] == later["restart"] == "VERIFICATION_EXHAUSTED"
+    assert later["verification_attempts"] == 2
+    assert restarts == []
+
+    # A genuine new progress beat must re-arm verification once, not forever.
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start")
+    clock[0] = 520.0
+    watchdog.check()
+    assert calls == [10.0, 41.0, 520.0]
+
+
+def test_completion_beat_is_emitted_only_after_operation_returns(runtime, monkeypatch):
+    events = []
+
+    class Recorder:
+        def monotonic(self):
+            return 700.0
+
+        def beat(self, name, **details):
+            events.append((details.get("phase"), details.get("state"), details.get("progress")))
+
+    recorder = Recorder()
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", recorder)
+
+    def failing_fetch(*_a, **_k):
+        events.append(("fetch_call", None, None))
+        raise TimeoutError("position sync hung")
+
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state", failing_fetch)
+    with pytest.raises(TimeoutError):
+        ggpbot.sync_all_states()
+    assert events == [("position_sync_start", "BLOCKED", False), ("fetch_call", None, None)]
+
+    events.clear()
+
+    def completed_fetch(*_a, **_k):
+        events.append(("fetch_call", None, None))
+        return "FLAT", []
+
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state", completed_fetch)
+    ggpbot.sync_all_states()
+    assert events == [
+        ("position_sync_start", "BLOCKED", False),
+        ("fetch_call", None, None),
+        ("position_sync_complete", "RUNNING", True),
+    ]
+
+
+def test_failed_realized_pnl_is_not_reported_as_complete(runtime, monkeypatch):
+    events = []
+    ggpbot.STATE.update({"open": True, "current_symbol": SYMBOL})
+
+    class Recorder:
+        def monotonic(self):
+            return 800.0
+
+        def beat(self, name, **details):
+            events.append((
+                details.get("phase"), details.get("state"),
+                details.get("progress"), details.get("progress_seq"),
+            ))
+
+    recorder = Recorder()
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", recorder)
+    monkeypatch.setattr(ggpbot, "sync_position_state", lambda *_a, **_k: None)
+
+    def failed_pnl(*_a, **_k):
+        raise TimeoutError("pnl read failed")
+
+    monkeypatch.setattr(ggpbot, "get_realized_pnl", failed_pnl)
+    ggpbot.sync_all_states()
+
+    phases = [event[0] for event in events]
+    assert "realized_pnl_complete" not in phases
+    assert "realized_pnl_failed" in phases
+    failed = events[phases.index("realized_pnl_failed")]
+    completed = events[phases.index("position_sync_complete")]
+    assert failed[1] == "RUNNING"
+    assert failed[2] is False
+    assert failed[3] is None
+    assert completed[2] is True
+    assert completed[3] is not None
+    assert phases.index("position_sync_complete") < phases.index("realized_pnl_failed")
 
 
 # --- Incident 3: one governed OHLCV snapshot, bounded eligible retries --- #

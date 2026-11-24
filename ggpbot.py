@@ -11284,7 +11284,11 @@ def _main_loop_progress(phase, **details):
     if watchdog is None:
         return
     _MAIN_LOOP_PROGRESS_SEQ += 1
-    payload = {"state": "RUNNING", "phase": phase, "progress_seq": _MAIN_LOOP_PROGRESS_SEQ}
+    payload = {
+        "state": "RUNNING", "phase": phase, "progress": True,
+        "progress_seq": _MAIN_LOOP_PROGRESS_SEQ,
+        "thread_name": threading.current_thread().name,
+    }
     payload.update(details)
     watchdog.beat("main_loop", **payload)
 
@@ -11303,17 +11307,39 @@ def _exchange_call_phase_deadline_sec():
     return max(5.0, min(90.0, (timeout_ms / 1000.0) + 10.0))
 
 
-def _main_loop_blocked_phase(phase, reason, *, timeout_sec=None, **details):
-    """Announce entry into a bounded blocking phase with a real deadline."""
-    global _MAIN_LOOP_PROGRESS_SEQ
+def _main_loop_status(phase, reason, **details):
+    """Record a terminal phase outcome without advancing liveness.
+
+    Used for failed/blocked outcomes so a failure cannot masquerade as a
+    genuinely completed operation.
+    """
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return
-    _MAIN_LOOP_PROGRESS_SEQ += 1
+    payload = {
+        "state": "RUNNING", "phase": phase, "reason": reason,
+        "progress": False,
+        "thread_name": threading.current_thread().name,
+    }
+    payload.update(details)
+    watchdog.beat("main_loop", **payload)
+
+
+def _main_loop_blocked_phase(phase, reason, *, timeout_sec=None, **details):
+    """Announce entry into a bounded blocking phase without claiming progress.
+
+    This is a status-only observation (``progress=False``). Only the completion
+    beat advances liveness, so a dead thread or a permanently blocked call can
+    never be kept alive by the deadline itself.
+    """
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        return
     deadline = max(5.0, float(timeout_sec or _exchange_call_phase_deadline_sec()))
     payload = {
         "state": "BLOCKED", "phase": phase, "reason": reason,
-        "progress_seq": _MAIN_LOOP_PROGRESS_SEQ,
+        "progress": False,
+        "thread_name": threading.current_thread().name,
         "blocked_until": watchdog.monotonic() + deadline,
     }
     payload.update(details)
@@ -11445,21 +11471,29 @@ def _verify_engine_recovery(symbol=None, *, caller="direct", component="engine",
                            details={"symbol_diagnostics": symbol_diagnostics,
                                     "symbol_status": symbol_status})
             return False, reason, context
-        # Flat with no controlled symbol: ask the exchange for all positions.
-        # This is a symbol-free read, never an inferred/synthetic symbol.
+        # Flat with no controlled symbol: ask the exchange for ALL account-wide
+        # USDT-margined swap positions. No symbol is inferred or synthesized.
+        # A FLAT result is accepted only from a complete, authoritative snapshot;
+        # every partial/malformed/failed/ambiguous response stays UNKNOWN.
+        from bingx_protection import validate_account_position_snapshot
         try:
-            positions = safe_api_call(ex.fetch_positions)
+            raw_positions = safe_api_call(ex.fetch_positions)
         except Exception as exc:
             reason = f"engine_recovery_flat_query_unknown:{type(exc).__name__}"
+            context["snapshot_reason"] = reason
             return False, reason, context
-        if not isinstance(positions, list):
-            return False, "engine_recovery_flat_query_invalid", context
-        open_rows = [row for row in positions if abs(_position_contracts(row)) > 0]
-        if open_rows:
+        status, open_rows, snapshot_reason, snapshot_diag = validate_account_position_snapshot(
+            ex, raw_positions)
+        context["snapshot_reason"] = snapshot_reason
+        context["snapshot_diagnostics"] = snapshot_diag
+        if status == "UNKNOWN":
+            return False, f"engine_recovery_flat_query_unknown:{snapshot_reason}", context
+        if status == "OPEN":
             reason = "engine_recovery_unexpected_exchange_position"
-            detected_symbol = _position_symbol(open_rows[0]) or ""
+            detected_symbol = _position_symbol(open_rows[0]) if open_rows else ""
             _recovery_hold(reason, symbol=detected_symbol,
-                           details={"symbol_status": "UNEXPECTED_EXCHANGE_SYMBOL"})
+                           details={"symbol_status": "UNEXPECTED_EXCHANGE_SYMBOL",
+                                    "snapshot_diagnostics": snapshot_diag})
             return False, reason, context
         context["flat_verified"] = True
         return True, "FLAT_VERIFIED_NO_SYMBOL", context
@@ -11699,7 +11733,8 @@ def start_naiso_services():
     # Startup exchange recovery runs before the first loop iteration. Classify it
     # as a bounded startup phase instead of letting the watchdog call it a stall.
     watchdog.beat("main_loop", state="BLOCKED", phase="startup_recovery",
-                  reason="STARTUP_RECOVERY",
+                  reason="STARTUP_RECOVERY", progress=False,
+                  thread_name=threading.current_thread().name,
                   blocked_until=watchdog.monotonic() + 300.0)
     watchdog.register("exchange_reconciliation", interval_sec=15.0, grace_sec=60.0,
                       critical=True, restartable=True,
@@ -12761,8 +12796,14 @@ def _position_symbol(pos):
     return str(pos.get("symbol") or info.get("symbol") or "")
 
 
-def fetch_position_tri_state(symbol=None):
-    """Return OPEN/FLAT/UNKNOWN; API errors must never be interpreted as FLAT."""
+def fetch_position_tri_state(symbol=None, *, strict_account_snapshot=False):
+    """Return OPEN/FLAT/UNKNOWN; API errors must never be interpreted as FLAT.
+
+    ``strict_account_snapshot`` requires a complete authoritative account-wide
+    BingX swap snapshot before an unsymbolized query may conclude FLAT. It is
+    used by the main-loop sync and recovery paths; symbol-scoped callers keep
+    the legacy shape for compatibility.
+    """
     global LAST_POSITION_FETCH_STATUS
     if PAPER_MODE:
         status = "OPEN" if STATE.get("open") else "FLAT"
@@ -12788,7 +12829,19 @@ def fetch_position_tri_state(symbol=None):
         if result is None or not isinstance(result, (list, tuple)):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
-        open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
+        if strict_account_snapshot and not symbol:
+            from bingx_protection import validate_account_position_snapshot
+            status, strict_rows, reason, snapshot_diag = validate_account_position_snapshot(ex, result)
+            if status == "UNKNOWN":
+                LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+                log_execution(
+                    f"[POS_SYNC] account-wide snapshot not authoritative: {reason} "
+                    f"rows={snapshot_diag.get('rows')} supported_markets={snapshot_diag.get('supported_markets')}",
+                    "ERROR", debounce_key=f"tri_state_snapshot_{reason}", debounce_sec=30)
+                return "UNKNOWN", None
+            open_positions = strict_rows
+        else:
+            open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
         if symbol:
             target = roro_canonical_symbol(symbol)
             matches = [p for p in open_positions if roro_canonical_symbol(_position_symbol(p)) == target]
@@ -14096,7 +14149,7 @@ def sync_all_states():
         sync_position_state(symbol)
         status = str(MEMORY.get("position_status") or "")
     else:
-        status, positions = fetch_position_tri_state(None)
+        status, positions = fetch_position_tri_state(None, strict_account_snapshot=True)
         if status == "UNKNOWN":
             MEMORY["position_status"] = "UNKNOWN"
             MEMORY["current_position"] = None
@@ -14126,8 +14179,13 @@ def sync_all_states():
             real_pnl, real_pnl_pct = get_realized_pnl(symbol)
             MEMORY["total_pnl"] = real_pnl
             MEMORY["total_pnl_pct"] = real_pnl_pct
-        except Exception:
-            pass
+        except Exception as exc:
+            # A failed read is not a completed phase. Report the terminal outcome
+            # without advancing liveness; the next real iteration beat proves the
+            # loop is still running.
+            _main_loop_status("realized_pnl_failed", "EXCHANGE_REALIZED_PNL_FAILED",
+                              symbol=str(symbol), error=type(exc).__name__)
+            return
         _main_loop_progress("realized_pnl_complete", symbol=str(symbol))
 
 
