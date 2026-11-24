@@ -1,4 +1,4 @@
-"""Persistent, execution-free EMA9/EMA15 crossover strategy with Session-VWAP bias.
+"""Persistent, execution-free EMA9/Session-VWAP crossover strategy with Session-VWAP bias.
 
 Direct entry consumes closed OHLCV bars; the legacy causal-zone pullback evaluator remains available.
 Session VWAP uses OHLC4 and actual
@@ -119,7 +119,7 @@ def _find_causal_zone(frame: pd.DataFrame, cross_index: int, side: str, atr: flo
 
 
 def indicator_series(frame: pd.DataFrame) -> Dict[str, Any]:
-    """Closed-bar EMA9/15/50, ATR14 and UTC session OHLC4 VWAP series."""
+    """Closed-bar EMA9/EMA50, ATR14 and UTC session OHLC4 VWAP series."""
     x = _clean_closed(frame, None, 900)
     if len(x) < 51:
         return {"valid": False, "reason": "need_at_least_51_closed_candles"}
@@ -140,7 +140,7 @@ def indicator_series(frame: pd.DataFrame) -> Dict[str, Any]:
 
 
 def indicators(frame: pd.DataFrame) -> Dict[str, Any]:
-    """Calculate closed-candle EMA9/15/50, ATR14 and UTC OHLC4 Session VWAP."""
+    """Calculate closed-candle EMA9/EMA50, ATR14 and UTC OHLC4 Session VWAP."""
     values = indicator_series(frame)
     if not values.get("valid"):
         return values
@@ -254,14 +254,14 @@ class UnifiedEMAVWAPPullbackEngine:
             target = float(tp1)
             if atr <= 0:
                 return reject("invalid_atr")
-            if setup.entry_path == "DIRECT_EMA9_EMA15_CROSS":
+            if setup.entry_path == "DIRECT_EMA9_VWAP_CROSS":
                 if setup.crossover_ts is None or setup.last_candle_ts != setup.crossover_ts:
                     return reject("direct_cross_not_on_latest_closed_candle")
                 if not all(_finite(v) for v in (setup.vwap, setup.ema9)):
                     return reject("direct_cross_vwap_or_ema_missing")
-                if setup.direction == "BUY" and (entry <= float(setup.vwap) or float(setup.ema9) <= float(setup.vwap)):
+                if setup.direction == "BUY" and entry <= float(setup.vwap):
                     return reject("buy_vwap_alignment_lost")
-                if setup.direction == "SELL" and (entry >= float(setup.vwap) or float(setup.ema9) >= float(setup.vwap)):
+                if setup.direction == "SELL" and entry >= float(setup.vwap):
                     return reject("sell_vwap_alignment_lost")
             else:
                 if (not _finite(setup.causal_zone_low) or not _finite(setup.causal_zone_high)
@@ -274,12 +274,12 @@ class UnifiedEMAVWAPPullbackEngine:
             if setup.direction == "BUY":
                 if target <= entry:
                     return reject("tp1_not_forward_of_entry")
-                extension = (0.0 if setup.entry_path == "DIRECT_EMA9_EMA15_CROSS"
+                extension = (0.0 if setup.entry_path == "DIRECT_EMA9_VWAP_CROSS"
                              else max(0.0, (entry - float(setup.causal_zone_high)) / atr))
             elif setup.direction == "SELL":
                 if target >= entry:
                     return reject("tp1_not_forward_of_entry")
-                extension = (0.0 if setup.entry_path == "DIRECT_EMA9_EMA15_CROSS"
+                extension = (0.0 if setup.entry_path == "DIRECT_EMA9_VWAP_CROSS"
                              else max(0.0, (float(setup.causal_zone_low) - entry) / atr))
             else:
                 return reject("invalid_setup_direction")
@@ -292,7 +292,7 @@ class UnifiedEMAVWAPPullbackEngine:
                 return reject("entry_window_missed_no_chase", "NO_CHASE")
             # TP1 must provide real forward space; a target inside the entry/zone
             # boundary is not a valid execution handoff.
-            if setup.entry_path != "DIRECT_EMA9_EMA15_CROSS":
+            if setup.entry_path != "DIRECT_EMA9_VWAP_CROSS":
                 if setup.direction == "BUY" and target <= float(setup.causal_zone_high):
                     return reject("tp1_atr_or_causal_zone_unknown")
                 if setup.direction == "SELL" and target >= float(setup.causal_zone_low):
@@ -311,7 +311,7 @@ class UnifiedEMAVWAPPullbackEngine:
             if (setup is None or setup.status != "ENTRY_READY"
                     or setup.entry_status != "AUTHORIZED"):
                 return False
-            if (setup.entry_path != "DIRECT_EMA9_EMA15_CROSS"
+            if (setup.entry_path != "DIRECT_EMA9_VWAP_CROSS"
                     and (setup.rejection_ts is None or setup.confirmation_ts is None
                          or int(setup.confirmation_ts) <= int(setup.rejection_ts))):
                 return False
@@ -340,17 +340,11 @@ class UnifiedEMAVWAPPullbackEngine:
 
     def evaluate_direct_cross(self, symbol: str, frame: pd.DataFrame,
                               now_ms: Optional[int] = None) -> Dict[str, Any]:
-        """Authorize a fresh EMA9/EMA15 cross when closed price and EMA9 agree with VWAP.
-
-        This is an entry signal only. It does not classify the trade or manage a position.
-        """
+        """Detect a fresh closed-candle EMA9/Session-VWAP cross; entry signal only."""
         now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
         x = _clean_closed(frame, now_ms, self.timeframe_s)
         with self._lock:
             old = self.get(symbol)
-            # ENTRY_EXECUTING remains fail-closed until execution is reconciled.
-            # TRADE_OPEN is allowed to reset here because this evaluator is called
-            # only after the runtime has confirmed the account is flat and scanning resumed.
             if old and old.status == "ENTRY_EXECUTING":
                 return self._persist(old)
             if len(x) < 51:
@@ -358,10 +352,9 @@ class UnifiedEMAVWAPPullbackEngine:
                 setup.status = "WAITING_FOR_CONFIRMATION"
                 setup.reason = "insufficient_valid_closed_ohlcv"
                 setup.closed_candles = int(len(x))
-                setup.indicator_missing = ["ema9", "ema15", "vwap", "atr14"]
+                setup.indicator_missing = ["ema9", "vwap", "atr14"]
                 setup.updated_at = now_ms / 1000
                 return self._persist(setup)
-
             series = indicator_series(x)
             vals = indicators(x)
             if not series.get("valid") or not vals.get("valid"):
@@ -370,52 +363,44 @@ class UnifiedEMAVWAPPullbackEngine:
                               last_candle_ts=int(x.timestamp.iloc[-1]),
                               updated_at=now_ms / 1000, closed_candles=int(len(x)))
                 return self._persist(setup)
-
-            e9, e15 = series["ema9"], series["ema15"]
-            previous = (float(e9.iloc[-2]), float(e15.iloc[-2]))
-            current = (float(e9.iloc[-1]), float(e15.iloc[-1]))
+            ema9, vwap_series = series["ema9"], series["vwap_series"]
+            previous = (float(ema9.iloc[-2]), float(vwap_series.iloc[-2]))
+            current = (float(ema9.iloc[-1]), float(vwap_series.iloc[-1]))
             latest_ts = int(x.timestamp.iloc[-1])
             price = float(x.close.iloc[-1])
-            vwap = float(series["vwap_series"].iloc[-1])
             atr = float(series["atr14"].iloc[-1])
-            if not all(_finite(v) for v in (*previous, *current, price, vwap, atr)) or atr <= 0:
+            if not all(_finite(v) for v in (*previous, *current, price, atr)) or atr <= 0:
                 setup = Setup(str(symbol), status="WAITING_FOR_CONFIRMATION",
-                              reason="invalid_ema_vwap_or_atr", last_candle_ts=latest_ts,
+                              reason="invalid_ema9_vwap_or_atr", last_candle_ts=latest_ts,
                               updated_at=now_ms / 1000, closed_candles=int(len(x)))
                 return self._persist(setup)
-
-            if old and old.entry_path == "DIRECT_EMA9_EMA15_CROSS" and old.last_candle_ts == latest_ts:
+            if old and old.entry_path == "DIRECT_EMA9_VWAP_CROSS" and old.last_candle_ts == latest_ts:
                 return self._persist(old)
-
             side = None
             if previous[0] <= previous[1] and current[0] > current[1]:
                 side = "BUY"
             elif previous[0] >= previous[1] and current[0] < current[1]:
                 side = "SELL"
-
             if side is None:
                 setup = Setup(str(symbol), status="DISCOVERED",
-                              reason="no_new_closed_ema9_ema15_cross",
-                              ema9=current[0], ema15=current[1],
+                              reason="no_new_closed_ema9_vwap_cross",
+                              ema9=current[0], vwap=current[1],
                               ema50=float(series["ema50"].iloc[-1]),
-                              vwap=vwap, atr14=atr, price=price,
+                              atr14=atr, price=price,
                               closed_candles=int(len(x)), indicator_missing=[],
                               last_candle_ts=latest_ts, updated_at=now_ms / 1000)
                 return self._persist(setup)
-
-            aligned = (price > vwap and current[0] > vwap) if side == "BUY" else (
-                price < vwap and current[0] < vwap
-            )
+            aligned = price > current[1] if side == "BUY" else price < current[1]
             setup = Setup(
                 symbol=str(symbol), status="ENTRY_READY" if aligned else "INVALIDATED",
                 direction=side, crossover_ts=latest_ts, crossover_index=len(x) - 1,
-                crossover_price=price, ema9=current[0], ema15=current[1],
-                ema50=float(series["ema50"].iloc[-1]), price=price, vwap=vwap, atr14=atr,
+                crossover_price=price, ema9=current[0], vwap=current[1],
+                ema50=float(series["ema50"].iloc[-1]), price=price, atr14=atr,
                 closed_candles=int(len(x)), indicator_missing=[],
-                entry_path="DIRECT_EMA9_EMA15_CROSS", last_candle_ts=latest_ts,
+                entry_path="DIRECT_EMA9_VWAP_CROSS", last_candle_ts=latest_ts,
                 updated_at=now_ms / 1000,
-                reason=("closed_ema9_ema15_cross_vwap_aligned" if aligned
-                        else "ema9_ema15_cross_vwap_direction_mismatch"),
+                reason=("closed_ema9_vwap_cross_aligned" if aligned
+                        else "ema9_vwap_cross_price_side_mismatch"),
                 entry_status="NOT_READY" if aligned else "BLOCKED",
             )
             return self._persist(setup)
@@ -725,7 +710,7 @@ def execution_handoff_allowed(engine: UnifiedEMAVWAPPullbackEngine, symbol: str,
         return False
     if setup.direction != side:
         return False
-    if setup.entry_path == "DIRECT_EMA9_EMA15_CROSS":
+    if setup.entry_path == "DIRECT_EMA9_VWAP_CROSS":
         return bool(setup.crossover_ts is not None and setup.last_candle_ts == setup.crossover_ts)
     return bool(setup.rejection_ts is not None and setup.confirmation_ts is not None
                 and setup.confirmation_ts > setup.rejection_ts)
