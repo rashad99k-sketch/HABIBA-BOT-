@@ -5600,26 +5600,37 @@ def dynamic_spread_tolerance(symbol):
 
 # ========== RF SCANNER ==========
 _SCANNER_FRAME_CACHE = {}
+_SCANNER_FRAME_LAST_VALID = {}
 _SCANNER_FRAME_CACHE_LOCK = threading.RLock()
 _SCANNER_FRAME_CACHE_TTL = _env_float_range("SCANNER_FRAME_CACHE_TTL", 90.0, 15.0, 180.0)
+_SCANNER_FRAME_LAST_VALID_MAX = max(100, SCANNER_UNIVERSE_MAX + 20)
+
+def _scanner_frame_key(symbol):
+    canonicalizer = globals().get("roro_canonical_symbol")
+    return str(canonicalizer(symbol) if callable(canonicalizer) else
+               str(symbol or "").upper().replace("/", "-").split(":")[0].strip())
 
 def _get_scanner_frame(symbol, limit=150):
-    """One short-lived frame snapshot per symbol shared by both discovery scanners."""
-    key = str(symbol)
-    now = time.monotonic()
+    """Fetch one shared frame per canonical symbol; preserve last known-good data."""
+    key, now = _scanner_frame_key(symbol), time.monotonic()
     with _SCANNER_FRAME_CACHE_LOCK:
         item = _SCANNER_FRAME_CACHE.get(key)
         if item and now - item[0] < _SCANNER_FRAME_CACHE_TTL:
             return item[1].copy()
-    frame = get_ohlcv_safe(symbol, limit)
-    if frame is not None:
+    exchange_symbol = (globals().get("roro_exchange_symbol") or (lambda value: value))(symbol)
+    frame = get_ohlcv_safe(exchange_symbol, limit)
+    if frame is not None and validate_dataframe(frame, min(51, limit)):
+        stamp, snapshot = time.monotonic(), frame.copy()
         with _SCANNER_FRAME_CACHE_LOCK:
-            _SCANNER_FRAME_CACHE[key] = (time.monotonic(), frame.copy())
-            if len(_SCANNER_FRAME_CACHE) > SCANNER_UNIVERSE_MAX + 20:
-                oldest = sorted(_SCANNER_FRAME_CACHE.items(), key=lambda kv: kv[1][0])
-                for old_key, _ in oldest[:max(1, len(_SCANNER_FRAME_CACHE) - SCANNER_UNIVERSE_MAX)]:
-                    _SCANNER_FRAME_CACHE.pop(old_key, None)
-    return frame
+            _SCANNER_FRAME_CACHE[key] = (stamp, snapshot)
+            _SCANNER_FRAME_LAST_VALID[key] = (stamp, snapshot)
+            while len(_SCANNER_FRAME_LAST_VALID) > _SCANNER_FRAME_LAST_VALID_MAX:
+                oldest_key = min(_SCANNER_FRAME_LAST_VALID, key=lambda k: _SCANNER_FRAME_LAST_VALID[k][0])
+                _SCANNER_FRAME_LAST_VALID.pop(oldest_key, None)
+        return snapshot.copy()
+    with _SCANNER_FRAME_CACHE_LOCK:
+        previous = _SCANNER_FRAME_LAST_VALID.get(key)
+        return previous[1].copy() if previous else None
 
 def get_usdt_perp_symbols():
     try:
@@ -8700,6 +8711,8 @@ def sniper_engine_v2():
 
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
 def update_institutional_flow_scanner():
+    if _position_management_mode():
+        return
     try:
         df = get_ohlcv_safe(DEFAULT_SYMBOL, 100)
         if df is None or not validate_dataframe(df, 80):
@@ -8739,7 +8752,7 @@ def live_institutional_updater():
     while True:
         try:
             # Do not run during open trade to avoid duplicate API calls and thread contention
-            if STATE.get("open"):
+            if _position_management_mode():
                 time.sleep(5)
                 continue
             symbol = DEFAULT_SYMBOL
@@ -8891,6 +8904,9 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
+def _position_management_mode():
+    return bool(STATE.get("open") or TRADE_STATE.get("in_position"))
+
 def main_loop_sniper():
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, RECOVERY_BLOCK_ENTRIES
     last_scan = 0
@@ -8912,7 +8928,7 @@ def main_loop_sniper():
             now = time.time()
             sync_all_states()
 
-            if now - last_flow_update > 60:
+            if not _position_management_mode() and now - last_flow_update > 60:
                 update_institutional_flow_scanner()
                 last_flow_update = now
 
@@ -8921,6 +8937,7 @@ def main_loop_sniper():
                 if STATE.get("open"):
                     continue
             if TRADE_STATE["in_position"] or STATE["open"]:
+                MEMORY["runtime_mode"] = "POSITION_MANAGEMENT_ONLY"
                 if STATE.get("recovery_hold"):
                     recovery_reason = str(STATE.get("recovery_reason") or MEMORY.get("recovery_status") or "management_state_incomplete")
                     log_execution(f"[RECOVERY_HOLD] {recovery_reason} | exposure tracked; retrying journal/exchange reconciliation; no new entries or fabricated TP/SL actions", "ERROR",
@@ -8930,6 +8947,7 @@ def main_loop_sniper():
                     continue
                 _live_manager.manage_live_trade()
             else:
+                MEMORY["runtime_mode"] = "SCANNING"
                 if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
                     time.sleep(1)
                     continue
@@ -9016,13 +9034,17 @@ def _integration_fetch_frame(symbol):
     # Reuse the scanner snapshot cache; strategy/watchlist refresh must not
     # issue a second OHLCV request for a symbol already fetched this cycle.
     return _get_scanner_frame(roro_exchange_symbol(symbol), 150)
-def _peek_scanner_frame(symbol):
-    """Return a fresh scanner cache entry without issuing an exchange request."""
-    key = str(symbol)
+def _peek_scanner_frame(symbol, include_stale=False):
+    """Read shared cache without API calls; stale snapshots are opt-in and diagnostic-only."""
+    key, now = _scanner_frame_key(symbol), time.monotonic()
     with _SCANNER_FRAME_CACHE_LOCK:
         item = _SCANNER_FRAME_CACHE.get(key)
-        if item and time.monotonic() - item[0] < _SCANNER_FRAME_CACHE_TTL:
+        if item and now - item[0] < _SCANNER_FRAME_CACHE_TTL:
             return item[1].copy()
+        if include_stale:
+            item = _SCANNER_FRAME_LAST_VALID.get(key)
+            if item:
+                return item[1].copy()
     return None
 
 # Per-symbol stateful trend/context engines. Keeping these instances separate avoids
@@ -9146,10 +9168,17 @@ def _refresh_ema_vwap_setups(watchlist):
             continue
         exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
         try:
-            frame = _peek_scanner_frame(roro_exchange_symbol(exchange_sym))
+            frame = _peek_scanner_frame(exchange_sym, include_stale=True)
+            cache_key = _scanner_frame_key(exchange_sym)
+            with _SCANNER_FRAME_CACHE_LOCK:
+                cache_item = _SCANNER_FRAME_CACHE.get(cache_key) or _SCANNER_FRAME_LAST_VALID.get(cache_key)
+                snapshot_age = max(0.0, time.monotonic() - cache_item[0]) if cache_item else None
+                is_fresh = bool(cache_item and snapshot_age is not None and snapshot_age < _SCANNER_FRAME_CACHE_TTL)
             if frame is None:
                 item["institutional_decision_state"] = item.get("decision_state")
-                item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION", "reason": "awaiting_fresh_scanner_cache"}
+                item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION", "reason": "no_valid_scanner_snapshot",
+                    "diagnostics": {"snapshot_age_seconds": None, "closed_candles": 0,
+                                    "source": "shared_scanner_cache", "missing": ["ohlcv_snapshot"]}}
                 item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
@@ -9157,9 +9186,17 @@ def _refresh_ema_vwap_setups(watchlist):
             closed = roro_validate_closed_frame(
                 frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
             )
-            result = EMA_VWAP_ENTRY_ENGINE.evaluate(
-                str(canonical), closed, now_ms=int(time.time() * 1000)
-            )
+            result = EMA_VWAP_ENTRY_ENGINE.evaluate(str(canonical), closed, now_ms=int(time.time() * 1000))
+            result["diagnostics"] = {
+                "snapshot_age_seconds": round(snapshot_age, 2) if snapshot_age is not None else None,
+                "closed_candles": int(len(closed)),
+                "source": "shared_scanner_cache_last_valid" if not is_fresh else "shared_scanner_cache",
+                "fresh": bool(is_fresh),
+                "missing": [key for key in ("ema9", "ema15", "vwap", "atr14") if result.get(key) is None],
+            }
+            if not is_fresh and result.get("status") == "ENTRY_READY":
+                result["status"] = "WAITING_FOR_CONFIRMATION"
+                result["reason"] = "stale_snapshot_entry_handoff_blocked"
             # Preserve the institutional engine's opinion for diagnostics, but
             # expose only the EMA/VWAP lifecycle as the canonical entry state.
             if "decision_state" in item:
@@ -9463,6 +9500,10 @@ _SCANNER_TASK_LOCKS = {}
 _SCANNER_TASK_STATUS = {}
 
 def dispatch_scanner_task(name, function, *args, **kwargs):
+    if _position_management_mode():
+        _SCANNER_TASK_STATUS[name] = {"state": "PAUSED_FOR_POSITION", "last_completed": time.time()}
+        MEMORY.setdefault("scanner_tasks", {})[name] = dict(_SCANNER_TASK_STATUS[name])
+        return False
     with _SCANNER_TASKS_LOCK:
         lock = _SCANNER_TASK_LOCKS.setdefault(name, threading.Lock())
         if not lock.acquire(blocking=False):
@@ -9472,7 +9513,7 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
 
     def runner():
         try:
-            if STATE.get("open") or TRADE_STATE.get("in_position"):
+            if _position_management_mode():
                 _SCANNER_TASK_STATUS[name] = {"state": "PAUSED_FOR_POSITION", "last_completed": time.time()}
             else:
                 function(*args, **kwargs)
