@@ -102,6 +102,101 @@ def _canonical_symbol(value: Any) -> str:
     return text
 
 
+def normalize_exchange_symbol(value: Any) -> str:
+    """Return one CCXT/BingX USDT-margined swap symbol, or ``''`` if invalid.
+
+    Accepted forms include ``DOGE``, ``DOGE/USDT``, ``DOGE-USDT``, ``DOGEUSDT``
+    and ``DOGE/USDT:USDT``. An empty base asset (for example ``':USDT'``) is
+    never converted into a truthy symbol.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip().upper()
+    if not text or text.startswith(":") or text == "USDT":
+        return ""
+
+    base = ""
+    if text.endswith(":USDT"):
+        root = text[:-5].strip()
+        if "/" in root:
+            base = root.split("/", 1)[0].strip()
+    elif "/" in text:
+        parts = text.split("/", 1)
+        base, quote = parts[0].strip(), parts[1].strip()
+        if quote != "USDT":
+            return ""
+    elif text.endswith("-USDT"):
+        base = text[:-5].strip()
+    elif text.endswith("USDT") and len(text) > 4:
+        base = text[:-4].strip()
+    else:
+        # Bare base assets such as BTC/DOGE are used by config and journal state.
+        base = text
+
+    if not base or any(ch in base for ch in ("/", ":", "_", " ")):
+        return ""
+    if not all(ch.isalnum() for ch in base):
+        return ""
+    return f"{base}/USDT:USDT"
+
+
+def validate_exchange_symbol(exchange: Any, symbol: Any) -> tuple:
+    """Validate a symbol against loaded market metadata before any exchange call.
+
+    Returns ``(symbol, reason, diagnostics)``. ``reason`` is ``MARKET_CONFIRMED``
+    only when the exchange metadata confirms the market; otherwise the returned
+    symbol is empty and callers must fail closed without sending a request.
+    """
+    original = "" if symbol is None else str(symbol)
+    normalized = normalize_exchange_symbol(symbol)
+    diagnostics = {
+        "original_symbol": original[:80],
+        "normalized_symbol": normalized,
+        "source": "NONE",
+        "market_type": "UNKNOWN",
+        "market_id": "",
+    }
+    if not normalized:
+        return "", "INVALID_BASE_ASSET", diagnostics
+
+    markets = getattr(exchange, "markets", None)
+    if isinstance(markets, dict) and markets:
+        market = markets.get(normalized)
+        if market is None:
+            for key, value in markets.items():
+                if _canonical_symbol(key) == _canonical_symbol(normalized):
+                    market = value
+                    break
+        if market is not None:
+            meta = market if isinstance(market, dict) else {}
+            diagnostics.update({
+                "source": "exchange.markets",
+                "market_type": str(meta.get("type") or meta.get("category") or
+                                   ("swap" if meta.get("swap") else "UNKNOWN"))[:40],
+                "market_id": str(meta.get("id") or "")[:60],
+            })
+            return normalized, "MARKET_CONFIRMED", diagnostics
+
+    market_fn = getattr(exchange, "market", None)
+    if callable(market_fn):
+        try:
+            meta = market_fn(normalized)
+        except Exception as exc:
+            diagnostics["source"] = "market_lookup_failed"
+            diagnostics["market_type"] = f"{type(exc).__name__}"[:40]
+            return "", "MARKET_LOOKUP_FAILED", diagnostics
+        if isinstance(meta, dict) and (meta.get("symbol") or meta.get("id")):
+            diagnostics.update({
+                "source": "exchange.market",
+                "market_type": str(meta.get("type") or meta.get("category") or "UNKNOWN")[:40],
+                "market_id": str(meta.get("id") or "")[:60],
+            })
+            return normalized, "MARKET_CONFIRMED", diagnostics
+
+    diagnostics["source"] = "market_metadata_unavailable"
+    return "", "MARKET_NOT_FOUND", diagnostics
+
+
 def _positive_float(value: Any) -> Optional[float]:
     try:
         number = float(value)

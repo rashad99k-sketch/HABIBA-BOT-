@@ -32,10 +32,16 @@ ORDER_WRITE_METHODS = frozenset({
 NON_RETRYABLE_PATTERNS = (
     "authentication", "unauthorized", "permission", "forbidden", "api-key",
     "api key", "invalid symbol", "invalidsymbol", "symbol not found",
-    "unknown symbol", "invalid signature", "signature error", "timestamp",
+    "unknown symbol", "does not have market symbol", "not have market symbol",
+    "market symbol :", "invalid signature", "signature error", "timestamp",
     "recvwindow", "configuration", "misconfigured", "invalid parameter",
     "invalid order", "unsupported", "insufficient balance", "insufficient margin",
 )
+
+# Only confirmed transport/transient classes may open a read circuit. Business,
+# configuration and unknown application failures are surfaced but never treated
+# as evidence that the exchange endpoint is down.
+CIRCUIT_FAILURE_KINDS = frozenset({"RATE_LIMITED", "TIMEOUT", "NETWORK", "SERVER_TRANSIENT"})
 
 TRANSIENT_PATTERNS = (
     "429", "100410", "rate limit", "too many request", "timeout", "timedout",
@@ -127,6 +133,7 @@ class ApiResilience:
             "circuit_opens": 0,
             "circuit_rejections": 0,
             "half_open_successes": 0,
+            "business_rejections": 0,
         }
         self._enabled = True
 
@@ -172,6 +179,7 @@ class ApiResilience:
 
     def record_failure(self, method: str, exc: BaseException) -> ApiFailureClass:
         kind = classify_api_error(exc, method=str(method))
+        counts_toward_circuit = kind.kind in CIRCUIT_FAILURE_KINDS
         with self._lock:
             state = self._endpoints.setdefault(str(method), _EndpointState())
             now = float(self._monotonic())
@@ -180,17 +188,24 @@ class ApiResilience:
                 self._counters["rate_limited"] += 1
             elif kind.kind == "TIMEOUT":
                 self._counters["timeouts"] += 1
-            state.failures += 1
+            elif not counts_toward_circuit:
+                self._counters["business_rejections"] += 1
             state.last_failure_kind = kind.kind
             state.last_failure_at = now
+            # A half-open probe is released whether it succeeds, fails with a
+            # transport error, or is rejected by a business rule.
             state.half_open_inflight = 0
-            if state.failures >= self.failure_threshold and state.opened_at <= 0:
-                state.opened_at = now
-                self._counters["circuit_opens"] += 1
-            elif state.opened_at > 0:
-                # A failed half-open probe restarts the full cooldown instead of
-                # allowing another probe on the very next request.
-                state.opened_at = now
+            if counts_toward_circuit:
+                state.failures += 1
+                if state.failures >= self.failure_threshold and state.opened_at <= 0:
+                    state.opened_at = now
+                    self._counters["circuit_opens"] += 1
+                elif state.opened_at > 0:
+                    # A failed half-open transport probe restarts the full
+                    # cooldown. Cooldown expiry alone never proves exchange health.
+                    state.opened_at = now
+            # Business/configuration failures are recorded for diagnostics but
+            # never open, extend or clear a transport circuit.
         return kind
 
     def backoff_delay(self, attempt: int, *, rate_limited: bool = False) -> float:
