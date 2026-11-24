@@ -140,10 +140,229 @@ def compute_session_vwap(df: pd.DataFrame, timeframe_seconds: int = 900,
     return out
 
 
+
+def validate_dual_ema_vwap_entry_gate(
+    df: pd.DataFrame, side: str, ema_fn: Callable,
+    timeframe_seconds: int = 900, now_ms: Optional[int] = None,
+    lookback_candles: int = 2,
+) -> Dict[str, Any]:
+    """Authorize only a fresh closed-candle EMA9/VWAP cross.
+
+    EMA50 is deliberately a soft directional diagnostic. Its absence, lack of
+    a fresh cross, or non-alignment never vetoes a valid EMA9/VWAP trigger.
+    This function does not place orders and does not invent calibrated quality
+    weights; it returns observable features for the downstream authority.
+    """
+    direction = str(side or "").upper()
+    lookback = max(1, min(3, int(lookback_candles)))
+    expected = "BULLISH" if direction == "BUY" else "BEARISH"
+    result: Dict[str, Any] = {
+        "ready": False, "side": direction, "reason": "invalid_side",
+        "trigger": "EMA9_VWAP", "ema9_cross": None, "ema50_cross": None,
+        "ema9_cross_timestamp": None, "ema50_cross_timestamp": None,
+        "ema9": None, "ema50": None, "vwap": None,
+        "ema50_alignment": "UNAVAILABLE", "ema50_distance_atr": None,
+        "ema50_slope_atr": None, "cross_quality": "UNRATED_PENDING_CALIBRATION",
+        "quality_features": {}, "lookback_candles": lookback,
+    }
+    if direction not in {"BUY", "SELL"}:
+        return result
+    if not validate_ohlcv(df):
+        result["reason"] = "invalid_ohlcv"
+        return result
+    closed = closed_candles(df, timeframe_seconds, now_ms=now_ms)
+    if len(closed) < 15:
+        result["reason"] = "insufficient_closed_candles_for_ema9_and_atr"
+        return result
+    vwap = compute_session_vwap(closed, timeframe_seconds, now_ms=now_ms)
+    if vwap is None:
+        result["reason"] = "session_vwap_unavailable"
+        return result
+    try:
+        close = closed["close"].astype(float)
+        ema9 = pd.Series(ema_fn(close, 9), index=closed.index, dtype=float)
+        if len(ema9) != len(closed):
+            raise ValueError("EMA9 length mismatch")
+        if not np.isfinite(float(ema9.iloc[-1])) or not np.isfinite(float(vwap.iloc[-1])):
+            raise ValueError("non-finite EMA9/VWAP")
+        ema50 = None
+        if len(closed) >= 50:
+            candidate = pd.Series(ema_fn(close, 50), index=closed.index, dtype=float)
+            if len(candidate) == len(closed) and np.isfinite(float(candidate.iloc[-1])):
+                ema50 = candidate
+    except Exception as exc:
+        result["reason"] = f"indicator_calculation_failed:{type(exc).__name__}"
+        return result
+
+    latest_closed_timestamp = int(closed["timestamp"].iloc[-1])
+    now_value_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    latest_closed_at_ms = latest_closed_timestamp + timeframe_seconds * 1000
+    data_age_seconds = (now_value_ms - latest_closed_at_ms) / 1000.0
+    max_data_age_seconds = float(lookback * timeframe_seconds)
+    if data_age_seconds < 0.0 or data_age_seconds > max_data_age_seconds:
+        result["reason"] = "stale_closed_candle_data"
+        result["data_age_seconds"] = data_age_seconds
+        result["max_data_age_seconds"] = max_data_age_seconds
+        return result
+
+    latest_gap = float(ema9.iloc[-1]) - float(vwap.iloc[-1])
+    if (direction == "BUY" and latest_gap <= 0.0) or (direction == "SELL" and latest_gap >= 0.0):
+        result["reason"] = "latest_closed_ema9_vwap_relationship_not_directional"
+        return result
+
+    first_idx = max(1, len(closed) - lookback)
+    cross_idx = None
+    cross_direction = None
+    for idx in range(len(closed) - 1, first_idx - 1, -1):
+        prev_gap = float(ema9.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+        gap = float(ema9.iloc[idx]) - float(vwap.iloc[idx])
+        crossed = ("BULLISH" if prev_gap < 0.0 < gap else
+                   "BEARISH" if prev_gap > 0.0 > gap else None)
+        if crossed is not None:
+            cross_idx, cross_direction = idx, crossed
+            break
+
+    stale_cross = False
+    cross_age_seconds = None
+    if cross_idx is not None:
+        cross_closed_at_ms = int(closed["timestamp"].iloc[cross_idx]) + timeframe_seconds * 1000
+        cross_age_seconds = (now_value_ms - cross_closed_at_ms) / 1000.0
+        result["cross_age_seconds"] = cross_age_seconds
+        if cross_age_seconds < 0.0 or cross_age_seconds > max_data_age_seconds:
+            cross_idx = None
+            cross_direction = None
+            stale_cross = True
+
+    e9 = float(ema9.iloc[-1])
+    vw = float(vwap.iloc[-1])
+    e50 = float(ema50.iloc[-1]) if ema50 is not None else None
+    atr_series = pd.concat([
+        (closed["high"] - closed["low"]).rename("hl"),
+        (closed["high"] - closed["close"].shift(1)).abs().rename("hc"),
+        (closed["low"] - closed["close"].shift(1)).abs().rename("lc"),
+    ], axis=1).max(axis=1)
+    atr = float(atr_series.rolling(14, min_periods=14).mean().iloc[-1])
+    if not np.isfinite(atr) or atr <= 0:
+        result["reason"] = "atr_unavailable_for_normalized_cross_context"
+        return result
+
+    ema50_cross = None
+    ema50_cross_ts = None
+    ema50_distance_atr = None
+    ema50_slope_atr = None
+    ema50_alignment = "UNAVAILABLE"
+    if ema50 is not None:
+        e50_gap = float(ema50.iloc[-1]) - float(vwap.iloc[-1])
+        for idx in range(len(closed) - 1, first_idx - 1, -1):
+            prev_gap = float(ema50.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+            gap = float(ema50.iloc[idx]) - float(vwap.iloc[idx])
+            crossed = ("BULLISH" if prev_gap < 0.0 < gap else
+                       "BEARISH" if prev_gap > 0.0 > gap else None)
+            if crossed:
+                ema50_cross = crossed
+                ema50_cross_ts = int(closed["timestamp"].iloc[idx])
+                break
+        ema50_distance_atr = abs(float(close.iloc[-1]) - e50) / atr
+        if len(ema50) >= 4:
+            ema50_slope_atr = (e50 - float(ema50.iloc[-4])) / (3.0 * atr)
+        slope = ema50_slope_atr if ema50_slope_atr is not None else 0.0
+        price_above = float(close.iloc[-1]) > e50
+        if direction == "BUY":
+            if price_above and slope >= 0.0:
+                ema50_alignment = "SUPPORTIVE"
+            elif not price_above and slope < 0.0:
+                ema50_alignment = "OPPOSED"
+            else:
+                ema50_alignment = "NEUTRAL"
+        else:
+            if (not price_above) and slope <= 0.0:
+                ema50_alignment = "SUPPORTIVE"
+            elif price_above and slope > 0.0:
+                ema50_alignment = "OPPOSED"
+            else:
+                ema50_alignment = "NEUTRAL"
+
+    signal_idx = cross_idx if cross_idx is not None else len(closed) - 1
+    candle = closed.iloc[signal_idx]
+    candle_range = float(candle["high"] - candle["low"])
+    body = abs(float(candle["close"]) - float(candle["open"]))
+    body_ratio = body / candle_range if candle_range > 0 else 0.0
+    close_location = ((float(candle["close"]) - float(candle["low"])) / candle_range
+                      if candle_range > 0 else 0.5)
+    upper_wick = float(candle["high"]) - max(float(candle["open"]), float(candle["close"]))
+    lower_wick = min(float(candle["open"]), float(candle["close"])) - float(candle["low"])
+    rel_volume = None
+    if signal_idx >= 20:
+        baseline = float(closed["volume"].iloc[signal_idx - 20:signal_idx].mean())
+        if baseline > 0:
+            rel_volume = float(candle["volume"]) / baseline
+    prev_gap = float(ema9.iloc[signal_idx - 1]) - float(vwap.iloc[signal_idx - 1]) if signal_idx > 0 else 0.0
+    signal_gap = float(ema9.iloc[signal_idx]) - float(vwap.iloc[signal_idx])
+    gap_atr = abs(signal_gap) / atr
+    ema9_slope_atr = (e9 - float(ema9.iloc[-4])) / (3.0 * atr) if len(ema9) >= 4 else None
+    vwap_slope_atr = (vw - float(vwap.iloc[-4])) / (3.0 * atr) if len(vwap) >= 4 and np.isfinite(float(vwap.iloc[-4])) else None
+    whipsaw_count = 0
+    for idx in range(max(1, len(closed) - 8), len(closed)):
+        a = float(ema9.iloc[idx - 1]) - float(vwap.iloc[idx - 1])
+        b = float(ema9.iloc[idx]) - float(vwap.iloc[idx])
+        if (a < 0 < b) or (a > 0 > b):
+            whipsaw_count += 1
+
+    result.update({
+        "ema9": e9, "ema50": e50, "vwap": vw,
+        "ema9_cross": cross_direction,
+        "ema50_cross": ema50_cross,
+        "ema9_cross_timestamp": int(closed["timestamp"].iloc[cross_idx]) if cross_idx is not None else None,
+        "ema50_cross_timestamp": ema50_cross_ts,
+        "latest_closed_timestamp": latest_closed_timestamp,
+        "data_age_seconds": data_age_seconds,
+        "max_data_age_seconds": max_data_age_seconds,
+        "signal_candle_timestamp": int(closed["timestamp"].iloc[signal_idx]),
+        "signal_candle_id": f"{direction}:{int(closed['timestamp'].iloc[signal_idx])}",
+        "ema50_alignment": ema50_alignment,
+        "ema50_distance_atr": ema50_distance_atr,
+        "ema50_slope_atr": ema50_slope_atr,
+        "ema9_vwap_gap_atr": gap_atr,
+        "quality_features": {
+            "signal_candle_direction": "BULLISH" if float(candle["close"]) > float(candle["open"]) else "BEARISH" if float(candle["close"]) < float(candle["open"]) else "DOJI",
+            "body_ratio": body_ratio,
+            "close_location": close_location,
+            "upper_wick_ratio": upper_wick / candle_range if candle_range > 0 else 0.0,
+            "lower_wick_ratio": lower_wick / candle_range if candle_range > 0 else 0.0,
+            "ema9_vwap_gap_atr": gap_atr,
+            "ema9_slope_atr": ema9_slope_atr,
+            "vwap_slope_atr": vwap_slope_atr,
+            "relative_volume": rel_volume,
+            "ema50_alignment": ema50_alignment,
+            "ema50_distance_atr": ema50_distance_atr,
+            "ema50_slope_atr": ema50_slope_atr,
+            "whipsaw_crosses_last_8_closed": whipsaw_count,
+            "signal_candle_timestamp": int(closed["timestamp"].iloc[signal_idx]),
+        },
+    })
+    if cross_idx is None or cross_direction != expected:
+        result["reason"] = (
+            "stale_ema9_vwap_cross" if stale_cross
+            else "missing_fresh_directional_ema9_vwap_cross"
+        )
+        return result
+    result.update({
+        "ready": True,
+        "reason": "fresh_closed_ema9_vwap_cross_ema50_soft_confirmation",
+        "cross_quality": "UNRATED_PENDING_CALIBRATION",
+        "authorization_state": "EMA9_TRIGGER_VALID",
+    })
+    return result
+
+
 def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
                         ema_len: int = 9, timeframe_seconds: int = 900,
                         now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """Rank proximity to the stated EMA9/VWAP cross without permitting entry."""
+    """Rank proximity to EMA9/VWAP without permitting entry.
+
+    The result is evidence-rich and remains ranking-only. All measurements use
+    completed candles and a true true-range ATR for cross normalization.
+    """
     if not validate_ohlcv(df):
         return None
     closed = closed_candles(df, timeframe_seconds, now_ms=now_ms)
@@ -153,11 +372,23 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
     if vwap is None:
         return None
     try:
-        e = ema_fn(closed["close"].astype(float), ema_len)
-        ema_now, vwap_now = float(e.iloc[-1]), float(vwap.iloc[-1])
-        prev_gap = float(e.iloc[-2] - vwap.iloc[-2])
+        close_series = closed["close"].astype(float)
+        e9 = ema_fn(close_series, ema_len)
+        e50 = ema_fn(close_series, 50)
+        ema_now, vwap_now = float(e9.iloc[-1]), float(vwap.iloc[-1])
+        prev_gap = float(e9.iloc[-2] - vwap.iloc[-2])
         gap = float(ema_now - vwap_now)
-        atr_proxy = float((closed["high"] - closed["low"]).rolling(14).mean().iloc[-1])
+        ema50_ready = len(closed) >= 50 and len(e50) >= 2
+        ema50_now = float(e50.iloc[-1]) if ema50_ready and np.isfinite(float(e50.iloc[-1])) else None
+        ema50_prev_gap = float(e50.iloc[-2] - vwap.iloc[-2]) if ema50_ready and np.isfinite(float(e50.iloc[-2])) else None
+        ema50_gap = (ema50_now - vwap_now) if ema50_now is not None else None
+        previous_close = closed["close"].shift(1)
+        true_range = pd.concat([
+            (closed["high"] - closed["low"]).rename("hl"),
+            (closed["high"] - previous_close).abs().rename("hc"),
+            (closed["low"] - previous_close).abs().rename("lc"),
+        ], axis=1).max(axis=1)
+        atr_proxy = float(true_range.rolling(14, min_periods=14).mean().iloc[-1])
     except Exception:
         return None
     if not all(np.isfinite(x) for x in (ema_now, vwap_now, prev_gap, gap, atr_proxy)):
@@ -165,14 +396,40 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
     if ema_now <= 0 or vwap_now <= 0 or atr_proxy <= 0:
         return None
     direction = "BUY" if gap > 0 else ("SELL" if gap < 0 else "NEUTRAL")
+    # Keep the legacy EMA9/VWAP calculation unchanged; EMA50 is an independent signal.
     crossed = "BULLISH" if prev_gap <= 0 < gap else ("BEARISH" if prev_gap >= 0 > gap else None)
+    crossed50 = (
+        "BULLISH" if ema50_prev_gap is not None and ema50_gap is not None and ema50_prev_gap <= 0 < ema50_gap
+        else "BEARISH" if ema50_prev_gap is not None and ema50_gap is not None and ema50_prev_gap >= 0 > ema50_gap
+        else None
+    )
+    cross_conflict = bool(crossed and crossed50 and crossed != crossed50)
+    any_cross = None if cross_conflict else (crossed or crossed50)
     gap_pct = abs(gap) / vwap_now * 100.0
     gap_atr = abs(gap) / atr_proxy
+    latest_closed_ts = int(closed["timestamp"].iloc[-1])
+    now_value_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    latest_closed_at_ms = latest_closed_ts + int(timeframe_seconds) * 1000
+    data_age_seconds = (now_value_ms - latest_closed_at_ms) / 1000.0
+    max_data_age_seconds = max(float(timeframe_seconds) * 2.0, 1.0)
+    data_freshness = "FRESH" if 0.0 <= data_age_seconds <= max_data_age_seconds else "STALE"
+    signal_candle = closed.iloc[-1]
+    candle_range = float(signal_candle["high"] - signal_candle["low"])
+    candle_body = abs(float(signal_candle["close"] - signal_candle["open"]))
+    body_strength = candle_body / candle_range if candle_range > 0 else 0.0
+    upper_wick = float(signal_candle["high"] - max(signal_candle["open"], signal_candle["close"]))
+    lower_wick = float(min(signal_candle["open"], signal_candle["close"]) - signal_candle["low"])
+    volume_base = float(closed["volume"].iloc[-21:-1].mean()) if len(closed) >= 21 else 0.0
+    relative_volume = float(signal_candle["volume"]) / volume_base if volume_base > 0 else None
     closeness = max(0.0, min(55.0, 55.0 * (1.0 - min(gap_atr, 2.0) / 2.0)))
     convergence = 25.0 if abs(gap) < abs(prev_gap) else 0.0
-    cross_bonus = 20.0 if crossed else 0.0
+    cross_bonus = 20.0 if any_cross else 0.0
     score = max(0.0, min(100.0, closeness + convergence + cross_bonus))
-    if crossed:
+    if cross_conflict:
+        state = "CROSS_CONFLICT"
+    elif data_freshness != "FRESH":
+        state = "STALE_DATA"
+    elif any_cross:
         state = "CROSS_CONFIRMED"
     elif direction == "NEUTRAL":
         state = "AT_VWAP"
@@ -186,13 +443,40 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         "direction": direction,
         "signal": "BULLISH" if direction == "BUY" else ("BEARISH" if direction == "SELL" else "NEUTRAL"),
         "cross": crossed,
+        "cross_ema9": crossed,
+        "cross_ema50": crossed50,
+        "cross_any": any_cross,
+        "cross_conflict": cross_conflict,
+        "cross_trigger": "CONFLICT" if cross_conflict else "EMA9_VWAP" if crossed else "EMA50_VWAP" if crossed50 else "NONE",
+        "ema50_direction": "BUY" if ema50_gap is not None and ema50_gap > 0 else "SELL" if ema50_gap is not None and ema50_gap < 0 else "NEUTRAL",
         "state": state,
         "score": round(score, 2),
-        "ema9": round(ema_now, 10), "vwap": round(vwap_now, 10),
+        "ema9": round(ema_now, 10), "ema50": round(ema50_now, 10) if ema50_now is not None else None,
+        "vwap": round(vwap_now, 10),
         "gap": round(gap, 10), "gap_pct": round(gap_pct, 5),
         "gap_atr": round(gap_atr, 4), "gap_change": round(gap - prev_gap, 10),
+        "ema50_gap": round(ema50_gap, 10) if ema50_gap is not None else None,
         "converging": bool(abs(gap) < abs(prev_gap)),
-        "candle_timestamp": int(closed["timestamp"].iloc[-1]),
+        "candle_timestamp": latest_closed_ts,
+        "latest_closed_timestamp": latest_closed_ts,
+        "data_age_seconds": round(data_age_seconds, 3),
+        "max_data_age_seconds": max_data_age_seconds,
+        "data_freshness": data_freshness,
+        "market_regime": "UNKNOWN",
+        "atr": round(atr_proxy, 10),
+        "ema9_slope_atr": round((ema_now - float(e9.iloc[-4])) / (3.0 * atr_proxy), 6) if len(e9) >= 4 else None,
+        "vwap_slope_atr": round((vwap_now - float(vwap.iloc[-4])) / (3.0 * atr_proxy), 6) if len(vwap) >= 4 else None,
+        "ema50_slope_atr": round((float(e50.iloc[-1]) - float(e50.iloc[-4])) / (3.0 * atr_proxy), 6)
+            if ema50_ready and len(e50) >= 4 else None,
+        "ema9_vwap_relationship_previous": "ABOVE" if prev_gap > 0 else "BELOW" if prev_gap < 0 else "EQUAL",
+        "ema9_vwap_relationship_current": "ABOVE" if gap > 0 else "BELOW" if gap < 0 else "EQUAL",
+        "cross_direction": any_cross,
+        "cross_age_seconds": ((now_value_ms - (int(closed["timestamp"].iloc[-2]) + int(timeframe_seconds) * 1000)) / 1000.0
+                              if crossed else None),
+        "relative_volume": relative_volume,
+        "candle_body_strength": body_strength,
+        "upper_wick_ratio": upper_wick / candle_range if candle_range > 0 else 0.0,
+        "lower_wick_ratio": lower_wick / candle_range if candle_range > 0 else 0.0,
     }
 
 
@@ -328,7 +612,15 @@ def find_causal_order_block(df: pd.DataFrame, side: str, price: float, atr: floa
             continue
         if side == "SELL" and not later.empty and (later.close > float(ob.high)).any():
             continue
-        low, high = float(ob.low), float(ob.high)
+        # Use the institutional OB body-to-wick range rather than the
+        # entire candle: bullish demand = low -> open; bearish supply = open -> high.
+        candle_low, candle_high = float(ob.low), float(ob.high)
+        low, high = (
+            (candle_low, float(ob.open)) if side == "BUY"
+            else (float(ob.open), candle_high)
+        )
+        if not (0 < low < high):
+            continue
         gap = max(low - price, 0.0, price - high)
         distance_atr = gap / atr
         if distance_atr > 1.5:
@@ -343,6 +635,8 @@ def find_causal_order_block(df: pd.DataFrame, side: str, price: float, atr: floa
                                - age * 0.025))
         return {
             "low": low, "high": high, "price": (low + high) / 2.0,
+            "candle_low": candle_low, "candle_high": candle_high,
+            "zone_definition": "BULLISH_LOW_TO_OPEN" if side == "BUY" else "BEARISH_OPEN_TO_HIGH",
             "strength": round(strength, 2), "distance_atr": round(distance_atr, 3),
             "age_bars": float(age), "volume_ratio": round(volume_ratio, 3),
             "timestamp": float(ob.timestamp),

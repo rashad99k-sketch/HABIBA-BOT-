@@ -59,7 +59,7 @@ class ResourceManager:
         with self._lock:
             item = self.cache.get(key)
             if not item: return None
-            if item[0] < time.monotonic(): self.cache.pop(key, None); return None
+            if item[0] <= time.monotonic(): self.cache.pop(key, None); return None
             self.cache.move_to_end(key); return item[1]
 
     def record(self, event: Any) -> None:
@@ -70,7 +70,7 @@ class ResourceManager:
         preserve = set(preserve_keys); removed = 0; now = time.monotonic()
         with self._lock:
             for key, (expiry, _) in list(self.cache.items()):
-                if key not in preserve and expiry < now: self.cache.pop(key, None); removed += 1
+                if key not in preserve and expiry <= now: self.cache.pop(key, None); removed += 1
             while len(self.cache) > self.max_cache_items:
                 key, value = self.cache.popitem(last=False)
                 if key in preserve:

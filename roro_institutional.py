@@ -14,6 +14,9 @@ from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 
+from location_authority import validate_location_zone
+from roro_trend_timing import evaluate_early_trend_timing
+
 
 class DecisionState(str, Enum):
     ENTRY_READY = "ENTRY_READY"
@@ -71,6 +74,16 @@ def _event_id(symbol: str, side: str, setup: str, ts: Any) -> str:
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+def _location_event_id(symbol: str, side: str, zone_name: str,
+                       zone_timestamp: Any, structure_timestamp: Any) -> str:
+    """Deduplicate one structural event at one zone, but allow a genuinely new BOS/sweep."""
+    raw = (
+        f"{symbol}|{side}|LOCATION|{zone_name}|"
+        f"{int(zone_timestamp)}|{int(structure_timestamp)}"
+    ).encode()
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
 def _closed(df: pd.DataFrame, now_ms: Optional[int] = None, timeframe_ms: int = 900_000) -> pd.DataFrame:
     if not _valid_frame(df):
         return pd.DataFrame()
@@ -119,12 +132,23 @@ def _confirmed_pivots(df: pd.DataFrame, end: Optional[int] = None, left_right: i
 
 def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr: float, side: str):
     # Fourth value is the timestamp when the zone became knowable to the strategy.
-    levels = [(float(fallback_level), float(fallback_level), "BOS_LEVEL", None)]
+    direction = str(side or "").upper()
+    # Location-first mode forbids a naked BOS level from substituting for an institutional zone.
+    location_first = bool(context.get("location_first_required"))
+    levels = [] if location_first else [(float(fallback_level), float(fallback_level), "BOS_LEVEL", None)]
     ob = context.get("order_block")
     if isinstance(ob, dict):
         try:
             # An OB only becomes actionable after its confirming displacement.
+            # Strict mode also verifies the OB's actual directional definition.
             available_ts = ob.get("impulse_timestamp", ob.get("timestamp"))
+            if location_first:
+                expected_definition = "BULLISH_LOW_TO_OPEN" if direction == "BUY" else "BEARISH_OPEN_TO_HIGH"
+                zone_definition = str(ob.get("zone_definition") or "").upper()
+                ob_direction = str(ob.get("direction") or "").upper()
+                expected_direction = "BULLISH" if direction == "BUY" else "BEARISH"
+                if zone_definition != expected_definition and ob_direction != expected_direction:
+                    raise ValueError("order_block_direction_unconfirmed")
             levels.append((float(ob["low"]), float(ob["high"]), "ORDER_BLOCK",
                            int(available_ts) if available_ts is not None else None))
         except (KeyError, TypeError, ValueError):
@@ -133,10 +157,78 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
     if isinstance(fvg, dict) and fvg.get("status") not in ("INVALIDATED", "FULLY_FILLED"):
         try:
             available_ts = fvg.get("timestamp")
+            if location_first:
+                expected_direction = "BULLISH" if direction == "BUY" else "BEARISH"
+                if str(fvg.get("direction") or "").upper() != expected_direction:
+                    raise ValueError("fvg_direction_mismatch")
             levels.append((float(fvg["lower"]), float(fvg["upper"]), "FVG",
                            int(available_ts) if available_ts is not None else None))
         except (KeyError, TypeError, ValueError):
             pass
+
+    # Consume only the zone that is structurally aligned with the proposed side.
+    # confirmed_at_timestamp prevents using a pivot before its right-side bars closed.
+    sr = context.get("support_resistance")
+    expected_type = "SUPPORT" if direction == "BUY" else "RESISTANCE" if direction == "SELL" else ""
+    sr_key = "supports" if direction == "BUY" else "resistances" if direction == "SELL" else ""
+    if expected_type and isinstance(sr, dict):
+        zones = sr.get(sr_key, [])
+        if isinstance(zones, list):
+            for zone in zones:
+                if not isinstance(zone, dict):
+                    continue
+                try:
+                    zone_type = str(zone.get("type") or "").upper()
+                    status = str(zone.get("status") or "").upper()
+                    low, high = float(zone.get("low")), float(zone.get("high"))
+                    strength = float(zone.get("strength", 0) or 0)
+                    distance = float(zone.get("distance_atr", float("inf")))
+                    available_ts = int(zone["confirmed_at_timestamp"])
+                    if (zone_type != expected_type or status != "CONFIRMED"
+                            or not (0 < low < high) or strength < 5.0
+                            or not math.isfinite(distance) or distance > 1.5
+                            or available_ts <= 0):
+                        continue
+                    levels.append((low, high, expected_type, available_ts))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+    if location_first:
+        # The central authority applies the same side/quality/freshness/no-chase
+        # policy for every entry engine; this module remains execution-free.
+        actionable = []
+        latest_ts = int(context.get("latest_timestamp", 0) or 0)
+        timeframe_ms = int(context.get("timeframe_ms", 900_000) or 900_000)
+        reference_price = context.get("reference_price")
+        max_distance_atr = float(context.get("max_location_distance_atr", 1.5) or 1.5)
+        for low, high, name, available_ts in levels:
+            if name == "ORDER_BLOCK":
+                metadata = dict(ob or {})
+            elif name == "FVG":
+                metadata = dict(fvg or {})
+            else:
+                sr_zones = (sr or {}).get("supports" if name == "SUPPORT" else "resistances", [])
+                metadata = {}
+                for sr_zone in sr_zones:
+                    if not isinstance(sr_zone, dict):
+                        continue
+                    try:
+                        if (float(sr_zone.get("low", 0) or 0) == low
+                                and float(sr_zone.get("high", 0) or 0) == high):
+                            metadata = dict(sr_zone)
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            metadata.update({
+                "kind": name, "low": low, "high": high,
+                "available_timestamp": available_ts,
+            })
+            validation = validate_location_zone(
+                metadata, direction, reference_price, atr, latest_ts, timeframe_ms,
+                max_age_bars=48, max_distance_atr=max_distance_atr,
+            )
+            if validation.get("valid"):
+                actionable.append((low, high, name, available_ts))
+        return actionable
     return levels
 
 
@@ -273,7 +365,16 @@ class ReversalEngine:
                                          int(x.timestamp.iloc[sweep_idx]), level, None, 35.0)
         # A retest must occur on a candle AFTER the MSS candle, followed by a later trigger candle.
         zones = _zone_retest_candidates(context, float(structural_level), atr, side)
-        retest_idx = None; retest_zone = ""
+        if context.get("location_first_required") and not zones:
+            return InstitutionalDecision(
+                DecisionState.WAITING_FOR_RETEST.value, setup_name, side,
+                "waiting_for_fresh_institutional_location",
+                ("sweep_or_failed_auction", "closed_mss"),
+                ("no_fresh_nearby_order_block_or_fvg",),
+                _event_id(symbol, side, setup_name, int(x.timestamp.iloc[sweep_idx])),
+                int(x.timestamp.iloc[sweep_idx]), level, None, 60.0,
+            )
+        retest_idx = None; retest_zone = ""; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
@@ -284,6 +385,7 @@ class ReversalEngine:
                 held = float(candle.close) > zlow if side == "BUY" else float(candle.close) < zhigh
                 if touched and held:
                     retest_idx, retest_zone = r, zname
+                    retest_zone_ts = available_ts
                     break
             if retest_idx is not None:
                 break
@@ -318,9 +420,14 @@ class ReversalEngine:
             evidence = ("prior_liquidity_pool", "sweep", "reclaim", "closed_mss", f"post_mss_retest:{retest_zone}", "directional_trigger")
         ts = int(x.timestamp.iloc[sweep_idx])
         score = 75.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
+        location_event_id = (
+            _location_event_id(symbol, side, retest_zone, retest_zone_ts, ts)
+            if context.get("location_first_required") and retest_zone_ts is not None
+            else _event_id(symbol, side, setup_name, ts)
+        )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, setup_name, side,
                                      "reversal_sequence_confirmed", evidence, (),
-                                     _event_id(symbol, side, setup_name, ts), ts, level, stop, min(100.0, score))
+                                     location_event_id, ts, level, stop, min(100.0, score))
 
 
 class ContinuationEngine:
@@ -341,7 +448,20 @@ class ContinuationEngine:
         e20 = x.close.ewm(span=20, adjust=False).mean()
         e50 = x.close.ewm(span=50, adjust=False).mean()
         bullish = side == "BUY"
-        aligned = (float(e20.iloc[-1]) > float(e50.iloc[-1]) and float(e20.iloc[-1]) > float(e20.iloc[-4]) and float(last.close) >= float(e20.iloc[-1])) if bullish else (float(e20.iloc[-1]) < float(e50.iloc[-1]) and float(e20.iloc[-1]) < float(e20.iloc[-4]) and float(last.close) <= float(e20.iloc[-1]))
+        legacy_aligned = (
+            float(e20.iloc[-1]) > float(e50.iloc[-1])
+            and float(e20.iloc[-1]) > float(e20.iloc[-4])
+            and float(last.close) >= float(e20.iloc[-1])
+        ) if bullish else (
+            float(e20.iloc[-1]) < float(e50.iloc[-1])
+            and float(e20.iloc[-1]) < float(e20.iloc[-4])
+            and float(last.close) <= float(e20.iloc[-1])
+        )
+        # Permit a genuinely early trend before EMA20/EMA50 cross only when
+        # the faster EMA9/EMA20, session VWAP, Wilder ADX and directional DI
+        # already confirm the move on closed candles.
+        early_timing = evaluate_early_trend_timing(x, side)
+        aligned = bool(legacy_aligned or early_timing.get("valid"))
         if not aligned:
             return InstitutionalDecision(DecisionState.REJECTED.value, "TREND_CONTINUATION_RETEST", side,
                                          "trend_regime_not_aligned", rejection_reasons=("trend_regime_not_aligned",))
@@ -364,6 +484,17 @@ class ContinuationEngine:
             return InstitutionalDecision(DecisionState.WAITING_FOR_CONFIRMATION.value, "TREND_CONTINUATION_RETEST", side,
                                          "waiting_for_closed_bos_and_displacement", rejection_reasons=("closed_bos_pending",))
         bos_idx, broken_level, bos_name = bos_event
+        # A valid BOS is not an evergreen entry event. On M15, expire its
+        # continuation retest window after eight closed candles.
+        bos_age_bars = (len(x) - 1) - bos_idx
+        if bos_age_bars > 8:
+            return InstitutionalDecision(
+                DecisionState.WAITING_FOR_RETEST.value, "TREND_CONTINUATION_RETEST", side,
+                "bos_event_stale_wait_for_new_structure", (bos_name,),
+                ("bos_retest_window_expired",),
+                _event_id(symbol, side, "TREND_CONTINUATION_RETEST", int(x.timestamp.iloc[bos_idx])),
+                int(x.timestamp.iloc[bos_idx]), broken_level, None, 40.0,
+            )
         volume_base = float(x.volume.iloc[max(0, bos_idx - 20):bos_idx].mean())
         volume_ratio = float(x.volume.iloc[bos_idx]) / volume_base if volume_base > 0 else 0.0
         if volume_ratio < 0.85:
@@ -372,11 +503,24 @@ class ContinuationEngine:
                                          _event_id(symbol, side, "TREND_CONTINUATION_RETEST", int(x.timestamp.iloc[bos_idx])),
                                          int(x.timestamp.iloc[bos_idx]), broken_level, None, 45.0)
         zones = _zone_retest_candidates(context, broken_level, atr, side)
+        if context.get("location_first_required") and not zones:
+            return InstitutionalDecision(
+                DecisionState.WAITING_FOR_RETEST.value, "TREND_CONTINUATION_RETEST", side,
+                "waiting_for_fresh_institutional_location",
+                (bos_name, "displacement"),
+                ("no_fresh_nearby_order_block_or_fvg",),
+                _event_id(symbol, side, "TREND_CONTINUATION_RETEST", int(x.timestamp.iloc[bos_idx])),
+                int(x.timestamp.iloc[bos_idx]), broken_level, None, 55.0,
+            )
         # Prefer a nearby causal zone, but keep a shallow pullback path for strong trends.
-        if causal_level is not None:
+        if causal_level is not None and not context.get("location_first_required"):
+            # Preserve the legacy external-level fallback only for legacy callers.
+            # Strict location-first mode must retest an actual validated OB/FVG/SR zone.
             zones.insert(0, (float(causal_level), float(causal_level), "CAUSAL_LEVEL", int(x.timestamp.iloc[bos_idx])))
-        retest_idx = None; pullback_type = None; retest_zone = None
+        retest_idx = None; pullback_type = None; retest_zone = None; retest_zone_ts = None
         for r in range(bos_idx + 1, len(x) - 1):
+            if r - bos_idx > 8:
+                break
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
             for zlow, zhigh, zname, available_ts in zones:
@@ -386,11 +530,19 @@ class ContinuationEngine:
                 holds = float(candle.close) > zlow if bullish else float(candle.close) < zhigh
                 if touches and holds:
                     retest_idx, pullback_type, retest_zone = r, "RETEST" if zname == "BOS_LEVEL" else "PULLBACK", zname
+                    retest_zone_ts = available_ts
                     break
             if retest_idx is not None:
                 break
-        if retest_idx is None:
-            # Micro pullback: short, shallow countertrend candles followed by a closed trigger.
+        # A retest that happened too long before the trigger is stale. Do
+        # not reuse it to authorize a late continuation entry.
+        if retest_idx is not None and (len(x) - 1 - retest_idx) > 3:
+            retest_idx = None
+            pullback_type = None
+            retest_zone = None
+            retest_zone_ts = None
+        if retest_idx is None and not context.get("location_first_required"):
+            # Legacy micro-pullback fallback remains available only outside strict location-first mode.
             begin = max(bos_idx + 1, len(x) - 4)
             segment = x.iloc[begin:-1]
             if len(segment) >= 1:
@@ -438,13 +590,43 @@ class ContinuationEngine:
         if stop is None:
             return InstitutionalDecision(DecisionState.REJECTED.value, "TREND_CONTINUATION_RETEST", side,
                                          stop_reason, rejection_reasons=(stop_reason,))
-        evidence = (bos_name, "displacement", f"{pullback_type}:{retest_zone}", "post_retest_trigger", "trend_ema20_ema50_alignment", f"bos_volume_ratio:{volume_ratio:.2f}")
+        timing = early_timing
         ts = int(x.timestamp.iloc[bos_idx])
+        if not timing.get("valid"):
+            timing_state = (
+                DecisionState.NO_CHASE.value
+                if timing.get("status") == "NO_CHASE"
+                else DecisionState.WAITING_FOR_CONFIRMATION.value
+            )
+            timing_reason = str(timing.get("reason") or "trend_timing_not_confirmed")
+            timing_evidence = (
+                bos_name, "displacement", f"{pullback_type}:{retest_zone}",
+                "post_retest_trigger", "trend_ema20_ema50_alignment",
+            )
+            return InstitutionalDecision(
+                timing_state, "TREND_CONTINUATION_RETEST", side, timing_reason,
+                timing_evidence, (timing_reason,),
+                _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts),
+                ts, broken_level, None, 55.0,
+            )
+        evidence = (
+            bos_name, "displacement", f"{pullback_type}:{retest_zone}",
+            "post_retest_trigger",
+            ("trend_ema20_ema50_alignment" if legacy_aligned else "ema9_ema20_early_alignment"),
+            f"timing_phase:{timing.get('phase')}",
+            f"adx_rising:{timing.get('adx')}",
+            f"ema9_extension_atr:{timing.get('ema9_extension_atr')}",
+            f"vwap_extension_atr:{timing.get('vwap_extension_atr')}",
+        )
         score = 70.0 + (10.0 if context.get("volume_confirmed") else 0.0) + (5.0 if context.get("order_block") else 0.0)
+        location_event_id = (
+            _location_event_id(symbol, side, retest_zone, retest_zone_ts, ts)
+            if context.get("location_first_required") and retest_zone_ts is not None
+            else _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts)
+        )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, "TREND_CONTINUATION_RETEST", side,
                                      "continuation_sequence_confirmed", evidence, (),
-                                     _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts), ts,
-                                     broken_level, stop, min(100.0, score))
+                                     location_event_id, ts, broken_level, stop, min(100.0, score))
 
 
 class UnifiedEntryAuthority:

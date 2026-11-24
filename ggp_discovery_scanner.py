@@ -185,7 +185,19 @@ def professional_lightweight_scan(
     now_ms: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Bounded scan using a caller-provided shared cache; no order/execution calls."""
-    symbols = list(symbols)[:max(1, int(max_symbols))]
+    # Canonicalize and deduplicate at the scanner boundary so multiple
+    # discovery sources cannot process one market twice in one cycle.
+    unique_symbols = []
+    seen_symbols = set()
+    for raw_symbol in symbols:
+        key = str(raw_symbol or "").strip().upper()
+        if not key or key in seen_symbols:
+            continue
+        seen_symbols.add(key)
+        unique_symbols.append(raw_symbol)
+        if len(unique_symbols) >= max(1, int(max_symbols)):
+            break
+    symbols = unique_symbols
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     stats: Dict[str, Any] = {
         "total": len(symbols), "valid_data": 0, "data_error": 0,

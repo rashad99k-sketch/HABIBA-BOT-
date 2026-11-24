@@ -80,6 +80,14 @@ from ggp_market_data import (
     FETCH_MIN_CANDLES,
     timeframe_seconds as _timeframe_seconds,
 )
+from ggp_market_intelligence import (
+    classify_zone_event, advance_failed_breakout_confirmation,
+    is_confirmed_failed_breakout_evidence, build_scalp_target,
+    build_support_resistance_zones, classify_dynamic_trade_classification,
+)
+from ggp_institutional_bridge import build_liquidity_pools
+from roro_confluence import classify_liquidity as _classify_live_liquidity
+from location_authority import validate_location_zone
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -105,7 +113,7 @@ def record_trade_management_event(event_type, status="INFO", *, log_level=None,
     logger = globals().get("log_execution")
     if logger and (log_level or event_type not in {"BOARD_DECISION"}):
         details = []
-        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "reason", "order_id"):
+        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "entry_mode", "entry_behavior", "reason", "order_id"):
             value = event.get(key)
             if value not in (None, ""):
                 details.append(f"{key}={value}")
@@ -144,6 +152,13 @@ def _env_float_range(name, default, minimum, maximum):
     except (TypeError, ValueError):
         print(f"[CONFIG] Invalid {name}; safe default {default} applied")
         return float(default)
+
+# Observational only: all routine trade-management decisions still come from
+# TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
+TRADE_MANAGEMENT_LOG = TradeManagementEventLog(max_items=200)
+_TRADE_EVENT_DEDUPE = {}
+_TRADE_EVENT_DEDUPE_LOCK = threading.RLock()
+
 
 # ========== INSTITUTIONAL ENGINES (EMBEDDED) ==========
 class SmartMoneyEngine:
@@ -270,14 +285,18 @@ class MomentumFlowEngine:
         ema_fast = close.ewm(span=9).mean()
         ema_slow = close.ewm(span=21).mean()
         momentum_spread = ((ema_fast - ema_slow) / ema_slow.replace(0, np.nan)) * 100
-        norm_spread = max(-2.5, min(2.5, momentum_spread.iloc[-1])) / 2.5
-        momentum_health = 50 + (norm_spread * 50)
-        continuation_strength = min(100, max(0, abs(momentum_spread.iloc[-1]) * 20))
-        trend_expansion = momentum_spread.iloc[-1] > 0.35
-        momentum_decay = momentum_spread.iloc[-1] < 0.05
-        climax_risk = max(0, rsi.iloc[-1] - 70) * 3
+        # Direction-neutral strength; flow_bias below carries the sign.
+        # Signed spread previously mislabeled strong bearish trends as weak.
+        abs_spread = abs(float(momentum_spread.iloc[-1]))
+        norm_strength = min(2.5, abs_spread) / 2.5
+        momentum_health = 50 + (norm_strength * 50)
+        continuation_strength = min(100, max(0, abs_spread * 20))
+        trend_expansion = abs_spread > 0.35
+        momentum_decay = abs_spread < 0.05
+        rsi_now = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+        climax_risk = max(0.0, rsi_now - 70.0, 30.0 - rsi_now) * 3.0
         exhaustion_risk = max(0, 40 - momentum_health)
-        greed_state = (rsi.iloc[-1] > 75) and trend_expansion
+        greed_state = (rsi_now > 75) and trend_expansion
         if momentum_spread.iloc[-1] > 0:
             flow_bias = "BUY"
         elif momentum_spread.iloc[-1] < 0:
@@ -296,6 +315,7 @@ class MomentumFlowEngine:
             "trend_expansion": bool(trend_expansion),
             "momentum_decay": bool(momentum_decay),
             "climax_risk": safe_float_val(climax_risk),
+            "rsi_value": safe_float_val(rsi_now),
             "exhaustion_risk": safe_float_val(exhaustion_risk),
             "greed_state": bool(greed_state),
             "flow_bias": flow_bias
@@ -309,6 +329,7 @@ class MomentumFlowEngine:
             "trend_expansion": False,
             "momentum_decay": False,
             "climax_risk": 0.0,
+            "rsi_value": 50.0,
             "exhaustion_risk": 0.0,
             "greed_state": False,
             "flow_bias": "NEUTRAL"
@@ -337,7 +358,7 @@ class TradeStateMachine:
         self.last_state_change = 0
         self.state_confidence = 0.0
 
-    def update(self, smart: dict, momentum: dict, adx: float, regime: str) -> str:
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None) -> str:
         banker = smart.get("banker_pressure", 50)
         retail = smart.get("retailer_pressure", 50)
         dist_risk = smart.get("distribution_risk", 0)
@@ -349,34 +370,37 @@ class TradeStateMachine:
         expansion = momentum.get("trend_expansion", False)
         decay = momentum.get("momentum_decay", False)
         bias_detailed = smart.get("institutional_bias_detailed", "NEUTRAL")
+        direction = str(side or "").upper()
+        smart_bias = str(smart.get("institutional_bias") or "").upper()
+        momentum_bias = str(momentum.get("flow_bias") or "").upper()
+        smart_opposed = direction in ("BUY", "SELL") and smart_bias in ("BUY", "SELL") and smart_bias != direction
+        momentum_aligned = (direction not in ("BUY", "SELL") or momentum_bias not in ("BUY", "SELL") or momentum_bias == direction) and not smart_opposed
+        adverse_smart_flow = smart_opposed and (dist_risk > 60 or banker > 65)
 
         # PANIC_EXIT
         if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and
-            dist_risk > 75 and mom_health < 15 and cont_strength < 20):
+            dist_risk > 75 and cont_strength < 20 and decay
+            and (direction not in ("BUY", "SELL") or smart_opposed)):
             new_state = "PANIC_EXIT"
-        # MOMENTUM_COLLAPSE
-        elif mom_health < 15 and cont_strength < 25 and decay:
+        # MOMENTUM_COLLAPSE uses directional strength/decay, not signed health.
+        elif cont_strength < 25 and decay and (direction not in ("BUY", "SELL") or smart_opposed):
             new_state = "MOMENTUM_COLLAPSE"
         # LIQUIDITY_EXHAUSTION
         elif exh_risk > 70 or climax > 75:
             new_state = "LIQUIDITY_EXHAUSTION"
         # PROFIT_DEFENSE
-        elif dist_risk > 50 and banker < 45 and mom_health < 30:
+        elif adverse_smart_flow and dist_risk > 50 and cont_strength < 30:
             new_state = "PROFIT_DEFENSE"
-        # DISTRIBUTION
-        elif dist_risk > 60 and banker < 45:
+        # Distribution is adverse only when institutional flow opposes this position.
+        elif adverse_smart_flow and dist_risk > 60:
             new_state = "DISTRIBUTION"
-        # ACCUMULATION
-        elif banker > 65 and dist_risk < 25 and mom_health > 40:
+        elif banker > 65 and dist_risk < 25 and mom_health > 40 and direction != "SELL":
             new_state = "ACCUMULATION"
-        # EXPANSION
-        elif adx > 30 and expansion and cont_strength > 60 and mom_health > 50:
+        elif adx > 30 and expansion and cont_strength > 60 and mom_health > 50 and momentum_aligned:
             new_state = "EXPANSION"
-        # TREND_RIDE
-        elif cont_strength > 75 and mom_health > 60 and dist_risk < 30:
+        elif cont_strength > 75 and mom_health > 60 and dist_risk < 30 and momentum_aligned:
             new_state = "TREND_RIDE"
-        # HEALTHY_PULLBACK
-        elif 20 <= adx <= 35 and mom_health > 45 and not expansion and not decay and dist_risk < 40:
+        elif 20 <= adx <= 35 and mom_health > 45 and not expansion and not decay and dist_risk < 40 and momentum_aligned:
             new_state = "HEALTHY_PULLBACK"
         # FAKE_BREAKOUT
         elif retail > 70 and banker < 45 and climax > 60:
@@ -525,16 +549,24 @@ CACHE = {
 }
 _last_api_call = 0.0
 MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
+# BingX documents the USDT-M swap kline endpoint at 1 request/second per IP.
+# Keep the slower market-data endpoint pacing distinct from the generic
+# account/management request scheduler and serialize it across all workers.
+BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.0, 2.0)
+_API_METHOD_MIN_INTERVALS = {"fetch_ohlcv": BINGX_KLINE_MIN_INTERVAL}
 _API_RATE_LOCK = threading.Lock()
+_LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
-def rate_limit():
-    """Serialize request-start scheduling across scanner and management threads."""
+def rate_limit(func=None):
+    """Serialize API request starts, applying endpoint-specific minimum spacing."""
     global _last_api_call
+    method_name = getattr(func, "__name__", "") if func is not None else ""
+    min_interval = max(MIN_API_INTERVAL, _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL))
     with _API_RATE_LOCK:
         now = time.monotonic()
         elapsed = now - _last_api_call
-        if elapsed < MIN_API_INTERVAL:
-            time.sleep(MIN_API_INTERVAL - elapsed)
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
         _last_api_call = time.monotonic()
 
 CACHE_LOCK = threading.RLock()
@@ -567,7 +599,7 @@ def safe_api_call(func, *args, **kwargs):
     # create_order call: BingX may have accepted the first request already.
     is_order_write = getattr(func, "__name__", "") in {"create_order", "create_market_order", "create_limit_order"}
     if is_order_write:
-        rate_limit()
+        rate_limit(func)
         try:
             return func(*args, **kwargs)
         except Exception as exc:
@@ -585,10 +617,15 @@ def safe_api_call(func, *args, **kwargs):
             raise
     for attempt in range(3):
         try:
-            rate_limit()
+            rate_limit(func)
             return func(*args, **kwargs)
         except Exception as e:
             if "rate limit" in str(e).lower() or "100410" in str(e):
+                _LAST_API_RATE_LIMIT.update({
+                    "ts": time.time(),
+                    "method": getattr(func, "__name__", "exchange_call"),
+                    "message": str(e)[:180],
+                })
                 wait = min(8, 2 ** attempt)
                 try:
                     log_execution(
@@ -647,12 +684,27 @@ def tg_start(balance, mode):
     balance_text = f"{balance:.2f} USDT" if isinstance(balance, (int, float)) and math.isfinite(balance) else "UNAVAILABLE"
     send_once(f"🚀 <b>GGP Institutional</b>\n💼 Balance: {balance_text}\n⚙️ Mode: {html_escape(str(mode))}\n⚖️ Leverage policy: 20x\n🧠 Trade manager: Unified", "startup", 86400)
 
-def tg_entry(side, symbol, entry, sl, tp, score, reason, entry_type):
-    side_emoji = "🟢" if side == "BUY" else "🔴"
+def tg_entry(side, symbol, entry, sl, tp1, score, reason, entry_type,
+             tp2=None, qty=None, leverage=None, trade_id=None):
+    side_text = str(side).upper()
+    side_emoji = "🟢" if side_text == "BUY" else "🔴" if side_text == "SELL" else "⚪"
     safe_symbol = html_escape(str(symbol))
     safe_type = html_escape(str(entry_type))
-    safe_reason = html_escape(str(reason)[:100])
-    send_once(f"{side_emoji} <b>{html_escape(str(side))} {safe_type}</b>\n📊 {safe_symbol}\n💰 Entry: {entry:.8f}\n🛑 Structural SL: {sl:.8f}\n🎯 TP1: {tp:.8f}\n🧠 Score: {score}\n📌 {safe_reason}", f"entry_{symbol}", 60)
+    safe_reason = html_escape(str(reason)[:160])
+    parts = [
+        f"{side_emoji} <b>POSITION OPENED · {html_escape(side_text)} {safe_type}</b>",
+        f"📊 {safe_symbol}",
+        f"💰 Planned entry: {safe_float(entry):.8f}",
+        f"🛑 Structural SL: {safe_float(sl):.8f}",
+        f"🥇 TP1: {safe_float(tp1):.8f}",
+        f"🥈 TP2: {safe_float(tp2):.8f}" if tp2 is not None and safe_float(tp2) > 0 else "🥈 TP2: NOT SET",
+    ]
+    if qty is not None: parts.append(f"📦 Position quantity: {safe_float(qty):.8f}")
+    if leverage is not None: parts.append(f"⚖️ Leverage: {safe_float(leverage):.2f}x")
+    if score is not None: parts.append(f"🧠 Setup score: {html_escape(str(score))}")
+    if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
+    parts.append(f"📌 Setup: {safe_reason}")
+    send_once("\n".join(parts), f"entry_{trade_id or symbol}", 5)
 
 def tg_tp_hit(symbol, tp_level, pnl_pct=None, qty=None, fill_price=None, order_id=None,
               realized_pnl_usdt=None, pnl_source=None, side=None, entry_price=None):
@@ -685,23 +737,36 @@ def tg_sl_hit(symbol, pnl_pct=None, pnl_usdt=None, fill_price=None, order_id=Non
     send_once("\n".join(parts), f"sl_{symbol}_{order_id or 'verified'}", 30)
 
 def tg_close(symbol, pnl_pct, duration_min, side, close_reason=None, pnl_usdt=None,
-             entry_price=None, exit_price=None, pnl_source=None):
+              entry_price=None, exit_price=None, pnl_source=None,
+              total_qty=None, trade_id=None):
     reason = str(close_reason or "CLOSE").upper()
     if reason == "TP2": icon, title = "🥈", "TP2 VERIFIED · POSITION CLOSED"
     elif reason.startswith("RANGE_SCALP"): icon, title = "⚡", "RANGE SCALP · POSITION CLOSED"
     elif "STOP" in reason: icon, title = "🛑", "STOP / PROTECTIVE EXIT · POSITION CLOSED"
     elif "STRICT" in reason or "THESIS" in reason or "EMERGENCY" in reason: icon, title = "⛔", "STRICT EXIT VERIFIED · POSITION CLOSED"
-    else: icon, title = (("✅" if pnl_usdt is not None and pnl_usdt >= 0 else "❌") if pnl_usdt is not None else "⚪"), "POSITION CLOSED"
-    parts = [f"{icon} <b>{title}</b>", f"📊 {html_escape(str(symbol))} ({html_escape(str(side))})"]
+    else: icon, title = "📋", "POSITION CLOSED"
+    if pnl_usdt is None:
+        outcome = "RESULT: PNL UNAVAILABLE — NOT CLASSIFIED"
+    elif pnl_usdt > 0:
+        outcome = "RESULT: PROFIT"
+    elif pnl_usdt < 0:
+        outcome = "RESULT: LOSS"
+    else:
+        outcome = "RESULT: BREAKEVEN"
+    parts = [f"{icon} <b>{title}</b>", f"📊 {html_escape(str(symbol))} ({html_escape(str(side))})",
+             f"<b>{outcome}</b>"]
     if pnl_usdt is not None:
         parts.append(f"💵 Total realized PnL: {safe_float(pnl_usdt):+.4f} USDT")
         if pnl_pct is not None: parts.append(f"📈 Total realized ROE: {safe_float(pnl_pct):+.2f}%")
     else: parts.append("💵 Total realized PnL: UNAVAILABLE — exchange data incomplete")
     if entry_price and safe_float(entry_price) > 0: parts.append(f"Entry: {safe_float(entry_price):.8f}")
     if exit_price and safe_float(exit_price) > 0: parts.append(f"Final exit fill: {safe_float(exit_price):.8f}")
+    if total_qty is not None: parts.append(f"📦 Original position quantity: {safe_float(total_qty):.8f}")
     parts.extend([f"⏱ Duration: {safe_float(duration_min):.0f} min", f"Reason: {html_escape(reason)}"])
     if pnl_source: parts.append(f"🧾 Source: {html_escape(str(pnl_source))}")
-    send_once("\n".join(parts), f"close_{symbol}_{reason}", 10)
+    if trade_id: parts.append(f"🔖 Trade ID: {html_escape(str(trade_id))}")
+    close_key = str(trade_id or (str(symbol) + "_" + reason))
+    send_once("\n".join(parts), f"close_{close_key}", 1)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{html_escape(str(error_type))}]\n{html_escape(str(err_msg)[:200])}", f"err_{error_type}_{str(err_msg)[:50]}", 60)
@@ -868,25 +933,71 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
     return df
 
 # ========== DATA FETCHING (OPTIMIZED CACHE) ==========
+OHLCV_FETCH_DIAGNOSTICS = {}
+
+def _record_ohlcv_fetch_diagnostic(symbol, reason, *, received=0, detail=""):
+    key = str(symbol or "")
+    OHLCV_FETCH_DIAGNOSTICS[key] = {
+        "reason": str(reason),
+        "received_candles": int(received or 0),
+        "detail": str(detail or "")[:180],
+        "timestamp": time.time(),
+        "timeframe": str(INTERVAL),
+    }
+
+
 def fetch_ohlcv(symbol, limit=150):
+    started_at = time.time()
+    sym = str(symbol or "")
     try:
         sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
-        if not data or len(data) < 100:
+        if not data:
+            rate = _LAST_API_RATE_LIMIT
+            reason = (
+                "OHLCV_RATE_LIMITED"
+                if rate.get("method") == "fetch_ohlcv" and float(rate.get("ts", 0.0)) >= started_at
+                else "OHLCV_EMPTY"
+            )
+            _record_ohlcv_fetch_diagnostic(sym, reason, detail="exchange returned no OHLCV rows")
+            return None
+        if len(data) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(data),
+                detail=f"fetcher minimum is 100 rows; received {len(data)}",
+            )
             return None
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-        df = df.dropna()
+        for col in ["timestamp", "open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
         if len(df) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
+                detail=f"only {len(df)} complete OHLCV rows remained after validation",
+            )
             return None
-        if (df['close'] == 0).any() or (df['high'] == 0).any() or (df['low'] == 0).any():
+        if (df[["close", "high", "low"]] <= 0).any().any():
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_EMPTY", received=len(df), detail="non-positive OHLC value",
+            )
             return None
-        df = df.sort_index().drop_duplicates(subset=['timestamp']).ffill().bfill()
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
         if len(df) < 100:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
+                detail=f"only {len(df)} unique OHLCV rows remained",
+            )
             return None
+        _record_ohlcv_fetch_diagnostic(sym, "OK", received=len(df))
         return df
     except Exception as e:
+        rate_limited = "rate limit" in str(e).lower() or "100410" in str(e)
+        _record_ohlcv_fetch_diagnostic(
+            sym,
+            "OHLCV_RATE_LIMITED" if rate_limited else "OHLCV_EMPTY",
+            detail=f"{type(e).__name__}: {e}",
+        )
         print(color_text(f"fetch_ohlcv error for {symbol}: {e}", YELLOW))
         return None
 
@@ -2312,8 +2423,8 @@ class InstitutionalTradeBrain:
         self.last_update = 0
         self.current_trade_state = "RANGE_CHOP"
 
-    def update(self, smart: dict, momentum: dict, adx: float, regime: str):
-        self.current_trade_state = self.state_machine.update(smart, momentum, adx, regime)
+    def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None):
+        self.current_trade_state = self.state_machine.update(smart, momentum, adx, regime, side=side)
         self.last_update = time.time()
         return self.current_trade_state
 
@@ -2334,10 +2445,10 @@ class InstitutionalTradeBrain:
 
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
-from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached,
-                              select_range_target_pct, tp2_reassessment, thesis_failure_action,
+from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
+                              tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
-                              RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              trend_target_prices, RANGE_MODE, TREND_MODE, STANDARD_MODE)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2391,10 +2502,38 @@ class TradeManagementBoard:
                 "action": action.value, "reason": str(reason), "symbol": symbol,
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
-                "profit_mode": profit_mode, "tp1_hit": bool(ctx.get("tp1_hit")),
+                "profit_mode": profit_mode,
+                "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
+                "fresh_ema9_vwap_cross": bool(ctx.get("fresh_ema9_vwap_cross", False)),
+                "fresh_ema50_vwap_cross": bool(ctx.get("fresh_ema50_vwap_cross", False)),
+                "vwap_cross_direction": str(ctx.get("vwap_cross_direction") or ""),
+                "vwap_cross_trigger": str(ctx.get("vwap_cross_trigger") or "NONE"),
+                "market_regime": str(ctx.get("regime") or "UNKNOWN"),
+                "trade_classification": str(ctx.get("trade_classification") or "UNCLASSIFIED"),
+                "trade_classification_reasons": list(ctx.get("trade_classification_reasons") or []),
+                "tp1_hit": bool(ctx.get("tp1_hit")),
                 "tp2_hit": bool(ctx.get("tp2_hit")),
                 "tp1_price": safe_float(ctx.get("tp1_price")),
                 "tp2_price": safe_float(ctx.get("tp2_price")),
+                "opposing_liquidity_status": str(ctx.get("opposing_liquidity_status") or "UNKNOWN"),
+                "opposing_liquidity_level": safe_float(ctx.get("opposing_liquidity_level"), 0.0),
+                "scalp_target_status": str(ctx.get("scalp_target_status") or "UNKNOWN"),
+                "scalp_target_price": safe_float(ctx.get("scalp_target_price"), 0.0),
+                "scalp_target_tp1_price": safe_float(ctx.get("scalp_target_tp1_price"), 0.0),
+                "risk_score": safe_float(params.get("risk_score"), 0.0),
+                "risk_groups": list(params.get("risk_groups") or []),
+                "scalp_target_selected_pct": safe_float(ctx.get("scalp_target_selected_pct"), 0.0),
+                "mfe_roe": safe_float(ctx.get("peak_roe"), roe),
+                "current_roe": roe,
+                "time_in_trade_seconds": max(0.0, time.time() - safe_float(ctx.get("entry_time"), time.time())),
+                "evidence_used": list(ctx.get("evidence_used") or params.get("risk_groups") or []),
+                "evidence_missing": list(ctx.get("evidence_missing") or []),
+                "risk_state": str(ctx.get("risk_state") or params.get("risk_state") or "UNKNOWN"),
+                "protection_status": str(ctx.get("protection_status") or ("EXCHANGE_VERIFIED" if ctx.get("native_sl_verified") else "UNKNOWN")),
+                "execution_result": str(ctx.get("execution_result") or "NOT_SUBMITTED"),
+                "exchange_verification_result": str(ctx.get("exchange_verification_result") or "NOT_REQUIRED"),
             }
             self._decision_history.append(meta)
             signature = (action.value, str(reason), symbol)
@@ -2415,17 +2554,70 @@ class TradeManagementBoard:
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
 
-        thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
-        thesis_action, thesis_reason = thesis_failure_action(
-            side, roe, thesis_score, ctx.get("thesis_failure_reasons") or [],
-            structural_invalidation=bool(ctx.get("structural_invalidation")))
-        if thesis_action == "EXIT":
-            return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
-                            str(ctx.get("thesis_failure_reason") or thesis_reason))
-        if thesis_action == "PROTECT" and not ctx.get("be_done"):
-            return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
-        if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
-            return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
+        if ctx.get("indicator_decisions_allowed", True):
+            # Unified danger assessment consumes independent evidence from the existing
+            # smart-money, momentum, DI/ADX, continuation, EMA structure, liquidity,
+            # order-block/FVG and support/resistance engines.
+            exit_risk = evaluate_exit_risk(ctx)
+            STATE["exit_risk_snapshot"] = dict(exit_risk)
+            record_trade_management_event(
+                "PROFIT_RISK_ASSESSMENT", exit_risk.get("action", "HOLD"),
+                dedupe_key=f"profit_risk:{ctx.get('symbol')}:{ctx.get('side')}:{exit_risk.get('action')}:{exit_risk.get('score')}",
+                dedupe_seconds=10, symbol=ctx.get("symbol"), side=side,
+                risk_score=exit_risk.get("score"), risk_groups=list(exit_risk.get("groups") or []),
+                reasons=list(exit_risk.get("reasons") or ()), roe_pct=roe,
+            )
+            if exit_risk.get("action") == "HARD_EXIT":
+                return decision(
+                    TradeDecisionType.THESIS_FAILURE_EXIT,
+                    "PROFIT_BRAIN_HARD_RISK:" + ",".join(exit_risk.get("reasons", ())),
+                    close_reason="PROFIT_DANGER_HARD_EXIT",
+                    risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
+                )
+            if exit_risk.get("action") == "CLOSE_PROFIT":
+                return decision(
+                    TradeDecisionType.FULL_CLOSE,
+                    "PROFIT_DANGER_LOCK:" + ",".join(exit_risk.get("reasons", ())),
+                    close_reason="PROFIT_DANGER_LOCK",
+                    risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
+                )
+            if exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
+                fee_buffer = max(entry * 0.0010, atr * 0.10)
+                candidate_stop = (
+                    max(entry + fee_buffer, current - 0.50 * atr)
+                    if side == "BUY" else
+                    min(entry - fee_buffer, current + 0.50 * atr)
+                )
+                if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+                    return decision(
+                        TradeDecisionType.LOCK_PROFITS,
+                        "PROFIT_DANGER_TIGHTEN:" + ",".join(exit_risk.get("reasons", ())),
+                        new_sl=candidate_stop, risk_score=exit_risk.get("score"),
+                        risk_groups=exit_risk.get("groups"),
+                    )
+
+            # A failed breakout is supporting thesis evidence, not an independent
+            # exit signal. Require a fresh same-side event and two adjacent closed
+            # candles confirming price remained back inside the causal zone.
+            mi = ctx.get("market_intelligence") if isinstance(ctx.get("market_intelligence"), dict) else {}
+            zone_evidence_valid = is_confirmed_failed_breakout_evidence(mi, side)
+            thesis_reasons = list(ctx.get("thesis_failure_reasons") or [])
+            thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
+            if zone_evidence_valid:
+                thesis_score = min(100.0, thesis_score + 18.0)
+                thesis_reasons.append("confirmed_failed_breakout_reentry")
+                STATE["failed_breakout_thesis_credit_applied"] = True
+
+            thesis_action, thesis_reason = thesis_failure_action(
+                side, roe, thesis_score, thesis_reasons,
+                structural_invalidation=bool(ctx.get("structural_invalidation")))
+            if thesis_action == "EXIT":
+                return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
+                                str(ctx.get("thesis_failure_reason") or thesis_reason))
+            if thesis_action == "PROTECT" and not ctx.get("be_done"):
+                return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
+            if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
+                return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
 
         sl_price = safe_float(ctx.get("synthetic_sl"), 0.0)
         if sl_price > 0 and current > 0:
@@ -2436,16 +2628,33 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is an intentional exception: it is enabled only by the
-        # multi-evidence policy. The single target closes the entire remaining
-        # exposure, while a previously verified TP1 remains recorded as a real fill.
+        # RANGE_SCALP is a SINGLE-TARGET mode: no partial TP1 and no runner.
+        # On target, close the full verified remaining exposure through the
+        # existing strict FULL_CLOSE execution/reconciliation path.
         if profit_mode == "RANGE_SCALP":
-            range_target = safe_float(ctx.get("range_target_price"), 0.0)
-            if range_target > 0 and target_reached(side, current, range_target):
-                return decision(TradeDecisionType.FULL_CLOSE,
-                                f"range_scalp_single_target_hit_{safe_float(ctx.get('range_target_move_pct'), 0.5):.2f}pct",
-                                close_reason="RANGE_SCALP_TARGET")
-            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target")
+            scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
+            scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
+            range_target = (
+                safe_float(ctx.get("range_target_price"), 0.0)
+                or (scalp_target if scalp_target_status == "VALID" else 0.0)
+            )
+            target_source = ("adaptive_price_target"
+                             if safe_float(ctx.get("range_target_price"), 0.0) > 0
+                             else "opposing_liquidity_fallback")
+            if range_target > 0 and entry > 0 and remaining > 0:
+                if target_reached(side, current, range_target):
+                    return decision(
+                        TradeDecisionType.FULL_CLOSE,
+                        f"range_scalp_{target_source}_single_target_full_exit",
+                        close_reason="SCALP_TARGET", target_price=range_target,
+                        target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+                        opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0),
+                    )
+            return decision(
+                TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target",
+                target_price=range_target, target_source=target_source,
+                target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+            )
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
         # This compensates for any previously confirmed partial fill and never
@@ -2494,7 +2703,6 @@ class TradeManagementBoard:
                 str(ctx.get("ema_state") or "UNKNOWN"),
                 safe_float(ctx.get("peak_drawdown_roe", 0.0)),
                 tp1_verified=True,
-                trend_evidence_score=safe_float(ctx.get("trend_evidence_score"), 0.0),
             )
             favourable = safe_float(ctx.get("max_price"), entry) if side == "BUY" else safe_float(ctx.get("min_price"), entry)
             new_stop = favourable - trail_mult * atr if side == "BUY" else favourable + trail_mult * atr
@@ -2521,6 +2729,43 @@ class TradeManagementBoard:
         return decision(TradeDecisionType.HOLD, "no_profit_management_trigger")
 
 # ========== REAL EXCHANGE ORDERS (SAFE) ==========
+def _is_definitive_close_rejection(exc):
+    """True only for exchange-side validation rejection before order acceptance.
+
+    Transport/timeouts and generic exchange errors remain ambiguous and must
+    continue through the strict reconciliation gate.
+    """
+    return any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
+
+def _is_min_amount_close_rejection(exc):
+    """Recognize only explicit venue minimum-size rejections, not every InvalidOrder.
+
+    BingX documents dedicated minimum-size errors (including 101202, 101485,
+    and 110422). Message matching is kept narrow for CCXT versions that wrap
+    venue codes differently. Precision, side, mode, and other InvalidOrder
+    failures must never trigger an automatic full-position exit.
+    """
+    message = str(exc or "").lower()
+    explicit_codes = ("101202", "101485", "110422")
+    if any(code in message for code in explicit_codes):
+        return True
+    minimum_terms = (
+        "minimum order amount", "amount below exchange minimum",
+        "below minimum amount", "minimum quantity",
+        "closing order size is below the minimum",
+        "order size is below the minimum", "minimum nominal value",
+        "minsizecoin", "minsizeusd",
+        "minimum notional", "min notional", "notional value is too small",
+        "order quantity is less than minimum", "quantity is less than minimum",
+        "amount is less than minimum", "less than the minimum order size",
+        "minimum trade amount", "trade amount is below minimum",
+    )
+    return (any(cls.__name__ == "InvalidOrder" for cls in type(exc).__mro__)
+            and any(term in message for term in minimum_terms))
+
+
+
+
 def _close_failure(message, *, unresolved=True):
     """Fail closed after an ambiguous exchange operation; never fabricate a fill."""
     STATE["execution_unresolved"] = bool(unresolved)
@@ -2626,6 +2871,7 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             return _close_failure("close quantity rounded to zero", unresolved=False)
         close_side = "sell" if side == "BUY" else "buy"
         mode_result = BingXPositionModeAdapter(ex).read(sym)
+        close_mode_label = getattr(getattr(mode_result, "mode", None), "value", "UNKNOWN")
         if mode_result.mode is PositionMode.UNKNOWN:
             return _close_failure(f"position mode UNKNOWN; close blocked: {mode_result.reason}", unresolved=True)
         close_params = build_position_order_params(
@@ -2644,15 +2890,69 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
         STATE.update({"pending_close_order_id": order_id, "pending_close_reason": str(close_reason),
                       "pending_close_before_qty": before, "pending_close_requested_qty": requested,
                       "pending_close_target_remaining_qty": target_remaining_qty,
-                      "pending_close_started_at": time.time(), "execution_unresolved": True,
+                      "pending_close_started_at": time.time(), "execution_unresolved": True, "close_blocked_reason": None,
                       "close_reconciliation_required": True})
-        bot_ids = STATE.setdefault("bot_close_order_ids", [])
+        bot_ids = STATE.get("bot_close_order_ids")
+        if not isinstance(bot_ids, list):
+            # A recovered/partially initialized STATE may contain None here.
+            # Normalize the journal field before membership checks; never let
+            # local metadata shape prevent an already-submitted close from
+            # being reconciled against the exchange.
+            bot_ids = []
+            STATE["bot_close_order_ids"] = bot_ids
         if order_id not in bot_ids:
             bot_ids.append(order_id)
             if len(bot_ids) > 50:
                 del bot_ids[:-50]
         _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
     except Exception as exc:
+        if _is_definitive_close_rejection(exc):
+            # BingX rejected the request at validation time; this is not an
+            # accepted-but-unknown MARKET order. Re-read the live exposure and,
+            # for TP1 only, fall back once to closing the entire verified
+            # remainder rather than leaving a profitable position unmanaged.
+            STATE.update({"execution_unresolved": False,
+                          "close_reconciliation_required": False,
+                          "close_blocked_reason": f"EXCHANGE_INVALID_ORDER: {exc}",
+                          "close_blocked_at": time.time()})
+            rejected_status, rejected_position = fetch_position_tri_state(symbol)
+            log_execution(
+                f"[CLOSE_REJECTED] {symbol} {close_reason}: "
+                f"{type(exc).__name__}: {exc}; no order accepted "
+                f"| requested_qty={safe_float(locals().get('requested'), 0.0):.12g} "
+                f"| exchange_before_qty={safe_float(locals().get('before'), 0.0):.12g} "
+                f"| live_rejected_qty={safe_float(_position_contracts(rejected_position), 0.0) if rejected_position is not None else 0.0:.12g} "
+                f"| position_mode={locals().get('close_mode_label', 'UNKNOWN')} "
+                f"| normalized_symbol={locals().get('sym', normalize_symbol(symbol))}",
+                "WARN",
+            )
+            if rejected_status == "FLAT":
+                _clear_confirmed_flat(symbol, reason="CLOSE_REJECTED_BUT_EXCHANGE_FLAT")
+                return True
+            if rejected_status == "OPEN":
+                rejected_qty = _position_contracts(rejected_position)
+                if (rejected_qty > 0 and str(close_reason).upper() == "TP1"
+                        and _is_min_amount_close_rejection(exc)):
+                    log_execution(f"[TP1_FALLBACK] {symbol}: venue minimum-size rejection; "
+                                  f"attempting one strict full close of verified qty={rejected_qty:.10f}", "WARN")
+                    fallback_ok = _verified_market_reduce_impl(
+                        symbol, qty=rejected_qty,
+                        close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+                    if fallback_ok and STATE.get("close_verified") and safe_float(STATE.get("remaining_qty")) <= max(rejected_qty * 0.002, 1e-10):
+                        finalize = globals().get("finalize_trade_with_reality")
+                        if callable(finalize):
+                            finalize(symbol, close_reason="TP1_MIN_AMOUNT_FULL_CLOSE")
+                        log_execution(f"[TP1_FALLBACK] {symbol}: full remaining exposure closed and finalized", "SUCCESS")
+                        return True
+                    log_execution(f"[TP1_FALLBACK] {symbol}: full-close attempt did not verify FLAT; "
+                                  "position remains active under exchange protection", "ERROR")
+                    return False
+            # Position unavailable or a non-TP1 action: leave the real position
+            # and its exchange-native protection intact, but do not mislabel a
+            # definitive validation rejection as an unresolved order outcome.
+            log_execution(f"[CLOSE_REJECTED] {symbol}: no safe fallback; "
+                          "position remains under normal exchange synchronization", "ERROR")
+            return False
         return _close_failure(f"market close submission ambiguous: {type(exc).__name__}: {exc}")
 
     post_status, post_position, order_state = "UNKNOWN", None, order
@@ -2844,6 +3144,158 @@ def _closed_candle_frame(df, timeframe=None):
 
 
 # ========== LIVE TRADE MANAGER WITH NEW BOARD ==========
+_NATIVE_STOP_MOVE_LOCK = threading.RLock()
+_NATIVE_STOP_MOVE_DEDUPE_SEC = 300.0
+
+
+def _state_position_mode():
+    raw = str(STATE.get("position_mode") or "UNKNOWN").upper().replace("-", "_").replace(" ", "_")
+    try:
+        return PositionMode(raw)
+    except Exception:
+        return PositionMode.UNKNOWN
+
+
+def _move_native_stop_verified(symbol, new_trigger_price, *, action="MOVE_SL", reason=""):
+    """Move the venue-native stop and adopt the new level only after read-back.
+
+    The execution service owns all cancel/replace verification. This bridge adds
+    management-side materiality, de-duplication and state/journal handling. A
+    failed move never claims success: RETAINED keeps the verified previous stop,
+    LOST enters the existing recovery hold, and PAPER updates synthetic state only.
+    """
+    new_price = safe_float(new_trigger_price, 0.0)
+    side = str(STATE.get("side") or "").upper()
+    if new_price <= 0 or side not in {"BUY", "SELL"}:
+        return False, "INVALID_STOP_MOVE_INPUT", {}
+
+    min_step = max(abs(safe_float(STATE.get("entry"), 0.0)) * 0.0005, 1e-12)
+    now = time.time()
+    with _NATIVE_STOP_MOVE_LOCK:
+        last_price = safe_float(STATE.get("native_sl_last_requested_price"), 0.0)
+        last_ts = safe_float(STATE.get("native_sl_last_update_ts"), 0.0)
+        if last_price > 0 and abs(new_price - last_price) <= min_step \
+                and now - last_ts < _NATIVE_STOP_MOVE_DEDUPE_SEC:
+            return True, "DUPLICATE_SKIPPED", {"requested_price": new_price}
+
+        current = safe_float(STATE.get("native_sl_last_verified_price"),
+                             safe_float(STATE.get("native_sl_original_price"),
+                                        safe_float(STATE.get("synthetic_sl"), 0.0)))
+        improves = (current <= 0 or new_price > current + min_step) if side == "BUY" \
+            else (current <= 0 or new_price < current - min_step)
+        if not improves:
+            return False, "NOT_MATERIAL", {}
+
+        record = {
+            "symbol": symbol, "side": side, "action": action, "reason": reason,
+            "requested_stop": new_price, "previous_stop": current or None,
+            "previous_order_id": STATE.get("native_sl_order_id"),
+        }
+        if PAPER_MODE:
+            STATE.update({
+                "native_sl_policy": "PAPER_SYNTHETIC_ONLY",
+                "native_sl_local_target": new_price,
+                "native_sl_last_requested_price": new_price,
+                "native_sl_last_update_ts": now,
+                "native_sl_last_result": "PAPER_SIMULATED",
+                "native_sl_last_reason": "paper_mode_no_exchange_stop_move",
+            })
+            record_trade_management_event(
+                "NATIVE_SL_MOVE", "PAPER_SIMULATED", log_level="INFO",
+                dedupe_key=f"native_sl:{symbol}:{new_price:.8f}", dedupe_seconds=60,
+                **record, order_id=STATE.get("native_sl_order_id"))
+            return True, "PAPER_SIMULATED", record
+
+        if (STATE.get("recovery_hold") or STATE.get("external_close_detected")
+                or STATE.get("close_reconciliation_required") or STATE.get("execution_unresolved")):
+            STATE.update({"native_sl_last_result": "BLOCKED_UNRESOLVED",
+                          "native_sl_last_reason": "management_state_unresolved"})
+            record_trade_management_event(
+                "NATIVE_SL_MOVE", "BLOCKED", log_level="ERROR", **record)
+            return False, "BLOCKED_UNRESOLVED", record
+
+        qty = safe_float(STATE.get("remaining_qty"), safe_float(STATE.get("qty"), 0.0))
+        previous_qty = safe_float(STATE.get("native_sl_original_qty"),
+                                  safe_float(STATE.get("initial_qty"), qty))
+        if qty <= 0:
+            STATE.update({"native_sl_last_result": "INVALID_QUANTITY",
+                          "native_sl_last_reason": "no_remaining_position_quantity"})
+            return False, "INVALID_QUANTITY", record
+        try:
+            service = TradeExecutionService(
+                ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
+                logger=lambda message: log_execution(f"[NATIVE_SL_MOVE] {message}", "INFO"),
+            )
+            result = service.replace_native_stop(
+                symbol=normalize_symbol(symbol), side=side, quantity=qty,
+                new_trigger_price=new_price, mode=_state_position_mode(),
+                position_side=STATE.get("position_side"),
+                previous_order_id=STATE.get("native_sl_order_id"),
+                previous_trigger_price=current or None,
+                previous_quantity=previous_qty,
+            )
+        except Exception as exc:
+            STATE.update({"native_sl_last_result": "EXCEPTION",
+                          "native_sl_last_reason": type(exc).__name__})
+            record_trade_management_event(
+                "NATIVE_SL_MOVE", "EXCEPTION", log_level="ERROR",
+                **record, error=f"{type(exc).__name__}: {exc}")
+            return False, "EXCEPTION", record
+
+        outcome = str(getattr(result, "outcome", "") or "").upper()
+        result_reason = str(getattr(result, "reason", "") or "")
+        order_id = getattr(result, "order_id", None) or STATE.get("native_sl_order_id")
+        record.update({"outcome": outcome, "order_id": order_id, "service_reason": result_reason})
+        STATE.update({
+            "native_sl_last_requested_price": new_price,
+            "native_sl_last_update_ts": now,
+            "native_sl_last_result": outcome,
+            "native_sl_last_reason": result_reason,
+        })
+
+        if outcome == "MOVED":
+            STATE.update({
+                "native_sl_order_id": order_id,
+                "native_sl_last_verified_price": new_price,
+                "native_sl_original_price": new_price,
+                "native_sl_verified": True,
+                "native_sl_status": "VERIFIED",
+                "native_sl_policy": "EXCHANGE_VERIFIED_MOVED",
+            })
+            record_trade_management_event(
+                "NATIVE_SL_MOVED", "EXCHANGE_VERIFIED", log_level="SUCCESS",
+                dedupe_key=f"native_sl:{symbol}:{new_price:.8f}", dedupe_seconds=60,
+                **record)
+            return True, "MOVED", record
+
+        if outcome == "RETAINED":
+            # The previous stop was re-read and proven active. Keep it authoritative.
+            STATE.update({
+                "native_sl_order_id": order_id,
+                "native_sl_verified": True,
+                "native_sl_status": "VERIFIED_RETAINED",
+                "native_sl_policy": "EXCHANGE_STOP_RETAINED_SYNTHETIC_ADVANCED",
+            })
+            record_trade_management_event(
+                "NATIVE_SL_RETAINED", "EXCHANGE_VERIFIED", log_level="WARN",
+                dedupe_key=f"native_sl:{symbol}:{new_price:.8f}", dedupe_seconds=60,
+                **record)
+            return False, "RETAINED", record
+
+        STATE.update({
+            "native_sl_verified": False,
+            "native_sl_status": "UNVERIFIED",
+            "native_sl_policy": "EXCHANGE_STOP_UNVERIFIED_HOLD",
+            "recovery_hold": True,
+            "recovery_reason": "native_sl_move_" + (result_reason or "lost"),
+        })
+        record_trade_management_event(
+            "NATIVE_SL_MOVE_LOST", "RECOVERY_HOLD", log_level="ERROR",
+            dedupe_key=f"native_sl:{symbol}:{new_price:.8f}", dedupe_seconds=60,
+            **record)
+        return False, "LOST", record
+
+
 class LiveTradeManager:
     def __init__(self, event_bus, exchange_sync, recovery_guard):
         self.event_bus = event_bus
@@ -2977,9 +3429,6 @@ class LiveTradeManager:
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
-        # A new trade must never inherit the previous trade's management throttle.
-        self.last_management_ts = 0.0
-        self.last_log_ts = 0.0
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -3069,8 +3518,48 @@ class LiveTradeManager:
             f"BE={bool(STATE.get('be_done'))} Trail(local)={bool(STATE.get('trail_activated'))} | "
             f"ADX={safe_float(STATE.get('adx_live')):.1f} DI+={safe_float(STATE.get('di_plus_live')):.1f} "
             f"DI-={safe_float(STATE.get('di_minus_live')):.1f} Continuation={safe_float(STATE.get('continuation_probability'),0.5):.2f} | "
+            f"VWAPCross={STATE.get('vwap_cross_trigger', 'UNKNOWN')} Direction={STATE.get('vwap_cross_direction', 'UNKNOWN')} | "
             f"State={state_str} RecoveryHold={bool(STATE.get('recovery_hold'))}",
             "INFO", debounce_key=f"profit_brain_status_{symbol}", debounce_sec=15
+        )
+
+    def _apply_price_only_management(self, symbol, mark_price, reason):
+        """Run verified price/target/stop checks without stale indicator authority."""
+        if self.lifecycle_state != TradeLifecycleState.LIVE or not STATE.get("open"):
+            return
+        context = {
+            "symbol": symbol, "side": str(STATE.get("side") or "").upper(),
+            "entry": safe_float(STATE.get("entry")), "current_price": safe_float(mark_price),
+            "atr": safe_float(STATE.get("atr")), "roe": safe_float(STATE.get("roe_pct")),
+            "remaining_qty": safe_float(STATE.get("remaining_qty"), safe_float(STATE.get("qty"))),
+            "initial_qty": safe_float(STATE.get("initial_qty"), safe_float(STATE.get("qty"))),
+            "synthetic_sl": safe_float(STATE.get("synthetic_sl", STATE.get("sl"))),
+            "trail_stop": safe_float(STATE.get("trail_stop")),
+            "trail_active": bool(STATE.get("trail_activated")),
+            "tp1_hit": bool(STATE.get("tp1_hit")), "tp2_hit": bool(STATE.get("tp2_hit")),
+            "tp1_price": safe_float(STATE.get("tp1_price", STATE.get("synthetic_tp1"))),
+            "tp2_price": safe_float(STATE.get("tp2_price")),
+            "range_target_price": safe_float(STATE.get("range_target_price")),
+            "range_target_move_pct": safe_float(STATE.get("range_target_move_pct")),
+            "scalp_target_status": str(STATE.get("scalp_target_status") or "UNKNOWN"),
+            "scalp_target_price": safe_float(STATE.get("scalp_target_price")),
+            "profit_mode": str(STATE.get("profit_mode") or STANDARD_MODE),
+            "trade_state": "UNKNOWN", "continuation_probability": 0.5,
+            "adx": 20.0, "smart_money": {}, "momentum": {},
+            "be_done": bool(STATE.get("be_done")),
+            "execution_unresolved": bool(STATE.get("execution_unresolved")),
+            "close_reconciliation_required": bool(STATE.get("close_reconciliation_required")),
+            "recovery_hold": bool(STATE.get("recovery_hold")),
+            "indicator_decisions_allowed": False,
+        }
+        decision = self.board.evaluate(context)
+        self._last_decision = decision
+        self._execute_decision(decision, symbol)
+        log_execution(
+            f"[PRICE_ONLY_MANAGEMENT] {symbol} reason={reason} decision={decision.action.value} "
+            f"detail={decision.reason}",
+            "INFO", debounce_key=f"price_only_management:{symbol}:{decision.action.value}:{decision.reason}",
+            debounce_sec=10,
         )
 
     def _apply_management(self, symbol, now):
@@ -3107,6 +3596,7 @@ class LiveTradeManager:
                 f"keep current protection (Native SL unchanged)",
                 "WARN", debounce_key=f"mkt_fetch_error_{symbol}", debounce_sec=30)
             STATE["last_market_data_freshness"] = "INVALID"
+            self._apply_price_only_management(symbol, mark_price, "ohlcv_fetch_error")
             return
         df_live = _closed_candle_frame(raw_frame, INTERVAL)
         received = 0 if raw_frame is None else int(len(raw_frame))
@@ -3144,6 +3634,8 @@ class LiveTradeManager:
                 f"  Cache Status: {'HIT' if ohlcv_source == 'CACHE_HIT' else 'MISS'}\n"
                 f"  -> insufficient completed candles; keep current protection (Native SL unchanged)",
                 "WARN", debounce_key=f"mkt_insufficient_{symbol}", debounce_sec=30)
+            STATE["last_market_data_freshness"] = "INSUFFICIENT"
+            self._apply_price_only_management(symbol, mark_price, "insufficient_closed_candles")
             return
         # Freshness relative to the last closed candle we processed.
         prev_closed = safe_float(STATE.get("last_management_closed_candle_ts"), 0.0)
@@ -3191,6 +3683,54 @@ class LiveTradeManager:
 
         # Heavy calculations every 5 seconds (ADX, DI, SmartMoney, Momentum, StateMachine)
         if now - self.last_heavy_calc_ts >= 5:
+            # Preserve the legacy closed-candle EMA9/session-VWAP method and add
+            # an independent EMA50/VWAP cross. This is management context, not
+            # an order by itself. Open-position protection never waits for a cross.
+            try:
+                _cross_snapshot = _roro_ema9_vwap_proximity(
+                    df_live, ema, ema_len=9,
+                    timeframe_seconds=_timeframe_seconds(INTERVAL),
+                    now_ms=int(now * 1000),
+                )
+                if isinstance(_cross_snapshot, dict):
+                    _cross_snapshot = dict(_cross_snapshot)
+                    _cross_ts_ms = safe_float(_cross_snapshot.get("candle_timestamp"), 0.0)
+                    _cross_frame_seconds = float(_timeframe_seconds(INTERVAL))
+                    _cross_age = max(0.0, float(now) - (_cross_ts_ms / 1000.0 + _cross_frame_seconds))
+                    _cross_max_age = 2.0 * _cross_frame_seconds
+                    _cross_event = bool(_cross_snapshot.get("cross_ema9") or _cross_snapshot.get("cross_ema50"))
+                    _cross_snapshot.update({
+                        "cross_age_seconds": _cross_age if _cross_event else None,
+                        "cross_max_age_seconds": _cross_max_age,
+                        "timeframe_seconds": _cross_frame_seconds,
+                        "cross_fresh": bool(_cross_event and _cross_age <= _cross_max_age),
+                    })
+                    STATE["vwap_cross_snapshot"] = dict(_cross_snapshot)
+                    STATE["fresh_ema9_vwap_cross"] = bool(_cross_snapshot.get("cross_ema9") and _cross_snapshot.get("cross_fresh"))
+                    STATE["fresh_ema50_vwap_cross"] = bool(_cross_snapshot.get("cross_ema50") and _cross_snapshot.get("cross_fresh"))
+                    STATE["vwap_cross_direction"] = str(_cross_snapshot.get("cross_any") or "")
+                    STATE["vwap_cross_trigger"] = str(_cross_snapshot.get("cross_trigger") or "NONE")
+                    STATE["vwap_cross_candle_timestamp"] = int(_cross_snapshot.get("candle_timestamp") or 0)
+                    STATE["vwap_cross_age_seconds"] = _cross_snapshot.get("cross_age_seconds")
+                    STATE["vwap_cross_max_age_seconds"] = _cross_max_age
+                else:
+                    STATE["vwap_cross_snapshot"] = {}
+                    STATE["fresh_ema9_vwap_cross"] = False
+                    STATE["fresh_ema50_vwap_cross"] = False
+                    STATE["vwap_cross_direction"] = ""
+                    STATE["vwap_cross_trigger"] = "UNKNOWN"
+                    STATE["vwap_cross_age_seconds"] = None
+                    STATE["vwap_cross_max_age_seconds"] = 2.0 * float(_timeframe_seconds(INTERVAL))
+            except Exception as _cross_error:
+                STATE["vwap_cross_snapshot"] = {}
+                STATE["fresh_ema9_vwap_cross"] = False
+                STATE["fresh_ema50_vwap_cross"] = False
+                STATE["vwap_cross_direction"] = ""
+                STATE["vwap_cross_trigger"] = "UNKNOWN"
+                log_execution(
+                    f"[EMA_VWAP_CROSS] {symbol}: {type(_cross_error).__name__}: {_cross_error}",
+                    "WARN", debounce_key=f"ema_vwap_cross_{symbol}", debounce_sec=60
+                )
             plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
             if plus_di is None: plus_di = 20.0
             if minus_di is None: minus_di = 20.0
@@ -3238,10 +3778,48 @@ class LiveTradeManager:
 
             smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
             momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
+            # Refresh liquidity-event evidence from completed candles; the entry snapshot
+            # is retained separately for provenance and is never mistaken for live evidence.
+            try:
+                _live_liq = _classify_live_liquidity(df_live, atr, build_liquidity_pools)
+                STATE["management_liquidity"] = {
+                    "event": str(getattr(_live_liq, "event", "UNKNOWN") or "UNKNOWN"),
+                    "direction": str(getattr(_live_liq, "direction", "UNKNOWN") or "UNKNOWN"),
+                    "level": safe_float(getattr(_live_liq, "level", 0.0), 0.0),
+                    "confidence": safe_float(getattr(_live_liq, "confidence", 0.0), 0.0),
+                    "reasons": list(getattr(_live_liq, "reasons", []) or []),
+                    "confirmed_at": safe_float(getattr(_live_liq, "timestamp", 0.0), 0.0),
+                    "source": "LIVE_CLOSED_CANDLE_LIQUIDITY_ENGINE",
+                }
+            except Exception as _live_liq_error:
+                STATE["management_liquidity"] = {
+                    "event": "UNKNOWN", "direction": "UNKNOWN", "level": 0.0,
+                    "confidence": 0.0, "reasons": [type(_live_liq_error).__name__],
+                    "source": "LIVE_CLOSED_CANDLE_LIQUIDITY_ENGINE",
+                }
 
             regime = self.regime_classifier.classify(df_live, ob)
-            trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
+            trade_state = self.brain.update(smart_money, momentum, adx_now, regime, side=side)
             STATE["trade_state"] = trade_state
+            _liq_snapshot = STATE.get("management_liquidity") or {}
+            _trade_class, _trade_class_reasons = classify_dynamic_trade_classification(
+                adx=adx_now,
+                momentum_strength=momentum.get("momentum_health"),
+                volume_ratio=volume_ratio,
+                continuation_probability=STATE.get("continuation_probability", 0.5),
+                structure_aligned=bool(STATE.get("structure_aligned", False)),
+                structure_broken=bool(STATE.get("structure_broken", False)),
+                counter_pressure=STATE.get("counter_pressure", 0.0),
+                momentum_decay=bool(momentum.get("momentum_decay", False)),
+                liquidity_supportive=safe_float(_liq_snapshot.get("confidence"), 0.0) >= 50.0,
+            )
+            STATE["trade_classification"] = _trade_class
+            STATE["trade_classification_reasons"] = list(_trade_class_reasons)
+            STATE.setdefault("trade_classification_history", []).append({
+                "classification": _trade_class, "reasons": list(_trade_class_reasons),
+                "closed_candle_timestamp": closed_candle_ts, "updated_at": time.time(),
+            })
+            STATE["trade_classification_history"] = STATE["trade_classification_history"][-20:]
             STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
             STATE["delay_tp1"] = self.brain.should_delay_tp1()
             STATE["adx_live"] = adx_now
@@ -3282,116 +3860,57 @@ class LiveTradeManager:
             STATE["continuation_reasons"] = continuation_eval.reasons
             STATE["continuation_pressure"] = cont_pressure_score
 
-            # Unified profit-mode policy: ADX is supporting evidence, never a regime switch.
-            # All slopes and structure evidence below come from completed OHLCV candles.
-            ema9_slope_atr = vwap_slope_atr = atr_expansion_ratio = None
-            structure_score = None
-            candle_follow_through = False
-            opposing_liquidity_near = False
-            opposing_liquidity_distance_pct = None
-            entry_quality_score = None
-            estimated_round_trip_cost_pct = safe_float(STATE.get("estimated_round_trip_cost_pct"), None)
-            pools = []
-            try:
-                closed = df_live.tail(120).copy()
-                atr_series = compute_atr(closed, 14)
-                atr_now = safe_float(atr_series.iloc[-1], 0.0)
-                atr_base = safe_float(atr_series.iloc[-21:-1].median(), 0.0) if len(atr_series) >= 22 else 0.0
-                if atr_now > 0 and atr_base > 0:
-                    atr_expansion_ratio = atr_now / atr_base
-                ema9_series = ema(closed["close"], 9)
-                if atr_now > 0 and len(ema9_series) >= 5:
-                    ema9_slope_atr = (safe_float(ema9_series.iloc[-1]) - safe_float(ema9_series.iloc[-5])) / atr_now
-                try:
-                    from roro_confluence import compute_session_vwap
-                    vwap_series = compute_session_vwap(
-                        closed[["timestamp", "open", "high", "low", "close", "volume"]].copy(),
-                        timeframe_seconds=900, now_ms=int(time.time() * 1000))
-                    if vwap_series is not None:
-                        valid_vwap = vwap_series.dropna()
-                        if len(valid_vwap) >= 5 and atr_now > 0:
-                            vwap_slope_atr = (safe_float(valid_vwap.iloc[-1]) - safe_float(valid_vwap.iloc[-5])) / atr_now
-                except Exception as vwap_exc:
-                    log_execution(f"[PROFIT_EVIDENCE] session VWAP unavailable: {type(vwap_exc).__name__}", "WARN")
-                bos_up, bos_down = detect_bos(closed, lookback=5)
-                directional_bos = bool((side == "BUY" and bos_up) or (side == "SELL" and bos_down))
-                _ema20 = ema(closed["close"], 20).iloc[-1]
-                _ema50 = ema(closed["close"], 50).iloc[-1]
-                _close = safe_float(closed["close"].iloc[-1])
-                ema_structure = bool(
-                    (_ema20 > _ema50 and _close > _ema20) if side == "BUY"
-                    else (_ema20 < _ema50 and _close < _ema20))
-                structure_score = 70.0 if ema_structure and structure_aligned else (50.0 if ema_structure else 20.0)
-                last_bar = closed.iloc[-1]
-                bar_range = max(safe_float(last_bar["high"]) - safe_float(last_bar["low"]), 1e-12)
-                body = abs(safe_float(last_bar["close"]) - safe_float(last_bar["open"]))
-                directional_candle = (
-                    safe_float(last_bar["close"]) > safe_float(last_bar["open"]) if side == "BUY"
-                    else safe_float(last_bar["close"]) < safe_float(last_bar["open"]))
-                candle_follow_through = directional_bos or bool(directional_candle and body/bar_range >= 0.55)
-                recent = closed.tail(61).reset_index(drop=True)
-                for i in range(2, len(recent)-2):
-                    if side == "BUY":
-                        level = safe_float(recent.high.iloc[i], 0.0)
-                        if level > mark_price and level >= max(safe_float(v, 0.0) for v in recent.high.iloc[i-2:i+3]):
-                            pools.append(level)
-                    else:
-                        level = safe_float(recent.low.iloc[i], 0.0)
-                        if 0 < level < mark_price and level <= min(safe_float(v, float("inf")) for v in recent.low.iloc[i-2:i+3]):
-                            pools.append(level)
-                if pools and entry > 0:
-                    nearest_pool = min(pools, key=lambda x: abs(x-entry))
-                    opposing_liquidity_distance_pct = abs(nearest_pool-entry) / entry * 100.0
-                    opposing_liquidity_near = opposing_liquidity_distance_pct <= 0.75
-                    _continuation_quality = max(0.0, min(100.0, safe_float(continuation_eval.continuation_probability, 0.5) * 100.0))
-                    _momentum_quality = max(0.0, min(100.0, safe_float(momentum.get("momentum_health"), 50.0)))
-                    _volume_quality = max(0.0, min(100.0, volume_ratio * 50.0))
-                    _structure_quality = max(0.0, min(100.0, structure_score))
-                    # Weighted average: 30% continuation, 25% momentum,
-                    # 20% relative volume and 25% structure. Every component
-                    # is normalized to 0..100 before applying its weight.
-                    entry_quality_score = (
-                        0.30 * _continuation_quality
-                        + 0.25 * _momentum_quality
-                        + 0.20 * _volume_quality
-                        + 0.25 * _structure_quality
-                    )
-            except Exception as evidence_exc:
-                log_execution(f"[PROFIT_EVIDENCE] partial evidence unavailable: {type(evidence_exc).__name__}", "WARN")
-
+            # Unified profit-mode policy: range scalp is allowed only with multiple
+            # independent weakness/thin-liquidity observations. Missing data is NOT range.
             mode_context = {
                 "side": side, "regime": regime, "trade_state": trade_state,
+            "market_intelligence": {
+                **(STATE.get("market_intelligence") or {}),
+                "zone_side": str(STATE.get("side") or "").upper(),
+                "trading_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "zone_event_fresh": (
+                    safe_float(STATE.get("zone_event_last_candle_ts"), 0.0) > 0
+                    and 0 <= time.time() - safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
+                "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
+            },
                 "adx": adx_now, "adx_slope": adx_slope,
                 "continuation_probability": continuation_eval.continuation_probability,
                 "di_plus": plus_di, "di_minus": minus_di,
                 "volume_ratio": volume_ratio,
                 "momentum_strength": momentum.get("momentum_health"),
                 "spread_pct": STATE.get("entry_spread_pct"),
-                "opposing_liquidity_distance_pct": opposing_liquidity_distance_pct,
-                "entry_quality_score": entry_quality_score,
-                "estimated_round_trip_cost_pct": estimated_round_trip_cost_pct,
                 "liquidity_quality": STATE.get("liquidity_quality", "UNKNOWN"),
                 "orderbook_depth_usdt": STATE.get("orderbook_depth_usdt"),
                 "min_orderbook_depth_usdt": STATE.get("min_orderbook_depth_usdt", 0),
                 "structure_broken": bool(STATE.get("structure_broken", False)),
-                "ema9_slope_atr": ema9_slope_atr,
-                "vwap_slope_atr": vwap_slope_atr,
-                "atr_expansion_ratio": atr_expansion_ratio,
-                "structure_score": structure_score,
-                "candle_follow_through": candle_follow_through,
-                "opposing_liquidity_near": opposing_liquidity_near,
                 "trend_expansion": bool(momentum.get("trend_expansion", False)),
+                "fresh_ema9_vwap_cross": bool(STATE.get("fresh_ema9_vwap_cross", False)),
+                "fresh_ema50_vwap_cross": bool(STATE.get("fresh_ema50_vwap_cross", False)),
+                "vwap_cross_direction": str(STATE.get("vwap_cross_direction") or ""),
+                "vwap_cross_trigger": str(STATE.get("vwap_cross_trigger") or "NONE"),
+                "vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds"),
+                "vwap_cross_max_age_seconds": STATE.get("vwap_cross_max_age_seconds"),
             }
-            STATE["entry_zone_intact"] = bool((mode_context.get("structure_score") or 0) >= 50 and not mode_context.get("structure_broken", False))
-            STATE["adverse_divergence"] = bool(
-                mode_context.get("momentum_strength") is not None
-                and mode_context.get("momentum_strength") < 35
-                and mode_context.get("continuation_probability", 0.5) < 0.45
-            )
-            STATE["opposing_liquidity_near"] = bool(opposing_liquidity_near)
-            STATE["opposing_liquidity_distance_pct"] = opposing_liquidity_distance_pct
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
             current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
+            # Once a confirmed trend runner is established, ordinary weakening
+            # cannot demote it into a one-shot scalp. A trend downgrade may move
+            # to the standard 50/50 plan; only thesis/structure failure can close it.
+            if current_mode == TREND_MODE and candidate_mode == RANGE_MODE:
+                _trend_broken = bool(
+                    ema_context_live.get("break_confirmed")
+                    or STATE.get("structural_invalidation")
+                    or safe_float(STATE.get("thesis_failure_score"), 0.0) >= 50.0
+                )
+                if not _trend_broken:
+                    candidate_mode = STANDARD_MODE
+                    candidate_reason = "trend_runner_protected_from_range_demotion"
+                    candidate_evidence = tuple(list(candidate_evidence) + ["trend_mode_downgrade_guard"])
             last_mode_ts = safe_float(STATE.get("profit_mode_last_candle_ts"), 0.0)
             if closed_candle_ts > last_mode_ts:
                 STATE["profit_mode_last_candle_ts"] = closed_candle_ts
@@ -3409,52 +3928,187 @@ class LiveTradeManager:
                     else:
                         STATE["profit_mode_candidate"] = candidate_mode
                         STATE["profit_mode_candidate_count"] = 1
-                    # Require two distinct closed candles before switching established mode.
+                    # Require two completed candles before changing an established mode.
                     if STATE["profit_mode_candidate_count"] >= 2:
                         current_mode = candidate_mode
                         STATE["profit_mode"] = current_mode
                         STATE["profit_mode_candidate_count"] = 0
                 STATE["profit_mode_reason"] = candidate_reason
                 STATE["profit_mode_evidence"] = list(candidate_evidence)
-                trend_votes = [
-                    ema9_slope_atr is not None and vwap_slope_atr is not None and
-                    (ema9_slope_atr > 0 and vwap_slope_atr > 0 if side == "BUY" else ema9_slope_atr < 0 and vwap_slope_atr < 0),
-                    structure_score is not None and structure_score >= 60,
-                    continuation_eval.continuation_probability >= 0.62,
-                    safe_float(momentum.get("momentum_health"), 0.0) >= 55,
-                    volume_ratio >= 1.0,
-                    atr_expansion_ratio is not None and atr_expansion_ratio >= 1.05,
-                    bool((plus_di > minus_di) if side == "BUY" else (minus_di > plus_di)),
-                    candle_follow_through,
-                ]
-                STATE["trend_evidence_score"] = 100.0 * sum(bool(x) for x in trend_votes) / len(trend_votes)
+                # Build one opposing-liquidity snapshot from completed candles per candle.
+                if closed_candle_ts > safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0):
+                    try:
+                        _pool_data = build_liquidity_pools(df_live.tail(120).reset_index(drop=True))
+                        _pool_levels = _pool_data.get("high_pools", []) if side == "BUY" else _pool_data.get("low_pools", [])
+                        _pool = select_opposing_liquidity_pool(_pool_levels, side, mark_price)
+                        STATE["opposing_liquidity_status"] = _pool.get("status", "UNKNOWN")
+                        STATE["opposing_liquidity_level"] = safe_float(_pool.get("level"), 0.0)
+                        STATE["opposing_liquidity_distance_pct"] = safe_float(_pool.get("distance_pct"), 0.0)
+                        STATE["opposing_liquidity_timestamp"] = closed_candle_ts
+                        _existing_scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
+                        _existing_scalp_status = str(STATE.get("scalp_target_status") or "UNKNOWN").upper()
+                        # Latch the first valid entry-anchored target for this trade.
+                        # Later swing-pool changes must never move a profit target farther away.
+                        if _existing_scalp_status == "VALID" and _existing_scalp_target > 0:
+                            pass
+                        elif _pool.get("status") == "VALID":
+                            _scalp_plan = build_scalp_target(side, entry, _pool.get("level"))
+                            STATE["scalp_target_status"] = _scalp_plan.get("status", "UNKNOWN")
+                            STATE["scalp_target_price"] = safe_float(_scalp_plan.get("target_price"), 0.0)
+                            STATE["scalp_target_tp1_price"] = safe_float(_scalp_plan.get("tp1_target_price"), 0.0)
+                            STATE["scalp_target_selected_pct"] = safe_float(_scalp_plan.get("target_pct"), 0.0)
+                            STATE["scalp_target_selection_reason"] = str(_scalp_plan.get("reason") or "target_not_available")
+                        else:
+                            STATE["scalp_target_status"] = "NO_TARGET"
+                            STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_tp1_price"] = 0.0
+                            STATE["scalp_target_selected_pct"] = 0.0
+                            STATE["scalp_target_selection_reason"] = "no_verified_opposing_pool"
+                        # Rebuild confirmed opposing support/resistance from completed candles.
+                        # These levels are exit-risk context only; they never create entries.
+                        _sr_snapshot = build_support_resistance_zones(
+                            df_live.tail(120).to_dict("records"),
+                            price=mark_price, atr=atr, lookback=120,
+                            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=6,
+                        )
+                        _sr_key = "resistances" if side == "BUY" else "supports"
+                        _sr_candidates = [
+                            z for z in (_sr_snapshot.get(_sr_key) or [])
+                            if isinstance(z, dict)
+                            and str(z.get("status") or "").upper() == "CONFIRMED"
+                            and safe_float(z.get("distance_atr"), 999.0) >= 0.0
+                        ]
+                        _sr_nearest = min(
+                            _sr_candidates,
+                            key=lambda z: safe_float(z.get("distance_atr"), 999.0),
+                            default=None,
+                        )
+                        STATE["management_support_resistance"] = _sr_snapshot
+                        STATE["opposing_zone_distance_atr"] = (
+                            safe_float(_sr_nearest.get("distance_atr"), 999.0)
+                            if _sr_nearest else None
+                        )
+                        STATE["opposing_zone_level"] = (
+                            safe_float(_sr_nearest.get("level"), 0.0)
+                            if _sr_nearest else 0.0
+                        )
+                        _sr_rejection = False
+                        if _sr_nearest and safe_float(_sr_nearest.get("distance_atr"), 999.0) <= 0.50:
+                            _last_sr_candle = df_live.iloc[-1]
+                            _sr_range = max(
+                                safe_float(_last_sr_candle.get("high")) - safe_float(_last_sr_candle.get("low")),
+                                1e-12,
+                            )
+                            if side == "BUY":
+                                _upper_wick = safe_float(_last_sr_candle.get("high")) - max(
+                                    safe_float(_last_sr_candle.get("open")), safe_float(_last_sr_candle.get("close"))
+                                )
+                                _sr_rejection = (
+                                    safe_float(_last_sr_candle.get("high")) >= safe_float(_sr_nearest.get("low"))
+                                    and safe_float(_last_sr_candle.get("close")) < safe_float(_sr_nearest.get("low"))
+                                    and _upper_wick / _sr_range >= 0.35
+                                )
+                            else:
+                                _lower_wick = min(
+                                    safe_float(_last_sr_candle.get("open")), safe_float(_last_sr_candle.get("close"))
+                                ) - safe_float(_last_sr_candle.get("low"))
+                                _sr_rejection = (
+                                    safe_float(_last_sr_candle.get("low")) <= safe_float(_sr_nearest.get("high"))
+                                    and safe_float(_last_sr_candle.get("close")) > safe_float(_sr_nearest.get("high"))
+                                    and _lower_wick / _sr_range >= 0.35
+                                )
+                        STATE["opposing_zone_rejection"] = bool(_sr_rejection)
+                        record_trade_management_event(
+                            "OPPOSING_LIQUIDITY_REFRESH", "OBSERVED",
+                            dedupe_key=f"opposing_pool:{symbol}:{side}:{closed_candle_ts}",
+                            dedupe_seconds=0, symbol=symbol, side=side, price=mark_price,
+                            reference_level=STATE["opposing_liquidity_level"],
+                            distance_pct=STATE["opposing_liquidity_distance_pct"],
+                            scalp_target_pct=STATE["scalp_target_selected_pct"],
+                            scalp_target_price=STATE.get("scalp_target_price", 0.0),
+                            scalp_target_tp1_price=STATE.get("scalp_target_tp1_price", 0.0),
+                            scalp_target_status=STATE.get("scalp_target_status", "UNKNOWN"),
+                            reason=STATE["scalp_target_selection_reason"],
+                        )
+                    except Exception as _pool_error:
+                        STATE["opposing_liquidity_status"] = "UNKNOWN"
+                        STATE["opposing_liquidity_level"] = 0.0
+                        STATE["opposing_liquidity_distance_pct"] = 0.0
+                        # Keep a previously latched target through transient pool-data errors.
+                        if not (str(STATE.get("scalp_target_status") or "").upper() == "VALID"
+                                and safe_float(STATE.get("scalp_target_price"), 0.0) > 0):
+                            STATE["scalp_target_status"] = "UNKNOWN"
+                            STATE["scalp_target_price"] = 0.0
+                            STATE["scalp_target_tp1_price"] = 0.0
+                            STATE["scalp_target_selected_pct"] = 0.0
+                            STATE["scalp_target_selection_reason"] = "pool_analysis_error"
+                        log_execution(
+                            f"[OPPOSING_LIQUIDITY] {symbol}: {type(_pool_error).__name__}: {_pool_error}",
+                            "WARN", debounce_key=f"opposing_pool_{symbol}", debounce_sec=60
+                        )
                 if current_mode == RANGE_MODE and not safe_float(STATE.get("range_target_price"), 0.0):
-                    target_pct, target_reason = select_range_target_pct({
-                        **mode_context,
-                        "entry_quality_score": entry_quality_score,
-                        "estimated_round_trip_cost_pct": estimated_round_trip_cost_pct,
-                        "opposing_liquidity_distance_pct": opposing_liquidity_distance_pct,
+                    # Range exits are anchored to the nearest opposing swing-liquidity
+                    # pool, not a hard-coded 0.5/1/2% price move. Use completed bars only.
+                    swing_levels = []
+                    try:
+                        recent = df_live.tail(61).reset_index(drop=True)
+                        for i in range(2, len(recent) - 2):
+                            hi = safe_float(recent.iloc[i].get("high"), 0.0)
+                            lo = safe_float(recent.iloc[i].get("low"), 0.0)
+                            if hi > 0 and hi >= max(safe_float(x, 0.0) for x in recent["high"].iloc[i-2:i+3]):
+                                swing_levels.append(hi)
+                            if lo > 0 and lo <= min(safe_float(x, float("inf")) for x in recent["low"].iloc[i-2:i+3]):
+                                swing_levels.append(lo)
+                    except Exception:
+                        swing_levels = []
+                    adaptive_target, target_reason = adaptive_range_target_price(
+                        side, entry, atr, swing_levels)
+                    # Percentage objective is a PRICE move (0.25/0.50/1.00%), not leveraged ROE.
+                    # Use the last three completed candles as follow-through evidence.
+                    _aligned_closed = 0
+                    for _candle_idx in range(max(0, len(df_live) - 4), len(df_live) - 1):
+                        _candle = df_live.iloc[_candle_idx]
+                        _candle_aligned = (
+                            safe_float(_candle.get("close"), 0.0) > safe_float(_candle.get("open"), 0.0)
+                            if side == "BUY" else
+                            safe_float(_candle.get("close"), 0.0) < safe_float(_candle.get("open"), 0.0)
+                        )
+                        _aligned_closed += int(bool(_candle_aligned))
+                    _target_pct, _target_pct_reason = select_range_target_pct({
+                        **mode_context, "side": side,
+                        "aligned_closed_candles": _aligned_closed,
+                        "adverse_rejection": bool(STATE.get("adverse_rejection", False)),
                     })
-                    if target_pct > 0:
-                        target_price = range_target_price(side, entry, target_pct)
-                        if pools:
-                            nearest = min(pools, key=lambda x: abs(x-entry))
-                            buffer = max(atr * 0.10, 0.0)
-                            target_price = min(target_price, nearest-buffer) if side == "BUY" else max(target_price, nearest+buffer)
-                        if target_price > 0 and ((side == "BUY" and target_price > entry) or (side == "SELL" and target_price < entry)):
-                            STATE["range_target_price"] = target_price
-                            STATE["range_target_move_pct"] = abs(target_price-entry) / entry * 100.0
-                            STATE["range_target_reason"] = target_reason
-                    if not safe_float(STATE.get("range_target_price"), 0.0):
-                        current_mode = STANDARD_MODE
-                        STATE["profit_mode"] = STANDARD_MODE
-                        STATE["profit_mode_reason"] = "scalp_target_edge_unproven_fallback_two_stage"
-                        STATE["profit_mode_evidence"] = list(candidate_evidence) + ["scalp_target_edge_unproven"]
+                    _percent_target = range_target_price(side, entry, _target_pct)
+                    _pool_level = safe_float(STATE.get("opposing_liquidity_level"), 0.0)
+                    _scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
+                    if _pool_level > 0 and str(STATE.get("scalp_target_status") or "").upper() == "VALID" and _scalp_target > 0:
+                        _pool_target = _pool_level - atr * 0.10 if side == "BUY" else _pool_level + atr * 0.10
+                        _before_pool = _scalp_target < _pool_target if side == "BUY" else _scalp_target > _pool_target
+                        if _before_pool and ((side == "BUY" and _scalp_target > entry) or (side == "SELL" and _scalp_target < entry)):
+                            adaptive_target = round(_scalp_target, 12)
+                            target_reason = str(STATE.get("scalp_target_selection_reason") or "entry_anchored_scalp_target")
+                        else:
+                            target_reason = "opposing_pool_geometry_rejected_atr_fallback"
+                    elif _pool_level > 0:
+                        target_reason = str(STATE.get("scalp_target_selection_reason") or "no_valid_scalp_target") + "_atr_fallback"
+                    # Apply the percentage cap AFTER liquidity-pool geometry so no
+                    # later pool adjustment can turn a scalp into a distant target.
+                    if _percent_target > 0:
+                        if side == "BUY":
+                            adaptive_target = min(adaptive_target, _percent_target) if adaptive_target > 0 else _percent_target
+                        else:
+                            adaptive_target = max(adaptive_target, _percent_target) if adaptive_target > 0 else _percent_target
+                    STATE["range_target_price"] = adaptive_target
+                    STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
+                    STATE["range_target_reason"] = target_reason
                 elif current_mode != RANGE_MODE:
                     STATE["range_target_price"] = 0.0
                     STATE["range_target_move_pct"] = 0.0
-                    STATE["range_target_reason"] = ""
-                log_execution(f"[PROFIT_MODE] {symbol} mode={current_mode} candidate={candidate_mode} reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
+                log_execution(
+                    f"[PROFIT_MODE] {symbol} entry_mode={STATE.get('trading_mode', 'UNCLASSIFIED')} "
+                    f"management_mode={current_mode} candidate={candidate_mode} "
+                    f"reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
 
             # Thesis failure check
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
@@ -3571,13 +4225,11 @@ class LiveTradeManager:
         if not _decision_allowed:
             self.last_decision_blocked_reason = "stale_or_missing_market_data"
             log_execution(
-                f"[DECISION_BLOCKED] {symbol}: market data {_freshness}"
-                f"{' missing=' + ','.join(_missing) if _missing else ''}; "
-                f"no new management decision (SL/BE/trail/TP/close) executed. "
-                f"Native SL and TP protection on the exchange are unchanged.",
+                f"[PRICE_ONLY_MANAGEMENT] {symbol}: indicator snapshot {_freshness}; "
+                f"indicator-driven risk actions paused, but verified price/target/stop checks continue.",
                 "WARN", debounce_key=f"decision_blocked_{symbol}", debounce_sec=30)
-            return
-        self.last_decision_blocked_reason = None
+        else:
+            self.last_decision_blocked_reason = None
 
         # ========== BUILD CONTEXT FOR BOARD ==========
         # Re-evaluate TP2 only after TP1 has actually filled. A weak continuation
@@ -3592,17 +4244,37 @@ class LiveTradeManager:
                 safe_float(STATE.get("adx_live"), 20.0),
                 safe_float(STATE.get("adx_slope"), 0.0), structure_aligned,
                 max_atr_distance=safe_float(os.getenv("TP2_MAX_ATR_DISTANCE", "3.0"), 3.0),
-                min_continuation=safe_float(os.getenv("TP2_MIN_CONTINUATION", "0.45"), 0.45),
-                adverse_divergence=bool(STATE.get("adverse_divergence", False)),
-                zone_intact=bool(STATE.get("entry_zone_intact", True)),
-                opposing_liquidity_blocked=bool(STATE.get("opposing_liquidity_near", False)),
-                volume_ratio=safe_float(STATE.get("volume_ratio"), 0.0))
+                min_continuation=safe_float(os.getenv("TP2_MIN_CONTINUATION", "0.45"), 0.45))
         context = {
             "symbol": symbol, "side": side, "entry": entry, "current_price": mark_price,
+            "indicator_decisions_allowed": bool(_decision_allowed),
             "atr": atr, "roe": roe,
             "remaining_qty": safe_float(STATE.get("remaining_qty"), STATE.get("qty", 0.0)),
             "initial_qty": safe_float(STATE.get("initial_qty"), STATE.get("qty", 0.0)),
             "smart_money": smart_money, "momentum": momentum,
+            "exit_risk_snapshot": dict(STATE.get("exit_risk_snapshot") or {}),
+            "entry_order_block": dict(STATE.get("entry_order_block") or {}),
+            "entry_fvg": dict(STATE.get("entry_fvg") or {}),
+            "entry_liquidity": dict(STATE.get("entry_liquidity") or {}),
+            "entry_golden_zone": dict(STATE.get("entry_golden_zone") or {}),
+            "distribution_risk": safe_float(smart_money.get("distribution_risk"), 0.0),
+            "exhaustion_risk": safe_float(momentum.get("exhaustion_risk"), 0.0),
+            "climax_risk": safe_float(momentum.get("climax_risk"), 0.0),
+            "momentum_decay": bool(momentum.get("momentum_decay", False)),
+            "flow_bias": str(momentum.get("flow_bias") or "UNKNOWN"),
+            "counter_pressure": safe_float(STATE.get("counter_pressure"), 0.0),
+            "reclaim_risk": safe_float(STATE.get("reclaim_risk"), 0.0),
+            "hold_quality": str(STATE.get("hold_quality") or "UNKNOWN"),
+            "trend_strength": safe_float(STATE.get("trend_strength"), 0.0),
+            "structure_aligned": bool(STATE.get("structure_aligned", False)),
+            "structure_broken": bool(STATE.get("structure_broken", False)),
+            "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
+            "opposing_zone_distance_atr": safe_float(STATE.get("opposing_zone_distance_atr"), None),
+            "management_support_resistance": dict(STATE.get("management_support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
+            "opposing_zone_level": safe_float(STATE.get("opposing_zone_level"), 0.0),
+            "opposing_zone_rejection": bool(STATE.get("opposing_zone_rejection", False)),
+            "liquidity": dict(STATE.get("management_liquidity") or STATE.get("entry_liquidity") or {}),
+            "zone_event": str((STATE.get("market_intelligence") or {}).get("zone_event") or "UNKNOWN"),
             "adx": adx_now, "adx_slope": safe_float(STATE.get("adx_slope")),
             "di_plus": plus_di, "di_minus": minus_di,
             "regime": STATE.get("market_regime", "UNKNOWN"),
@@ -3623,14 +4295,46 @@ class LiveTradeManager:
             "synthetic_tp1": STATE.get("synthetic_tp1", 0), "tp2_price": STATE.get("tp2_price", 0),
             "range_target_price": STATE.get("range_target_price", 0),
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
+            "opposing_liquidity_status": STATE.get("opposing_liquidity_status", "UNKNOWN"),
+            "opposing_liquidity_level": safe_float(STATE.get("opposing_liquidity_level"), 0.0),
+            "scalp_target_status": STATE.get("scalp_target_status", "UNKNOWN"),
+            "scalp_target_price": safe_float(STATE.get("scalp_target_price"), 0.0),
+            "scalp_target_tp1_price": safe_float(STATE.get("scalp_target_tp1_price"), 0.0),
+            "scalp_target_selected_pct": safe_float(STATE.get("scalp_target_selected_pct"), 0.0),
+            "scalp_target_selection_reason": str(STATE.get("scalp_target_selection_reason") or ""),
+            "opposing_liquidity": {
+                "status": STATE.get("opposing_liquidity_status", "UNKNOWN"),
+                "level": safe_float(STATE.get("opposing_liquidity_level"), 0.0),
+                "distance_pct": safe_float(STATE.get("opposing_liquidity_distance_pct"), 0.0),
+                "source": "CLOSED_CANDLE_SWING_POOLS",
+                "timestamp": safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0),
+            },
+
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
-            "zone_intact": bool(STATE.get("entry_zone_intact", True)),
-            "adverse_divergence": bool(STATE.get("adverse_divergence", False)),
-            "opposing_liquidity_near": bool(STATE.get("opposing_liquidity_near", False)),
-            "trend_evidence_score": safe_float(STATE.get("trend_evidence_score"), 0.0),
+            "fresh_ema9_vwap_cross": bool(STATE.get("fresh_ema9_vwap_cross", False)),
+            "fresh_ema50_vwap_cross": bool(STATE.get("fresh_ema50_vwap_cross", False)),
+            "vwap_cross_direction": str(STATE.get("vwap_cross_direction") or ""),
+            "vwap_cross_trigger": str(STATE.get("vwap_cross_trigger") or "NONE"),
+            "vwap_cross_snapshot": dict(STATE.get("vwap_cross_snapshot") or {}),
+            "vwap_cross_age_seconds": STATE.get("vwap_cross_age_seconds"),
+            "vwap_cross_max_age_seconds": STATE.get("vwap_cross_max_age_seconds"),
+            "entry_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(STATE.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "entry_mode_confidence": safe_float(STATE.get("entry_behavior_confidence"), 0.0),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
+            "trade_classification": str(STATE.get("trade_classification") or "UNCLASSIFIED"),
+            "trade_classification_reasons": list(STATE.get("trade_classification_reasons") or []),
+            "entry_time": safe_float(STATE.get("entry_time"), time.time()),
+            "native_sl_verified": bool(STATE.get("native_sl_verified")),
+            "protection_status": "PAPER_SIMULATED" if PAPER_MODE else ("EXCHANGE_VERIFIED" if STATE.get("native_sl_verified") else "UNVERIFIED"),
+            "execution_result": "UNRESOLVED" if STATE.get("execution_unresolved") else "NOT_SUBMITTED",
+            "exchange_verification_result": "RECOVERY_HOLD" if STATE.get("recovery_hold") else "POSITION_SYNCED",
+            "risk_state": "BLOCKED_DATA_QUALITY" if not _decision_allowed else ("PROTECTED" if STATE.get("tp1_hit") else "MANAGING"),
+            "evidence_used": ["ADX", "DI", "CONTINUATION", "REGIME", "EMA9_VWAP", "EMA50", "LIQUIDITY",
+                              "SMART_MONEY", "MOMENTUM", "STRUCTURE"],
+            "evidence_missing": list(_missing) + list(_stale),
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
             "partial_done": STATE.get("partial_closed", False),
             "execution_unresolved": STATE.get("execution_unresolved", False),
@@ -3645,6 +4349,117 @@ class LiveTradeManager:
             "emergency_exit": bool(STATE.get("emergency_exit", False)),
             "emergency_reason": STATE.get("emergency_reason", ""),
         }
+
+        # Closed-candle zone lifecycle; context only, no order side effects.
+        try:
+            _zone_low = safe_float(STATE.get("entry_zone_low"), 0.0)
+            _zone_high = safe_float(STATE.get("entry_zone_high"), 0.0)
+            _last_zone_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+            if last_closed_ts is not None and _zone_low > 0 and _zone_high > _zone_low and len(df_live) >= 3 and last_closed_ts > _last_zone_ts:
+                # Re-derive the completed-candle frame at the point of use. This
+                # prevents a live/in-progress tail row from entering the zone
+                # classifier even if the upstream fetch format changes.
+                _zone_frame = _closed_candle_frame(raw_frame, INTERVAL)
+                if _zone_frame is None or getattr(_zone_frame, "empty", True):
+                    _zone_frame = df_live.copy()
+                _zone_frame = _zone_frame.tail(12).copy()
+                if "timestamp" not in _zone_frame.columns:
+                    _zone_frame["timestamp"] = _zone_frame.index
+                _zone_rows = []
+                for _candle in _zone_frame[["timestamp", "open", "high", "low", "close"]].to_dict("records"):
+                    _stamp = safe_float(_candle.get("timestamp"), 0.0)
+                    if _stamp > 1e12:
+                        _stamp /= 1000.0
+                    _candle["timestamp"] = _stamp
+                    _zone_rows.append(_candle)
+                _zone_result = classify_zone_event(
+                    _zone_rows, side=side, zone_low=_zone_low, zone_high=_zone_high, atr=atr
+                )
+                if _zone_result.get("event") != "INSUFFICIENT_DATA":
+                    _event_ts = safe_float(_zone_result.get("timestamp"), last_closed_ts)
+                    if _event_ts > _last_zone_ts:
+                        _prior_event = str(STATE.get("zone_event") or "").upper()
+                        _prior_streak = int(safe_float(STATE.get("failed_breakout_streak"), 0))
+                        _management_event, _failure_streak = advance_failed_breakout_confirmation(
+                            previous_event=_prior_event,
+                            previous_timestamp=_last_zone_ts,
+                            previous_streak=_prior_streak,
+                            current_event=_zone_result["event"],
+                            current_timestamp=_event_ts,
+                            timeframe_seconds=_timeframe_seconds(INTERVAL),
+                        )
+                        _failure_active = (
+                            _management_event == "FAILED_BREAKOUT" and _failure_streak >= 2
+                        )
+                        _previous_mi = STATE.get("market_intelligence") or {}
+                        _mi_confidence = (
+                            max(safe_float(_previous_mi.get("zone_event_confidence"), 0.0),
+                                safe_float(_zone_result.get("confidence"), 0.0))
+                            if _failure_active else safe_float(_zone_result.get("confidence"), 0.0)
+                        )
+                        STATE["zone_event"] = _management_event
+                        STATE["zone_event_last_candle_ts"] = _event_ts
+                        STATE["failed_breakout_streak"] = _failure_streak
+                        STATE["failed_breakout_last_candle_ts"] = _event_ts if _failure_active else 0.0
+                        STATE["market_intelligence"] = {
+                            **_previous_mi,
+                            "zone_event": _management_event,
+                            "raw_zone_event": _zone_result["event"],
+                            "zone_event_confirmed": (bool(_zone_result.get("confirmed")) if _management_event != "FAILED_BREAKOUT" else _failure_active),
+                            "zone_event_confidence": _mi_confidence,
+                            "zone_reference_level": safe_float(_zone_result.get("level"), 0.0),
+                            "zone_event_reasons": list(_zone_result.get("reason_codes") or []),
+                            "zone_event_timestamp": _event_ts,
+                            "zone_event_fresh": (
+                                0 <= time.time() - _event_ts
+                                <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                            ),
+                            "zone_side": str(side or "").upper(),
+                            "failed_breakout_streak": _failure_streak,
+                            "failed_breakout_last_candle_ts": _event_ts if _failure_active else 0.0,
+                            "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
+                        }
+                        record_trade_management_event(
+                            "MARKET_STRUCTURE_EVENT",
+                            "CONFIRMED" if (bool(_zone_result.get("confirmed")) and _management_event != "FAILED_BREAKOUT") or _failure_active else "OBSERVED",
+                            dedupe_key=f"zone:{symbol}:{_management_event}:{_event_ts}",
+                            dedupe_seconds=0, symbol=symbol, side=side,
+                            reason=f"{_management_event}; raw={_zone_result['event']}; streak={_failure_streak}",
+                            price=mark_price, reference_level=_zone_result.get("level"),
+                            confidence=_mi_confidence,
+                        )
+        except Exception as _zone_error:
+            log_execution(
+                f"[MARKET_INTELLIGENCE] {symbol}: {type(_zone_error).__name__}: {_zone_error}",
+                "WARN", debounce_key=f"zone_observation_{symbol}", debounce_sec=60
+            )
+
+        # Refresh the intelligence snapshot AFTER the closed-candle observer.
+        # The management context is constructed earlier in this cycle, so without
+        # this hand-off the board would only ever see the previous candle's evidence.
+        try:
+            _mi_context = dict(STATE.get("market_intelligence") or {})
+            _mi_event_ts = safe_float(STATE.get("zone_event_last_candle_ts"), 0.0)
+            _mi_context.update({
+                "zone_event_fresh": (
+                    _mi_event_ts > 0
+                    and 0 <= time.time() - _mi_event_ts
+                    <= max(2 * _timeframe_seconds(INTERVAL), 300)
+                ),
+                "zone_side": str(side or "").upper(),
+                "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
+                "failed_breakout_thesis_credit_applied": bool(
+                    STATE.get("failed_breakout_thesis_credit_applied", False)
+                ),
+            })
+            context["market_intelligence"] = _mi_context
+        except Exception as _mi_context_error:
+            context["market_intelligence"] = {}
+            log_execution(
+                f"[MARKET_INTELLIGENCE_CONTEXT] {symbol}: "
+                f"{type(_mi_context_error).__name__}: {_mi_context_error}",
+                "WARN", debounce_key=f"mi_context_{symbol}", debounce_sec=60
+            )
 
         # ========== GET DECISION FROM BOARD ==========
         decision = self.board.evaluate(context)
@@ -3671,24 +4486,27 @@ class LiveTradeManager:
             current_sl = safe_float(STATE.get("synthetic_sl"), safe_float(STATE.get("sl")))
             improves = (new_sl > current_sl) if side == "BUY" else (new_sl < current_sl or current_sl <= 0)
             if new_sl > 0 and improves:
-                # Only move the venue stop when the improvement is material; this
-                # avoids a cancel/replace on every micro-ratchet while still
-                # protecting the runner. Local state is always ratcheted.
+                # Local ratchet is immediate, but a venue cancel/replace is only
+                # submitted for a material improvement and never duplicated.
                 min_step = max(abs(safe_float(STATE.get("entry"))) * 0.0005, 1e-12)
                 material = (new_sl - current_sl) >= min_step if side == "BUY" else (current_sl - new_sl) >= min_step
                 STATE["synthetic_sl"] = new_sl
                 if action == TradeDecisionType.BREAKEVEN:
                     STATE["be_done"] = True
-                # Policy: the exchange-native SL is immutable after entry.
-                # Profit protection is synthetic/local and closes through the
-                # strict reduce-only execution path; never cancel/replace venue SL.
+                if material:
+                    move_ok, move_status, move_record = _move_native_stop_verified(
+                        symbol, new_sl, action=action.value, reason=str(decision.reason))
+                else:
+                    move_ok, move_status, move_record = False, "NOT_MATERIAL", {}
+                moved = move_status == "MOVED"
                 event = "BREAKEVEN_APPLIED" if action == TradeDecisionType.BREAKEVEN else "TRAIL_UPDATED"
                 record_trade_management_event(
-                    event, "LOCAL_STATE_UPDATED",
+                    event, "EXCHANGE_VERIFIED" if moved else "LOCAL_STATE_UPDATED",
                     log_level="INFO", **common, new_sl=new_sl,
-                    native_sl_unchanged=True,
+                    native_sl_unchanged=not moved,
+                    native_sl_move_status=move_status,
                     native_sl_order_id=STATE.get("native_sl_order_id"),
-                    protection_layer="INTERNAL_SYNTHETIC_ONLY")
+                    protection_layer="EXCHANGE_VERIFIED" if moved else "INTERNAL_SYNTHETIC_ONLY")
                 _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
             return
         if action == TradeDecisionType.PARTIAL_CLOSE:
@@ -3707,14 +4525,19 @@ class LiveTradeManager:
                     be_buffer = max(safe_float(STATE.get("entry")) * 0.0010, safe_float(STATE.get("atr")) * 0.10)
                     be_stop = safe_float(STATE.get("entry")) + be_buffer if side == "BUY" else safe_float(STATE.get("entry")) - be_buffer
                     current_sl = safe_float(STATE.get("synthetic_sl"))
-                    if (side == "BUY" and be_stop > current_sl) or (side == "SELL" and (current_sl <= 0 or be_stop < current_sl)):
+                    be_improves = (side == "BUY" and be_stop > current_sl) or (side == "SELL" and (current_sl <= 0 or be_stop < current_sl))
+                    if be_improves:
                         STATE["synthetic_sl"] = be_stop
                     STATE["be_done"] = True
                     STATE["trail_activated"] = True
-                    # Keep the original exchange-native SL fixed. The BE+ level
-                    # above is an internal synthetic stop only; no venue stop move.
                     STATE["be_local"] = True
-                    STATE["native_sl_policy"] = "FIXED_FROM_ENTRY"
+                    if be_improves:
+                        move_ok, move_status, move_record = _move_native_stop_verified(
+                            symbol, be_stop, action="BREAKEVEN", reason="tp1_verified_protect_runner")
+                        if move_status == "MOVED":
+                            STATE["be_local"] = False
+                    else:
+                        move_ok, move_status, move_record = False, "NOT_MATERIAL", {}
                     _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
                     fill_price = safe_float(STATE.get("last_close_fill_price")) or None
                     order_id = STATE.get("last_close_order_id")
@@ -3725,6 +4548,7 @@ class LiveTradeManager:
                         qty_closed=filled, remaining_qty=remaining, original_qty=initial,
                         fill_price=fill_price, order_id=order_id, realized_pnl_usdt=STATE.get("last_close_order_realized_pnl"),
                         pnl_source=source, runner_protected=True, target_remaining_qty=target_remaining,
+                        native_sl_move_status=move_status,
                     )
                     tp1_realized = STATE.get("last_close_order_realized_pnl")
                     tp1_margin = safe_float(STATE.get("initial_margin")) * (filled / initial if initial > 0 else 0.5)
@@ -3759,14 +4583,21 @@ class LiveTradeManager:
                     STATE["trail_stop"] = new_stop
                     STATE["trail_activated"] = True
                     STATE["trail_tightened"] = True
-                    # Internal trailing ratchet only. The venue-native SL remains
-                    # at its original, verified entry protection price.
+                    if material:
+                        move_ok, move_status, move_record = _move_native_stop_verified(
+                            symbol, new_stop, action="TRAIL", reason=str(decision.reason))
+                        if move_status == "MOVED":
+                            STATE["synthetic_sl"] = new_stop
+                    else:
+                        move_ok, move_status, move_record = False, "NOT_MATERIAL", {}
+                    moved = move_status == "MOVED"
                     record_trade_management_event(
-                        "TRAIL_UPDATED", "LOCAL_STATE_UPDATED",
+                        "TRAIL_UPDATED", "EXCHANGE_VERIFIED" if moved else "LOCAL_STATE_UPDATED",
                         log_level="INFO", **common, trail_stop=new_stop,
-                        multiplier=params.get("multiplier"), native_sl_unchanged=True,
+                        multiplier=params.get("multiplier"), native_sl_unchanged=not moved,
+                        native_sl_move_status=move_status,
                         native_sl_order_id=STATE.get("native_sl_order_id"),
-                        protection_layer="INTERNAL_SYNTHETIC_ONLY")
+                        protection_layer="EXCHANGE_VERIFIED" if moved else "INTERNAL_SYNTHETIC_ONLY")
                     _persist_trade_journal_snapshot(force=True) if "_persist_trade_journal_snapshot" in globals() else None
             return
         if action in (TradeDecisionType.FULL_CLOSE, TradeDecisionType.THESIS_FAILURE_EXIT, TradeDecisionType.EMERGENCY_EXIT):
@@ -3792,7 +4623,7 @@ class LiveTradeManager:
                                                    remaining_qty=0.0, fill_price=fill_price, order_id=order_id,
                                                    realized_pnl_usdt=tp2_realized,
                                                    pnl_source=STATE.get("last_close_order_pnl_source", STATE.get("last_close_pnl_source")))
-                elif close_reason == "RANGE_SCALP_TARGET":
+                elif close_reason in {"RANGE_SCALP_TARGET", "SCALP_TARGET"}:
                     record_trade_management_event("RANGE_SCALP_VERIFIED", "PAPER_SIMULATED" if PAPER_MODE else "EXCHANGE_VERIFIED",
                                                    log_level="SUCCESS", **common, qty_closed=filled,
                                                    remaining_qty=0.0, range_target=STATE.get("range_target_price"),
@@ -3934,11 +4765,6 @@ def sync_position_state(symbol=None):
         STATE["mark_price"] = snap.mark_price
         STATE["liquidation_price"] = snap.liquidation_price
 
-    # The normal LIVE reconciliation path already emits this event after
-    # applying the confirmed snapshot. Emit only for PAPER, whose synthetic
-    # snapshot otherwise has no reconcile event to activate its manager.
-    if PAPER_MODE:
-        _exchange_sync.event_bus.emit("reconciled", snap)
     return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
 
 def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
@@ -4452,33 +5278,44 @@ def detect_structure_shift(df):
     return None
 
 def get_clustered_zones(df, lookback=120, cluster_pct=0.002):
-    highs = df['high'].values[-lookback:]
-    lows = df['low'].values[-lookback:]
-    swing_highs = []
-    for i in range(2, len(highs)-2):
-        if highs[i] == max(highs[i-2:i+3]):
-            swing_highs.append(highs[i])
-    swing_lows = []
-    for i in range(2, len(lows)-2):
-        if lows[i] == min(lows[i-2:i+3]):
-            swing_lows.append(lows[i])
-    def cluster(points, pct):
-        if not points:
-            return []
-        points = sorted(points)
-        clusters = []
-        current = [points[0]]
-        for p in points[1:]:
-            if abs(p - current[-1]) / p < pct:
-                current.append(p)
-            else:
-                clusters.append(sum(current)/len(current))
-                current = [p]
-        clusters.append(sum(current)/len(current))
-        return clusters
-    res_levels = cluster(swing_highs, cluster_pct)
-    sup_levels = cluster(swing_lows, cluster_pct)
-    return sup_levels, res_levels
+    """Compatibility wrapper over the canonical confirmed S/R zone engine."""
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 20:
+        return [], []
+    try:
+        validator = globals().get("roro_validate_closed_frame")
+        if not callable(validator):
+            return [], []
+        now_ms, _time_source = _entry_exchange_time_ms()
+        closed = validator(
+            df.copy(), now_ms=int(now_ms),
+            timeframe_s=int(_roro_timeframe_seconds(str(INTERVAL))),
+        )
+        if not isinstance(closed, pd.DataFrame) or len(closed) < 20:
+            return [], []
+        atr_series = compute_atr(closed)
+        atr_value = safe_float(atr_series.iloc[-1], 0.0) if atr_series is not None and len(atr_series) else 0.0
+        price = safe_float(closed["close"].iloc[-1], 0.0)
+        if atr_value <= 0 or price <= 0:
+            return [], []
+        zones = build_support_resistance_zones(
+            closed.tail(max(20, int(lookback))).to_dict("records"),
+            price=price, atr=atr_value, lookback=lookback,
+            pivot_span=2, cluster_atr=0.22, min_touches=2, max_zones=8,
+        )
+        if zones.get("status") != "VALID":
+            return [], []
+        supports = [
+            float(z["level"]) for z in zones.get("supports", [])
+            if z.get("status") == "CONFIRMED" and float(z.get("strength", 0) or 0) >= 5.0
+        ]
+        resistances = [
+            float(z["level"]) for z in zones.get("resistances", [])
+            if z.get("status") == "CONFIRMED" and float(z.get("strength", 0) or 0) >= 5.0
+        ]
+        return supports, resistances
+    except Exception as exc:
+        log_execution(f"[STRUCTURE_ZONES] S/R calculation unavailable: {type(exc).__name__}: {exc}", "WARN")
+        return [], []
 
 def detect_liquidity_cluster(df, lb=20, tol=0.001):
     highs = df['high'].iloc[-lb:]
@@ -4801,7 +5638,62 @@ def council_decision(context):
     final_score = max(0, min(12, score))
     return final_score, reasons
 
-def compute_sl_tp(entry_price, side, classification, atr, df):
+def _market_price_tick_size(symbol, reference_price):
+    """Return one exchange price increment for strict TP ordering."""
+    try:
+        market = ex.market(normalize_symbol(symbol))
+        precision = (market.get("precision") or {}).get("price")
+        if precision is not None:
+            precision = float(precision)
+            if math.isfinite(precision) and precision > 0:
+                mode = getattr(ex, "precisionMode", None)
+                if mode == getattr(ccxt, "TICK_SIZE", object()):
+                    return precision
+                if mode == getattr(ccxt, "DECIMAL_PLACES", object()):
+                    return 10.0 ** (-int(precision))
+                if mode == getattr(ccxt, "SIGNIFICANT_DIGITS", object()):
+                    magnitude = math.floor(math.log10(abs(float(reference_price))))
+                    return 10.0 ** (magnitude - int(precision) + 1)
+    except Exception:
+        pass
+    # Conservative numerical fallback for PAPER/mocked markets without metadata.
+    return max(abs(float(reference_price)) * 1e-8, 1e-12)
+
+
+def _order_take_profit_levels(entry_price, side, tp1_price, tp2_price, tick_size):
+    """Keep TP1 nearest and TP2 strictly farther from entry after rounding."""
+    entry = float(entry_price)
+    tp1 = float(tp1_price)
+    tp2 = float(tp2_price)
+    tick = max(float(tick_size), max(abs(entry) * 1e-12, 1e-12))
+    direction = str(side or "").strip().upper()
+    if direction == "BUY":
+        tp1 = max(tp1, entry + tick)
+        tp2_distance = max(abs(entry - tp2), abs(tp1 - entry) + tick)
+        tp2 = entry + tp2_distance
+        if tp2 <= tp1:
+            tp2 = tp1 + tick
+    elif direction == "SELL":
+        tp1 = min(tp1, entry - tick)
+        tp2_distance = max(abs(entry - tp2), abs(entry - tp1) + tick)
+        tp2 = entry - tp2_distance
+        if tp2 >= tp1:
+            tp2 = tp1 - tick
+    else:
+        raise ValueError("side must be BUY or SELL when ordering TP levels")
+    return tp1, tp2
+
+
+def compute_sl_tp(entry_price, side, classification, atr, df, symbol=None):
+    """Build directional SL/TP levels; TP2 must remain beyond TP1 after min-distance adjustment."""
+    side = str(side or "").strip().upper()
+    entry_price = float(entry_price)
+    atr = float(atr)
+    if side not in {"BUY", "SELL"} or not math.isfinite(entry_price) or entry_price <= 0:
+        raise ValueError("invalid entry price or side for SL/TP calculation")
+    if not math.isfinite(atr) or atr <= 0:
+        raise ValueError("ATR must be finite and positive for SL/TP calculation")
+    pricing_symbol = symbol or getattr(df, "symbol", None) or DEFAULT_SYMBOL
     if classification == "REVERSAL":
         pools = build_liquidity_pools(df)
         if side == "BUY":
@@ -4811,19 +5703,44 @@ def compute_sl_tp(entry_price, side, classification, atr, df):
         min_sl_dist = 1.2 * atr
         if abs(entry_price - sl) < min_sl_dist:
             sl = entry_price - min_sl_dist if side == "BUY" else entry_price + min_sl_dist
-        tp1 = entry_price * (1 + 0.005) if side == "BUY" else entry_price * (1 - 0.005)
-        tp2 = entry_price * (1 + 0.01) if side == "BUY" else entry_price * (1 - 0.01)
+        # Normal reversal geometry is the canonical 0.50% / 1.00% price-move
+        # two-stage plan. The live manager may choose a more conservative
+        # adaptive 0.25% target, but entry geometry must not become a trend
+        # 2.00% / 3.00% target by accident.
+        tp1 = entry_price * (1.0 + (0.50 / 100.0 if side == "BUY" else -0.50 / 100.0))
+        tp2 = entry_price * (1.0 + (1.00 / 100.0 if side == "BUY" else -1.00 / 100.0))
     elif classification == "EARLY_TREND":
         ema50 = ema(df['close'], 50).iloc[-1]
         sl = ema50 - atr * 1.2 if side == "BUY" else ema50 + atr * 1.2
-        tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
-        tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
+        tp1, tp2 = trend_target_prices(side, entry_price)
     else:
         sl = entry_price - atr * 1.6 if side == "BUY" else entry_price + atr * 1.6
-        tp1 = entry_price * (1 + 0.008) if side == "BUY" else entry_price * (1 - 0.008)
-        tp2 = entry_price * (1 + 0.02) if side == "BUY" else entry_price * (1 - 0.02)
-    sl, tp1 = PrecisionSafety.adjust_sl_tp(df.symbol if hasattr(df, 'symbol') else DEFAULT_SYMBOL, entry_price, sl, tp1, side, atr)
-    return sl, tp1, tp2
+        tp1, tp2 = trend_target_prices(side, entry_price)
+
+    # Preserve the existing SL volatility safety adjustment. Profit targets
+    # are fixed price-move percentages and must not be silently widened by ATR.
+    sl, tp1 = PrecisionSafety.adjust_sl_tp(
+        pricing_symbol, entry_price, sl, tp1, side, atr
+    )
+    # The legacy adjustment only moved TP1; when ATR was wide it could push
+    # TP1 beyond the fixed-percentage TP2. Move TP2 outward, never TP1 inward.
+    tick_size = _market_price_tick_size(pricing_symbol, entry_price)
+    tp2 = PrecisionSafety.normalize_price(pricing_symbol, tp2)
+    tp1, tp2 = _order_take_profit_levels(entry_price, side, tp1, tp2, tick_size)
+    # Re-normalize, then enforce strict ordering once more to account for rounding
+    # collapsing adjacent levels to the same exchange tick.
+    tp1 = PrecisionSafety.normalize_price(pricing_symbol, tp1)
+    tp2 = PrecisionSafety.normalize_price(pricing_symbol, tp2)
+    tp1, tp2 = _order_take_profit_levels(entry_price, side, tp1, tp2, tick_size)
+    if side == "BUY" and not (entry_price < tp1 < tp2):
+        raise ValueError(
+            f"TP_PRECISION_ORDER_INVALID BUY entry={entry_price} tp1={tp1} tp2={tp2} tick={tick_size}"
+        )
+    if side == "SELL" and not (tp2 < tp1 < entry_price):
+        raise ValueError(
+            f"TP_PRECISION_ORDER_INVALID SELL entry={entry_price} tp1={tp1} tp2={tp2} tick={tick_size}"
+        )
+    return float(sl), float(tp1), float(tp2)
 
 # ========== EXECUTION LAYER ==========
 STATE = {
@@ -4878,8 +5795,21 @@ STATE = {
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+
+    "opposing_liquidity_status": "UNKNOWN",
+    "opposing_liquidity_level": 0.0,
+    "opposing_liquidity_distance_pct": 0.0,
+    "opposing_liquidity_timestamp": 0.0,
+    "scalp_target_selected_pct": 0.0,
+    "scalp_target_price": 0.0,
+    "scalp_target_tp1_price": 0.0,
+    "scalp_target_status": "UNKNOWN",
+    "scalp_target_selection_reason": "",
+
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
-    "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
+    "native_sl_last_verified_price": 0.0, "native_sl_last_requested_price": 0.0,
+    "native_sl_last_update_ts": 0.0, "native_sl_last_result": "NONE", "native_sl_last_reason": "",
+    "native_sl_original_qty": 0.0, "native_sl_local_target": 0.0,
     "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
     "execution_unresolved": False, "close_reconciliation_required": False,
     "close_verified": False, "last_close_verified": False, "last_close_order_id": None,
@@ -4892,6 +5822,18 @@ STATE = {
     "structural_invalidation": False, "thesis_failure_reasons": [],
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
+    "zone_event_last_candle_ts": 0.0,
+    "failed_breakout_streak": 0,
+    "failed_breakout_last_candle_ts": 0.0,
+    "failed_breakout_thesis_credit_applied": False,
+    "entry_zone_low": 0.0,
+    "entry_zone_high": 0.0,
+    "support_resistance": {"status": "UNKNOWN", "supports": [], "resistances": []},
+    "entry_behavior_confidence": 0.0,
+    "entry_behavior_reasons": [],
+    "trading_mode": "UNCLASSIFIED",
+    "entry_behavior": "WAIT_FOR_STRUCTURE",
+    "market_intelligence": {},
 }
 paper = {"balance": 10000.0, "position": None}
 _ACTIVE_TRADE = False
@@ -4993,6 +5935,20 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
+            # Keep the single-position gate closed, but make the reason visible.
+            # Only verified-flat finalization/reconciliation may release it.
+            log_execution(
+                f"[ENTRY_LOCKED] {sym}: active trade lock is held "
+                f"| state_open={bool(STATE.get('open'))} "
+                f"| trade_state_open={bool(TRADE_STATE.get('in_position'))} "
+                f"| recovery_hold={bool(STATE.get('recovery_hold'))} "
+                f"| execution_unresolved={bool(STATE.get('execution_unresolved'))} "
+                f"| close_reconciliation_required={bool(STATE.get('close_reconciliation_required'))} "
+                f"| recovery_block_entries={bool(globals().get('RECOVERY_BLOCK_ENTRIES', False))}",
+                "WARN",
+                debounce_key=f"entry_locked:{sym}",
+                debounce_sec=10,
+            )
             return None
         _ACTIVE_TRADE = True
     order = None
@@ -5127,7 +6083,308 @@ def close_partial(ratio):
     # This is kept for backward compatibility; use safe_close_partial now
     return safe_close_partial(STATE["current_symbol"], ratio)
 
+
+# ========== INSTITUTIONAL ENTRY CLOSED-CANDLE GATE ==========
+ENTRY_CLOSED_CANDLE_MIN_BARS = 80
+ENTRY_CLOSED_CANDLE_MAX_AGE_INTERVALS = 2.0
+ENTRY_CANDLE_RETRY_DELAY_SEC = 0.35
+_ENTRY_TIME_LOCK = threading.Lock()
+_ENTRY_TIME_SNAPSHOT = {"monotonic": 0.0, "epoch_ms": 0, "source": "LOCAL_UTC_EPOCH"}
+
+
+def _entry_exchange_time_ms():
+    """Use cached BingX server time where available; otherwise use UTC epoch time."""
+    now_mono = time.monotonic()
+    with _ENTRY_TIME_LOCK:
+        snap = dict(_ENTRY_TIME_SNAPSHOT)
+        if snap["epoch_ms"] > 0 and now_mono - snap["monotonic"] <= 15.0:
+            return int(snap["epoch_ms"] + (now_mono - snap["monotonic"]) * 1000.0), snap["source"]
+
+        epoch_ms = None
+        source = "LOCAL_UTC_EPOCH"
+        exchange_obj = globals().get("ex")
+        has = getattr(exchange_obj, "has", {}) if exchange_obj is not None else {}
+        fetch_time = getattr(exchange_obj, "fetch_time", None) if exchange_obj is not None else None
+        if callable(fetch_time) and isinstance(has, dict) and has.get("fetchTime"):
+            try:
+                value = safe_api_call(fetch_time)
+                if value is not None:
+                    candidate = int(float(value))
+                    epoch_ms = candidate if candidate > 10**12 else candidate * 1000
+                    if epoch_ms > 0:
+                        source = "BINGX_SERVER_TIME"
+            except Exception as exc:
+                logger = globals().get("log_execution")
+                if logger:
+                    logger(
+                        f"[ENTRY_TIME] exchange time unavailable; UTC epoch fallback ({type(exc).__name__})",
+                        "WARN", debounce_key="entry_exchange_time_fallback", debounce_sec=60,
+                    )
+        if epoch_ms is None:
+            epoch_ms = int(time.time() * 1000)
+
+        _ENTRY_TIME_SNAPSHOT.update({
+            "monotonic": now_mono, "epoch_ms": epoch_ms, "source": source,
+        })
+        return int(epoch_ms), source
+
+
+def _entry_symbol_key(symbol):
+    canonical = globals().get("roro_canonical_symbol")
+    try:
+        return str(canonical(symbol)) if callable(canonical) else str(symbol).strip().upper()
+    except Exception:
+        return str(symbol).strip().upper()
+
+
+def _validate_entry_closed_frame(symbol, frame, context=None, *, now_ms=None, time_source=""):
+    """Validate symbol/timeframe, closed-bar status, age and minimum history."""
+    context = context if isinstance(context, dict) else {}
+    expected_symbol = context.get("exchange_symbol") or context.get("symbol")
+    if expected_symbol and _entry_symbol_key(expected_symbol) != _entry_symbol_key(symbol):
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": f"context_symbol={expected_symbol} requested_symbol={symbol}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    expected_tf = str(INTERVAL)
+    context_tf = str(context.get("candle_timeframe") or expected_tf)
+    if context_tf != expected_tf:
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": f"context_timeframe={context_tf} expected_timeframe={expected_tf}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        fetch_diag = OHLCV_FETCH_DIAGNOSTICS.get(str(normalize_symbol(symbol)), {})
+        last_rate = _LAST_API_RATE_LIMIT
+        rate_recent = (
+            last_rate.get("method") == "fetch_ohlcv"
+            and time.time() - float(last_rate.get("ts", 0.0)) <= 15.0
+        )
+        reason = fetch_diag.get("reason")
+        if reason not in {"OHLCV_RATE_LIMITED", "INSUFFICIENT_CLOSED_BARS"}:
+            reason = "OHLCV_RATE_LIMITED" if rate_recent else "OHLCV_EMPTY"
+        return None, {
+            "reason": reason,
+            "detail": fetch_diag.get("detail") or "no usable OHLCV frame was available",
+            "received_candles": int(fetch_diag.get("received_candles", 0) or 0),
+            "source": context.get("closed_candle_source", "EXCHANGE_FETCH"),
+        }
+
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    if not required.issubset(set(frame.columns)):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": f"missing_columns={sorted(required - set(frame.columns))}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    timestamps = pd.to_numeric(frame["timestamp"], errors="coerce").dropna()
+    if timestamps.empty or float(timestamps.max()) < 10**12:
+        return None, {
+            "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+            "detail": "timestamps are missing or not Unix milliseconds",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+    timeframe_s = int(_roro_timeframe_seconds(expected_tf))
+    expected_interval_ms = timeframe_s * 1000
+    diffs = timestamps.sort_values().diff().dropna()
+    positive_diffs = diffs[diffs > 0]
+    if len(positive_diffs) >= 5:
+        median_interval_ms = float(positive_diffs.median())
+        ratio = median_interval_ms / float(expected_interval_ms)
+        if not 0.80 <= ratio <= 1.20:
+            return None, {
+                "reason": "SYMBOL_TIMEFRAME_MISMATCH",
+                "detail": (
+                    f"median_bar_interval_ms={median_interval_ms:.0f} "
+                    f"expected_interval_ms={expected_interval_ms}"
+                ),
+                "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+            }
+
+    if now_ms is None:
+        now_ms, time_source = _entry_exchange_time_ms()
+    validator = globals().get("roro_validate_closed_frame")
+    if not callable(validator):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": "closed-candle validator is unavailable",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+    try:
+        closed = validator(
+            frame.copy(), now_ms=int(now_ms), timeframe_s=timeframe_s,
+        )
+    except Exception as exc:
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": f"validator_error={type(exc).__name__}:{exc}",
+            "source": context.get("closed_candle_source", "ENTRY_CONTEXT"),
+        }
+
+    source = context.get("closed_candle_source", "ENTRY_CONTEXT")
+    received = int(len(frame))
+    closed_count = int(len(closed)) if isinstance(closed, pd.DataFrame) else 0
+    if closed_count == 0:
+        return None, {
+            "reason": "ONLY_FORMING_CANDLE",
+            "detail": "OHLCV rows exist but none has a confirmed close time",
+            "received_candles": received,
+            "closed_candles": 0,
+            "time_source": time_source,
+            "source": source,
+        }
+    if closed_count < ENTRY_CLOSED_CANDLE_MIN_BARS:
+        return None, {
+            "reason": "INSUFFICIENT_CLOSED_BARS",
+            "detail": (
+                f"closed_candles={closed_count} "
+                f"required={ENTRY_CLOSED_CANDLE_MIN_BARS}"
+            ),
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+
+    last_open_ms = int(float(closed["timestamp"].iloc[-1]))
+    close_time_ms = last_open_ms + expected_interval_ms
+    age_ms = int(now_ms) - close_time_ms
+    if age_ms < -2000:
+        return None, {
+            "reason": "ONLY_FORMING_CANDLE",
+            "detail": f"latest_bar_not_closed_yet_by_exchange_time age_ms={age_ms}",
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+    max_age_ms = int(expected_interval_ms * ENTRY_CLOSED_CANDLE_MAX_AGE_INTERVALS)
+    if age_ms > max_age_ms:
+        return None, {
+            "reason": "CLOSED_CANDLE_STALE",
+            "detail": (
+                f"last_closed_ts={last_open_ms} age_sec={age_ms / 1000.0:.1f} "
+                f"max_age_sec={max_age_ms / 1000.0:.1f}"
+            ),
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+    if not validate_dataframe(closed, ENTRY_CLOSED_CANDLE_MIN_BARS):
+        return None, {
+            "reason": "OHLCV_EMPTY",
+            "detail": "closed OHLCV frame failed structural/finite data validation",
+            "received_candles": received,
+            "closed_candles": closed_count,
+            "time_source": time_source,
+            "source": source,
+        }
+
+    return closed.reset_index(drop=True), {
+        "reason": "VALID",
+        "received_candles": received,
+        "closed_candles": closed_count,
+        "last_closed_candle_ts": last_open_ms,
+        "closed_candle_age_sec": round(max(0.0, age_ms / 1000.0), 3),
+        "time_source": time_source,
+        "source": source,
+        "timeframe": expected_tf,
+    }
+
+
+def resolve_entry_closed_candles(symbol, context=None):
+    """Reuse the exact authorized frame; perform at most one short fresh retry."""
+    context = context if isinstance(context, dict) else {}
+    shared_frame = context.get("closed_candle_frame")
+    if isinstance(shared_frame, pd.DataFrame):
+        frame = shared_frame.copy()
+        source = str(context.get("closed_candle_source") or "SHARED_AUTHORIZATION_FRAME")
+    else:
+        frame = get_ohlcv_safe(symbol, 150)
+        source = "SCANNER_CACHE_OR_EXCHANGE"
+
+    local_context = dict(context)
+    local_context.setdefault("exchange_symbol", symbol)
+    local_context.setdefault("candle_timeframe", str(INTERVAL))
+    local_context["closed_candle_source"] = source
+
+    final_frame = None
+    final_diag = None
+    for attempt in range(2):
+        if attempt == 1:
+            # Only one bounded retry. It bypasses the generic 30/90s frame cache.
+            time.sleep(ENTRY_CANDLE_RETRY_DELAY_SEC)
+            frame = fetch_ohlcv(symbol, 150)
+            source = "FRESH_EXCHANGE_RETRY"
+            local_context["closed_candle_source"] = source
+        now_ms, time_source = _entry_exchange_time_ms()
+        checked, diagnostic = _validate_entry_closed_frame(
+            symbol, frame, local_context, now_ms=now_ms, time_source=time_source,
+        )
+        if checked is not None:
+            final_frame, final_diag = checked, diagnostic
+            break
+        final_diag = diagnostic
+        reason = str(diagnostic.get("reason", "OHLCV_EMPTY"))
+        if reason in {"OHLCV_RATE_LIMITED", "SYMBOL_TIMEFRAME_MISMATCH"}:
+            break
+
+    MEMORY.setdefault("last_closed_candle_validation", {}).update({
+        "symbol": str(symbol),
+        **(final_diag or {"reason": "OHLCV_EMPTY"}),
+        "checked_at": time.time(),
+    })
+    if final_frame is not None:
+        log_execution(
+            f"[ENTRY_CANDLE_VALID] {symbol} timeframe={final_diag.get('timeframe')} "
+            f"closed={final_diag.get('closed_candles')} "
+            f"last_closed_ts={final_diag.get('last_closed_candle_ts')} "
+            f"age_sec={final_diag.get('closed_candle_age_sec')} "
+            f"time_source={final_diag.get('time_source')} source={final_diag.get('source')}",
+            "INFO",
+        )
+    return final_frame, (final_diag or {"reason": "OHLCV_EMPTY"})
+
+
+def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONAL_ENTRY_GATE"):
+    """Feed structured candle-data rejections into the Dashboard WHY NO ENTRY panel."""
+    diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+    reason_code = str(diagnostic.get("reason") or "OHLCV_EMPTY")
+    detail = str(diagnostic.get("detail") or "closed-candle validation failed")
+    now = time.time()
+    metrics = MEMORY.setdefault("entry_rejection_metrics", {})
+    metrics[reason_code] = int(metrics.get(reason_code, 0) or 0) + 1
+    MEMORY["last_closed_candle_validation"] = {
+        "symbol": str(symbol), "side": str(side), "reason": reason_code,
+        "detail": detail, "stage": stage, "checked_at": now,
+        **{k: v for k, v in diagnostic.items() if k not in {"reason", "detail"}},
+    }
+    feed = MEMORY.setdefault("no_entry_feed", [])
+    feed.append({
+        "time": now, "symbol": str(symbol), "side": str(side),
+        "reason": f"{reason_code}: {detail}", "score": None,
+        "category": reason_code, "stage": stage,
+    })
+    MEMORY["no_entry_feed"] = feed[-100:]
+    log_execution(
+        f"[ENTRY_DATA_REJECT] {symbol} {side} stage={stage} reason={reason_code} detail={detail}",
+        "ERROR",
+        debounce_key=f"entry_data_reject:{symbol}:{reason_code}",
+        debounce_sec=5,
+    )
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
+    if daily_loss_cooldown_active():
+        log_execution(f"[ENTRY_BLOCKED] drawdown cooldown active; {symbol} {side} rejected", "WARN",
+                      debounce_key=f"loss_cooldown_entry:{symbol}", debounce_sec=15)
+        return False
     # Canonicalize once at the strategy/execution boundary so every downstream
     # risk, position, SL/TP and management branch sees the same direction token.
     side = str(side or "").strip().upper()
@@ -5136,6 +6393,75 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
     trade_id = uuid.uuid4().hex
     institutional_entry_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+    # Final execution-boundary gate: no institutional, sniper, RF or legacy
+    # setup can bypass the mandatory EMA9-to-session-VWAP closed-candle cross.
+    gate_frame = institutional_entry_ctx.get("closed_candle_frame")
+    gate_frame_source = institutional_entry_ctx.get("closed_candle_source") or "ENTRY_CONTEXT"
+    gate_tf = str(institutional_entry_ctx.get("candle_timeframe") or INTERVAL)
+    try:
+        # Legacy callers may not carry the RORO frame in their context. Re-fetch
+        # through the existing shared scanner-frame cache; missing data never bypasses the gate.
+        if gate_frame is None:
+            gate_frame = _integration_fetch_frame(symbol)
+            gate_frame_source = "SHARED_SCANNER_FRAME_FALLBACK"
+        gate_result = _validate_dual_ema_vwap_entry_gate(
+            gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
+            now_ms=int(time.time() * 1000), lookback_candles=2,
+        )
+        gate_result["frame_source"] = gate_frame_source
+    except Exception as gate_exc:
+        gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
+    raw_signal_id = str(gate_result.get("signal_candle_id") or "").strip()
+    if raw_signal_id:
+        try:
+            event_symbol = normalize_symbol(symbol)
+        except Exception:
+            event_symbol = str(symbol or "").strip().upper()
+        gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
+    institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
+    # Preserve the exact gate snapshot for the serialized final execution wrapper.
+    globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
+    if not gate_result.get("ready"):
+        log_execution(
+            f"[VWAP_ENTRY_GATE] BLOCKED {symbol} {side} reason={gate_result.get('reason')} "
+            f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} "
+            f"VWAP={gate_result.get('vwap')} EMA9_cross={gate_result.get('ema9_cross')} "
+            f"EMA50_cross={gate_result.get('ema50_cross')} closed_ts={gate_result.get('latest_closed_timestamp')}",
+            "WARN", debounce_key=f"dual_ema_vwap_gate:{symbol}:{side}:{gate_result.get('reason')}",
+            debounce_sec=5,
+        )
+        return False
+    # Consume the current signal identity only after this call has computed it,
+    # and before sizing/order submission. Fail closed if durable state is unreadable.
+    entry_event_id = str(gate_result.get("durable_event_id") or "").strip()
+    entry_event_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not entry_event_id and not PAPER_MODE and MODE_LIVE:
+        log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: missing signal candle identity for {symbol}", "ERROR")
+        return False
+    if entry_event_id and entry_event_journal is None and not PAPER_MODE and MODE_LIVE:
+        log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: durable journal unavailable for {entry_event_id}", "ERROR")
+        return False
+    if entry_event_id and entry_event_journal is not None:
+        try:
+            if entry_event_journal.is_event_consumed(entry_event_id):
+                log_execution(
+                    f"[ENTRY_EVENT_GUARD] BLOCKED duplicate closed-candle signal {entry_event_id}",
+                    "WARN", debounce_key=f"entry_event_consumed:{entry_event_id}", debounce_sec=30,
+                )
+                return False
+        except Exception as event_exc:
+            log_execution(
+                f"[ENTRY_EVENT_GUARD] BLOCKED: cannot verify durable event state "
+                f"for {entry_event_id}: {type(event_exc).__name__}: {event_exc}", "ERROR",
+            )
+            return False
+    log_execution(
+        f"[VWAP_ENTRY_GATE] PASSED {symbol} {side} "
+        f"EMA9_cross_ts={gate_result.get('ema9_cross_timestamp')} "
+        f"EMA50_cross_ts={gate_result.get('ema50_cross_timestamp')} "
+        f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} VWAP={gate_result.get('vwap')}",
+        "INFO", debounce_key=f"dual_ema_vwap_gate_pass:{symbol}:{side}", debounce_sec=5,
+    )
     entry_spread_pct = safe_float(institutional_entry_ctx.get("spread_pct"), 0.0) or 0.0
     entry_liquidity_quality = str(institutional_entry_ctx.get("liquidity_quality") or "UNKNOWN")
     entry_orderbook_depth = safe_float(institutional_entry_ctx.get("orderbook_depth_usdt"), 0.0) or 0.0
@@ -5146,17 +6472,51 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             raise ValueError("entry price must be finite and positive")
         if not math.isfinite(structural_stop) or structural_stop <= 0:
             raise ValueError("structural stop must be finite and positive")
-        validate_trade_geometry(
-            side=side, entry_price=reference_price, stop_price=structural_stop,
-            tp1_price=tp1, tp2_price=tp2,
-        )
+        try:
+            validate_trade_geometry(
+                side=side, entry_price=reference_price, stop_price=structural_stop,
+                tp1_price=tp1, tp2_price=tp2,
+            )
+        except ValueError as geometry_exc:
+            raise ValueError(
+                f"{geometry_exc}; side={side} entry={reference_price:.12g} "
+                f"SL={structural_stop:.12g} TP1={float(tp1):.12g} TP2={float(tp2):.12g}"
+            ) from geometry_exc
         # Real available balance from BingX Futures ("free" USDT), with source and
         # fetch timestamp so freshness is provable. A stale/unreadable balance must
         # block the entry rather than silently produce a tiny position.
-        free_bal, balance_source, balance_ts = get_available_balance_snapshot()
-        balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
-        if balance <= 0:
-            raise ValueError("available USDT balance is zero or unreadable")
+        # Sniper V2 targets 20% of TOTAL wallet balance. Free balance is
+        # checked separately as an exchange feasibility gate. Other strategies
+        # keep their existing free-margin sizing path unchanged.
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            if institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
+                raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
+            wallet_snapshot = None if PAPER_MODE else safe_api_call(ex.fetch_balance)
+            wallet_balance, free_balance, balance_source = _sniper_v2_wallet_balances(
+                wallet_snapshot=wallet_snapshot,
+                paper_wallet_balance=paper.get("balance", 0.0),
+                paper_mode=PAPER_MODE,
+            )
+            balance_ts = time.time()
+            target_margin = free_balance * 0.20
+            if wallet_balance <= 0 or target_margin <= 0:
+                raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
+            if free_balance <= 0:
+                raise ValueError(
+                    f"SNIPER_FREE_MARGIN_UNAVAILABLE: wallet_total={wallet_balance:.4f} "
+                    f"free={free_balance:.4f}"
+                )
+            balance = free_balance
+            log_execution(
+                f"[SNIPER_SIZING_BASIS] wallet_total={wallet_balance:.4f} "
+                f"target_margin_20pct={target_margin:.4f} free_margin={free_balance:.4f}",
+                "INFO",
+            )
+        else:
+            free_bal, balance_source, balance_ts = get_available_balance_snapshot()
+            balance = max(0.0, free_bal * BALANCE_SAFETY_FACTOR)
+            if balance <= 0:
+                raise ValueError("available USDT balance is zero or unreadable")
         sym = normalize_symbol(symbol)
         try:
             market = ex.market(sym)
@@ -5171,10 +6531,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
         # A caller-supplied label such as SNIPER is not proof of setup quality.
         # Only the unified institutional Watchlist may authorize the strong 30% tier.
-        strong_tier_authorized = bool(
-            institutional_entry_ctx.get("capital_allocation_tier") == "STRONG_30_PERCENT"
-            and institutional_entry_ctx.get("sizing_eligible_strong") is True
-        )
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            if classification != "SNIPER_V2" or institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
+                raise ValueError("SNIPER_V2_SIZING_POLICY_CONTEXT_INVALID")
+            strong_tier_authorized = False
+        else:
+            strong_tier_authorized = bool(
+                institutional_entry_ctx.get("capital_allocation_tier") == "STRONG_30_PERCENT"
+                and institutional_entry_ctx.get("sizing_eligible_strong") is True
+            )
         sizing_classification = effective_sizing_classification(
             classification, strong_tier_authorized=strong_tier_authorized
         )
@@ -5199,6 +6564,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
         actual_notional = qty * contract_size * reference_price
         margin = actual_notional / LEVERAGE
+        if institutional_entry_ctx.get("sniper_v2") is True:
+            required_free_margin = margin * 1.01
+            if free_balance + 1e-9 < required_free_margin:
+                raise ValueError(
+                    f"SNIPER_FREE_MARGIN_INSUFFICIENT_AFTER_RISK_GATE: "
+                    f"wallet_total={wallet_balance:.4f} target_margin={target_margin:.4f} "
+                    f"actual_margin={margin:.4f} required_with_buffer={required_free_margin:.4f} "
+                    f"free={free_balance:.4f}"
+                )
         effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
         estimated_stop_loss = qty * contract_size * effective_stop_distance
         max_stop_loss = sizing.max_risk_usdt
@@ -5228,7 +6602,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "[POSITION_SIZING_AUDIT]\n"
             f"  Symbol: {sym}\n"
             f"  Direction: {side}\n"
-            f"  BingX Available Balance: {balance:.4f} USDT\n"
+            f"  Sizing Balance Basis: AVAILABLE_FREE\n"
+            f"  Sizing Balance: {balance:.4f} USDT\n"
             f"  Balance Source: {balance_source}\n"
             f"  Balance Timestamp: {balance_ts:.3f}\n"
             f"  Allocation Percentage: {margin_percent*100:.0f}%\n"
@@ -5266,7 +6641,21 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
-    df = get_ohlcv_safe(symbol, 100)
+    institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
+    if not PAPER_MODE and MODE_LIVE and institutional_ctx:
+        df, candle_diagnostic = resolve_entry_closed_candles(symbol, institutional_ctx)
+        if df is None:
+            record_entry_data_rejection(symbol, side, candle_diagnostic)
+            log_execution(
+                f"[ENTRY] {candle_diagnostic.get('reason', 'OHLCV_EMPTY')} for authorized "
+                f"institutional setup; LIVE blocked",
+                "ERROR",
+            )
+            return False
+    else:
+        # Preserve the existing PAPER and legacy/manual data path.
+        df = get_ohlcv_safe(symbol, 100)
+
     adx_series = compute_adx(df) if df is not None else None
     adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else 20.0
 
@@ -5274,21 +6663,26 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
         if institutional_ctx:
             setup = str(institutional_ctx.get("setup_type", "")).upper()
-            zone_type = str(institutional_ctx.get("causal_zone_type") or "").upper()
-            zone_low = safe_float(institutional_ctx.get("causal_zone_low"), None)
-            zone_high = safe_float(institutional_ctx.get("causal_zone_high"), None)
-            valid = (institutional_ctx.get("ema_vwap_authorized") is True
-                     and zone_type in ("FVG", "ORDER_BLOCK")
-                     and zone_low is not None and zone_high is not None
-                     and math.isfinite(zone_low) and math.isfinite(zone_high)
-                     and 0 < zone_low < zone_high)
+            evidence = [str(x).lower() for x in institutional_ctx.get("evidence", [])]
+            if setup in ("REVERSAL_ENGINE", "LIQUIDITY_SWEEP_REVERSAL"):
+                required = ("prior_liquidity_pool", "sweep", "reclaim", "closed_mss", "directional_trigger")
+                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
+            elif setup == "FAILED_AUCTION_REVERSAL":
+                required = ("failed_auction", "outside_acceptance_failed", "reclaim", "closed_mss", "directional_trigger")
+                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
+            elif setup in ("TREND_CONTINUATION_ENGINE", "TREND_CONTINUATION_RETEST"):
+                has_bos = any("bos" in ev for ev in evidence)
+                has_displacement = any("displacement" in ev for ev in evidence)
+                has_retest = any(token in ev for ev in evidence for token in ("retest:", "pullback:", "micro_pullback:"))
+                has_trigger = any("post_retest_trigger" in ev for ev in evidence)
+                valid = has_bos and has_displacement and has_retest and has_trigger
+            else:
+                valid = False
             if not valid:
-                log_execution("[ENTRY] LIVE blocked: EMA/VWAP authorization or causal OB/FVG proof missing", "ERROR")
+                log_execution(f"[ENTRY] Institutional authorization incomplete for {setup}; LIVE blocked", "ERROR")
                 return False
-            if df is None:
-                log_execution("[ENTRY] No fresh closed-candle data for authorized EMA/VWAP setup; LIVE blocked", "ERROR")
-                return False
-            log_execution(f"[ENTRY] EMA/VWAP + causal {zone_type} authorization accepted; institutional models remain contextual", "INFO")
+            # ADX, EMA and VWAP remain contextual evidence. They are not universal entry gates.
+            log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} treated as context, not a hard cross gate", "INFO")
         else:
             # Legacy/manual entry path keeps its existing stricter safeguards.
             if not (25 <= adx_val <= 38):
@@ -5390,6 +6784,28 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "risk_budget_basis": "TARGET_MARGIN",
             "risk_budget_usdt": sizing.max_risk_usdt,
             "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "zone_event": "INSIDE_ZONE" if safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+            "zone_event_last_candle_ts": 0.0,
+            "failed_breakout_streak": 0,
+            "failed_breakout_last_candle_ts": 0.0,
+            "failed_breakout_thesis_credit_applied": False,
+            "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
+            "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "support_resistance": dict(institutional_entry_ctx.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
+            "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
+            "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
+            "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(institutional_entry_ctx.get("entry_behavior") or (institutional_entry_ctx.get("market_intelligence") or {}).get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "market_intelligence": {
+                **(institutional_entry_ctx.get("market_intelligence") or {}),
+                "zone_side": side,
+                "failed_breakout_streak": 0,
+                "failed_breakout_thesis_credit_applied": False,
+            },
+            "entry_order_block": dict(institutional_entry_ctx.get("order_block") or {}),
+            "entry_fvg": dict(institutional_entry_ctx.get("fvg") or {}),
+            "entry_liquidity": dict(institutional_entry_ctx.get("liquidity") or {}),
+            "entry_golden_zone": dict(institutional_entry_ctx.get("golden_zone") or {}),
             "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
@@ -5406,6 +6822,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "institutional_flow": "NEUTRAL",
             "synthetic_sl": sl,
             "native_sl_original_price": sl,
+            "native_sl_original_qty": qty,
+            "native_sl_last_verified_price": sl,
             "entry_spread_pct": entry_spread_pct,
             "liquidity_quality": entry_liquidity_quality,
             "orderbook_depth_usdt": entry_orderbook_depth,
@@ -5414,7 +6832,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+            "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
+            "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
+            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_tp1_price": 0.0, "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
+
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
+    "native_sl_last_verified_price": 0.0, "native_sl_last_requested_price": 0.0,
+    "native_sl_last_update_ts": 0.0, "native_sl_last_result": "NONE", "native_sl_last_reason": "",
+    "native_sl_original_qty": 0.0, "native_sl_local_target": 0.0,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
             "execution_unresolved": False, "close_reconciliation_required": False,
             "close_verified": False, "last_close_verified": False, "last_close_order_id": None,
@@ -5438,7 +6863,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         return True
 
     sym = normalize_symbol(symbol)
@@ -5456,6 +6881,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "entry_time": time.time(), "tp1_hit": False, "tp2_hit": False,
         "trail_activated": False, "be_done": False,
     }
+    if daily_loss_cooldown_active():
+        log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
+        return False
     order = open_position(side, qty, symbol, stop_loss=sl, trade_id=trade_id,
                           management_state=pending_management_state)
     if order:
@@ -5485,6 +6913,28 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "risk_budget_basis": "TARGET_MARGIN",
             "risk_budget_usdt": sizing.max_risk_usdt,
             "trade_type": trade_type, "entry_type": entry_type, "be_done": False,
+            "zone_event": "INSIDE_ZONE" if safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0) > 0 else "INSUFFICIENT_DATA",
+            "zone_event_last_candle_ts": 0.0,
+            "failed_breakout_streak": 0,
+            "failed_breakout_last_candle_ts": 0.0,
+            "failed_breakout_thesis_credit_applied": False,
+            "entry_zone_low": safe_float(institutional_entry_ctx.get("entry_zone_low"), 0.0),
+            "entry_zone_high": safe_float(institutional_entry_ctx.get("entry_zone_high"), 0.0),
+            "support_resistance": dict(institutional_entry_ctx.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
+            "entry_behavior_confidence": safe_float(institutional_entry_ctx.get("entry_behavior_confidence"), 0.0),
+            "entry_behavior_reasons": list(institutional_entry_ctx.get("entry_behavior_reasons") or []),
+            "trading_mode": str(institutional_entry_ctx.get("trading_mode") or (institutional_entry_ctx.get("market_intelligence") or {}).get("mode") or "UNCLASSIFIED"),
+            "entry_behavior": str(institutional_entry_ctx.get("entry_behavior") or (institutional_entry_ctx.get("market_intelligence") or {}).get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+            "market_intelligence": {
+                **(institutional_entry_ctx.get("market_intelligence") or {}),
+                "zone_side": side,
+                "failed_breakout_streak": 0,
+                "failed_breakout_thesis_credit_applied": False,
+            },
+            "entry_order_block": dict(institutional_entry_ctx.get("order_block") or {}),
+            "entry_fvg": dict(institutional_entry_ctx.get("fvg") or {}),
+            "entry_liquidity": dict(institutional_entry_ctx.get("liquidity") or {}),
+            "entry_golden_zone": dict(institutional_entry_ctx.get("golden_zone") or {}),
             "tp1_hit": False, "tp2_hit": False, "trail_stop": 0.0,
             "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
             "roe_pct": 0.0, "mark_price": price, "initial_margin": margin,
@@ -5501,6 +6951,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "institutional_flow": "NEUTRAL",
             "synthetic_sl": sl,
             "native_sl_original_price": sl,
+            "native_sl_original_qty": qty,
+            "native_sl_last_verified_price": sl,
             "entry_spread_pct": entry_spread_pct,
             "liquidity_quality": entry_liquidity_quality,
             "orderbook_depth_usdt": entry_orderbook_depth,
@@ -5519,7 +6971,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
+            "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
+            "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
+            "scalp_target_selected_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_tp1_price": 0.0,
+            "scalp_target_status": "UNKNOWN", "scalp_target_selection_reason": "",
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
+    "native_sl_last_verified_price": 0.0, "native_sl_last_requested_price": 0.0,
+    "native_sl_last_update_ts": 0.0, "native_sl_last_result": "NONE", "native_sl_last_reason": "",
+    "native_sl_original_qty": 0.0, "native_sl_local_target": 0.0,
             "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0, "tp1_execution_price": None,
             "close_reconciliation_required": False,
             "close_verified": False, "last_close_verified": False, "last_close_order_id": None,
@@ -5572,17 +7031,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _persist_trade_journal_snapshot(force=True)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
-        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
+        tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         time.sleep(1)
         sync_position_state(symbol)
-        # Start the sole trade manager immediately after the exchange position
-        # and native stop have been reconciled. The manager retains its own
-        # fail-closed checks for UNKNOWN exposure/protection and market data.
-        if (STATE.get("open") and not STATE.get("recovery_hold")
-                and not STATE.get("execution_unresolved")
-                and (PAPER_MODE or STATE.get("native_sl_verified"))
-                and _live_manager.lifecycle_state == TradeLifecycleState.LIVE):
-            _live_manager.manage_live_trade()
         return True
     else:
         return False
@@ -7057,9 +8508,17 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                      (time.time()-safe_float(STATE.get("entry_time"), time.time()))/60.0,
                      STATE.get("side"), close_reason=reason,
                      pnl_usdt=pnl_usdt if pnl_known else None,
-                     entry_price=entry, exit_price=close_price, pnl_source=pnl_source)
+                     entry_price=entry, exit_price=close_price, pnl_source=pnl_source,
+                      total_qty=initial_qty, trade_id=trade_id)
         except Exception:
             pass
+
+    # Snapshot unresolved safety gates BEFORE local close-state cleanup.
+    # A verified exchange close does not automatically resolve recovery work.
+    unresolved_execution = bool(STATE.get("execution_unresolved"))
+    close_reconciliation_required = bool(STATE.get("close_reconciliation_required"))
+    recovery_hold_active = bool(STATE.get("recovery_hold"))
+    recovery_block_entries = bool(globals().get("RECOVERY_BLOCK_ENTRIES", False))
 
     preserved = {"last_close_diagnostic": STATE.get("last_close_diagnostic"),
                  "last_close_reason": reason, "last_close_fill_price": close_price,
@@ -7070,16 +8529,53 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                   "current_symbol": None, "trade_id": None, "tp1_hit": False, "tp2_hit": False,
                   "tp1_done": False, "partial_closed": False, "trail_activated": False,
                   "trail_stop": 0.0, "be_done": False, "close_verified": False,
-                  "execution_unresolved": False, "close_reconciliation_required": False,
-                  "recovery_hold": False, "profit_mode": None, "range_target_price": 0.0,
+                  "execution_unresolved": unresolved_execution,
+                  "close_reconciliation_required": close_reconciliation_required,
+                  "recovery_hold": recovery_hold_active, "profit_mode": None, "range_target_price": 0.0,
                   "range_target_move_pct": 0.0, "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0,
                   "last_close_verified": False, "last_close_order_id": None,
                   "last_close_filled_qty": 0.0, "last_close_realized_pnl": 0.0,
                   "last_close_pnl_complete": True, "bot_close_order_ids": []})
     STATE.update(preserved)
+    # This finalizer is gated by close_verified=True: publish the verified flat
+    # exposure to the runtime memory consumed by dashboard/synchronization.
+    MEMORY["position_status"] = "FLAT"
+    MEMORY["current_position"] = None
     TRADE_STATE.update({"in_position": False, "symbol": None, "side": None, "entry": 0.0,
                         "qty": 0.0, "tp1_hit": False, "tp2_hit": False,
                         "trail_on": False, "zone": None, "location": None, "reason": []})
+
+    # This function is entered only after close_verified=True. Release the
+    # single-trade lock only if every local/recovery gate agrees the account is
+    # flat and no execution uncertainty remains.
+    release_reasons = []
+    if STATE.get("open"):
+        release_reasons.append("STATE_OPEN")
+    if TRADE_STATE.get("in_position"):
+        release_reasons.append("TRADE_STATE_OPEN")
+    if unresolved_execution:
+        release_reasons.append("EXECUTION_UNRESOLVED")
+    if close_reconciliation_required:
+        release_reasons.append("CLOSE_RECONCILIATION_REQUIRED")
+    if recovery_hold_active:
+        release_reasons.append("RECOVERY_HOLD")
+    if recovery_block_entries:
+        release_reasons.append("RECOVERY_BLOCK_ENTRIES")
+    global _ACTIVE_TRADE
+    with _TRADE_LOCK:
+        if not release_reasons:
+            _ACTIVE_TRADE = False
+            log_execution(
+                f"[ENTRY_LOCK_RELEASED] {symbol}: verified full close finalized; next discovery cycle may authorize an entry",
+                "SUCCESS",
+            )
+        else:
+            _ACTIVE_TRADE = True
+            log_execution(
+                f"[ENTRY_LOCK_RETAINED] {symbol}: unresolved safety gates: {','.join(release_reasons)}",
+                "ERROR",
+            )
+
     _live_manager.lifecycle_state = TradeLifecycleState.CLOSED
     DASHBOARD_STATE["live_trade_mode"] = False
     clear_position_dashboard()
@@ -7165,26 +8661,8 @@ def cooldown_active():
     return STATE["cooldown_until"] and datetime.now(timezone.utc) < STATE["cooldown_until"]
 
 def emergency_kill_switch_active():
-    if STATE["daily_loss_limit_hit"]:
-        return True
-    bal = get_balance_safe()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if STATE["last_trade_day"] != today:
-        STATE["daily_peak_balance"] = bal
-        STATE["daily_loss_limit_hit"] = False
-        STATE["last_trade_day"] = today
-    else:
-        if STATE["daily_peak_balance"] is None:
-            STATE["daily_peak_balance"] = bal
-        else:
-            if bal > STATE["daily_peak_balance"]:
-                STATE["daily_peak_balance"] = bal
-            loss_pct = (STATE["daily_peak_balance"] - bal) / STATE["daily_peak_balance"] * 100
-            if loss_pct >= MAX_DAILY_LOSS_PCT:
-                STATE["daily_loss_limit_hit"] = True
-                log_execution(f"Daily loss limit hit: {loss_pct:.1f}%", "ERROR")
-                return True
-    return False
+    """Compatibility alias; drawdown now pauses entries instead of liquidating."""
+    return daily_loss_cooldown_active()
 
 def trailing_stop_new(price, atr):
     return False
@@ -7622,7 +9100,7 @@ def render_live_supervisor_panel():
 def dashboard():
     rf_items = MEMORY.get("rf_dashboard", [])[:20]
     rf_html = "".join([f"<div>{item['icon']} {item['symbol']} | {item['status']} | score={item['score']:.2f} | ADX={item['adx']:.1f} | RSI={item['rsi']:.1f}</div>" for item in rf_items])
-    
+
     scanner_buy = MEMORY.get("scanner_v2_buy", [])
     scanner_sell = MEMORY.get("scanner_v2_sell", [])
     buy_html = ""
@@ -7655,7 +9133,7 @@ def dashboard():
     </div>
     </div>
     """
-    
+
     decision_panel_html = """
     <div id="decision-panel" style="padding:12px; border:1px solid #2c3e50; margin-bottom:16px; border-radius:8px; background:#0a0c10;">
       <h3>🧠 UNIFIED TRADE MANAGEMENT LOG · TP1 / TP2 / STRICT EXIT</h3>
@@ -7663,7 +9141,7 @@ def dashboard():
       <div id="decision-list" style="max-height:400px; overflow-y:auto; font-size:13px;"></div>
     </div>
     """
-    
+
     watchlist_panel_html = """
     <div class="section smart-layer">
       <div class="title">👁 WATCHLIST / ACTIVE CANDIDATES</div>
@@ -7672,29 +9150,29 @@ def dashboard():
       </div>
     </div>
     """
-    
+
     no_entry_feed_section_html = """
     <div class="section smart-layer"><div class="title">🚫 WHY NO ENTRY (Last 5)</div>
     <div id="no-entry-feed" class="card" style="font-size:12px;"></div>
     </div>
     """
-    
+
     free_balance_card = '<div class="card">FREE BALANCE<div id="free_bal">-</div><div id="avail_margin">-</div></div>'
-    
+
     continuation_panel_html = """
     <div class="section smart-layer">
       <div class="title">📈 CONTINUATION ENGINE</div>
       <div id="continuation-panel" class="card" style="font-size:12px;"></div>
     </div>
     """
-    
+
     thesis_panel_html = """
     <div class="section smart-layer">
       <div class="title">🧠 TRADE THESIS</div>
       <div id="thesis-panel" class="card" style="font-size:12px;"></div>
     </div>
     """
-    
+
     confidence_regime_panel = """
     <div class="section smart-layer">
       <div class="title">📊 CONFIDENCE & REGIME</div>
@@ -7706,7 +9184,7 @@ def dashboard():
       </div>
     </div>
     """
-    
+
     flow_section_html = """
     <div class="section smart-layer">
       <div class="title">🧠 Institutional Flow Intelligence</div>
@@ -7751,9 +9229,9 @@ def dashboard():
     }
     </style>
     """
-    
+
     supervisor_panel_html = render_live_supervisor_panel()
-    
+
     html = f"""
 <!DOCTYPE html>
 <html><head><title>RF v28.1 Professional Trade Mgmt</title>
@@ -7783,7 +9261,7 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="section smart-layer"><div class="title">🌐 SCANNER 1 — PROFESSIONAL GLOBAL DISCOVERY (RF + SMART SCANNER V2)</div>
 <div id="discovery-scanner-panel" class="card" style="font-size:12px;">Waiting for initial market scan...</div>
 </div>
-<div class="section smart-layer"><div class="title">🧭 SCANNER 2 — EMA9 / SESSION VWAP PROXIMITY (CLOSED CANDLES · RANKING ONLY)</div>
+<div class="section smart-layer"><div class="title">🧭 EMA9 + EMA50 / SESSION VWAP (CLOSED CANDLES · ENTRY GATE)</div>
 <div id="proximity-scanner-panel" class="card" style="font-size:12px;max-height:320px;overflow-y:auto;">Waiting for first rotating batch...</div>
 </div>
 {supervisor_panel_html}
@@ -7970,7 +9448,7 @@ function updateUI(d) {{
         let pHtml = "";
         d.ema9_vwap_proximity_scanner.forEach(item => {{
             let icon = item.cross ? "⚡" : (item.state === "NEAR_CROSS" || item.state === "CONVERGING" ? "🟡" : item.direction === "BUY" ? "📈" : item.direction === "SELL" ? "📉" : "⚪");
-            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} <small>· Closed candle · Ranking only</small></div>`;
+            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} | Cross: ${{item.cross_trigger || "NONE"}} <small>· Closed candle · Ranking only</small></div>`;
         }});
         let pm = d.ema9_vwap_proximity_scanner_meta || {{}};
         document.getElementById("proximity-scanner-panel").innerHTML = (pHtml || "No proximity candidates") + `<small>Batch: ${{pm.observed_this_batch ?? 0}} | Pool: ${{pm.symbols ?? 0}} | Updated: ${{pm.updated_at ? new Date(pm.updated_at*1000).toLocaleTimeString() : "-"}} | Role: ${{pm.role || "RANKING_ONLY"}}</small>`;
@@ -7982,11 +9460,6 @@ function updateUI(d) {{
         for (let sym in d.watchlist) {{
             let w = d.watchlist[sym];
             let sideIcon = w.side === "BUY" ? "🟢" : (w.side === "SELL" ? "🔴" : "⚪");
-            let strategy = w.ema_vwap_strategy || {{}};
-            let strategyState = strategy.status || w.strategy_status || "UNKNOWN";
-            let strategyColor = strategyState === "ENTRY_READY" || strategyState === "TRADE_OPEN" ? "#2ecc71" :
-                (String(strategyState).startsWith("WAITING") ? "#f1c40f" :
-                (["INVALIDATED", "EXPIRED", "NO_CHASE"].includes(strategyState) ? "#e74c3c" : "#95a5a6"));
             let state = w.decision_state || w.state || "UNKNOWN";
             let stateColor = state === "ENTRY_READY" || state === "CONFIRMED" ? "#2ecc71" :
                 (String(state).startsWith("WAITING") || state === "NO_CHASE" ? "#f1c40f" :
@@ -8022,9 +9495,7 @@ function updateUI(d) {{
               <br><small>BUY hypothesis: ${{buyHyp.state || "NOT_ANALYZED"}} / ${{buyHyp.setup || "-"}} | SELL hypothesis: ${{sellHyp.state || "NOT_ANALYZED"}} / ${{sellHyp.setup || "-"}}</small>
               <br><small>Trend Engine: ${{instTrend.state || "UNKNOWN"}} / Health ${{instTrend.health ?? "?"}} | Trade State: ${{w.trade_state || "UNKNOWN"}}</small>
               <br><small>SL: ${{stopText}} | Data: ${{quality}} | Updated: ${{lastUpdate}}</small>
-              <br><small>EMA9/15 + UTC Session VWAP: <span style="color:${{strategyColor}}">${{strategyState}}</span> | Side: ${{strategy.direction || "UNKNOWN"}} | Pullback: ${{strategy.pullback_type || "UNKNOWN"}} | VWAP: ${{strategy.vwap ?? "UNKNOWN"}} | ATR14: ${{strategy.atr14 ?? "UNKNOWN"}}</small>
-              <br><small>Rejection: ${{strategy.rejection_ts ? new Date(strategy.rejection_ts).toLocaleString() : "WAITING/UNKNOWN"}} | Confirmation: ${{strategy.confirmation_ts ? new Date(strategy.confirmation_ts).toLocaleString() : "WAITING/UNKNOWN"}} | Strategy reason: ${{strategy.reason || "No strategy event yet"}}</small>
-              <br><small>Institutional evidence: ${{reasonsStr || "None"}} | Existing institutional decision: ${{state}} | Rejection: ${{rejectStr || "None"}}</small>
+              <br><small>EMA9/EMA50/VWAP: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
             </div>`;
         }}
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
@@ -8287,8 +9758,9 @@ def data():
             "ema9_vwap_proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner", [])[:30],
             "ema9_vwap_proximity_scanner_meta": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}),
             "watchlist": watchlist_data,
-            "ema_vwap_strategy_watchlist": EMA_VWAP_ENTRY_ENGINE.all(),
             "no_entry_feed": no_entry_feed,
+            "entry_rejection_metrics": MEMORY.get("entry_rejection_metrics", {}),
+            "last_closed_candle_validation": MEMORY.get("last_closed_candle_validation", {}),
             "continuation_probability": STATE.get("continuation_probability", 0.5),
             "hold_quality": STATE.get("hold_quality", "UNKNOWN"),
             "counter_pressure": STATE.get("counter_pressure", 0.0),
@@ -8312,11 +9784,8 @@ def data():
 
 @app.route("/trade", methods=["POST"])
 def manual_trade():
-    # Manual dashboard entries are intentionally disabled: every opening order
-    # must consume a one-time authorization from the closed-candle EMA/VWAP
-    # pullback lifecycle. Manual close remains available below.
-    return jsonify({"error": "Manual entry disabled; wait for a closed-candle EMA9/Session-VWAP crossover and causal-zone pullback/rejection/confirmation from the strategy engine.",
-                    "code": "EMA_VWAP_AUTHORITY_REQUIRED"}), 409
+    if daily_loss_cooldown_active():
+        return jsonify({"error": "New entries paused by daily drawdown cooldown"}), 423
     if RECOVERY_BLOCK_ENTRIES or STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
         return jsonify({"error": "Entry blocked until existing exchange/recovery state is reconciled"}), 409
     data = request.json or {}
@@ -8380,7 +9849,7 @@ def health():
         "proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}).get("state", "UNKNOWN"),
         "trade_management_authority": "TradeManagementBoard / LiveTradeManager",
         "trade_management_events": len(TRADE_MANAGEMENT_LOG),
-        "telegram": {"configured": TELEGRAM_NOTIFIER.configured},
+        "telegram": TELEGRAM_NOTIFIER.status(),
     })
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
@@ -8420,10 +9889,6 @@ def hourly_cleanup():
             for _, key in dated[:max(0, len(CACHE) - CACHE_MAX_ITEMS)]:
                 CACHE.pop(key, None)
                 removed += 1
-    try:
-        gc.collect()
-    except Exception:
-        pass
     manager = globals().get("INSTITUTIONAL_RESOURCE_MANAGER")
     if manager:
         try:
@@ -8432,6 +9897,34 @@ def hourly_cleanup():
                                           "cleanup_result": result.get("result")}
         except Exception as exc:
             log_execution(f"[RESOURCE] cleanup/metrics unavailable: {exc}", "WARN")
+            # Fall back to one collection only when the resource manager failed.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+    else:
+        try:
+            gc.collect()
+        except Exception:
+            pass
+    # PASSIVE checkpoint is bounded and does not force active readers/writers
+    # to stop. Keep it on the same five-minute maintenance cadence.
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is not None and callable(getattr(journal, "checkpoint_wal", None)):
+        try:
+            checkpoint = journal.checkpoint_wal("PASSIVE")
+            MEMORY["journal_maintenance"] = {
+                **checkpoint,
+                "checked_at": now,
+            }
+            if checkpoint.get("busy"):
+                log_execution(
+                    f"[JOURNAL] WAL checkpoint deferred by active connection: {checkpoint}",
+                    "WARN",
+                )
+        except Exception as exc:
+            log_execution(f"[JOURNAL] passive WAL checkpoint failed: {type(exc).__name__}: {exc}", "WARN")
+
     _last_cleanup = now
     log_execution(f"[RESOURCE] bounded cleanup removed={removed} cache={len(CACHE)}", "INFO")
 
@@ -8519,184 +10012,570 @@ def run_scanner_v2(symbols=None):
 # ========== SNIPER V2 ==========
 SNIPER_ZONES = {}
 
-def is_pivot_high(df, lookback=3):
-    if len(df) < lookback * 2 + 1:
-        return False
-    current_high = df['high'].iloc[-1]
-    left_highs = df['high'].iloc[-(lookback+1):-1]
-    if any(current_high <= h for h in left_highs):
-        return False
-    return True
+# ========== SNIPER V2 — CLOSED-CANDLE, RORO-AUTHORIZED ==========
+# Stateful zone watcher. It is a signal provider only: actual orders still pass
+# through execute_entry(), which remains the only entry gateway.
+SNIPER_ZONES = {}
+SNIPER_V2_LAST_PIVOT_TS = {}
+SNIPER_V2_ENABLED = _env_bool("SNIPER_V2_ENABLED", True)
+SNIPER_V2_SCAN_INTERVAL = _env_int_range("SNIPER_V2_SCAN_INTERVAL", 15, 5, 120)
+SNIPER_V2_MAX_SYMBOLS = _env_int_range("SNIPER_V2_MAX_SYMBOLS", 8, 1, 20)
+SNIPER_V2_PIVOT_LOOKBACK = _env_int_range("SNIPER_V2_PIVOT_LOOKBACK", 3, 2, 8)
+SNIPER_V2_ZONE_ATR_WIDTH = _env_float_range("SNIPER_V2_ZONE_ATR_WIDTH", 0.50, 0.15, 1.50)
+SNIPER_V2_SL_ATR_BUFFER = _env_float_range("SNIPER_V2_SL_ATR_BUFFER", 0.40, 0.10, 1.00)
+SNIPER_V2_TP1_MOVE_PCT = 0.40
+SNIPER_V2_TP2_MOVE_PCT = 1.00
+SNIPER_V2_ZONE_MAX_AGE_SEC = _env_int_range("SNIPER_V2_ZONE_MAX_AGE_SEC", 14400, 900, 86400)
+SNIPER_V2_CONFIRMATION_WINDOW_BARS = _env_int_range("SNIPER_V2_CONFIRMATION_WINDOW_BARS", 3, 1, 10)
+SNIPER_V2_MAX_ENTRY_DISTANCE_ATR = _env_float_range("SNIPER_V2_MAX_ENTRY_DISTANCE_ATR", 0.75, 0.20, 2.00)
+_SNIPER_V2_LAST_SCAN = 0.0
+_SNIPER_V2_LOCK = threading.Lock()
+SNIPER_V2_METRICS = {
+    "state": "DISABLED" if not SNIPER_V2_ENABLED else "IDLE",
+    "symbols_scanned": 0, "zones_waiting": 0, "zones_ready": 0,
+    "entries": 0, "last_scan": 0.0, "last_error": None,
+}
 
-def is_pivot_low(df, lookback=3):
-    if len(df) < lookback * 2 + 1:
+
+def _sniper_v2_wallet_balances(*, wallet_snapshot=None, paper_wallet_balance=0.0, paper_mode=False):
+    """Return (total wallet USDT, free USDT, source); total sizes, free only gates execution."""
+    if paper_mode:
+        total = safe_float(paper_wallet_balance, 0.0)
+        free = total
+        source = "PAPER_WALLET_TOTAL"
+    else:
+        if not isinstance(wallet_snapshot, dict):
+            raise ValueError("SNIPER_WALLET_BALANCE_UNAVAILABLE")
+        total = safe_float((wallet_snapshot.get("total") or {}).get("USDT"), 0.0)
+        free = safe_float((wallet_snapshot.get("free") or {}).get("USDT"), 0.0)
+        source = "BINGX_FUTURES_FREE_USDT"
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("SNIPER_WALLET_TOTAL_INVALID")
+    if not math.isfinite(free) or free < 0:
+        raise ValueError("SNIPER_FREE_MARGIN_INVALID")
+    return total, free, source
+
+
+def is_pivot_high(df, lookback=None):
+    """A pivot high is valid only after configured right-side candles are closed."""
+    n = int(lookback or SNIPER_V2_PIVOT_LOOKBACK)
+    if df is None or len(df) < (2 * n + 1):
         return False
-    current_low = df['low'].iloc[-1]
-    left_lows = df['low'].iloc[-(lookback+1):-1]
-    if any(current_low >= l for l in left_lows):
+    idx = len(df) - n - 1
+    pivot = float(df["high"].iloc[idx])
+    left = df["high"].iloc[idx - n:idx]
+    right = df["high"].iloc[idx + 1:idx + n + 1]
+    return bool(pivot > float(left.max()) and pivot >= float(right.max()))
+
+
+def is_pivot_low(df, lookback=None):
+    """A pivot low is valid only after configured right-side candles are closed."""
+    n = int(lookback or SNIPER_V2_PIVOT_LOOKBACK)
+    if df is None or len(df) < (2 * n + 1):
         return False
-    return True
+    idx = len(df) - n - 1
+    pivot = float(df["low"].iloc[idx])
+    left = df["low"].iloc[idx - n:idx]
+    right = df["low"].iloc[idx + 1:idx + n + 1]
+    return bool(pivot < float(left.min()) and pivot <= float(right.min()))
+
 
 def detect_strong_pivot(df, side, atr):
-    if len(df) < 20:
+    """Confirm displacement/rejection/extension using closed candles."""
+    if df is None or len(df) < 55 or not np.isfinite(float(atr)) or float(atr) <= 0:
         return False, []
-    reasons = []
-    strong = False
-    if side == "TOP":
-        move_up = df['high'].iloc[-1] - df['low'].iloc[-6] if len(df) >= 6 else 0
-        if move_up > atr * 1.5:
-            reasons.append("strong_move_up")
-            strong = True
-        last = df.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        upper_wick = last['high'] - max(last['open'], last['close'])
-        if upper_wick > body:
-            reasons.append("rejection_wick")
-            strong = True
-        ema50 = ema(df['close'], 50).iloc[-1]
-        distance = abs(last['close'] - ema50) / ema50 if ema50 > 0 else 0
-        if distance > atr / last['close']:
-            reasons.append("overextended")
-            strong = True
-    else:
-        move_down = df['high'].iloc[-6] - df['low'].iloc[-1] if len(df) >= 6 else 0
-        if move_down > atr * 1.5:
-            reasons.append("strong_move_down")
-            strong = True
-        last = df.iloc[-1]
-        body = abs(last['close'] - last['open'])
-        lower_wick = min(last['open'], last['close']) - last['low']
-        if lower_wick > body:
-            reasons.append("rejection_wick")
-            strong = True
-        ema50 = ema(df['close'], 50).iloc[-1]
-        distance = abs(last['close'] - ema50) / ema50 if ema50 > 0 else 0
-        if distance > atr / last['close']:
-            reasons.append("overextended")
-            strong = True
-    return strong, reasons
-
-def check_sniper_confirmation(df, zone_type):
-    if len(df) < 2:
-        return False, 0
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    body = abs(last['close'] - last['open'])
-    range_ = last['high'] - last['low']
-    confirm = 0
-    if zone_type == 'TOP':
-        upper_wick = last['high'] - max(last['open'], last['close'])
-        if range_ > 0 and upper_wick > body * 0.5:
-            confirm += 1
+    body = abs(float(last["close"]) - float(last["open"]))
+    reasons = []
+    if str(side).upper() == "TOP":
+        move = float(last["high"]) - float(df["low"].iloc[-6])
+        wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+        if move > atr * 1.5:
+            reasons.append("strong_move_up")
     else:
-        lower_wick = min(last['open'], last['close']) - last['low']
-        if range_ > 0 and lower_wick > body * 0.5:
-            confirm += 1
-    if zone_type == 'TOP':
-        zone_high = SNIPER_ZONES.get(df.symbol if hasattr(df, 'symbol') else '', {}).get('high', last['high']+1)
-        if last['high'] > zone_high and last['close'] < zone_high:
-            confirm += 1
+        move = float(df["high"].iloc[-6]) - float(last["low"])
+        wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
+        if move > atr * 1.5:
+            reasons.append("strong_move_down")
+    if body > 0 and wick > body:
+        reasons.append("rejection_wick")
+    ema50 = ema(df["close"], 50).iloc[-1]
+    if np.isfinite(ema50) and ema50 > 0 and abs(float(last["close"]) - float(ema50)) > atr:
+        reasons.append("overextended")
+    return len(set(reasons)) >= 2, reasons
+
+
+def check_sniper_confirmation(df, zone_type, zone=None):
+    """Closed-candle rejection and reclaim; no forming-candle confirmation."""
+    if df is None or len(df) < 2 or not isinstance(zone, dict):
+        return False, 0
+    last, prev = df.iloc[-1], df.iloc[-2]
+    body = abs(float(last["close"]) - float(last["open"]))
+    candle_range = float(last["high"]) - float(last["low"])
+    if candle_range <= 0:
+        return False, 0
+    checks = 0
+    if str(zone_type).upper() == "TOP":
+        wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+        if wick >= max(body * 0.5, candle_range * 0.20):
+            checks += 1
+        if float(last["high"]) > float(zone["high"]) and float(last["close"]) < float(zone["high"]):
+            checks += 1
+        if float(last["close"]) < float(last["open"]) and float(prev["close"]) >= float(prev["open"]):
+            checks += 1
     else:
-        zone_low = SNIPER_ZONES.get(df.symbol if hasattr(df, 'symbol') else '', {}).get('low', last['low']-1)
-        if last['low'] < zone_low and last['close'] > zone_low:
-            confirm += 1
-    if zone_type == 'TOP':
-        if last['close'] < last['open'] and prev['close'] > prev['open']:
-            confirm += 1
-    else:
-        if last['close'] > last['open'] and prev['close'] < prev['open']:
-            confirm += 1
-    return confirm >= 2, confirm
+        wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
+        if wick >= max(body * 0.5, candle_range * 0.20):
+            checks += 1
+        if float(last["low"]) < float(zone["low"]) and float(last["close"]) > float(zone["low"]):
+            checks += 1
+        if float(last["close"]) > float(last["open"]) and float(prev["close"]) <= float(prev["open"]):
+            checks += 1
+    return checks >= 2, checks
+
+
+_SNIPER_V2_SYMBOL_CURSOR = 0
+
+
+def _sniper_v2_symbols():
+    """Build a rotating bounded batch from the live unified Watchlist.
+
+    Legacy Radar and scanner feeds are fallbacks only. The current unified
+    Watchlist is the primary universe, so Sniper observes the same symbols
+    already enriched by the production discovery pipeline.
+    """
+    global _SNIPER_V2_SYMBOL_CURSOR
+    now = time.time()
+    candidates = {}
+
+    def add_candidate(raw_symbol, score=0.0):
+        if not raw_symbol:
+            return
+        exchange_symbol = roro_exchange_symbol(raw_symbol)
+        key = roro_canonical_symbol(exchange_symbol)
+        if not key:
+            return
+        try:
+            rank = float(score or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            rank = 0.0
+        current = candidates.get(key)
+        if current is None or rank > current[0]:
+            candidates[key] = (rank, exchange_symbol)
+
+    # Primary: active unified institutional Watchlist entries.
+    watchlist = MEMORY.get("watchlist", {})
+    if isinstance(watchlist, dict):
+        terminal_states = {
+            "REJECTED", "HARD_REJECT", "INVALIDATED", "EXPIRED",
+            "NO_DATA", "STALE", "ENTRY_WINDOW_MISSED",
+        }
+        for canonical, item in watchlist.items():
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("decision_state") or item.get("state") or "").upper()
+            if state in terminal_states:
+                continue
+            updated = safe_float(
+                item.get("last_update", item.get("last_updated", item.get("updated_at", 0.0))),
+                0.0,
+            )
+            # Ignore old residual Watchlist rows; fresh discovery refreshes these.
+            if updated > 0 and now - updated > 1800:
+                continue
+            raw = item.get("exchange_symbol") or item.get("symbol") or canonical
+            add_candidate(raw, item.get("score", item.get("discovery_score", 0.0)))
+
+    # Fallbacks keep the feature useful during Watchlist warm-up without
+    # introducing a new broad-market scan or extra exchange API fan-out.
+    fallback_feeds = (
+        MEMORY.get("radar_top5") or [],
+        MEMORY.get("radar_watchlist") or [],
+        MEMORY.get("scanner_v2_buy") or [],
+        MEMORY.get("scanner_v2_sell") or [],
+        MEMORY.get("rf_watchlist") or [],
+    )
+    if not candidates:
+        for feed in fallback_feeds:
+            for row in feed:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("exchange_symbol") or row.get("symbol")
+                add_candidate(raw, row.get("score", row.get("discovery_score", 0.0)))
+
+    ranked = [value[1] for _, value in sorted(
+        candidates.items(), key=lambda pair: pair[1][0], reverse=True
+    )]
+    if not ranked:
+        return []
+    batch_size = min(SNIPER_V2_MAX_SYMBOLS, len(ranked))
+    start = _SNIPER_V2_SYMBOL_CURSOR % len(ranked)
+    selected = [ranked[(start + offset) % len(ranked)] for offset in range(batch_size)]
+    _SNIPER_V2_SYMBOL_CURSOR = (start + batch_size) % len(ranked)
+    return selected
+
+
+def _sniper_v2_update_zone(symbol, closed):
+    """Create/update a persistent zone from closed candles; never places an order.
+
+    Lifecycle is deliberately explicit:
+      PIVOT_CONFIRMED -> WAIT_FOR_DEPARTURE -> WAIT_FOR_RETEST -> READY.
+    A candle that created/confirmed the pivot cannot also count as its retest.
+    """
+    key = roro_canonical_symbol(symbol)
+    if not key or closed is None or len(closed) < 80:
+        return None
+    try:
+        candle_ts = int(closed.timestamp.iloc[-1])
+        price = float(closed.close.iloc[-1])
+        previous_close = float(closed.close.iloc[-2])
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    if candle_ts <= 0 or not np.isfinite(price) or price <= 0:
+        return None
+    atr_series = compute_atr(closed, 14)
+    atr_value = float(atr_series.iloc[-1]) if len(atr_series) else float("nan")
+    if not np.isfinite(atr_value) or atr_value <= 0:
+        return None
+
+    zone = SNIPER_ZONES.get(key)
+    if isinstance(zone, dict):
+        # One transition pass per confirmed closed candle, not every 15-second scan.
+        last_processed_ts = int(zone.get("last_candle_ts", 0) or 0)
+        if candle_ts <= last_processed_ts:
+            return zone
+
+        zone["last_candle_ts"] = candle_ts
+        age = time.time() - float(zone.get("created_at", time.time()))
+        if age > SNIPER_V2_ZONE_MAX_AGE_SEC:
+            zone["state"] = "EXPIRED"
+
+        zone_type = str(zone.get("type", "")).upper()
+        zone_low = float(zone.get("low", 0.0))
+        zone_high = float(zone.get("high", 0.0))
+        if zone_type not in {"TOP", "BOTTOM"} or zone_low <= 0 or zone_high <= zone_low:
+            zone["state"] = "INVALIDATED"
+
+        if zone.get("state") == "WAIT":
+            if zone_type == "TOP":
+                if price > zone_high + atr_value * 0.20:
+                    zone["state"] = "INVALIDATED"
+                elif not zone.get("departed") and price < zone_low - atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} TOP departure confirmed; waiting for retest", "INFO")
+                elif (
+                    zone.get("departed")
+                    and int(zone.get("departure_candle_ts", 0)) < candle_ts
+                    and previous_close < zone_low
+                    and float(closed.high.iloc[-1]) >= zone_low
+                    and zone_low <= price <= zone_high
+                ):
+                    zone["state"] = "READY"
+                    zone["retest_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} TOP retest confirmed; state=READY", "INFO")
+            else:
+                if price < zone_low - atr_value * 0.20:
+                    zone["state"] = "INVALIDATED"
+                elif not zone.get("departed") and price > zone_high + atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} BOTTOM departure confirmed; waiting for retest", "INFO")
+                elif (
+                    zone.get("departed")
+                    and int(zone.get("departure_candle_ts", 0)) < candle_ts
+                    and previous_close > zone_high
+                    and float(closed.low.iloc[-1]) <= zone_high
+                    and zone_low <= price <= zone_high
+                ):
+                    zone["state"] = "READY"
+                    zone["retest_candle_ts"] = candle_ts
+                    log_execution(f"[SNIPER_V2] {key} BOTTOM retest confirmed; state=READY", "INFO")
+
+        elif zone.get("state") == "READY":
+            # Do not keep a stale retest authorization indefinitely.
+            retest_ts = int(zone.get("retest_candle_ts", 0) or 0)
+            max_age_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000 * SNIPER_V2_CONFIRMATION_WINDOW_BARS)
+            if retest_ts <= 0 or candle_ts - retest_ts > max_age_ms:
+                zone["state"] = "EXPIRED"
+            elif zone_type == "TOP" and price > zone_high + atr_value * 0.20:
+                zone["state"] = "INVALIDATED"
+            elif zone_type == "BOTTOM" and price < zone_low - atr_value * 0.20:
+                zone["state"] = "INVALIDATED"
+
+        if zone.get("state") in {"EXPIRED", "INVALIDATED", "USED", "NO_CHASE"}:
+            SNIPER_ZONES.pop(key, None)
+            zone = None
+        else:
+            return zone
+
+    if zone is None:
+        n = SNIPER_V2_PIVOT_LOOKBACK
+        if is_pivot_high(closed, n):
+            pivot_idx = len(closed) - n - 1
+            pivot_ts = int(closed.timestamp.iloc[pivot_idx])
+            if int(SNIPER_V2_LAST_PIVOT_TS.get(key, 0)) == pivot_ts:
+                return None
+            pivot_frame = closed.iloc[:pivot_idx + 1]
+            pivot_atr_series = compute_atr(pivot_frame, 14)
+            pivot_atr = float(pivot_atr_series.iloc[-1]) if len(pivot_atr_series) else float("nan")
+            strong, reasons = detect_strong_pivot(pivot_frame, "TOP", pivot_atr)
+            if strong and np.isfinite(pivot_atr) and pivot_atr > 0:
+                pivot_high = float(closed.high.iloc[pivot_idx])
+                zone = {
+                    "symbol": symbol, "canonical_symbol": key, "type": "TOP",
+                    "high": pivot_high, "low": pivot_high - pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH,
+                    "pivot_timestamp": pivot_ts,
+                    "created_at": time.time(), "last_candle_ts": candle_ts,
+                    "state": "WAIT", "departed": False, "reasons": reasons,
+                }
+                # Right-side closed candles may already have moved price away.
+                # Record the departure, but never mark READY on this same candle.
+                if price < float(zone["low"]) - atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+        elif is_pivot_low(closed, n):
+            pivot_idx = len(closed) - n - 1
+            pivot_ts = int(closed.timestamp.iloc[pivot_idx])
+            if int(SNIPER_V2_LAST_PIVOT_TS.get(key, 0)) == pivot_ts:
+                return None
+            pivot_frame = closed.iloc[:pivot_idx + 1]
+            pivot_atr_series = compute_atr(pivot_frame, 14)
+            pivot_atr = float(pivot_atr_series.iloc[-1]) if len(pivot_atr_series) else float("nan")
+            strong, reasons = detect_strong_pivot(pivot_frame, "BOTTOM", pivot_atr)
+            if strong and np.isfinite(pivot_atr) and pivot_atr > 0:
+                pivot_low = float(closed.low.iloc[pivot_idx])
+                zone = {
+                    "symbol": symbol, "canonical_symbol": key, "type": "BOTTOM",
+                    "high": pivot_low + pivot_atr * SNIPER_V2_ZONE_ATR_WIDTH, "low": pivot_low,
+                    "pivot_timestamp": pivot_ts,
+                    "created_at": time.time(), "last_candle_ts": candle_ts,
+                    "state": "WAIT", "departed": False, "reasons": reasons,
+                }
+                if price > float(zone["high"]) + atr_value * 0.50:
+                    zone["departed"] = True
+                    zone["departure_candle_ts"] = candle_ts
+
+        if zone:
+            SNIPER_V2_LAST_PIVOT_TS[key] = int(zone["pivot_timestamp"])
+            SNIPER_ZONES[key] = zone
+            log_execution(
+                f"[SNIPER_V2] {key} {zone['type']} zone created "
+                f"pivot_ts={zone['pivot_timestamp']} bounds={zone['low']:.12g}-{zone['high']:.12g} "
+                f"departed={bool(zone.get('departed'))}",
+                "INFO",
+            )
+    return zone
+
+
+def _sniper_v2_confirmation_due(zone, candle_ts):
+    """Require a later closed candle after the retest candle for confirmation."""
+    if not isinstance(zone, dict) or str(zone.get("state", "")).upper() != "READY":
+        return False
+    retest_ts = int(zone.get("retest_candle_ts", 0) or 0)
+    current_ts = int(candle_ts or 0)
+    if retest_ts <= 0 or current_ts <= retest_ts:
+        return False
+    max_age_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000 * SNIPER_V2_CONFIRMATION_WINDOW_BARS)
+    return (current_ts - retest_ts) <= max_age_ms
+
+
+def _sniper_v2_structural_stop(side, zone, atr_value, roro_stop):
+    """Keep the RORO stop at least as far beyond the pivot zone as configured."""
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"} or not isinstance(zone, dict):
+        raise ValueError("invalid Sniper V2 stop inputs")
+    atr = float(atr_value)
+    authority_stop = float(roro_stop)
+    zone_low = float(zone.get("low"))
+    zone_high = float(zone.get("high"))
+    if not all(np.isfinite(v) and v > 0 for v in (atr, authority_stop, zone_low, zone_high)):
+        raise ValueError("Sniper V2 stop inputs must be finite and positive")
+    if zone_high <= zone_low:
+        raise ValueError("Sniper V2 zone geometry is invalid")
+    buffer = atr * SNIPER_V2_SL_ATR_BUFFER
+    if direction == "SELL":
+        return max(authority_stop, zone_high + buffer)
+    return min(authority_stop, zone_low - buffer)
+
 
 def sniper_engine_v2():
-    symbols = [c["symbol"] for c in MEMORY.get("radar_top5", [])] if MEMORY.get("radar_top5") else get_usdt_perp_symbols()[:20]
-    for sym in symbols:
-        df = get_ohlcv_safe(sym, 150)
-        if df is None or not validate_dataframe(df, 100):
-            continue
-        price = df['close'].iloc[-1]
-        atr_val = compute_atr(df).iloc[-1]
-        df.symbol = sym
-        if sym not in SNIPER_ZONES or SNIPER_ZONES[sym]["state"] in ("IDLE", "EXPIRED"):
-            if is_pivot_high(df, lookback=3):
-                strong_top, reasons_top = detect_strong_pivot(df, "TOP", atr_val)
-                if strong_top:
-                    zone = {
-                        "type": "TOP",
-                        "price": df['high'].iloc[-1],
-                        "high": df['high'].iloc[-1],
-                        "low": df['high'].iloc[-1] - atr_val * 0.5,
-                        "time": time.time(),
-                        "state": "WAIT",
-                        "confirm_count": 0,
-                        "reasons": reasons_top
-                    }
-                    SNIPER_ZONES[sym] = zone
-                    log_execution(f"[SNIPER_V2] {sym} TOP zone created at {zone['price']:.4f} reasons={reasons_top}", "INFO")
-                    continue
-            if is_pivot_low(df, lookback=3):
-                strong_bottom, reasons_bottom = detect_strong_pivot(df, "BOTTOM", atr_val)
-                if strong_bottom:
-                    zone = {
-                        "type": "BOTTOM",
-                        "price": df['low'].iloc[-1],
-                        "low": df['low'].iloc[-1],
-                        "high": df['low'].iloc[-1] + atr_val * 0.5,
-                        "time": time.time(),
-                        "state": "WAIT",
-                        "confirm_count": 0,
-                        "reasons": reasons_bottom
-                    }
-                    SNIPER_ZONES[sym] = zone
-                    log_execution(f"[SNIPER_V2] {sym} BOTTOM zone created at {zone['price']:.4f} reasons={reasons_bottom}", "INFO")
-                    continue
-        if sym in SNIPER_ZONES:
-            zone = SNIPER_ZONES[sym]
-            if zone["state"] == "WAIT":
-                if zone["type"] == "TOP":
-                    if zone["low"] <= price <= zone["high"]:
-                        zone["state"] = "READY"
-                        log_execution(f"[SNIPER_V2] {sym} price returned to TOP zone, state -> READY", "INFO")
-                    elif price > zone["high"] + atr_val * 0.2:
-                        zone["state"] = "EXPIRED"
-                        log_execution(f"[SNIPER_V2] {sym} TOP zone expired (price too high)", "WARN")
-                else:
-                    if zone["low"] <= price <= zone["high"]:
-                        zone["state"] = "READY"
-                        log_execution(f"[SNIPER_V2] {sym} price returned to BOTTOM zone, state -> READY", "INFO")
-                    elif price < zone["low"] - atr_val * 0.2:
-                        zone["state"] = "EXPIRED"
-                        log_execution(f"[SNIPER_V2] {sym} BOTTOM zone expired (price too low)", "WARN")
+    """One bounded scan cycle; execution stays on the unified GGP/RORO path."""
+    if daily_loss_cooldown_active():
+        SNIPER_V2_METRICS["state"] = "PAUSED_DAILY_LOSS_COOLDOWN"
+        return False
+
+    if not SNIPER_V2_ENABLED:
+        SNIPER_V2_METRICS["state"] = "DISABLED"
+        return False
+    if (STATE.get("open") or TRADE_STATE.get("in_position")
+            or globals().get("RECOVERY_BLOCK_ENTRIES", False)
+            or MEMORY.get("position_status") == "UNKNOWN"):
+        SNIPER_V2_METRICS["state"] = "PAUSED_FOR_POSITION_OR_RECOVERY"
+        return False
+    if not _SNIPER_V2_LOCK.acquire(blocking=False):
+        return False
+    try:
+        symbols = _sniper_v2_symbols()
+        SNIPER_V2_METRICS.update({
+            "state": "RUNNING", "last_scan": time.time(), "symbols_scanned": 0,
+            "zones_waiting": 0, "zones_ready": 0, "last_error": None,
+        })
+        for symbol in symbols:
+            if STATE.get("open") or TRADE_STATE.get("in_position"):
+                break
+            raw_frame = _get_scanner_frame(symbol, 150)
+            if raw_frame is None or not validate_dataframe(raw_frame, 80):
                 continue
-            if zone["state"] == "READY":
-                confirmed, conf_count = check_sniper_confirmation(df, zone["type"])
-                if confirmed:
-                    side = "SELL" if zone["type"] == "TOP" else "BUY"
-                    ob = get_orderbook_cached(sym, limit=10)
-                    should_enter, classification, narrative = evaluate_with_narrative(sym, side, price, atr_val, df, ob, side)
-                    if not should_enter:
-                        continue
-                    sl = zone["high"] + atr_val * 0.4 if side == "SELL" else zone["low"] - atr_val * 0.4
-                    tp1 = price * (1 - 0.004) if side == "SELL" else price * (1 + 0.004)
-                    tp2 = price * (1 - 0.01) if side == "SELL" else price * (1 + 0.01)
-                    reason_str = f"SNIPER_V2 {zone['type']} conf={conf_count} reasons={zone.get('reasons', [])} | NARR={narrative['classification']}"
-                    ok = execute_entry(side, sym, price, sl, tp1, tp2, 9, reason_str, atr_val,
-                                       trade_type="SNIPER_V2", entry_type="STRONG_PIVOT", classification=classification)
-                    if ok:
-                        log_execution(f"[SNIPER_V2] {sym} {side} entry executed", "SUCCESS")
-                        zone["state"] = "USED"
-                        SNIPER_ZONES.pop(sym, None)
-                        return True
-                elif conf_count >= 1:
-                    continue
-                else:
-                    if time.time() - zone["time"] > 3600:
-                        zone["state"] = "EXPIRED"
-                        log_execution(f"[SNIPER_V2] {sym} zone expired after 1 hour", "WARN")
-                    continue
-            if zone["state"] == "EXPIRED":
-                SNIPER_ZONES.pop(sym, None)
-    return False
+            closed = roro_validate_closed_frame(
+                raw_frame, now_ms=int(time.time() * 1000),
+                timeframe_s=_roro_timeframe_seconds(INTERVAL),
+            )
+            if closed is None or len(closed) < 80:
+                continue
+            key = roro_canonical_symbol(symbol)
+            zone = _sniper_v2_update_zone(symbol, closed)
+            SNIPER_V2_METRICS["symbols_scanned"] += 1
+            if not isinstance(zone, dict):
+                continue
+            zone_state = str(zone.get("state", ""))
+            if zone_state == "WAIT":
+                SNIPER_V2_METRICS["zones_waiting"] += 1
+                continue
+            if zone_state != "READY":
+                continue
+            SNIPER_V2_METRICS["zones_ready"] += 1
+            candle_ts = int(closed.timestamp.iloc[-1])
+            if not _sniper_v2_confirmation_due(zone, candle_ts):
+                continue
+            if int(zone.get("confirmation_candle_ts", 0)) == candle_ts:
+                continue
+            # Mark before evaluation so a closed candle is evaluated once only.
+            zone["confirmation_candle_ts"] = candle_ts
+            confirmed, count = check_sniper_confirmation(closed, zone["type"], zone)
+            zone["confirmation_count"] = count
+            if not confirmed:
+                continue
+            side = "SELL" if zone["type"] == "TOP" else "BUY"
+            live_price = get_ticker_safe(symbol)
+            if not live_price or not np.isfinite(float(live_price)) or float(live_price) <= 0:
+                log_execution(f"[SNIPER_V2] {key} rejected: live_price_unavailable", "WARN")
+                continue
+            price = float(live_price)
+            atr_value = float(compute_atr(closed, 14).iloc[-1])
+            if not np.isfinite(atr_value) or atr_value <= 0:
+                continue
+            distance_atr = abs(price - float(closed.close.iloc[-1])) / atr_value
+            if distance_atr > SNIPER_V2_MAX_ENTRY_DISTANCE_ATR:
+                zone["state"] = "NO_CHASE"
+                zone["no_chase_reason"] = "live_price_too_far_from_closed_confirmation"
+                log_execution(f"[SNIPER_V2] {key} NO_CHASE distance_atr={distance_atr:.3f}", "WARN")
+                continue
+            authority = roro_analyze_symbol_both(
+                symbol, closed, now_ms=int(time.time() * 1000), side_hints=[side]
+            )
+            if authority.get("decision_state") != "ENTRY_READY" or str(authority.get("side")).upper() != side:
+                log_execution(
+                    f"[SNIPER_V2] {key} blocked by RORO authority: "
+                    f"{authority.get('decision_reason') or authority.get('rejection_reasons')}",
+                    "INFO",
+                )
+                continue
+            event_id = str(authority.get("event_id") or "")
+            evidence = list(authority.get("evidence") or [])
+            setup = str(authority.get("decision_setup_type") or authority.get("setup_type") or "").upper()
+            if not event_id or not setup or not evidence:
+                log_execution(f"[SNIPER_V2] {key} blocked: incomplete_RORO_authorization", "WARN")
+                continue
+            if INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
+                log_execution(f"[SNIPER_V2] {key} blocked: duplicate_RORO_event={event_id}", "WARN")
+                continue
+            if "REVERSAL" not in setup and setup != "FAILED_AUCTION_REVERSAL":
+                log_execution(f"[SNIPER_V2] {key} blocked: RORO_setup_not_reversal ({setup})", "INFO")
+                continue
+            structural_stop = authority.get("structural_stop")
+            if structural_stop is None or not np.isfinite(float(structural_stop)):
+                log_execution(f"[SNIPER_V2] {key} blocked: structural_stop_missing", "WARN")
+                continue
+            structural_stop = _sniper_v2_structural_stop(side, zone, atr_value, float(structural_stop))
+            if (side == "SELL" and structural_stop <= price) or (side == "BUY" and structural_stop >= price):
+                log_execution(f"[SNIPER_V2] {key} blocked: invalid_RORO_stop_geometry", "WARN")
+                continue
+            tp1_move, tp2_move = SNIPER_V2_TP1_MOVE_PCT / 100.0, SNIPER_V2_TP2_MOVE_PCT / 100.0
+            tp1 = price * (1.0 - tp1_move if side == "SELL" else 1.0 + tp1_move)
+            tp2 = price * (1.0 - tp2_move if side == "SELL" else 1.0 + tp2_move)
+            _INSTITUTIONAL_ENTRY_CONTEXT = {
+                "setup_type": setup, "event_id": event_id, "evidence": evidence,
+                "structural_stop": structural_stop, "pullback_type": "SNIPER_ZONE_RETEST",
+                "trading_mode": "SNIPER",
+                "entry_behavior": "RETEST",
+                "entry_zone_low": safe_float(zone.get("low"), 0.0),
+                "entry_zone_high": safe_float(zone.get("high"), 0.0),
+                "entry_behavior_confidence": 0.88,
+                "entry_behavior_reasons": ["sniper_pivot_retest", "liquidity_mss_confirmed"],
+                "market_intelligence": {
+                    "mode": "SNIPER", "entry_behavior": "RETEST",
+                    "reference_low": safe_float(zone.get("low"), 0.0),
+                    "reference_high": safe_float(zone.get("high"), 0.0),
+                    "zone_side": side,
+                },
+                "exchange_symbol": symbol, "sniper_v2": True,
+                "capital_allocation_tier": "STANDARD_20_PERCENT",
+                "sizing_eligible_strong": False, "sizing_balance_basis": "WALLET_TOTAL",
+                "candle_timeframe": str(INTERVAL),
+                "closed_candle_frame": closed.copy(),
+                "closed_candle_source": "SNIPER_V2_CONFIRMED_FRAME",
+                "closed_candle_timestamp": int(closed["timestamp"].iloc[-1]),
+            }
+            try:
+                ok = execute_entry(
+                    side, symbol, price, structural_stop, float(tp1), float(tp2), 9.0,
+                    f"SNIPER_V2 {zone['type']} PIVOT_RETEST confirmation={count} "
+                    f"zone={zone['low']:.12g}-{zone['high']:.12g} RORO={setup}",
+                    atr_value, trade_type="SNIPER_V2", entry_type="SNIPER_V2",
+                    classification="SNIPER_V2",
+                )
+            finally:
+                _INSTITUTIONAL_ENTRY_CONTEXT = None
+            if ok:
+                zone["state"] = "USED"
+                SNIPER_ZONES.pop(key, None)
+                SNIPER_V2_METRICS["entries"] += 1
+                if INSTITUTIONAL_TRADE_JOURNAL:
+                    _persist_trade_journal_start(setup, authority)
+                    trade_id = str(STATE.get("trade_id") or "")
+                    if trade_id:
+                        INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
+                RORO_ENTRY_AUTHORITY.consume(event_id)
+                log_execution(
+                    f"[SNIPER_V2] EXECUTED {side} {symbol} event={event_id} "
+                    f"margin_target=20% wallet leverage={LEVERAGE}x TP1=0.4% TP2=1.0%",
+                    "SUCCESS",
+                )
+                return True
+        SNIPER_V2_METRICS["state"] = "IDLE"
+        return False
+    except Exception as exc:
+        SNIPER_V2_METRICS.update({
+            "state": "ERROR", "last_error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        })
+        log_execution(f"[SNIPER_V2] scan failed: {type(exc).__name__}: {exc}", "ERROR")
+        return False
+    finally:
+        _SNIPER_V2_LOCK.release()
+
+
+def _run_sniper_scan_if_due():
+    """Run synchronously inside the supervisor; avoid racing the other entry path."""
+    global _SNIPER_V2_LAST_SCAN
+    if not SNIPER_V2_ENABLED:
+        return False
+    now = time.time()
+    if now - _SNIPER_V2_LAST_SCAN < SNIPER_V2_SCAN_INTERVAL:
+        return False
+    _SNIPER_V2_LAST_SCAN = now
+    return sniper_engine_v2()
+
 
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
 def update_institutional_flow_scanner():
@@ -8911,6 +10790,13 @@ def main_loop_sniper():
         try:
             now = time.time()
             sync_all_states()
+            cooldown_active_now = daily_loss_cooldown_active()
+            if cooldown_active_now and not (STATE.get("open") or TRADE_STATE.get("in_position")):
+                # Keep the normal bounded TTL/resource cleanup alive while entry scanning is paused.
+                # Do not force full GC on every one-second cooldown poll.
+                hourly_cleanup()
+                time.sleep(1)
+                continue
 
             if now - last_flow_update > 60:
                 update_institutional_flow_scanner()
@@ -8943,6 +10829,9 @@ def main_loop_sniper():
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
                         smart_opportunity_selection()
                         last_candidate_scan = now
+                    # Sniper is an entry-only candidate engine; it never runs while
+                    # a position is open and uses the same bounded scanner cache.
+                    _run_sniper_scan_if_due()
                     time.sleep(1)
                 else:
                     time.sleep(1)
@@ -8958,21 +10847,9 @@ def main_loop_sniper():
                         scaling_logic(sym, df, None)
                         current_pnl = STATE.get("roe_pct", 0.0)
                         update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
-            if emergency_kill_switch_active():
-                if STATE.get("open"):
-                    closed = close_position_full(close_reason="EMERGENCY_KILL_SWITCH")
-                    if not closed:
-                        RECOVERY_BLOCK_ENTRIES = True
-                        log_execution("[KILL_SWITCH] Close not verified; preserving the open position state and retrying reconciliation", "ERROR")
-                        try:
-                            sync_position_state(STATE.get("current_symbol"))
-                        except Exception as exc:
-                            log_execution(f"[KILL_SWITCH] position reconciliation failed: {exc}", "ERROR")
-                    else:
-                        clear_position_dashboard()
-                        TRADE_STATE["in_position"] = False
-                time.sleep(5 if STATE.get("open") else 30)
-                continue
+            # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
+            # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
+            daily_loss_cooldown_active()
             print_snapshot()
             hourly_cleanup()
             time.sleep(BASE_SLEEP)
@@ -8990,7 +10867,7 @@ def safe_main_loop():
             log_execution(f"CRITICAL EXCEPTION: {traceback.format_exc()}", "ERROR")
             time.sleep(5)
 
-# ========== RORO -> GGP INSTITUTIONAL INTEGRATION ========== 
+# ========== RORO -> GGP INSTITUTIONAL INTEGRATION ==========
 # The bridge is deliberately appended so legacy GGP callers remain compatible.
 from ggp_institutional_bridge import (
     update_unified_watchlist, analyze_symbol as roro_analyze_symbol,
@@ -9000,8 +10877,9 @@ from ggp_institutional_bridge import (
     merge_candidates as roro_merge_candidates, AUTHORITY as RORO_ENTRY_AUTHORITY,
 )
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
-from roro_confluence import ema9_vwap_proximity as _roro_ema9_vwap_proximity, timeframe_seconds as _roro_timeframe_seconds
-from unified_ema_vwap_strategy import UnifiedEMAVWAPPullbackEngine, execution_handoff_allowed
+from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
+                             validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
     from roro_trade_journal import TradeJournal
@@ -9012,18 +10890,135 @@ except Exception as _integration_init_error:
     INSTITUTIONAL_TRADE_JOURNAL = None
     log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
 
+# Daily drawdown pause: separate from trade lifecycle and persisted independently.
+LOSS_COOLDOWN_SECONDS = _env_int_range("LOSS_COOLDOWN_SECONDS", 600, 60, 3600)
+_LOSS_COOLDOWN_LOCK = threading.RLock()
+_LOSS_COOLDOWN_STATE_KEY = "daily_drawdown_cooldown_v1"
+_LOSS_COOLDOWN_STATE = {"until": 0.0, "triggered_at": 0.0, "trigger_balance": None,
+                        "utc_day": None, "peak_balance": None, "trigger_count": 0}
+_LOSS_COOLDOWN_STORE_READY = False
+
+
+def _persist_loss_cooldown_state():
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None:
+        raise RuntimeError("trade journal unavailable; loss cooldown cannot be persisted")
+    journal.set_runtime_state(_LOSS_COOLDOWN_STATE_KEY, dict(_LOSS_COOLDOWN_STATE))
+
+
+def _load_loss_cooldown_state():
+    global _LOSS_COOLDOWN_STORE_READY
+    with _LOSS_COOLDOWN_LOCK:
+        if _LOSS_COOLDOWN_STORE_READY:
+            return True
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if journal is None:
+            STATE["loss_cooldown_persistence_failed"] = True
+            return False
+        try:
+            saved = journal.get_runtime_state(_LOSS_COOLDOWN_STATE_KEY, {})
+            if isinstance(saved, dict):
+                for key in _LOSS_COOLDOWN_STATE:
+                    if key in saved:
+                        _LOSS_COOLDOWN_STATE[key] = saved[key]
+            _LOSS_COOLDOWN_STORE_READY = True
+            STATE["daily_peak_balance"] = _LOSS_COOLDOWN_STATE.get("peak_balance")
+            STATE["last_trade_day"] = _LOSS_COOLDOWN_STATE.get("utc_day")
+            STATE["loss_cooldown_until"] = float(_LOSS_COOLDOWN_STATE.get("until") or 0.0)
+            return True
+        except Exception as exc:
+            STATE["loss_cooldown_persistence_failed"] = True
+            log_execution(f"[LOSS_COOLDOWN] persisted state load failed; entries fail-closed: {exc}", "ERROR")
+            return False
+
+
+def _loss_cooldown_readiness():
+    if STATE.get("open") or TRADE_STATE.get("in_position"):
+        return False, "POSITION_STILL_OPEN"
+    if STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required"):
+        return False, "EXECUTION_UNRESOLVED"
+    if STATE.get("recovery_hold") or globals().get("RECOVERY_BLOCK_ENTRIES", False):
+        return False, "RECOVERY_HOLD"
+    if MEMORY.get("position_status") not in {"FLAT", "CLOSED", "PAPER_RECONCILED_FLAT", "RECONCILED_FLAT"}:
+        return False, f"POSITION_STATUS_{MEMORY.get('position_status', 'UNKNOWN')}"
+    return True, "READY"
+
+
+def daily_loss_cooldown_active():
+    """Pause new entries after a 5% balance drawdown; never liquidate an open trade."""
+    now = time.time()
+    if not _load_loss_cooldown_state():
+        return True
+    with _LOSS_COOLDOWN_LOCK:
+        until = float(_LOSS_COOLDOWN_STATE.get("until") or 0.0)
+        if now < until:
+            return True
+        if until > 0:
+            ready, reason = _loss_cooldown_readiness()
+            if not ready:
+                log_execution(f"[LOSS_COOLDOWN] elapsed; entries remain blocked: {reason}", "WARN",
+                              debounce_key=f"loss_cooldown_readiness:{reason}", debounce_sec=30)
+                return True
+            bal = get_balance_safe()
+            if not bal or not math.isfinite(float(bal)) or float(bal) <= 0:
+                log_execution("[LOSS_COOLDOWN] cannot rebase: exchange balance unavailable; entries remain blocked", "ERROR")
+                return True
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            _LOSS_COOLDOWN_STATE.update({"until": 0.0, "peak_balance": float(bal),
+                                         "utc_day": today, "trigger_balance": None})
+            STATE.update({"loss_cooldown_until": 0.0, "daily_peak_balance": float(bal),
+                          "last_trade_day": today, "daily_loss_limit_hit": False})
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] rebase persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
+            log_execution(f"[LOSS_COOLDOWN] pause complete; new drawdown reference={float(bal):.4f} USDT", "SUCCESS")
+        bal = get_balance_safe()
+        if not bal or not math.isfinite(float(bal)) or float(bal) <= 0:
+            log_execution("[LOSS_COOLDOWN] balance unavailable; no new entries authorized", "WARN",
+                          debounce_key="loss_cooldown_balance_unavailable", debounce_sec=30)
+            return True
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        state_changed = False
+        if _LOSS_COOLDOWN_STATE.get("utc_day") != today or not _LOSS_COOLDOWN_STATE.get("peak_balance"):
+            _LOSS_COOLDOWN_STATE.update({"utc_day": today, "peak_balance": float(bal)})
+            state_changed = True
+        elif float(bal) > float(_LOSS_COOLDOWN_STATE["peak_balance"]):
+            _LOSS_COOLDOWN_STATE["peak_balance"] = float(bal)
+            state_changed = True
+        peak = float(_LOSS_COOLDOWN_STATE.get("peak_balance") or bal)
+        loss_pct = max(0.0, (peak - float(bal)) / peak * 100.0) if peak > 0 else 0.0
+        STATE["daily_peak_balance"] = peak
+        STATE["last_trade_day"] = today
+        if state_changed:
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] state persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
+        if loss_pct >= MAX_DAILY_LOSS_PCT:
+            until = now + LOSS_COOLDOWN_SECONDS
+            _LOSS_COOLDOWN_STATE.update({"until": until, "triggered_at": now,
+                "trigger_balance": float(bal), "utc_day": today,
+                "trigger_count": int(_LOSS_COOLDOWN_STATE.get("trigger_count") or 0) + 1})
+            STATE["loss_cooldown_until"] = until
+            try:
+                _persist_loss_cooldown_state()
+            except Exception as exc:
+                STATE["loss_cooldown_persistence_failed"] = True
+                log_execution(f"[LOSS_COOLDOWN] trigger persistence failed; entries fail-closed: {exc}", "ERROR")
+                return True
+            log_execution(f"[LOSS_COOLDOWN] drawdown={loss_pct:.2f}% reached {MAX_DAILY_LOSS_PCT:.2f}%; "
+                f"new entries paused for {LOSS_COOLDOWN_SECONDS // 60} minutes; open trade management remains active", "ERROR")
+            return True
+        return False
+
+
 def _integration_fetch_frame(symbol):
-    # Reuse the scanner snapshot cache; strategy/watchlist refresh must not
-    # issue a second OHLCV request for a symbol already fetched this cycle.
     return _get_scanner_frame(roro_exchange_symbol(symbol), 150)
-def _peek_scanner_frame(symbol):
-    """Return a fresh scanner cache entry without issuing an exchange request."""
-    key = str(symbol)
-    with _SCANNER_FRAME_CACHE_LOCK:
-        item = _SCANNER_FRAME_CACHE.get(key)
-        if item and time.monotonic() - item[0] < _SCANNER_FRAME_CACHE_TTL:
-            return item[1].copy()
-    return None
 
 # Per-symbol stateful trend/context engines. Keeping these instances separate avoids
 # one asset's trend state leaking into another asset's Watchlist decision.
@@ -9064,9 +11059,25 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                 if last_seen.get(symbol_key) != candle_ts:
                     MEMORY["_proximity_batch_updates"] = int(MEMORY.get("_proximity_batch_updates", 0)) + 1
                     last_seen[symbol_key] = candle_ts
+                    _observed_at = time.time()
+                    _proximity_frame_seconds = float(timeframe_seconds)
+                    _proximity_cross_event = bool(proximity.get("cross_ema9") or proximity.get("cross_ema50"))
+                    _proximity_cross_age = (
+                        max(0.0, _observed_at - (float(proximity.get("candle_timestamp") or 0) / 1000.0
+                                                 + _proximity_frame_seconds))
+                        if _proximity_cross_event else None
+                    )
+                    _proximity_cross_max_age = 2.0 * _proximity_frame_seconds
                     proximity_item = {
                         "symbol": symbol_key, "exchange_symbol": roro_exchange_symbol(symbol_for_proximity),
-                        **proximity, "updated_at": time.time(), "data_quality": "CLOSED_CANDLES",
+                        **proximity,
+                        "updated_at": _observed_at,
+                        "observation_age_seconds": 0.0,
+                        "timeframe_seconds": _proximity_frame_seconds,
+                        "cross_age_seconds": _proximity_cross_age,
+                        "cross_max_age_seconds": _proximity_cross_max_age,
+                        "cross_fresh": bool(_proximity_cross_event and _proximity_cross_age <= _proximity_cross_max_age),
+                        "data_quality": "CLOSED_CANDLES",
                         "role": "RANKING_ONLY_NOT_ENTRY_GATE",
                     }
                     rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
@@ -9076,7 +11087,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
-                icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross") else
+                icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
                                                 "🟡" if proximity.get("state") in ("NEAR_CROSS", "CONVERGING") else
                                                 "📈" if proximity.get("direction") == "BUY" else
                                                 "📉" if proximity.get("direction") == "SELL" else "⚪")
@@ -9115,7 +11126,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
         if advance_state:
             state_machine.update(
                 smart, momentum, float(adx_state.get("value", 0) or 0),
-                str(analysis.get("market_regime", "UNKNOWN"))
+                str(analysis.get("market_regime", "UNKNOWN")), side=side
             )
             engine_last[symbol_key] = candle_ts
         result["trade_state"] = state_machine.current_state
@@ -9129,52 +11140,6 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
     except Exception as exc:
         result["gpp_engine_diagnostics"] = {"status": "PARTIAL", "reason": f"{type(exc).__name__}:{str(exc)[:120]}"}
     return result
-
-_EMA_VWAP_SETUP_PATH = os.path.join(ENV_DIR, "data", "unified_ema_vwap_watchlist.json")
-EMA_VWAP_ENTRY_ENGINE = UnifiedEMAVWAPPullbackEngine(
-    _EMA_VWAP_SETUP_PATH, timeframe_s=_roro_timeframe_seconds(INTERVAL)
-)
-
-def _refresh_ema_vwap_setups(watchlist):
-    """Advance persistent strategy states using cached, confirmed OHLCV only."""
-    if not isinstance(watchlist, dict):
-        return
-    # Bounded work; the existing watchlist rotation and scanner cadence remain intact.
-    limit = max(1, int(INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS))
-    for canonical, item in list(watchlist.items())[:limit]:
-        if not isinstance(item, dict):
-            continue
-        exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
-        try:
-            frame = _peek_scanner_frame(roro_exchange_symbol(exchange_sym))
-            if frame is None:
-                item["institutional_decision_state"] = item.get("decision_state")
-                item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION", "reason": "awaiting_fresh_scanner_cache"}
-                item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
-                item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-                item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
-                continue
-            closed = roro_validate_closed_frame(
-                frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
-            )
-            result = EMA_VWAP_ENTRY_ENGINE.evaluate(
-                str(canonical), closed, now_ms=int(time.time() * 1000)
-            )
-            # Preserve the institutional engine's opinion for diagnostics, but
-            # expose only the EMA/VWAP lifecycle as the canonical entry state.
-            if "decision_state" in item:
-                item["institutional_decision_state"] = item.get("decision_state")
-            item["ema_vwap_strategy"] = result
-            item["strategy_status"] = result.get("status", "UNKNOWN")
-            item["decision_state"] = result.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
-        except Exception as exc:
-            item["institutional_decision_state"] = item.get("decision_state")
-            item["ema_vwap_strategy"] = {"status": "WAITING_FOR_CONFIRMATION",
-                                           "reason": f"strategy_error:{type(exc).__name__}"}
-            item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
-            item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
 
 _last_unified_watchlist_refresh = 0.0
 def refresh_unified_institutional_watchlist(force=False):
@@ -9190,7 +11155,6 @@ def refresh_unified_institutional_watchlist(force=False):
             batch_size=INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
             enrich=_enrich_with_existing_gpp_engines
         )
-        _refresh_ema_vwap_setups(MEMORY.setdefault("watchlist", {}))
         proximity_meta = MEMORY.setdefault("ema9_vwap_proximity_scanner_meta", {})
         proximity_meta.update({
             "observed_this_batch": int(MEMORY.get("_proximity_batch_updates", 0)),
@@ -9201,12 +11165,17 @@ def refresh_unified_institutional_watchlist(force=False):
             "closed_candles_only": True,
         })
         _last_unified_watchlist_refresh = now
+        MEMORY["_unified_watchlist_refresh_ok"] = True
         if INSTITUTIONAL_RESOURCE_MANAGER:
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
         return result
     except Exception as exc:
-        log_execution(f"[INTEGRATION] watchlist refresh failed: {exc}", "ERROR")
+        MEMORY["_unified_watchlist_refresh_ok"] = False
+        log_execution(
+            f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\\n{traceback.format_exc()}",
+            "ERROR",
+        )
         return MEMORY.setdefault("watchlist", {})
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None, source="ggp"):
@@ -9245,32 +11214,82 @@ RECOVERY_BLOCK_ENTRIES = False
 def smart_opportunity_selection():
     """Unified Watchlist -> institutional engines -> one existing GGP execution path."""
     global _INSTITUTIONAL_ENTRY_CONTEXT
-    refresh_unified_institutional_watchlist()
+    # Hard exposure/recovery gates run before any balance or market-data read so
+    # an unresolved exchange state can never trigger an unnecessary API call.
     if STATE.get("open") or TRADE_STATE.get("in_position"):
         return False
     if globals().get("RECOVERY_BLOCK_ENTRIES", False) or MEMORY.get("position_status") == "UNKNOWN":
         log_execution("[ENTRY_GUARD] Exchange recovery is unresolved; new entries blocked", "WARN")
         return False
+    if daily_loss_cooldown_active():
+        return False
+    refresh_unified_institutional_watchlist()
+    # Never authorize a new entry from a stale Watchlist after an integration failure.
+    # Existing position management runs in its independent lifecycle and is unaffected.
+    if MEMORY.get("_unified_watchlist_refresh_ok") is False:
+        log_execution("[ENTRY_GUARD] unified Watchlist refresh failed; stale candidates cannot authorize entries", "WARN")
+        return False
 
     watchlist = MEMORY.get("watchlist", {})
-    # EMA/VWAP closed-candle lifecycle is the sole entry decision authority.
-    # Institutional analysis supplies structural context and risk levels only.
-    ready = []
-    for sym, item in watchlist.items():
-        if not isinstance(item, dict):
-            continue
-        strategy_state = item.get("ema_vwap_strategy") or {}
-        if strategy_state.get("status") == "ENTRY_READY" and strategy_state.get("direction") in ("BUY", "SELL"):
-            ready.append((sym, item))
-    ready.sort(key=lambda pair: float(pair[1].get("score", pair[1].get("discovery_score", 0)) or 0), reverse=True)
+    ready = [(sym, item) for sym, item in watchlist.items()
+             if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
+    def _location_first_rank(pair):
+        _, candidate = pair
+        side_value = str(candidate.get("side") or "").upper()
+        price_value = safe_float(candidate.get("price"), 0.0)
+        market_intel = candidate.get("market_intelligence") if isinstance(candidate.get("market_intelligence"), dict) else {}
+        atr_value = safe_float(candidate.get("atr"), 0.0)
+        if atr_value <= 0 and price_value > 0:
+            # The bridge exposes ATR as a percentage in its internal intelligence
+            # snapshot; convert it only for ranking, never for entry authorization.
+            atr_pct = safe_float(market_intel.get("volatility_atr"), 0.0)
+            atr_value = price_value * atr_pct / 100.0 if atr_pct > 0 else 0.0
+        distances = []
+        ob = candidate.get("order_block")
+        if isinstance(ob, dict) and ob.get("valid", True):
+            try:
+                distance = float(ob.get("distance_atr"))
+                if math.isfinite(distance) and distance >= 0 and float(ob.get("strength", 0) or 0) >= 5.0:
+                    distances.append(distance)
+            except (TypeError, ValueError):
+                pass
+        fvg = candidate.get("fvg")
+        if isinstance(fvg, dict):
+            try:
+                expected = "BULLISH" if side_value == "BUY" else "BEARISH"
+                low, high = float(fvg.get("lower")), float(fvg.get("upper"))
+                if (str(fvg.get("direction") or "").upper() == expected
+                        and str(fvg.get("status") or "").upper() in ("UNFILLED", "PARTIALLY_FILLED")
+                        and float(fvg.get("size_atr", 0) or 0) >= 0.08
+                        and atr_value > 0 and price_value > 0 and 0 < low < high):
+                    distances.append(max(low - price_value, 0.0, price_value - high) / atr_value)
+            except (TypeError, ValueError):
+                pass
+        sr = candidate.get("support_resistance")
+        if isinstance(sr, dict):
+            key = "supports" if side_value == "BUY" else "resistances"
+            for zone in sr.get(key, []):
+                if not isinstance(zone, dict) or str(zone.get("status") or "").upper() != "CONFIRMED":
+                    continue
+                try:
+                    distance = float(zone.get("distance_atr"))
+                    if math.isfinite(distance) and distance >= 0 and float(zone.get("strength", 0) or 0) >= 5.0:
+                        distances.append(distance)
+                except (TypeError, ValueError):
+                    continue
+        golden = candidate.get("golden_zone") if isinstance(candidate.get("golden_zone"), dict) else {}
+        location_distance = min(distances) if distances else 999.0
+        location_quality = float(golden.get("score", 0) or 0)
+        score = float(candidate.get("score", candidate.get("discovery_score", 0)) or 0)
+        # Location proximity and quality lead; score is only the final tie-breaker.
+        return (location_distance <= 1.5, -location_distance, location_quality, score)
+
+    ready.sort(key=_location_first_rank, reverse=True)
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
-            strategy_snapshot = item.get("ema_vwap_strategy") or {}
-            side = str(strategy_snapshot.get("direction") or "").upper()
+            side = str(item.get("side", "")).upper()
             if side not in ("BUY", "SELL"):
-                item["entry_status"] = "BLOCKED"
-                item["rejection_reason"] = "ema_vwap_direction_unavailable"
                 continue
             exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
             df = _integration_fetch_frame(exchange_sym)
@@ -9285,27 +11304,29 @@ def smart_opportunity_selection():
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "insufficient_fresh_closed_ohlcv"
                 continue
-            # Evaluate both institutional sides independently for structural context.
-            # Neither side result can override or veto the EMA/VWAP direction.
+            # Re-evaluate BUY and SELL independently immediately before authorization.
+            # RF/V2 direction is only a tie-break hint and can never suppress the other side.
             fresh = roro_analyze_symbol_both(
                 exchange_sym, closed_df,
                 now_ms=int(time.time() * 1000),
-                side_hints=["BUY", "SELL"],
+                side_hints=item.get("side_hints") or [side],
             )
-            fresh.update(_enrich_with_existing_gpp_engines(closed_df, side, fresh))
-            institutional_state = fresh.get("decision_state")
+            fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
             item.update(fresh)
-            item["institutional_decision_state"] = institutional_state
-            # A fresh institutional ENTRY_READY must never overwrite a stale or
-            # invalidated EMA/VWAP setup. The strategy engine owns entry direction/state.
-            item["ema_vwap_strategy"] = strategy_snapshot
-            item["strategy_status"] = strategy_snapshot.get("status", "UNKNOWN")
-            item["decision_state"] = strategy_snapshot.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
             item["source"] = item.get("source") or "unified_watchlist"
-            item["side"] = side
+            if item.get("decision_state") != "ENTRY_READY":
+                continue
+            side = str(item.get("side", "")).upper()
+            if side not in ("BUY", "SELL"):
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "no_unambiguous_authorized_side"
+                continue
             event_id = str(item.get("event_id") or "")
-            if event_id and INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
+            if not event_id:
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "missing_event_id"
+                continue
+            if INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "duplicate_event_persisted"
                 continue
@@ -9316,102 +11337,101 @@ def smart_opportunity_selection():
                 continue
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
-            setup = str(item.get("decision_setup_type") or item.get("setup_type") or "EMA_VWAP_CAUSAL_ZONE").upper()
+
+            # Final no-chase check uses the latest execution reference price.
+            # The exact same authority used by RORO analysis validates the zone again.
+            latest_closed_ts = int(closed_df["timestamp"].iloc[-1])
+            timeframe_ms = int(_roro_timeframe_seconds(INTERVAL) * 1000)
+            location_candidates = []
+            ob_for_location = item.get("order_block")
+            if isinstance(ob_for_location, dict):
+                ob_zone = dict(ob_for_location)
+                ob_zone.update({
+                    "kind": "ORDER_BLOCK",
+                    "available_timestamp": ob_zone.get("impulse_timestamp", ob_zone.get("timestamp")),
+                })
+                location_candidates.append(ob_zone)
+            fvg_for_location = item.get("fvg")
+            if isinstance(fvg_for_location, dict):
+                fvg_zone = dict(fvg_for_location)
+                fvg_zone.update({"kind": "FVG", "low": fvg_zone.get("lower"),
+                                 "high": fvg_zone.get("upper"),
+                                 "available_timestamp": fvg_zone.get("timestamp")})
+                location_candidates.append(fvg_zone)
+            sr_for_location = item.get("support_resistance")
+            if isinstance(sr_for_location, dict):
+                sr_key = "supports" if side == "BUY" else "resistances"
+                for sr_zone in sr_for_location.get(sr_key, []):
+                    if isinstance(sr_zone, dict):
+                        sr_candidate = dict(sr_zone)
+                        sr_candidate.update({
+                            "kind": "SUPPORT" if side == "BUY" else "RESISTANCE",
+                            "available_timestamp": sr_candidate.get("confirmed_at_timestamp"),
+                        })
+                        location_candidates.append(sr_candidate)
+            location_checks = [
+                validate_location_zone(
+                    zone, side, price, float(atr_value), latest_closed_ts, timeframe_ms,
+                    max_age_bars=48, max_distance_atr=1.5,
+                )
+                for zone in location_candidates
+            ]
+            actionable_locations = [check for check in location_checks if check.get("valid")]
+            if not actionable_locations:
+                item["decision_state"] = "NO_CHASE"
+                item["rejection_reason"] = "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE"
+                log_execution(
+                    f"[LOCATION_FIRST] {exchange_sym} {side} blocked: no actionable zone within 1.5 ATR at execution price",
+                    "WARN",
+                )
+                continue
+
+            setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
+            if not ("REVERSAL" in setup or "CONTINUATION" in setup):
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "unsupported_setup_type"
+                continue
             classification = "REVERSAL" if "REVERSAL" in setup else "TREND"
-            # Stop is anchored to the same causal zone that produced the retest.
-            # An institutional stop may be reused only when it is beyond that zone.
-            setup_obj = EMA_VWAP_ENTRY_ENGINE.get(canonical)
-            if not setup_obj or not all(np.isfinite(float(v)) for v in (
-                    setup_obj.causal_zone_low, setup_obj.causal_zone_high, atr_value)):
+            sl = item.get("structural_stop")
+            if sl is None or not np.isfinite(float(sl)) or float(sl) <= 0:
                 item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "causal_zone_missing_for_stop"
+                item["rejection_reason"] = "structural_stop_missing"
                 continue
-            zone_low, zone_high = float(setup_obj.causal_zone_low), float(setup_obj.causal_zone_high)
-            buffer = 0.15 * float(atr_value)
-            proposed_sl = zone_low - buffer if side == "BUY" else zone_high + buffer
-            institutional_sl = item.get("structural_stop")
-            if institutional_sl is not None and np.isfinite(float(institutional_sl)):
-                candidate_sl = float(institutional_sl)
-                if (side == "BUY" and candidate_sl < zone_low) or (side == "SELL" and candidate_sl > zone_high):
-                    proposed_sl = candidate_sl
-            sl = proposed_sl
-            if not np.isfinite(sl) or sl <= 0 or (side == "BUY" and sl >= price) or (side == "SELL" and sl <= price):
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "causal_zone_stop_geometry_invalid"
-                continue
-            _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
-            # Use chart-derived directional liquidity to refine trend targets only.
-            # The causal-zone structural SL is never changed by target planning.
-            target_liquidity_levels = []
-            try:
-                liquidity_pools = build_liquidity_pools(closed_df)
-                if isinstance(liquidity_pools, dict):
-                    key = "high_pools" if side == "BUY" else "low_pools"
-                    for raw_level in liquidity_pools.get(key, []) or []:
-                        level = float(raw_level)
-                        if np.isfinite(level) and ((side == "BUY" and level > price) or (side == "SELL" and level < price)):
-                            target_liquidity_levels.append(level)
-            except Exception as target_pool_exc:
-                log_execution(f"[TARGET_LIQUIDITY] {canonical}: {type(target_pool_exc).__name__}", "WARN")
-            if classification in {"TREND", "EARLY_TREND"} and target_liquidity_levels:
-                try:
-                    from ggp_profit_brain import plan_trend_targets
-                    planned_tp1, planned_tp2, plan_reason = plan_trend_targets(
-                        side, price, float(atr_value), target_liquidity_levels,
-                        target1_atr=1.0, target2_price_move_pct=2.0,
-                        min_target2_atr=1.5, pool_buffer_atr=0.10)
-                    directionally_valid = (
-                        planned_tp1 > price and planned_tp2 > planned_tp1 if side == "BUY"
-                        else planned_tp1 < price and planned_tp2 < planned_tp1
-                    )
-                    if directionally_valid:
-                        tp1, tp2 = planned_tp1, planned_tp2
-                        item["profit_target_plan"] = plan_reason
-                    else:
-                        item["profit_target_plan"] = "existing_compute_sl_tp_fallback:" + plan_reason
-                except Exception as target_plan_exc:
-                    item["profit_target_plan"] = f"existing_compute_sl_tp_fallback:{type(target_plan_exc).__name__}"
+            _, tp1, tp2 = compute_sl_tp(
+                price, side, classification, float(atr_value), closed_df, symbol=exchange_sym
+            )
             if not (tp1 and tp2 and np.isfinite(float(tp1)) and np.isfinite(float(tp2))):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "profit_targets_invalid"
                 continue
-            strategy_gate = EMA_VWAP_ENTRY_ENGINE.authorize(canonical, price, float(tp1))
-            item["ema_vwap_strategy"] = {**(item.get("ema_vwap_strategy") or {}), **strategy_gate}
-            item["strategy_status"] = strategy_gate.get("status", "UNKNOWN")
-            item["decision_state"] = strategy_gate.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
-            if not strategy_gate.get("allowed"):
-                item["decision_state"] = strategy_gate.get("status") or "WAITING_FOR_CONFIRMATION"
-                item["rejection_reason"] = "ema_vwap_strategy:" + str(strategy_gate.get("reason", "not_authorized"))
-                continue
-            if EMA_VWAP_ENTRY_ENGINE.get(canonical) and EMA_VWAP_ENTRY_ENGINE.get(canonical).direction != side:
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "ema_vwap_strategy_direction_mismatch"
-                continue
             evidence = list(item.get("evidence") or [])
+            market_intelligence = item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {}
+
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
-                "event_id": event_id or None,
-                "causal_zone_type": setup_obj.causal_zone_type,
-                "causal_zone_low": zone_low,
-                "causal_zone_high": zone_high,
-                "causal_zone_ts": setup_obj.causal_zone_ts,
+                "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
-                "pullback_type": str(getattr(setup_obj, "entry_path", None) or getattr(setup_obj, "pullback_type", None) or "UNKNOWN"),
-                "entry_crossover_ts": setup_obj.crossover_ts,
-                "entry_rejection_ts": setup_obj.rejection_ts,
-                "entry_confirmation_ts": setup_obj.confirmation_ts,
-                "entry_zone_strength": (setup_obj.trend_evidence or {}).get("zone_status", "UNKNOWN"),
-                "entry_trend_evidence": dict(setup_obj.trend_evidence or {}),
+                "trading_mode": str(item.get("trading_mode") or market_intelligence.get("mode") or "UNCLASSIFIED"),
+                "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
+                "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
+                "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "support_resistance": dict(item.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
+                "order_block": dict(item.get("order_block") or {}),
+                "fvg": dict(item.get("fvg") or {}),
+                "liquidity": dict(item.get("liquidity") or {}),
+                "golden_zone": dict(item.get("golden_zone") or {}),
+                "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
+                "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
+                "market_intelligence": dict(market_intelligence),
+
+                "pullback_type": next((x.split(":", 1)[0] for x in evidence
+                                        if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
-                # This handoff token is created only after authorize() accepted the
-                # closed-bar EMA9/Session-VWAP cross + causal-zone pullback/rejection/confirmation.
-                "ema_vwap_authorized": True,
-                "canonical_symbol": canonical,
-                "side": side,
-                "entry_price": float(price),
-                "tp1": float(tp1),
+                "candle_timeframe": str(INTERVAL),
+                "closed_candle_frame": closed_df.copy(),
+                "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+                "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
@@ -9420,15 +11440,6 @@ def smart_opportunity_selection():
                 item["capital_allocation_tier"] = "STRONG_30_PERCENT" if is_strong else "STANDARD_20_PERCENT"
                 _INSTITUTIONAL_ENTRY_CONTEXT["capital_allocation_tier"] = item["capital_allocation_tier"]
                 _INSTITUTIONAL_ENTRY_CONTEXT["sizing_eligible_strong"] = bool(is_strong)
-                # The strategy only authorizes; all sizing, recovery, execution,
-                # fill and native-stop checks remain inside the original GGP path.
-                if not EMA_VWAP_ENTRY_ENGINE.mark_executing(canonical):
-                    item["decision_state"] = "WAITING_FOR_CONFIRMATION"
-                    item["strategy_status"] = "WAITING_FOR_CONFIRMATION"
-                    item["rejection_reason"] = "ema_vwap_authorization_not_consumable"
-                    continue
-                item["decision_state"] = "ENTRY_EXECUTING"
-                item["strategy_status"] = "ENTRY_EXECUTING"
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
                                    float(item.get("score", 0) or 0), reason, float(atr_value),
                                    trade_type=classification, entry_type="RORO_INSTITUTIONAL",
@@ -9436,17 +11447,13 @@ def smart_opportunity_selection():
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
-                EMA_VWAP_ENTRY_ENGINE.mark_open(canonical)
-                item["decision_state"] = "TRADE_OPEN"
-                item["strategy_status"] = "TRADE_OPEN"
                 item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
                 item["entry_timestamp"] = time.time()
                 _persist_trade_journal_start(setup, item)
                 trade_id = str(STATE.get("trade_id") or "")
                 if INSTITUTIONAL_TRADE_JOURNAL and trade_id:
                     INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
-                if event_id:
-                    RORO_ENTRY_AUTHORITY.consume(event_id)
+                RORO_ENTRY_AUTHORITY.consume(event_id)
                 log_execution(f"[INSTITUTIONAL_ENTRY] {setup} {side} {exchange_sym} event={event_id}", "SUCCESS")
                 return True
         except Exception as exc:
@@ -10924,36 +12931,41 @@ def sync_all_states():
         pass
 
 
-# Journal start/snapshot is tied to the existing GGP trade lifecycle, not a second manager.
+# Serialize final entry authorization so one closed-candle trigger cannot
+# submit two orders from concurrent scanner paths. The current signal is checked
+# inside the original entry function after gate calculation and before any order.
+_ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
-    # Final fail-closed authorization boundary. Every legacy scanner, radar,
-    # early-entry and manual caller resolves here; none can bypass the unified
-    # closed-candle EMA/VWAP pullback lifecycle.
-    side = args[0] if len(args) > 0 else kwargs.get("side")
-    symbol = args[1] if len(args) > 1 else kwargs.get("symbol")
-    price = args[2] if len(args) > 2 else kwargs.get("price")
-    tp1 = args[4] if len(args) > 4 else kwargs.get("tp1")
-    ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-    try:
-        canonical = roro_canonical_symbol(symbol) if symbol else ""
-        authorized = execution_handoff_allowed(
-            EMA_VWAP_ENTRY_ENGINE, canonical, side, price, tp1, ctx
-        )
-    except Exception as guard_exc:
-        authorized = False
-        log_execution(f"[EMA_VWAP_ENTRY_GATE] authorization check failed closed: {type(guard_exc).__name__}", "ERROR")
-    if not authorized:
-        log_execution(
-            f"[EMA_VWAP_ENTRY_GATE] BLOCKED legacy_or_unconfirmed_entry side={side} symbol={symbol}",
-            "WARN",
-        )
-        return False
-    result = _original_execute_entry_for_journal(*args, **kwargs)
-    if result and STATE.get("open"):
-        ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-        _persist_trade_journal_start(ctx.get("setup_type"))
-    return result
+    with _ENTRY_EVENT_EXECUTION_LOCK:
+        globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
+        result = _original_execute_entry_for_journal(*args, **kwargs)
+        gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
+        event_id = str(gate.get("durable_event_id") or "").strip()
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if result and STATE.get("open"):
+            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+            _persist_trade_journal_start(ctx.get("setup_type"))
+            if event_id and journal is not None:
+                trade_id = str(STATE.get("trade_id") or "")
+                try:
+                    if not trade_id or not journal.consume_event(event_id, trade_id):
+                        STATE["entry_event_persistence_failed"] = True
+                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                        log_execution(
+                            f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                            f"but could not durably consume signal {event_id}; new entries blocked",
+                            "ERROR",
+                        )
+                except Exception as exc:
+                    STATE["entry_event_persistence_failed"] = True
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
+                        f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
+                        "ERROR",
+                    )
+        return result
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):

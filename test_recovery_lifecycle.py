@@ -1,8 +1,8 @@
-"""End-to-end recovery, protection-move and capital-policy scenarios.
+"""End-to-end recovery, immutable-native-protection and capital-policy scenarios.
 
 These drive the real GGP code paths (startup recovery, runtime recovery, the
-verified market close, the native-stop replacement gateway and the sizing
-engine) against a deterministic mock exchange. No network or live keys are used.
+verified market close, the fixed native-stop policy and the sizing engine)
+against a deterministic mock exchange. No network or live keys are used.
 """
 import os
 import time
@@ -479,6 +479,134 @@ def test_runtime_recovery_is_idempotent_on_repeat_call(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # 12 & 13: timeout after close and accepted-but-still-open close
 # --------------------------------------------------------------------------- #
+
+def test_tp1_invalid_order_falls_back_to_one_verified_full_close(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path, filled=0.018)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    persisted_close_ids = []
+    persist_snapshot = ggpbot._persist_trade_journal_snapshot
+
+    def capture_close_order_snapshot(*args, **kwargs):
+        ids = ggpbot.STATE.get("bot_close_order_ids")
+        if isinstance(ids, list) and ids:
+            persisted_close_ids.append(list(ids))
+        return persist_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(ggpbot, "_persist_trade_journal_snapshot", capture_close_order_snapshot)
+
+    class MinAmountExchange(MockExchange):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._markets["ZEC/USDT:USDT"] = {
+                "id": "ZEC-USDT", "contractSize": 1.0,
+                "limits": {"amount": {"min": 0.001}, "cost": {"min": 1.0}},
+            }
+
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            if kind == "market" and amount < 0.001:
+                class InvalidOrder(Exception):
+                    pass
+                raise InvalidOrder("amount below exchange minimum 0.001")
+            if kind == "market":
+                self.position = None
+                return {"id": "zec-full-close", "status": "closed",
+                        "filled": amount, "remaining": 0.0, "average": 920.0}
+            return super().create_order(symbol, kind, side, amount, price, params)
+
+    position = _long_position(qty=0.018, entry=900.0, mark=920.0)
+    position["symbol"] = "ZEC/USDT:USDT"
+    ex = MinAmountExchange(position=position, open_orders=[])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "ZEC/USDT:USDT",
+                         "entry": 900.0, "qty": 0.018, "initial_qty": 0.018,
+                         "remaining_qty": 0.018, "trade_id": trade_id})
+    ggpbot.MEMORY["position_status"] = "OPEN"
+    ggpbot.MEMORY["current_position"] = {"symbol": "ZEC/USDT:USDT", "qty": 0.018}
+
+    assert ggpbot.safe_close_partial("ZEC/USDT:USDT", 0.05, close_reason="TP1") is True
+    market_orders = [call for call in ex.create_calls if call[1] == "market"]
+    assert len(market_orders) == 2
+    assert market_orders[0][3] == pytest.approx(0.0009)
+    assert market_orders[1][3] == pytest.approx(0.018)
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+    assert ggpbot.STATE["open"] is False
+    assert ggpbot.MEMORY["position_status"] == "FLAT"
+    assert ggpbot.MEMORY["current_position"] is None
+    assert any(ids.count("zec-full-close") == 1 for ids in persisted_close_ids)
+    # Finalization intentionally clears the transient close-order ID buffer.
+
+
+def test_tp1_non_minimum_invalid_order_does_not_force_full_close(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path, filled=0.018)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    class WrongParameterExchange(MockExchange):
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            if kind == "market":
+                class InvalidOrder(Exception):
+                    pass
+                raise InvalidOrder("invalid position side parameter")
+            return super().create_order(symbol, kind, side, amount, price, params)
+
+    position = _long_position(qty=0.018, entry=900.0, mark=920.0)
+    position["symbol"] = "ZEC/USDT:USDT"
+    ex = WrongParameterExchange(position=position, open_orders=[])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "ZEC/USDT:USDT",
+                         "entry": 900.0, "qty": 0.018, "initial_qty": 0.018,
+                         "remaining_qty": 0.018, "trade_id": trade_id})
+
+    assert ggpbot.safe_close_partial("ZEC/USDT:USDT", 0.05, close_reason="TP1") is False
+    assert len([call for call in ex.create_calls if call[1] == "market"]) == 1
+    assert ggpbot.STATE["open"] is True
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+
+
+def test_tp1_invalid_order_with_full_position_below_minimum_is_not_unresolved(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path, filled=0.0008)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    class DustExchange(MockExchange):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self._markets["ZEC/USDT:USDT"] = {
+                "id": "ZEC-USDT", "contractSize": 1.0,
+                "limits": {"amount": {"min": 0.001}, "cost": {"min": 1.0}},
+            }
+
+        def create_order(self, symbol, kind, side, amount, price=None, params=None):
+            self.create_calls.append((symbol, kind, side, amount, params or {}))
+            if kind == "market":
+                class InvalidOrder(Exception):
+                    pass
+                raise InvalidOrder("amount below exchange minimum 0.001")
+            return super().create_order(symbol, kind, side, amount, price, params)
+
+    position = _long_position(qty=0.0008)
+    position["symbol"] = "ZEC/USDT:USDT"
+    ex = DustExchange(position=position, open_orders=[])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    _fresh_state()
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "ZEC/USDT:USDT",
+                         "entry": 900.0, "qty": 0.0008, "initial_qty": 0.0008,
+                         "remaining_qty": 0.0008, "trade_id": trade_id})
+
+    assert ggpbot.safe_close_partial("ZEC/USDT:USDT", 0.5, close_reason="TP1") is False
+    assert len([call for call in ex.create_calls if call[1] == "market"]) == 2
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["close_reconciliation_required"] is False
+    assert ggpbot.STATE["open"] is True
+
+
+
 def test_close_timeout_blocks_and_does_not_resubmit(tmp_path, monkeypatch):
     journal, trade_id = _seed_journal(tmp_path)
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
@@ -531,49 +659,78 @@ def test_accepted_close_that_leaves_position_open_is_not_verified(tmp_path, monk
 # --------------------------------------------------------------------------- #
 # 14: native SL modification failure must keep protection honest
 # --------------------------------------------------------------------------- #
-def test_native_sl_is_immutable_after_entry_even_when_exchange_supports_replace(tmp_path, monkeypatch):
+def test_native_sl_move_failure_retains_previous_protection(tmp_path, monkeypatch):
+    # Post-entry modification is intentionally a no-op: the original verified
+    # BingX stop remains unchanged and no order-management API is called.
     journal, trade_id = _seed_journal(tmp_path)
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
-    ex = MockExchange(hedged=True, position=_long_position(), open_orders=[_native_stop(order_id="111")])
-    monkeypatch.setattr(ggpbot, "ex", ex)
-    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
-                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
-                         "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
-                         "native_sl_order_id": "111", "native_sl_verified": True,
-                         "native_sl_original_price": 95.0, "native_sl_status": "VERIFIED"})
-    assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
-                                               reason="BREAKEVEN") is False
-    assert ex.cancel_replace_calls == []
-    assert ex.cancel_calls == []
-    assert ex.create_calls == []
-    assert any(str(order.get("id")) == "111" and float(order.get("stopPrice")) == 95.0
-               for order in ex.open_orders)
-    assert ggpbot.STATE["native_sl_verified"] is True
-    assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
-    assert ggpbot.STATE["recovery_hold"] is False
-    row = journal.get(trade_id)
-    assert row["native_sl_order_id"] == "111"
-    assert row["native_sl_verified"] == 1
-
-
-def test_native_sl_immutable_policy_never_enters_false_recovery_hold(tmp_path, monkeypatch):
-    journal, trade_id = _seed_journal(tmp_path)
-    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
-    ex = MockExchange(hedged=True, position=_long_position(),
-                      open_orders=[_native_stop(order_id="111")],
+    ex = MockExchange(hedged=True, position=_long_position(), open_orders=[_native_stop()],
                       cancel_replace=False, fail_cancel=True)
     monkeypatch.setattr(ggpbot, "ex", ex)
     ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
                          "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
                          "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
                          "native_sl_order_id": "111", "native_sl_verified": True,
-                         "native_sl_original_price": 95.0, "native_sl_status": "VERIFIED"})
+                         "native_sl_status": "VERIFIED", "native_sl_original_price": 95.0,
+                         "recovery_hold": False})
     assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
                                                reason="BREAKEVEN") is False
-    assert ex.cancel_calls == [] and ex.create_calls == []
     assert ggpbot.STATE["native_sl_verified"] is True
+    assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+    assert ggpbot.STATE["native_sl_original_price"] == pytest.approx(95.0)
     assert ggpbot.STATE["recovery_hold"] is False
     assert ggpbot.STATE["native_sl_order_id"] == "111"
+    assert ex.cancel_calls == []
+    assert ex.cancel_replace_calls == []
+    assert ex.create_calls == []
+    assert len(ex.open_orders) == 1
+
+
+def test_native_sl_move_attempt_never_cancels_or_replaces_original_stop(tmp_path, monkeypatch):
+    # Even if an exchange mock would allow Cancel/Replace, the production
+    # policy forbids post-entry native-stop movement.
+    journal, trade_id = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+
+    ex = MockExchange(hedged=True, position=_long_position(),
+                      open_orders=[_native_stop(order_id="111")], cancel_replace=True)
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
+                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
+                         "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
+                         "native_sl_order_id": "111", "native_sl_verified": True,
+                         "native_sl_status": "VERIFIED", "native_sl_original_price": 95.0,
+                         "recovery_hold": False})
+    assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
+                                               reason="BREAKEVEN") is False
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.STATE["native_sl_verified"] is True
+    assert ggpbot.STATE["native_sl_order_id"] == "111"
+    assert ggpbot.STATE["native_sl_original_price"] == pytest.approx(95.0)
+    assert ex.cancel_calls == []
+    assert ex.cancel_replace_calls == []
+    assert ex.create_calls == []
+    assert [order["id"] for order in ex.open_orders] == ["111"]
+
+
+def test_native_sl_move_attempt_leaves_journal_protection_unchanged(tmp_path, monkeypatch):
+    journal, trade_id = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    ex = MockExchange(hedged=True, position=_long_position(), open_orders=[_native_stop()])
+    monkeypatch.setattr(ggpbot, "ex", ex)
+    ggpbot.STATE.update({"open": True, "side": "BUY", "current_symbol": "BTC/USDT:USDT",
+                         "entry": 100.0, "qty": 2.0, "initial_qty": 2.0, "remaining_qty": 2.0,
+                         "trade_id": trade_id, "position_mode": "HEDGE", "position_side": "LONG",
+                         "native_sl_order_id": "111", "native_sl_verified": True,
+                         "native_sl_status": "VERIFIED", "native_sl_original_price": 95.0,
+                         "recovery_hold": False})
+    assert ggpbot.move_native_stop_on_exchange("BTC/USDT:USDT", 100.5, 2.0,
+                                               reason="BREAKEVEN") is False
+    row = journal.get(trade_id)
+    assert row["state"]["native_sl_original_price"] == pytest.approx(95.0)
+    assert row["state"]["native_sl_order_id"] == "111"
+    assert ex.cancel_replace_calls == []
+    assert [order["id"] for order in ex.open_orders] == ["111"]
 
 
 # --------------------------------------------------------------------------- #
@@ -588,6 +745,93 @@ def test_journal_survives_restart_and_reloads_state(tmp_path, monkeypatch):
     assert row["state"]["tp1_hit"] is True
     assert row["remaining_qty"] == 1.0
     assert row["state"]["synthetic_sl"] == 95.0
+
+
+# --------------------------------------------------------------------------- #
+# Trade-lock lifecycle: a lock is released only by safe full-close finalization
+# --------------------------------------------------------------------------- #
+def test_verified_full_close_finalizer_releases_active_trade_lock(monkeypatch):
+    _fresh_state()
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+    monkeypatch.setattr(ggpbot, "tg_close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "clear_position_dashboard", lambda: None)
+    monkeypatch.setattr(ggpbot, "update_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.MEMORY["position_status"] = "FLAT"
+    ggpbot.STATE.update({
+        "open": True, "close_verified": True, "current_symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 0.0, "initial_qty": 1.0,
+        "remaining_qty": 0.0, "exchange_qty": 0.0, "trade_id": None,
+        "entry_time": time.time(), "last_close_fill_price": 101.0,
+        "last_close_realized_pnl": 1.0, "last_close_pnl_source": "BINGX_ORDER_REALIZED_PNL",
+        "last_close_pnl_complete": True, "last_close_reason": "TEST_VERIFIED_CLOSE",
+        "execution_unresolved": False, "close_reconciliation_required": False,
+        "recovery_hold": False, "initial_margin": 5.0,
+    })
+    ggpbot.TRADE_STATE.update({"in_position": True, "symbol": "BTC/USDT:USDT"})
+    try:
+        result = ggpbot.finalize_trade_with_reality("BTC/USDT:USDT", "TEST_VERIFIED_CLOSE")
+        assert result[0] == pytest.approx(1.0)
+        assert result[1] == pytest.approx(20.0)
+        assert ggpbot.STATE["open"] is False
+        assert ggpbot.TRADE_STATE["in_position"] is False
+        assert ggpbot._ACTIVE_TRADE is False
+    finally:
+        ggpbot.RECOVERY_BLOCK_ENTRIES = False
+        ggpbot.MEMORY["position_status"] = "FLAT"
+        ggpbot._ACTIVE_TRADE = False
+
+
+@pytest.mark.parametrize("blocked_flag", [
+    "execution_unresolved", "close_reconciliation_required", "recovery_hold",
+])
+def test_verified_full_close_retains_lock_if_recovery_gate_remains(monkeypatch, blocked_flag):
+    _fresh_state()
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+    monkeypatch.setattr(ggpbot, "tg_close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "clear_position_dashboard", lambda: None)
+    monkeypatch.setattr(ggpbot, "update_stats", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    ggpbot.MEMORY["position_status"] = "FLAT"
+    ggpbot.STATE.update({
+        "open": True, "close_verified": True, "current_symbol": "BTC/USDT:USDT",
+        "side": "BUY", "entry": 100.0, "qty": 0.0, "initial_qty": 1.0,
+        "remaining_qty": 0.0, "exchange_qty": 0.0, "trade_id": None,
+        "entry_time": time.time(), "last_close_fill_price": 101.0,
+        "last_close_realized_pnl": 1.0, "last_close_pnl_source": "BINGX_ORDER_REALIZED_PNL",
+        "last_close_pnl_complete": True, "last_close_reason": "TEST_VERIFIED_CLOSE",
+        "execution_unresolved": False, "close_reconciliation_required": False,
+        "recovery_hold": False, "initial_margin": 5.0,
+    })
+    ggpbot.STATE[blocked_flag] = True
+    ggpbot.TRADE_STATE.update({"in_position": True, "symbol": "BTC/USDT:USDT"})
+    try:
+        ggpbot.finalize_trade_with_reality("BTC/USDT:USDT", "TEST_VERIFIED_CLOSE")
+        assert ggpbot.STATE["open"] is False
+        assert ggpbot._ACTIVE_TRADE is True
+    finally:
+        ggpbot.STATE[blocked_flag] = False
+        ggpbot.RECOVERY_BLOCK_ENTRIES = False
+        ggpbot.MEMORY["position_status"] = "FLAT"
+        ggpbot._ACTIVE_TRADE = False
+
+
+def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch):
+    _fresh_state()
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
+    messages = []
+    monkeypatch.setattr(ggpbot, "log_execution", lambda message, *args, **kwargs: messages.append(str(message)))
+    assert ggpbot.open_position("BUY", 1.0, "BTC/USDT:USDT") is None
+    assert ggpbot._ACTIVE_TRADE is True
+    assert any("[ENTRY_LOCKED]" in message for message in messages)
 
 
 # --------------------------------------------------------------------------- #

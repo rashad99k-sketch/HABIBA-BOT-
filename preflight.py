@@ -8,6 +8,9 @@ required = [
     "ggpbot.py", "ggp_instance_lock.py", "ggp_runtime_config.py", "ggp_institutional_bridge.py",
     "roro_institutional.py", "roro_opportunity_pipeline.py", "roro_confluence.py",
     "roro_resource_manager.py", "roro_trade_journal.py", "bingx_protection.py",
+    "bingx_execution.py", "ggp_market_data.py", "ggp_market_intelligence.py",
+    "ggp_position_sizing.py", "ggp_recovery.py", "location_authority.py",
+    "roro_trend_timing.py",
     "roro_config.py", "requirements.txt", ".env.example",
     "RUN.bat", "RUN_WINDOWS.bat", "RUN_TESTS.bat",
 ]
@@ -29,7 +32,7 @@ if not errors:
     os.environ.setdefault("BINGX_API_SECRET", "")
     try:
         import ggpbot
-        for name in ("execute_entry", "smart_opportunity_selection", "main_loop_sniper", "LiveTradeManager", "TradeManagementBoard", "ExchangeSyncService"):
+        for name in ("execute_entry", "smart_opportunity_selection", "main_loop_sniper", "LiveTradeManager", "TradeManagementBoard", "ExchangeSyncService", "_move_native_stop_verified"):
             if not hasattr(ggpbot, name):
                 errors.append(f"ggpbot missing required symbol: {name}")
     except Exception as exc:
