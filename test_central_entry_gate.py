@@ -38,3 +38,14 @@ def test_direct_cross_entry_has_atr_stop_fallback_without_causal_zone():
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
     assert "ATR_FALLBACK_NO_CAUSAL_ZONE" in source
     assert "EMA9_VWAP_CROSS_VWAP_GATE" in source
+
+
+def test_watchlist_strategy_gate_does_not_depend_on_ema15_cross():
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    strategy = Path(__file__).with_name("unified_ema_vwap_strategy.py").read_text(encoding="utf-8")
+    start = strategy.index("    def evaluate_direct_cross(")
+    end = strategy.index("    def evaluate(", start)
+    direct = strategy[start:end]
+    assert "ema15" not in direct.lower()
+    assert "vwap_series" in direct
+    assert "EMA9_VWAP_CROSS_GATE" in source
