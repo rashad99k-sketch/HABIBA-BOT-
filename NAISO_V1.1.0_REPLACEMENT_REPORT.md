@@ -6,6 +6,7 @@
 - Archive SHA-256: `badf2048509ec52993ba0962a464ebe0a2551e3055dab1017515bfbfe4c15db6`
 - Archive contents: 123 files under `NAISO-LIVE-ema9-vwap-profit-brain-v1.1.0/`
 - Replacement branch: `release/naiso-live-v1.1.0` (created from `origin/main`)
+- Promotion: PR #8 — https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/8 — is being promoted to `main` as the project's primary version.
 - Backups created before replacement:
   - Branch/tag `backup/pre-naiso-v1.1.0-adaptive` / `pre-naiso-v1.1.0-adaptive` — preserves the previous uncommitted EMA9/VWAP adaptive working tree.
   - Tag `pre-naiso-v1.1.0-main` — preserves the previous production `main` commit.
@@ -87,4 +88,4 @@ The supplied v1.1.0 test report documented 536 passing tests. The final reposito
 
 ## Limitations
 
-No live BingX order, credential use, production deployment, 24-hour stability run, or live API-load measurement was performed. The PR is prepared for review only and has not been merged into `main`.
+No live BingX order, credential use, hosted production deployment, 24-hour stability run, or live API-load measurement was performed. PR #8 is promoted to `main` as the sole primary code line; the legacy PR #7 and pre-v1.1.0 refs remain only as immutable backups/history and are not part of `main`.
