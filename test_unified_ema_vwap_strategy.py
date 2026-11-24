@@ -288,16 +288,16 @@ def _patch_direct_cross_indicators(monkeypatch, side="BUY", aligned=True):
         ema9 = np.array([99.0] * 69 + [101.0])
         ema15 = np.array([100.0] * 70)
         vwap_values = np.full(70, 100.0)
-        vwap = 100.0 if aligned else 103.0
+        vwap = 100.0
         vwap_values[-1] = vwap
-        price = 102.0
+        price = 102.0 if aligned else 98.0
     else:
         ema9 = np.array([101.0] * 69 + [99.0])
         ema15 = np.array([100.0] * 70)
         vwap_values = np.full(70, 100.0)
-        vwap = 100.0 if aligned else 97.0
+        vwap = 100.0
         vwap_values[-1] = vwap
-        price = 98.0
+        price = 98.0 if aligned else 102.0
     monkeypatch.setattr(module, "indicator_series", lambda _frame: {
         "valid": True,
         "ema9": pd.Series(ema9),
