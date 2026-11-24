@@ -604,6 +604,94 @@ def rate_limit(func=None):
 CACHE_LOCK = threading.RLock()
 CACHE_MAX_ITEMS = _env_int_range("CACHE_MAX_ITEMS", 2500, 100, 10000)
 
+# One canonical market-data snapshot per symbol/timeframe. All callers (live
+# management, discovery scanners and the institutional Watchlist) share this
+# snapshot; caller-specific `limit` values only slice the cached frame.
+OHLCV_CACHE_LIMIT = 150
+OHLCV_RATE_LIMIT_COOLDOWN_SEC = _env_float_range("OHLCV_RATE_LIMIT_COOLDOWN_SEC", 3.0, 1.0, 15.0)
+_OHLCV_INFLIGHT_LOCKS = {}
+_OHLCV_INFLIGHT_GUARD = threading.Lock()
+_OHLCV_RATE_COOLDOWN = {"until": 0.0, "symbol_until": {}}
+
+
+def _ohlcv_inflight_lock(key):
+    """Return a stable per-key lock so concurrent callers cannot duplicate a fetch."""
+    with _OHLCV_INFLIGHT_GUARD:
+        lock = _OHLCV_INFLIGHT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _OHLCV_INFLIGHT_LOCKS[key] = lock
+        return lock
+
+
+def _ohlcv_canonical_cache_key(symbol, limit, *, htf=False):
+    """Canonicalize symbol aliases and limit buckets into one cache identity."""
+    try:
+        canonical = normalize_symbol(symbol)
+    except Exception:
+        canonical = str(symbol or "").strip().upper()
+    timeframe = "1h" if htf else str(INTERVAL)
+    return canonical, f"ohlcv_v2_{canonical}_{timeframe}_{OHLCV_CACHE_LIMIT}", timeframe
+
+
+def _ohlcv_cache_get(key, ttl, timeframe):
+    """Read one canonical OHLCV snapshot while its bounded TTL is valid.
+
+    Candle-level staleness is evaluated by ``resolve_entry_closed_candles`` where
+    it can trigger one governed refresh. The shared cache itself deliberately
+    keeps the established TTL semantics so management/scanner callers do not
+    issue duplicate requests between candles.
+    """
+    with CACHE_LOCK:
+        item = CACHE.get(key)
+        if not isinstance(item, dict) or "value" not in item or "ts" not in item:
+            return None
+        if time.time() - float(item["ts"]) >= ttl:
+            CACHE.pop(key, None)
+            return None
+        return item["value"]
+
+
+def _ohlcv_cache_set(key, frame, timeframe):
+    with CACHE_LOCK:
+        CACHE[key] = {
+            "value": frame.copy(),
+            "ts": time.time(),
+            "timeframe": str(timeframe),
+        }
+        if len(CACHE) > CACHE_MAX_ITEMS:
+            dated = sorted(
+                ((float(v.get("ts", 0)), k) for k, v in CACHE.items()
+                 if isinstance(v, dict) and "ts" in v and "value" in v),
+                key=lambda item: item[0]
+            )
+            for _, old_key in dated[:max(1, len(CACHE) - CACHE_MAX_ITEMS)]:
+                CACHE.pop(old_key, None)
+
+
+def _ohlcv_rate_limit_cooldown_remaining(symbol):
+    now = time.monotonic()
+    with _OHLCV_INFLIGHT_GUARD:
+        until = max(
+            float(_OHLCV_RATE_COOLDOWN.get("until", 0.0)),
+            float(_OHLCV_RATE_COOLDOWN.get("symbol_until", {}).get(str(symbol), 0.0)),
+        )
+    return max(0.0, until - now)
+
+
+def _mark_ohlcv_rate_limit_cooldown(symbol):
+    """Fence repeat kline requests briefly after a confirmed exchange rate-limit."""
+    now = time.monotonic()
+    until = now + OHLCV_RATE_LIMIT_COOLDOWN_SEC
+    with _OHLCV_INFLIGHT_GUARD:
+        _OHLCV_RATE_COOLDOWN["until"] = max(float(_OHLCV_RATE_COOLDOWN.get("until", 0.0)), until)
+        symbol_until = _OHLCV_RATE_COOLDOWN.setdefault("symbol_until", {})
+        symbol_until[str(symbol)] = max(float(symbol_until.get(str(symbol), 0.0)), until)
+        if len(symbol_until) > 500:
+            for key in [k for k, v in symbol_until.items() if float(v) <= now]:
+                symbol_until.pop(key, None)
+
+
 def cache_get(key, ttl):
     with CACHE_LOCK:
         item = CACHE.get(key)
@@ -638,11 +726,10 @@ def safe_api_call(func, *args, **kwargs):
         "cancel_order", "cancel_all_orders", "swapV1PrivatePostTradeCancelReplace",
     }
     resilience = globals().get("API_RESILIENCE")
-    if resilience is not None:
+    if is_order_write and resilience is not None:
         try:
+            resilience.before_call(method_name)
             resilience.count_request()
-            if not is_order_write:
-                resilience.before_call(method_name)
         except CircuitOpenError:
             if "MEMORY" in globals():
                 MEMORY["api_circuit_state"] = "OPEN"
@@ -674,11 +761,27 @@ def safe_api_call(func, *args, **kwargs):
     attempts = int(getattr(resilience, "max_attempts", 3) or 3) if resilience is not None else 3
     for attempt in range(attempts):
         try:
+            # The circuit gate must be enforced for every physical attempt. A
+            # retry after a transport failure may open the circuit; the next
+            # attempt must not slip past that gate.
+            if resilience is not None:
+                try:
+                    resilience.before_call(method_name)
+                except CircuitOpenError:
+                    if "MEMORY" in globals():
+                        MEMORY["api_circuit_state"] = "OPEN"
+                    log_execution(
+                        f"[API_CIRCUIT] {method_name} temporarily fenced on retry {attempt + 1}/{attempts}; no request sent",
+                        "WARN", debounce_key=f"api_circuit_{method_name}", debounce_sec=30)
+                    raise
+                resilience.count_request()
             rate_limit(func)
             result = func(*args, **kwargs)
             if resilience is not None:
                 resilience.record_success(method_name)
             return result
+        except CircuitOpenError:
+            raise
         except Exception as e:
             failure_kind = None
             if resilience is not None:
@@ -1045,14 +1148,22 @@ def fetch_ohlcv(symbol, limit=150):
     sym = str(symbol or "")
     try:
         sym = normalize_symbol(symbol)
+        cooldown = _ohlcv_rate_limit_cooldown_remaining(sym)
+        if cooldown > 0:
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_RATE_LIMITED",
+                detail=f"endpoint cooldown active for {cooldown:.2f}s; no request sent",
+            )
+            return None
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
         if not data:
             rate = _LAST_API_RATE_LIMIT
-            reason = (
-                "OHLCV_RATE_LIMITED"
-                if rate.get("method") == "fetch_ohlcv" and float(rate.get("ts", 0.0)) >= started_at
-                else "OHLCV_EMPTY"
+            rate_limited = (
+                rate.get("method") == "fetch_ohlcv" and float(rate.get("ts", 0.0)) >= started_at
             )
+            if rate_limited:
+                _mark_ohlcv_rate_limit_cooldown(sym)
+            reason = "OHLCV_RATE_LIMITED" if rate_limited else "OHLCV_EMPTY"
             _record_ohlcv_fetch_diagnostic(sym, reason, detail="exchange returned no OHLCV rows")
             return None
         if len(data) < 100:
@@ -1086,12 +1197,13 @@ def fetch_ohlcv(symbol, limit=150):
         _record_ohlcv_fetch_diagnostic(sym, "OK", received=len(df))
         return df
     except Exception as e:
-        rate_limited = "rate limit" in str(e).lower() or "100410" in str(e)
-        _record_ohlcv_fetch_diagnostic(
-            sym,
-            "OHLCV_RATE_LIMITED" if rate_limited else "OHLCV_EMPTY",
-            detail=f"{type(e).__name__}: {e}",
-        )
+        message = str(e).lower()
+        rate_limited = "rate limit" in message or "100410" in message
+        circuit_open = "circuit open" in message or "probe already in flight" in message
+        if rate_limited or circuit_open:
+            _mark_ohlcv_rate_limit_cooldown(sym)
+        reason = "OHLCV_RATE_LIMITED" if (rate_limited or circuit_open) else "OHLCV_EMPTY"
+        _record_ohlcv_fetch_diagnostic(sym, reason, detail=f"{type(e).__name__}: {e}")
         print(color_text(f"fetch_ohlcv error for {symbol}: {e}", YELLOW))
         return None
 
@@ -1163,29 +1275,40 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
     return get_ohlcv_safe_meta(symbol, limit, htf=htf)[0]
 
 
-def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
-    """Return (frame, source). `source` is CACHE_HIT or FRESH_REQUEST (or NONE).
+def get_ohlcv_safe_meta(symbol, limit=120, htf=False, *, force_refresh=False):
+    """Return (frame, source) from one canonical, single-flight OHLCV snapshot.
 
-    A CACHE_HIT means the frame was served from the local cache without any new
-    BingX request; it must never be logged as a new exchange request.
+    `source` is CACHE_HIT or FRESH_REQUEST (or NONE). A CACHE_HIT means the
+    caller served a shared snapshot without sending a new BingX request.
+    Caller-specific limits only slice the canonical frame; they never create a
+    second exchange request for the same symbol/timeframe.
     """
-    # Increase TTL during open trade to reduce API calls
     ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 30)
-    cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
-    cached = cache_get(cache_key, ttl)
-    if cached is not None:
-        if len(cached) >= 100:
-            return cached, "CACHE_HIT"
-    if htf:
-        df = fetch_ohlcv_htf(symbol, '1h', limit)
-    else:
-        df = fetch_ohlcv(symbol, limit)
-    if df is not None and validate_dataframe(df, min(limit, 100)):
-        cache_set(cache_key, df)
-        return df, "FRESH_REQUEST"
-    return None, "NONE"
+    canonical_symbol, cache_key, timeframe = _ohlcv_canonical_cache_key(symbol, limit, htf=htf)
+    if force_refresh:
+        with CACHE_LOCK:
+            CACHE.pop(cache_key, None)
+
+    cached = _ohlcv_cache_get(cache_key, ttl, timeframe)
+    if cached is not None and len(cached) >= 100:
+        return cached.tail(max(1, int(limit or OHLCV_CACHE_LIMIT))).copy(), "CACHE_HIT"
+
+    fetch_lock = _ohlcv_inflight_lock(cache_key)
+    with fetch_lock:
+        # Double-check after waiting so concurrent misses coalesce into one fetch.
+        cached = _ohlcv_cache_get(cache_key, ttl, timeframe)
+        if cached is not None and len(cached) >= 100:
+            return cached.tail(max(1, int(limit or OHLCV_CACHE_LIMIT))).copy(), "CACHE_HIT"
+        if htf:
+            df = fetch_ohlcv_htf(canonical_symbol, timeframe, OHLCV_CACHE_LIMIT)
+        else:
+            df = fetch_ohlcv(canonical_symbol, OHLCV_CACHE_LIMIT)
+        if df is not None and validate_dataframe(df, min(OHLCV_CACHE_LIMIT, 100)):
+            _ohlcv_cache_set(cache_key, df, timeframe)
+            return df.tail(max(1, int(limit or OHLCV_CACHE_LIMIT))).copy(), "FRESH_REQUEST"
+        return None, "NONE"
 
 def get_ticker_safe(symbol):
     # Use short TTL for live price
@@ -2548,7 +2671,8 @@ from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
                               tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
-                              trend_target_prices, RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              trend_target_prices, profit_target_convention,
+                              RANGE_MODE, TREND_MODE, STANDARD_MODE)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2591,6 +2715,7 @@ class TradeManagementBoard:
         continuation = safe_float(ctx.get("continuation_probability"), 0.5)
         trade_state = str(ctx.get("trade_state") or "UNKNOWN").upper()
         profit_mode = str(ctx.get("profit_mode") or "TWO_STAGE_50_50").upper()
+        entry_ctx = ctx.get("entry_context") if isinstance(ctx.get("entry_context"), dict) else {}
 
         def decision(action, reason, **params):
             result = TradeDecision(action, params=params, reason=reason)
@@ -2603,6 +2728,8 @@ class TradeManagementBoard:
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
                 "profit_mode": profit_mode,
+                "entry_context_available": bool(entry_ctx),
+                "entry_cross_event_id": str(entry_ctx.get("cross_event_id") or ""),
                 "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
                 "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
@@ -3526,9 +3653,13 @@ class LiveTradeManager:
         return False
 
     def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2):
-        # Do not inherit a previous position's reconcile throttle or cached regime.
+        # Do not inherit a previous position's reconcile throttle, cached regime
+        # or state-machine phase. Discovery/watchlist machines are separate.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        self.brain.current_state = "RANGE_CHOP"
+        STATE["trade_state"] = "RANGE_CHOP"
+        STATE.pop("last_trade_state_candle_ts", None)
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -3644,6 +3775,7 @@ class LiveTradeManager:
             "scalp_target_status": str(STATE.get("scalp_target_status") or "UNKNOWN"),
             "scalp_target_price": safe_float(STATE.get("scalp_target_price")),
             "profit_mode": str(STATE.get("profit_mode") or STANDARD_MODE),
+            "entry_context": dict(STATE.get("entry_context_snapshot") or {}),
             "trade_state": "UNKNOWN", "continuation_probability": 0.5,
             "adx": 20.0, "smart_money": {}, "momentum": {},
             "be_done": bool(STATE.get("be_done")),
@@ -3977,7 +4109,8 @@ class LiveTradeManager:
             # independent weakness/thin-liquidity observations. Missing data is NOT range.
             mode_context = {
                 "side": side, "regime": regime, "trade_state": trade_state,
-            "market_intelligence": {
+                "entry_context": dict(STATE.get("entry_context_snapshot") or {}),
+                "market_intelligence": {
                 **(STATE.get("market_intelligence") or {}),
                 "zone_side": str(STATE.get("side") or "").upper(),
                 "trading_mode": str(STATE.get("trading_mode") or "UNCLASSIFIED"),
@@ -3990,7 +4123,7 @@ class LiveTradeManager:
                 "failed_breakout_streak": int(safe_float(STATE.get("failed_breakout_streak"), 0)),
                 "failed_breakout_last_candle_ts": safe_float(STATE.get("failed_breakout_last_candle_ts"), 0.0),
                 "failed_breakout_thesis_credit_applied": bool(STATE.get("failed_breakout_thesis_credit_applied", False)),
-            },
+                },
                 "adx": adx_now, "adx_slope": adx_slope,
                 "continuation_probability": continuation_eval.continuation_probability,
                 "di_plus": plus_di, "di_minus": minus_di,
@@ -4424,6 +4557,7 @@ class LiveTradeManager:
             },
 
             "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
+            "entry_context": dict(STATE.get("entry_context_snapshot") or {}),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
             "fresh_ema9_vwap_cross": bool(STATE.get("fresh_ema9_vwap_cross", False)),
             "fresh_ema50_vwap_cross": bool(STATE.get("fresh_ema50_vwap_cross", False)),
@@ -6451,8 +6585,11 @@ def _validate_entry_closed_frame(symbol, frame, context=None, *, now_ms=None, ti
     }
 
 
+ENTRY_CANDLE_RETRYABLE_REASONS = frozenset({"CLOSED_CANDLE_STALE"})
+
+
 def resolve_entry_closed_candles(symbol, context=None):
-    """Reuse the exact authorized frame; perform at most one short fresh retry."""
+    """Reuse the authorized frame; refresh once only for a genuinely stale snapshot."""
     context = context if isinstance(context, dict) else {}
     shared_frame = context.get("closed_candle_frame")
     if isinstance(shared_frame, pd.DataFrame):
@@ -6471,10 +6608,13 @@ def resolve_entry_closed_candles(symbol, context=None):
     final_diag = None
     for attempt in range(2):
         if attempt == 1:
-            # Only one bounded retry. It bypasses the generic 30/90s frame cache.
+            # A single governed refresh through the shared single-flight cache.
+            # It never bypasses the API governor and only runs for a reason a
+            # newer closed candle can actually repair.
             time.sleep(ENTRY_CANDLE_RETRY_DELAY_SEC)
-            frame = fetch_ohlcv(symbol, 150)
-            source = "FRESH_EXCHANGE_RETRY"
+            refreshed, refresh_source = get_ohlcv_safe_meta(symbol, 150, force_refresh=True)
+            frame = refreshed
+            source = f"FRESH_EXCHANGE_RETRY:{refresh_source}"
             local_context["closed_candle_source"] = source
         now_ms, time_source = _entry_exchange_time_ms()
         checked, diagnostic = _validate_entry_closed_frame(
@@ -6485,7 +6625,7 @@ def resolve_entry_closed_candles(symbol, context=None):
             break
         final_diag = diagnostic
         reason = str(diagnostic.get("reason", "OHLCV_EMPTY"))
-        if reason in {"OHLCV_RATE_LIMITED", "SYMBOL_TIMEFRAME_MISMATCH"}:
+        if reason not in ENTRY_CANDLE_RETRYABLE_REASONS:
             break
 
     MEMORY.setdefault("last_closed_candle_validation", {}).update({
@@ -6571,6 +6711,34 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         except Exception:
             event_symbol = str(symbol or "").strip().upper()
         gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
+    else:
+        gate_result["durable_event_id"] = ""
+    cross_event_id = str(institutional_entry_ctx.get("cross_event_id") or "").strip()
+    if not cross_event_id and not PAPER_MODE and MODE_LIVE:
+        log_execution(
+            f"[CROSS_EVENT] BLOCKED LIVE {symbol} {side}: entry requires a durable confirmed cross event",
+            "ERROR",
+        )
+        return False
+    if cross_event_id:
+        if not _cross_event_is_usable(cross_event_id, side):
+            log_execution(
+                f"[CROSS_EVENT] BLOCKED {symbol} {side}: cross event {cross_event_id} "
+                "is not active or has no confirmed closed rejection breakout", "WARN",
+            )
+            return False
+        # Delayed breakout entries intentionally outlive the 2-candle fresh-cross
+        # gate. Bind execution back to the ORIGINAL cross identity and let the
+        # durable rejection lifecycle authorize this specific closed breakout.
+        _hydrate_cross_lifecycle_context(
+            institutional_entry_ctx, cross_event_id, gate_result, side, symbol, gate_tf,
+        )
+        if gate_result.get("durable_event_id") and cross_event_id != gate_result["durable_event_id"]:
+            log_execution(
+                f"[CROSS_EVENT] BLOCKED {symbol} {side}: watchlist event {cross_event_id} "
+                f"does not match execution gate event {gate_result['durable_event_id']}", "ERROR",
+            )
+            return False
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
     # Preserve the exact gate snapshot for the serialized final execution wrapper.
     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
@@ -6584,6 +6752,41 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             debounce_sec=5,
         )
         return False
+    # Every executed entry must be traceable to a durable confirmed-cross event,
+    # even when an older caller did not carry the Watchlist event id. The row is
+    # created only from the strict gate result above; scanner rows can never
+    # manufacture it.
+    gate_event_id = str(gate_result.get("durable_event_id") or "").strip()
+    gate_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not cross_event_id and gate_event_id and gate_journal is not None:
+        try:
+            gate_journal.record_cross_event(
+                event_id=gate_event_id,
+                symbol=roro_canonical_symbol(symbol),
+                exchange_symbol=str(symbol),
+                side=side,
+                direction=str(gate_result.get("ema9_cross") or "").upper(),
+                source=CONFIRMED_CROSS_EVENT_SOURCE,
+                timeframe=gate_tf,
+                signal_candle_timestamp=int(gate_result.get("signal_candle_timestamp") or 0),
+                closed_candle_timestamp=int(gate_result.get("latest_closed_timestamp") or 0),
+                expires_ts=time.time() + CONFIRMED_CROSS_EVENT_TTL_SEC,
+                metadata={**gate_result, "detection_method": "execute_entry_final_gate"},
+            )
+            cross_event_id = gate_event_id
+            institutional_entry_ctx["cross_event_id"] = cross_event_id
+        except Exception as exc:
+            log_execution(
+                f"[CROSS_EVENT] BLOCKED {symbol} {side}: cannot persist gate event "
+                f"{gate_event_id}: {type(exc).__name__}: {exc}", "ERROR",
+            )
+            return False
+        if not _cross_event_is_usable(cross_event_id, side):
+            log_execution(
+                f"[CROSS_EVENT] BLOCKED {symbol} {side}: gate event {cross_event_id} "
+                "is not an active confirmed cross", "ERROR",
+            )
+            return False
     # Consume the current signal identity only after this call has computed it,
     # and before sizing/order submission. Fail closed if durable state is unreadable.
     entry_event_id = str(gate_result.get("durable_event_id") or "").strip()
@@ -6615,6 +6818,19 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         f"EMA9={gate_result.get('ema9')} EMA50={gate_result.get('ema50')} VWAP={gate_result.get('vwap')}",
         "INFO", debounce_key=f"dual_ema_vwap_gate_pass:{symbol}:{side}", debounce_sec=5,
     )
+    # Freeze ADX/DI from the exact closed gate frame, not from a later scanner
+    # cycle. These values are part of the immutable entry context used by the
+    # single profit classifier during management.
+    try:
+        ctx_di_plus, ctx_di_minus, ctx_adx, _ = get_di_components(gate_frame)
+        institutional_entry_ctx["di_plus"] = ctx_di_plus
+        institutional_entry_ctx["di_minus"] = ctx_di_minus
+        institutional_entry_ctx["adx"] = ctx_adx
+    except Exception:
+        pass
+    institutional_entry_ctx["persistent_entry_context"] = _build_persistent_entry_context(
+        institutional_entry_ctx, gate_result, side, symbol, trade_id, atr_val,
+    )
     entry_spread_pct = safe_float(institutional_entry_ctx.get("spread_pct"), 0.0) or 0.0
     entry_liquidity_quality = str(institutional_entry_ctx.get("liquidity_quality") or "UNKNOWN")
     entry_orderbook_depth = safe_float(institutional_entry_ctx.get("orderbook_depth_usdt"), 0.0) or 0.0
@@ -6638,9 +6854,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         # Real available balance from BingX Futures ("free" USDT), with source and
         # fetch timestamp so freshness is provable. A stale/unreadable balance must
         # block the entry rather than silently produce a tiny position.
-        # Sniper V2 targets 20% of TOTAL wallet balance. Free balance is
-        # checked separately as an exchange feasibility gate. Other strategies
-        # keep their existing free-margin sizing path unchanged.
+        # Every strategy uses the same authoritative sizing engine on available
+        # (free) USDT margin. Sniper V2 additionally verifies wallet total is
+        # readable before using free margin; no second allocation is computed.
         if institutional_entry_ctx.get("sniper_v2") is True:
             if institutional_entry_ctx.get("sizing_balance_basis") != "AVAILABLE_FREE":
                 raise ValueError("SNIPER_V2_WALLET_TOTAL_BASIS_REQUIRED")
@@ -6791,6 +7007,76 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 f"Size reduced by design, not silently.",
                 "WARN"
             )
+        # Freeze one immutable decision before any order is submitted. No later
+        # stage is permitted to resize the quantity; precision only rounds it.
+        fee_rate = ESTIMATED_TAKER_FEE_PCT / 100.0
+        slippage_rate = ESTIMATED_SLIPPAGE_PCT / 100.0
+        reduction_reason = (
+            "STRUCTURAL_STOP_RISK_GATE" if sizing.binding_constraint == "RISK_GATE"
+            else "NONE_ALLOCATION_CEILING"
+        )
+        if qty < sizing.quantity - 1e-12:
+            reduction_reason += "+EXCHANGE_PRECISION_ROUND_DOWN"
+        sizing_decision = {
+            **sizing.as_dict(),
+            "schema_version": SIZING_DECISION_SCHEMA_VERSION,
+            "trade_id": trade_id,
+            "symbol": str(symbol),
+            "canonical_symbol": sym,
+            "side": side,
+            "balance_basis": "AVAILABLE_FREE",
+            "balance_source": str(balance_source),
+            "balance_timestamp": float(balance_ts),
+            "available_balance": balance,
+            "requested_classification": str(classification or "").upper(),
+            "strong_tier_authorized": bool(strong_tier_authorized),
+            "leverage": LEVERAGE,
+            "target_allocation_pct": margin_percent,
+            "entry_price": reference_price,
+            "structural_stop": structural_stop,
+            "stop_distance": sizing.stop_distance,
+            "risk_budget_usdt": sizing.max_risk_usdt,
+            "max_qty_before_precision": sizing.quantity,
+            "final_exchange_qty": qty,
+            "estimated_margin": expected_margin,
+            "estimated_sl_loss": estimated_stop_loss,
+            "estimated_fees": {
+                "taker_fee_pct_each_side": ESTIMATED_TAKER_FEE_PCT,
+                "entry_fee_usdt": notional * fee_rate,
+                "exit_fee_usdt": notional * fee_rate,
+                "round_trip_fee_usdt": 2.0 * notional * fee_rate,
+                "source": "CONSERVATIVE_PLANNING_ASSUMPTION_NOT_EXCHANGE_QUOTE",
+            },
+            "estimated_slippage": {
+                "slippage_pct_each_side": ESTIMATED_SLIPPAGE_PCT,
+                "round_trip_usdt": 2.0 * notional * slippage_rate,
+                "source": "CONSERVATIVE_PLANNING_ASSUMPTION_NOT_ACTUAL_FILL",
+            },
+            "reduction_reason": reduction_reason,
+            "structural_reduction_count": 1 if sizing.binding_constraint == "RISK_GATE" else 0,
+            "downstream_reduction_count": 0,
+            "cross_event_id": str(cross_event_id or gate_event_id or ""),
+            "entry_event_id": str(entry_event_id or ""),
+            "profit_target_convention": profit_target_convention(),
+        }
+        STATE["sizing_decision"] = dict(sizing_decision)
+        institutional_entry_ctx["sizing_decision"] = dict(sizing_decision)
+        if gate_journal is not None:
+            try:
+                persisted_decision = gate_journal.persist_sizing_decision(trade_id, sizing_decision)
+            except Exception as decision_exc:
+                persisted_decision = False
+                log_execution(
+                    f"[SIZING_DECISION] CRITICAL persist failed for {trade_id}: "
+                    f"{type(decision_exc).__name__}: {decision_exc}", "ERROR",
+                )
+            if not persisted_decision:
+                if not PAPER_MODE and MODE_LIVE:
+                    log_execution(
+                        f"[SIZING_DECISION] BLOCKED LIVE entry {trade_id}: durable decision unavailable", "ERROR",
+                    )
+                    return False
+                STATE["sizing_decision_persistence_failed"] = True
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
@@ -6929,6 +7215,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "exchange_qty": qty, "remaining_qty": qty,
             "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
             "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
+            "entry_context_snapshot": dict(institutional_entry_ctx.get("persistent_entry_context") or {}),
              "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
             "margin_allocation_pct": margin_percent, "margin_allocated": margin,
             "position_notional": notional, "position_leverage": LEVERAGE,
@@ -7058,6 +7345,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "exchange_qty": qty, "remaining_qty": qty,
             "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
             "peak": 0.0, "atr": atr_val, "entry_time": time.time(), "entry_reasons": [reason],
+            "entry_context_snapshot": dict(institutional_entry_ctx.get("persistent_entry_context") or {}),
              "trade_score": score, "partial_closed": False, "tp1_price": tp1, "tp2_price": tp2,
             "margin_allocation_pct": margin_percent, "margin_allocated": margin,
             "position_notional": notional, "position_leverage": LEVERAGE,
@@ -7208,22 +7496,401 @@ _SCANNER_FRAME_CACHE_LOCK = threading.RLock()
 _SCANNER_FRAME_CACHE_TTL = _env_float_range("SCANNER_FRAME_CACHE_TTL", 90.0, 15.0, 180.0)
 
 def _get_scanner_frame(symbol, limit=150):
-    """One short-lived frame snapshot per symbol shared by both discovery scanners."""
-    key = str(symbol)
-    now = time.monotonic()
-    with _SCANNER_FRAME_CACHE_LOCK:
-        item = _SCANNER_FRAME_CACHE.get(key)
-        if item and now - item[0] < _SCANNER_FRAME_CACHE_TTL:
-            return item[1].copy()
-    frame = get_ohlcv_safe(symbol, limit)
-    if frame is not None:
-        with _SCANNER_FRAME_CACHE_LOCK:
-            _SCANNER_FRAME_CACHE[key] = (time.monotonic(), frame.copy())
-            if len(_SCANNER_FRAME_CACHE) > SCANNER_UNIVERSE_MAX + 20:
-                oldest = sorted(_SCANNER_FRAME_CACHE.items(), key=lambda kv: kv[1][0])
-                for old_key, _ in oldest[:max(1, len(_SCANNER_FRAME_CACHE) - SCANNER_UNIVERSE_MAX)]:
-                    _SCANNER_FRAME_CACHE.pop(old_key, None)
+    """Use the same canonical single-flight snapshot as live management."""
+    frame, _source = get_ohlcv_safe_meta(symbol, limit)
     return frame
+
+
+# ===== CONFIRMED CLOSED-CANDLE EMA9/SESSION-VWAP CROSS EVENTS =====
+# Scanner/RF/V2/professional/radar rows remain discovery hints. Only the strict
+# execution gate below can create these durable, unique Watchlist opportunities.
+CONFIRMED_CROSS_EVENT_SOURCE = "CLOSED_CANDLE_EMA9_VWAP_CROSS"
+CONFIRMED_CROSS_EVENT_TTL_SEC = 4.0 * 3600.0
+CROSS_LIFECYCLE_SCHEMA = "CROSS_REJECTION_V1"
+try:
+    CROSS_REJECTION_MAX_CHASE_ATR = max(0.25, min(3.0, float(os.getenv("CROSS_REJECTION_MAX_CHASE_ATR", "1.5"))))
+except (TypeError, ValueError, OverflowError):
+    CROSS_REJECTION_MAX_CHASE_ATR = 1.5
+SIZING_DECISION_SCHEMA_VERSION = 1
+# Conservative planning assumptions for audit records only. They never resize a
+# position and are never presented as measured exchange fills or net PnL.
+ESTIMATED_TAKER_FEE_PCT = 0.05
+ESTIMATED_SLIPPAGE_PCT = 0.02
+
+
+def _confirmed_cross_event_id(symbol, timeframe, gate_result):
+    raw_signal_id = str((gate_result or {}).get("signal_candle_id") or "").strip()
+    if not raw_signal_id:
+        return ""
+    try:
+        event_symbol = normalize_symbol(symbol)
+    except Exception:
+        event_symbol = str(symbol or "").strip().upper()
+    return f"{event_symbol}:{timeframe}:{raw_signal_id}"
+
+
+def _advance_cross_event_lifecycles(rows):
+    """Advance active cross events using closed candles only, never a live bar."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    evaluator = globals().get("_evaluate_post_cross_rejection_breakout")
+    if journal is None or not callable(evaluator):
+        return 0
+    advanced = 0
+    for row in list(rows or []):
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("lifecycle_schema") or "") != CROSS_LIFECYCLE_SCHEMA:
+            continue
+        try:
+            frame = _get_scanner_frame(row.get("exchange_symbol") or row.get("symbol"))
+            lifecycle = evaluator(
+                frame, str(row.get("side") or ""), row,
+                ema_fn=ema, timeframe_seconds=_roro_timeframe_seconds(row.get("timeframe") or INTERVAL),
+                now_ms=int(time.time() * 1000), max_chase_atr=CROSS_REJECTION_MAX_CHASE_ATR,
+            )
+            if lifecycle.get("entry_ready") and str(lifecycle.get("phase") or "") != "BREAKOUT_CONFIRMED":
+                lifecycle["entry_ready"] = False
+            if journal.update_cross_event_lifecycle(row.get("event_id"), lifecycle):
+                advanced += 1
+        except Exception as exc:
+            log_execution(
+                f"[CROSS_EVENT] lifecycle advance failed for {row.get('event_id')}: "
+                f"{type(exc).__name__}: {exc}", "ERROR",
+                debounce_key=f"cross_lifecycle:{row.get('event_id')}", debounce_sec=10,
+            )
+    return advanced
+
+
+def _sync_confirmed_cross_events():
+    """Reload active cross events from the journal into the Watchlist feed."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    rows = []
+    if journal is not None:
+        try:
+            journal.expire_cross_events()
+            rows = journal.list_cross_events(statuses=("ACTIVE",))
+            if _advance_cross_event_lifecycles(rows):
+                rows = journal.list_cross_events(statuses=("ACTIVE",))
+        except Exception as exc:
+            log_execution(f"[CROSS_EVENT] sync failed: {type(exc).__name__}: {exc}", "ERROR")
+    lifecycle_projection = {}
+    for row in rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+            lifecycle_projection[str(row.get("event_id") or "")] = {
+                "cross_event_phase": str(metadata.get("phase") or "WAITING_FOR_PULLBACK"),
+                "cross_event_lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "cross_event_entry_ready": bool(metadata.get("entry_ready") is True),
+                "cross_event_rejection_high": metadata.get("rejection_high"),
+                "cross_event_rejection_low": metadata.get("rejection_low"),
+                "cross_event_rejection_timestamp": metadata.get("rejection_candle_timestamp"),
+                "cross_event_breakout_timestamp": metadata.get("breakout_candle_timestamp"),
+                "cross_event_breakout_close": metadata.get("breakout_close"),
+                "cross_event_chase_atr": metadata.get("chase_atr"),
+            }
+    MEMORY["confirmed_cross_events"] = [{
+        "symbol": str(row.get("symbol") or ""),
+        "exchange_symbol": str(row.get("exchange_symbol") or row.get("symbol") or ""),
+        "side": str(row.get("side") or "").upper(),
+        "cross_event_id": str(row.get("event_id") or ""),
+        "cross_event_source": str(row.get("source") or CONFIRMED_CROSS_EVENT_SOURCE),
+        "cross_event_direction": str(row.get("direction") or "").upper(),
+        "cross_event_timestamp": int(row.get("signal_candle_timestamp") or 0),
+        "cross_event_status": str(row.get("status") or "ACTIVE").upper(),
+        "cross_event_timeframe": str(row.get("timeframe") or INTERVAL),
+        "cross_event_detected_ts": float(row.get("detected_ts") or 0.0),
+        "cross_event_expires_ts": float(row.get("expires_ts") or 0.0),
+        **lifecycle_projection.get(str(row.get("event_id") or ""), {}),
+        "discovery_source": "confirmed_cross_event",
+        "role": "CONFIRMED_CROSS_EVENT",
+        "score": 100.0,
+        "side_hint": str(row.get("side") or "").upper(),
+        "sources": ["confirmed_cross_event"],
+    } for row in rows if row.get("event_id") and row.get("exchange_symbol")]
+    MEMORY["confirmed_cross_events_last_sync"] = time.time()
+    return rows
+
+
+def _invalidate_superseded_cross_events(symbol, direction, journal, keep_event_id=None):
+    key = roro_canonical_symbol(symbol)
+    keep = str(keep_event_id or "").strip()
+    for event in journal.list_cross_events(statuses=("ACTIVE",)):
+        event_id = str(event.get("event_id") or "")
+        if str(event.get("symbol") or "") != key or event_id == keep:
+            continue
+        reason = "opposite_confirmed_cross" if str(event.get("direction") or "").upper() != str(direction or "").upper() else "superseded_confirmed_cross"
+        try:
+            journal.invalidate_cross_event(event_id, reason)
+        except Exception as exc:
+            log_execution(
+                f"[CROSS_EVENT] invalidate failed for {event.get('event_id')}: "
+                f"{type(exc).__name__}: {exc}", "ERROR",
+            )
+
+
+def _detect_confirmed_cross_events(symbols):
+    """Create durable cross events only from the strict closed-candle gate."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None:
+        MEMORY["confirmed_cross_events"] = []
+        return 0
+    created = 0
+    now_ms = int(time.time() * 1000)
+    timeframe_seconds = _roro_timeframe_seconds(INTERVAL)
+    for symbol in list(symbols or [])[:SCANNER_UNIVERSE_MAX]:
+        try:
+            frame = _get_scanner_frame(symbol)
+        except Exception:
+            continue
+        if frame is None:
+            continue
+        for side in ("BUY", "SELL"):
+            try:
+                gate = _validate_dual_ema_vwap_entry_gate(
+                    frame, side, ema, timeframe_seconds=timeframe_seconds,
+                    now_ms=now_ms, lookback_candles=2,
+                )
+            except Exception:
+                continue
+            if not gate.get("ready") or str(gate.get("authorization_state") or "") != "EMA9_TRIGGER_VALID":
+                continue
+            direction = str(gate.get("ema9_cross") or "").upper()
+            expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
+            if direction != expected_direction:
+                continue
+            event_id = _confirmed_cross_event_id(symbol, INTERVAL, gate)
+            if not event_id:
+                continue
+            metadata = dict(gate)
+            metadata.update({
+                "source": CONFIRMED_CROSS_EVENT_SOURCE,
+                "detection_method": "validate_dual_ema_vwap_entry_gate",
+                "lookback_candles": 2,
+                "lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "phase": "WAITING_FOR_PULLBACK",
+                "entry_ready": False,
+                "cross_price": float(frame["close"].iloc[-1]),
+                "max_chase_atr": CROSS_REJECTION_MAX_CHASE_ATR,
+            })
+            try:
+                inserted = journal.record_cross_event(
+                    event_id=event_id,
+                    symbol=roro_canonical_symbol(symbol),
+                    exchange_symbol=str(symbol),
+                    side=side,
+                    direction=direction,
+                    source=CONFIRMED_CROSS_EVENT_SOURCE,
+                    timeframe=str(INTERVAL),
+                    signal_candle_timestamp=int(gate.get("signal_candle_timestamp") or 0),
+                    closed_candle_timestamp=int(gate.get("latest_closed_timestamp") or 0),
+                    expires_ts=time.time() + CONFIRMED_CROSS_EVENT_TTL_SEC,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                log_execution(
+                    f"[CROSS_EVENT] persist failed for {event_id}: {type(exc).__name__}: {exc}",
+                    "ERROR",
+                )
+                continue
+            if inserted:
+                created += 1
+                _invalidate_superseded_cross_events(symbol, direction, journal, keep_event_id=event_id)
+                log_execution(
+                    f"[CROSS_EVENT] CONFIRMED {event_id} side={side} "
+                    f"candle={gate.get('signal_candle_timestamp')}", "INFO",
+                )
+    _sync_confirmed_cross_events()
+    return created
+
+
+def _cross_event_is_usable(event_id, side=None):
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        return False
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None:
+        return False
+    try:
+        row = journal.get_cross_event(event_id)
+    except Exception:
+        return False
+    if not row or str(row.get("status") or "").upper() != "ACTIVE":
+        return False
+    if side and str(row.get("side") or "").upper() != str(side).upper():
+        return False
+    if float(row.get("expires_ts") or 0.0) <= time.time():
+        return False
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+        return (
+            str(metadata.get("phase") or "").upper() == "BREAKOUT_CONFIRMED"
+            and metadata.get("entry_ready") is True
+        )
+    return True
+
+
+def _get_confirmed_cross_event(event_id):
+    event_id = str(event_id or "").strip()
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if not event_id or journal is None:
+        return None
+    try:
+        return journal.get_cross_event(event_id)
+    except Exception:
+        return None
+
+
+def _hydrate_cross_lifecycle_context(ctx, event_id, gate_result, side, symbol, timeframe):
+    """Bind an execution to the original cross event and its rejection breakout.
+
+    The fresh-cross gate may legitimately be stale by the time a delayed
+    pullback/rejection/breakout occurs. In that case the durable lifecycle is
+    authoritative, but only when it explicitly says BREAKOUT_CONFIRMED.
+    """
+    row = _get_confirmed_cross_event(event_id)
+    if not row:
+        return False
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    if str(metadata.get("lifecycle_schema") or "") != CROSS_LIFECYCLE_SCHEMA:
+        return False
+    context = ctx if isinstance(ctx, dict) else {}
+    context.update({
+        "cross_event_phase": str(metadata.get("phase") or "WAITING_FOR_PULLBACK"),
+        "cross_event_lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+        "cross_event_entry_ready": bool(metadata.get("entry_ready") is True),
+        "cross_event_rejection_high": metadata.get("rejection_high"),
+        "cross_event_rejection_low": metadata.get("rejection_low"),
+        "cross_event_rejection_timestamp": metadata.get("rejection_candle_timestamp"),
+        "cross_event_breakout_timestamp": metadata.get("breakout_candle_timestamp"),
+        "cross_event_breakout_close": metadata.get("breakout_close"),
+        "cross_event_chase_atr": metadata.get("chase_atr"),
+        "cross_event_max_chase_atr": metadata.get("max_chase_atr"),
+        "cross_event_cross_price": metadata.get("cross_price"),
+        "cross_event_cross_atr": metadata.get("cross_atr"),
+    })
+    gate = gate_result if isinstance(gate_result, dict) else {}
+    gate["durable_event_id"] = str(row.get("event_id") or event_id)
+    gate["signal_candle_timestamp"] = int(row.get("signal_candle_timestamp") or 0)
+    original_signal_id = str(metadata.get("signal_candle_id") or "")
+    if not original_signal_id:
+        original_direction = "BUY" if str(side).upper() == "BUY" else "SELL"
+        original_signal_id = f"{original_direction}:{int(row.get('signal_candle_timestamp') or 0)}"
+    gate["signal_candle_id"] = original_signal_id
+    recomputed_event_id = _confirmed_cross_event_id(symbol, timeframe, gate)
+    if recomputed_event_id:
+        gate["durable_event_id"] = recomputed_event_id
+    gate["lifecycle_phase"] = context["cross_event_phase"]
+    gate["lifecycle_entry_ready"] = context["cross_event_entry_ready"]
+    if context["cross_event_entry_ready"] and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED":
+        gate["ready"] = True
+        gate["authorization_state"] = "POST_CROSS_REJECTION_BREAKOUT_VALID"
+        gate["reason"] = "closed_rejection_high_low_breakout_confirmed"
+    return True
+
+
+def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, atr_val=None):
+    """Freeze the actual entry evidence; never read live scanner state later."""
+    source = ctx if isinstance(ctx, dict) else {}
+    gate = gate_result if isinstance(gate_result, dict) else {}
+    ob = source.get("order_block") if isinstance(source.get("order_block"), dict) else {}
+    golden = source.get("golden_zone") if isinstance(source.get("golden_zone"), dict) else {}
+    liquidity = source.get("liquidity") if isinstance(source.get("liquidity"), dict) else {}
+    structure = source.get("market_structure") if isinstance(source.get("market_structure"), dict) else {}
+    market_intel = source.get("market_intelligence") if isinstance(source.get("market_intelligence"), dict) else {}
+    adx_di = source.get("adx_di") if isinstance(source.get("adx_di"), dict) else {}
+    support_resistance = source.get("support_resistance") if isinstance(source.get("support_resistance"), dict) else {}
+
+    def _number(value, default=None):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else default
+        except (TypeError, ValueError):
+            return default
+
+    def _first(*values):
+        for value in values:
+            if value is not None and value != "":
+                return value
+        return None
+
+    ob_fresh = str(ob.get("status") or source.get("order_block_status") or "").upper() in {
+        "FRESH", "UNTESTED", "VALID"
+    }
+    try:
+        canonical = roro_canonical_symbol(symbol)
+    except Exception:
+        canonical = str(symbol or "").strip().upper()
+    return {
+        "schema_version": 1,
+        "trade_id": str(trade_id or ""),
+        "symbol": canonical,
+        "exchange_symbol": str(symbol or ""),
+        "side": str(side or "").upper(),
+        "cross_event_id": str(_first(source.get("cross_event_id"), gate.get("durable_event_id")) or ""),
+        "cross_event_source": str(_first(source.get("cross_event_source"), CONFIRMED_CROSS_EVENT_SOURCE)),
+        "cross_event_direction": str(_first(source.get("cross_event_direction"), gate.get("ema9_cross")) or "").upper(),
+        "cross_event_timestamp": _first(source.get("cross_event_timestamp"), gate.get("signal_candle_timestamp")) or 0,
+        "cross_event_timeframe": str(_first(source.get("cross_event_timeframe"), gate.get("timeframe")) or INTERVAL),
+        "cross_event_status": str(_first(source.get("cross_event_status"), "ACTIVE")),
+        "cross_signal_candle_id": str(gate.get("signal_candle_id") or ""),
+        "durable_event_id": str(gate.get("durable_event_id") or ""),
+        "rejection_candle": {
+            "phase": str(_first(source.get("cross_event_phase"), gate.get("lifecycle_phase"), "WAITING_FOR_PULLBACK")),
+            "lifecycle_schema": str(_first(source.get("cross_event_lifecycle_schema"), CROSS_LIFECYCLE_SCHEMA)),
+            "entry_ready": bool(_first(source.get("cross_event_entry_ready"), gate.get("lifecycle_entry_ready"), False)),
+            "rejection_timestamp": _first(source.get("cross_event_rejection_timestamp"), gate.get("rejection_candle_timestamp")),
+            "rejection_high": _number(_first(source.get("cross_event_rejection_high"), gate.get("rejection_high"))),
+            "rejection_low": _number(_first(source.get("cross_event_rejection_low"), gate.get("rejection_low"))),
+            "breakout_timestamp": _first(source.get("cross_event_breakout_timestamp"), gate.get("breakout_candle_timestamp")),
+            "breakout_close": _number(_first(source.get("cross_event_breakout_close"), gate.get("breakout_close"))),
+            "chase_atr": _number(_first(source.get("cross_event_chase_atr"), gate.get("chase_atr"))),
+            "max_chase_atr": _number(source.get("cross_event_max_chase_atr"), CROSS_REJECTION_MAX_CHASE_ATR),
+        },
+        "actual_entry_price": None,
+        "actual_filled_qty": None,
+        "profit_target_convention": profit_target_convention(),
+        "entry_zone": {
+            "low": _number(source.get("entry_zone_low"), 0.0),
+            "high": _number(source.get("entry_zone_high"), 0.0),
+            "quality": _first(source.get("zone_quality"), golden.get("score")),
+            "state": str(golden.get("state") or "UNKNOWN"),
+        },
+        "order_block": {
+            "type": str(ob.get("type") or source.get("zone_type") or "UNKNOWN"),
+            "freshness": str(ob.get("status") or source.get("order_block_status") or "UNKNOWN"),
+            "valid": bool(ob.get("valid", ob_fresh)),
+            "low": _number(ob.get("low")),
+            "high": _number(ob.get("high")),
+            "strength": _number(ob.get("strength")),
+            "distance_atr": _number(ob.get("distance_atr")),
+        },
+        "supply_demand_zone": {
+            "zone_type": str(source.get("zone_type") or ("DEMAND" if str(side).upper() == "BUY" else "SUPPLY")),
+            "status": str(golden.get("state") or "UNKNOWN"),
+            "support_resistance": support_resistance,
+        },
+        "liquidity": dict(liquidity),
+        "market_structure": dict(structure),
+        "relative_volume": _number(_first(source.get("volume_ratio"), market_intel.get("volume_ratio"))),
+        "adx_di": {
+            "adx": _number(_first(source.get("adx"), adx_di.get("adx"))),
+            "di_plus": _number(_first(source.get("di_plus"), adx_di.get("di_plus"))),
+            "di_minus": _number(_first(source.get("di_minus"), adx_di.get("di_minus"))),
+        },
+        "atr": _number(_first(source.get("atr"), atr_val)),
+        "ema9": _number(_first(gate.get("ema9"), source.get("ema9"))),
+        "ema50": _number(_first(gate.get("ema50"), source.get("ema50"))),
+        "vwap": _number(_first(gate.get("vwap"), source.get("vwap"))),
+        "entry_regime": str(_first(source.get("market_regime"), market_intel.get("regime"), "UNKNOWN")),
+        "trading_mode": str(_first(source.get("trading_mode"), market_intel.get("mode"), "UNCLASSIFIED")),
+        "entry_behavior": str(_first(source.get("entry_behavior"), market_intel.get("entry_behavior"), "WAIT_FOR_STRUCTURE")),
+        "entry_behavior_confidence": _number(source.get("entry_behavior_confidence"), 0.0),
+        "evidence": list(source.get("evidence") or []),
+        "structural_stop": _number(source.get("structural_stop")),
+        "closed_candle_timestamp": source.get("closed_candle_timestamp") or gate.get("latest_closed_timestamp") or 0,
+        "frame_source": str(source.get("closed_candle_source") or gate.get("frame_source") or "UNKNOWN"),
+        "snapshot_ts": time.time(),
+    }
+
 
 def get_usdt_perp_symbols():
     """Load and validate the USDT swap universe through the central governor."""
@@ -11091,6 +11758,7 @@ def main_loop_sniper():
             if now - last_flow_update > 60:
                 update_institutional_flow_scanner()
                 last_flow_update = now
+                _main_loop_progress("institutional_flow_update_complete")
 
             if not (TRADE_STATE["in_position"] or STATE["open"]):
                 sync_position_state()
@@ -11116,9 +11784,11 @@ def main_loop_sniper():
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
                         smart_opportunity_selection()
                         last_candidate_scan = now
+                        _main_loop_progress("watchlist_refresh_complete")
                     # Sniper is an entry-only candidate engine; it never runs while
                     # a position is open and uses the same bounded scanner cache.
-                    _run_sniper_scan_if_due()
+                    if _run_sniper_scan_if_due():
+                        _main_loop_progress("sniper_scan_complete")
                     time.sleep(1)
                 else:
                     time.sleep(1)
@@ -11134,6 +11804,7 @@ def main_loop_sniper():
                         scaling_logic(sym, df, None)
                         current_pnl = STATE.get("roe_pct", 0.0)
                         update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
+                        _main_loop_progress("open_trade_risk_refresh_complete", symbol=str(sym))
             # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
             # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
             daily_loss_cooldown_active()
@@ -11160,7 +11831,64 @@ def _main_loop_progress(phase, **details):
     if watchdog is None:
         return
     _MAIN_LOOP_PROGRESS_SEQ += 1
-    payload = {"state": "RUNNING", "phase": phase, "progress_seq": _MAIN_LOOP_PROGRESS_SEQ}
+    payload = {
+        "state": "RUNNING", "phase": phase, "progress": True,
+        "progress_seq": _MAIN_LOOP_PROGRESS_SEQ,
+        "thread_name": threading.current_thread().name,
+    }
+    payload.update(details)
+    watchdog.beat("main_loop", **payload)
+
+
+def _exchange_call_phase_deadline_sec():
+    """Bound a synchronous exchange phase by the configured HTTP timeout.
+
+    This is not a watchdog timeout change: the watchdog grace window is
+    unchanged. It only labels a known blocking call with its real deadline so
+    a slow-but-bounded exchange read is not misreported as an engine stall.
+    """
+    try:
+        timeout_ms = float(getattr(ex, "timeout", 12000) or 12000)
+    except Exception:
+        timeout_ms = 12000.0
+    return max(5.0, min(90.0, (timeout_ms / 1000.0) + 10.0))
+
+
+def _main_loop_status(phase, reason, **details):
+    """Record a terminal phase outcome without advancing liveness.
+
+    Used for failed/blocked outcomes so a failure cannot masquerade as a
+    genuinely completed operation.
+    """
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        return
+    payload = {
+        "state": "RUNNING", "phase": phase, "reason": reason,
+        "progress": False,
+        "thread_name": threading.current_thread().name,
+    }
+    payload.update(details)
+    watchdog.beat("main_loop", **payload)
+
+
+def _main_loop_blocked_phase(phase, reason, *, timeout_sec=None, **details):
+    """Announce entry into a bounded blocking phase without claiming progress.
+
+    This is a status-only observation (``progress=False``). Only the completion
+    beat advances liveness, so a dead thread or a permanently blocked call can
+    never be kept alive by the deadline itself.
+    """
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is None:
+        return
+    deadline = max(5.0, float(timeout_sec or _exchange_call_phase_deadline_sec()))
+    payload = {
+        "state": "BLOCKED", "phase": phase, "reason": reason,
+        "progress": False,
+        "thread_name": threading.current_thread().name,
+        "blocked_until": watchdog.monotonic() + deadline,
+    }
     payload.update(details)
     watchdog.beat("main_loop", **payload)
 
@@ -11218,35 +11946,104 @@ def _exchange_position_matches_control_state(row, symbol, side=None, qty=None):
     return True
 
 
-def _verify_engine_recovery(symbol=None):
+def _verify_engine_recovery(symbol=None, *, caller="direct", component="engine",
+                            verification_source=""):
     """Verify BingX position, conditional orders and native SL before resume.
 
     Returns ``(verified, reason, context)``. Any failed or partial exchange read
     returns UNKNOWN-like failure, sets the recovery hold for an open exposure and
-    never authorizes management or scanner work.
+    never authorizes management or scanner work. Empty runtime symbols are never
+    converted into an exchange lookup; a flat state uses a symbol-free position
+    query and an open exposure with no symbol is explicitly rejected.
     """
-    raw_symbol = symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or ""
-    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
+    explicit_symbol = symbol is not None
+    if explicit_symbol:
+        raw_symbol = symbol
+        raw_symbol_source = "EXPLICIT_ARGUMENT"
+    else:
+        raw_symbol = STATE.get("current_symbol")
+        raw_symbol_source = "STATE.current_symbol"
+        if not raw_symbol:
+            raw_symbol = TRADE_STATE.get("symbol")
+            raw_symbol_source = "TRADE_STATE.symbol"
+        if not raw_symbol:
+            raw_symbol_source = "NONE"
+
     local_open = bool(STATE.get("open") or TRADE_STATE.get("in_position"))
+    has_raw_symbol = bool(str(raw_symbol or "").strip())
+    if explicit_symbol or has_raw_symbol:
+        sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
+        symbol_status = "VALID" if sym else "INVALID"
+    else:
+        sym, symbol_reason = "", "MISSING_SYMBOL"
+        symbol_status = "MISSING"
+        symbol_diagnostics = {
+            "original_symbol": "", "normalized_symbol": "", "source": "NONE",
+            "market_type": "UNKNOWN", "market_id": "",
+        }
     expected_side = str(STATE.get("side") or TRADE_STATE.get("side") or "").upper()
     expected_qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty")
                               or TRADE_STATE.get("qty"), 0.0)
     context = {
-        "symbol": sym or normalize_symbol(raw_symbol) or str(raw_symbol)[:80],
+        "symbol": sym or "",
+        "raw_symbol": str(raw_symbol or "")[:80],
+        "symbol_source": raw_symbol_source,
+        "symbol_status": symbol_status,
+        "caller": str(caller)[:80],
+        "component": str(component)[:80],
+        "verification_source": str(verification_source or raw_symbol_source)[:120],
         "local_open": local_open, "open_position_verified": False,
         "flat_verified": False, "orders_verified": False, "stop_verified": False,
         "paper_mode": bool(PAPER_MODE), "symbol_diagnostics": symbol_diagnostics,
     }
     if PAPER_MODE:
+        if not sym and local_open and symbol_status != "VALID":
+            reason = ("engine_recovery_invalid_base_asset" if symbol_status == "INVALID"
+                      else "engine_recovery_symbol_missing_open_exposure")
+            return False, reason, context
         context.update({"open_position_verified": local_open, "flat_verified": not local_open,
                         "paper_only": True})
         return True, "PAPER_MODE_RECOVERY", context
     if not sym:
-        reason = f"engine_recovery_{symbol_reason.lower()}"
+        if symbol_status == "INVALID" or explicit_symbol:
+            reason = f"engine_recovery_{symbol_reason.lower()}"
+            if local_open:
+                _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"),
+                               details={"symbol_diagnostics": symbol_diagnostics,
+                                        "symbol_status": symbol_status})
+            return False, reason, context
         if local_open:
-            _recovery_hold(reason, symbol=context["symbol"], trade_id=STATE.get("trade_id"),
-                           details={"symbol_diagnostics": symbol_diagnostics})
-        return False, reason, context
+            reason = "engine_recovery_symbol_missing_open_exposure"
+            _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"),
+                           details={"symbol_diagnostics": symbol_diagnostics,
+                                    "symbol_status": symbol_status})
+            return False, reason, context
+        # Flat with no controlled symbol: ask the exchange for ALL account-wide
+        # USDT-margined swap positions. No symbol is inferred or synthesized.
+        # A FLAT result is accepted only from a complete, authoritative snapshot;
+        # every partial/malformed/failed/ambiguous response stays UNKNOWN.
+        from bingx_protection import validate_account_position_snapshot
+        try:
+            raw_positions = safe_api_call(ex.fetch_positions)
+        except Exception as exc:
+            reason = f"engine_recovery_flat_query_unknown:{type(exc).__name__}"
+            context["snapshot_reason"] = reason
+            return False, reason, context
+        status, open_rows, snapshot_reason, snapshot_diag = validate_account_position_snapshot(
+            ex, raw_positions)
+        context["snapshot_reason"] = snapshot_reason
+        context["snapshot_diagnostics"] = snapshot_diag
+        if status == "UNKNOWN":
+            return False, f"engine_recovery_flat_query_unknown:{snapshot_reason}", context
+        if status == "OPEN":
+            reason = "engine_recovery_unexpected_exchange_position"
+            detected_symbol = _position_symbol(open_rows[0]) if open_rows else ""
+            _recovery_hold(reason, symbol=detected_symbol,
+                           details={"symbol_status": "UNEXPECTED_EXCHANGE_SYMBOL",
+                                    "snapshot_diagnostics": snapshot_diag})
+            return False, reason, context
+        context["flat_verified"] = True
+        return True, "FLAT_VERIFIED_NO_SYMBOL", context
     if local_open and (expected_side not in {"BUY", "SELL"} or expected_qty <= 0):
         reason = "engine_recovery_local_state_incomplete"
         if local_open:
@@ -11463,6 +12260,13 @@ def _resume_keep_alive_after_verification(_context=None):
     return True
 
 
+def _verify_main_loop_recovery():
+    """Watchdog entry point: keep caller/component provenance in recovery context."""
+    return _verify_engine_recovery(
+        caller="watchdog_stalled", component="main_loop",
+        verification_source="STATE.current_symbol|TRADE_STATE.symbol")
+
+
 def start_naiso_services():
     """Register engines with the watchdog and verified recovery callbacks."""
     watchdog = globals().get("NAISO_WATCHDOG")
@@ -11470,13 +12274,14 @@ def start_naiso_services():
         return False
     watchdog.register("main_loop", interval_sec=max(5.0, safe_float(BASE_SLEEP, 5.0)),
                       grace_sec=60.0, critical=True, restartable=True,
-                      recovery_verifier=_verify_engine_recovery,
+                      recovery_verifier=_verify_main_loop_recovery,
                       restart_fn=_resume_main_loop_after_verification,
                       lifecycle="BLOCKED", resume_requires_liveness=True)
     # Startup exchange recovery runs before the first loop iteration. Classify it
     # as a bounded startup phase instead of letting the watchdog call it a stall.
     watchdog.beat("main_loop", state="BLOCKED", phase="startup_recovery",
-                  reason="STARTUP_RECOVERY",
+                  reason="STARTUP_RECOVERY", progress=False,
+                  thread_name=threading.current_thread().name,
                   blocked_until=watchdog.monotonic() + 300.0)
     watchdog.register("exchange_reconciliation", interval_sec=15.0, grace_sec=60.0,
                       critical=True, restartable=True,
@@ -11549,6 +12354,7 @@ from ggp_institutional_bridge import (
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
                              validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             evaluate_post_cross_rejection_breakout as _evaluate_post_cross_rejection_breakout,
                              timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
@@ -11882,6 +12688,8 @@ def refresh_unified_institutional_watchlist(force=False):
         return MEMORY.setdefault("watchlist", {})
     try:
         MEMORY["_proximity_batch_updates"] = 0
+        # Persisted cross events survive scanner cycles and process restarts.
+        _sync_confirmed_cross_events()
         result = update_unified_watchlist(
             MEMORY, _integration_fetch_frame,
             max_items=INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS,
@@ -11925,7 +12733,13 @@ def cleanup_watchlist(ttl=900):
     # Snapshot before iteration: scanner threads may add/remove watchlist keys.
     for key, value in wl.copy().items():
         age=now-float(value.get("last_update", value.get("last_updated", now)) or now)
-        if age>ttl and value.get("decision_state") not in ("ENTRY_READY","WAITING_FOR_RETEST","WAITING_FOR_CONFIRMATION"):
+        active_cross_event = bool(
+            value.get("cross_event_id")
+            and str(value.get("cross_event_status", "ACTIVE")).upper() == "ACTIVE"
+        )
+        if (age>ttl and value.get("decision_state") not in
+                ("ENTRY_READY","WAITING_FOR_RETEST","WAITING_FOR_CONFIRMATION")
+                and not active_cross_event):
             wl.pop(key,None)
     if INSTITUTIONAL_RESOURCE_MANAGER:
         INSTITUTIONAL_RESOURCE_MANAGER.cleanup(preserve_keys=())
@@ -12063,6 +12877,11 @@ def smart_opportunity_selection():
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "duplicate_event_persisted"
                 continue
+            cross_event_id = str(item.get("cross_event_id") or "")
+            if cross_event_id and not _cross_event_is_usable(cross_event_id, side):
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "confirmed_cross_event_not_breakout_confirmed"
+                continue
             atr_value = compute_atr(closed_df).iloc[-1]
             if not np.isfinite(atr_value) or atr_value <= 0:
                 item["decision_state"] = "REJECTED"
@@ -12157,7 +12976,29 @@ def smart_opportunity_selection():
                 "entry_behavior_confidence": safe_float(item.get("entry_behavior_confidence", market_intelligence.get("confidence")), 0.0),
                 "entry_behavior_reasons": list(item.get("entry_behavior_reasons") or market_intelligence.get("reason_codes") or []),
                 "market_intelligence": dict(market_intelligence),
-
+                "zone_quality": item.get("zone_quality"),
+                "zone_type": item.get("zone_type"),
+                "market_structure": dict(item.get("market_structure") or {}),
+                "volume_ratio": item.get("volume_ratio"),
+                "adx": item.get("adx"),
+                "adx_di": dict(item.get("adx_di") or {}),
+                "ema9": item.get("ema9"),
+                "ema50": item.get("ema50"),
+                "vwap": item.get("vwap"),
+                "market_regime": item.get("market_regime"),
+                "cross_event_id": str(item.get("cross_event_id") or ""),
+                "cross_event_source": item.get("cross_event_source"),
+                "cross_event_direction": item.get("cross_event_direction"),
+                "cross_event_timestamp": item.get("cross_event_timestamp"),
+                "cross_event_phase": item.get("cross_event_phase"),
+                "cross_event_lifecycle_schema": item.get("cross_event_lifecycle_schema"),
+                "cross_event_entry_ready": item.get("cross_event_entry_ready"),
+                "cross_event_rejection_high": item.get("cross_event_rejection_high"),
+                "cross_event_rejection_low": item.get("cross_event_rejection_low"),
+                "cross_event_rejection_timestamp": item.get("cross_event_rejection_timestamp"),
+                "cross_event_breakout_timestamp": item.get("cross_event_breakout_timestamp"),
+                "cross_event_breakout_close": item.get("cross_event_breakout_close"),
+                "cross_event_chase_atr": item.get("cross_event_chase_atr"),
                 "pullback_type": next((x.split(":", 1)[0] for x in evidence
                                         if any(t in x.lower() for t in ("pullback:", "retest:", "micro_pullback:"))), None),
                 "exchange_symbol": exchange_sym,
@@ -12494,6 +13335,10 @@ def run_global_discovery_scanner():
     blended.sort(key=lambda item: float(item.get("score", 0) or 0), reverse=True)
     MEMORY["top_candidates"] = blended[:60]
 
+    # Confirmed crosses are derived only from the strict closed-candle gate over
+    # the USDT swap universe, never from any of the supplementary scanner rows.
+    new_cross_events = _detect_confirmed_cross_events(symbols)
+
     meta.update({
         "state": "IDLE", "last_completed": time.time(), "symbols_scanned": len(symbols),
         "professional_candidates": len(pro_candidates), "professional_valid_data": pro_stats.get("valid_data", 0),
@@ -12501,14 +13346,19 @@ def run_global_discovery_scanner():
         "buy_candidates": len(MEMORY.get("scanner_v2_buy", [])),
         "sell_candidates": len(MEMORY.get("scanner_v2_sell", [])),
         "radar_candidates": len(radar_candidates), "blended_candidates": len(blended),
+        "confirmed_cross_events": len(MEMORY.get("confirmed_cross_events", [])),
+        "confirmed_cross_events_new": int(new_cross_events),
         "duration_seconds": round(time.time() - started, 2),
         "universe_limit": SCANNER_UNIVERSE_MAX,
         "directional_cross_required": False,
+        "confirmed_cross_event_source": CONFIRMED_CROSS_EVENT_SOURCE,
     })
     log_execution(
         f"[DISCOVERY_SCANNER] complete symbols={len(symbols)} pro={len(pro_candidates)} "
         f"buy={meta['buy_candidates']} sell={meta['sell_candidates']} rf={len(rf_candidates)} "
-        f"radar={len(radar_candidates)} blended={len(blended)} duration={meta['duration_seconds']}s",
+        f"radar={len(radar_candidates)} blended={len(blended)} "
+        f"cross_events={meta['confirmed_cross_events']} new_crosses={new_cross_events} "
+        f"duration={meta['duration_seconds']}s",
         "INFO", debounce_key="discovery_scanner_complete", debounce_sec=60
     )
 
@@ -12538,8 +13388,14 @@ def _position_symbol(pos):
     return str(pos.get("symbol") or info.get("symbol") or "")
 
 
-def fetch_position_tri_state(symbol=None):
-    """Return OPEN/FLAT/UNKNOWN; API errors must never be interpreted as FLAT."""
+def fetch_position_tri_state(symbol=None, *, strict_account_snapshot=False):
+    """Return OPEN/FLAT/UNKNOWN; API errors must never be interpreted as FLAT.
+
+    ``strict_account_snapshot`` requires a complete authoritative account-wide
+    BingX swap snapshot before an unsymbolized query may conclude FLAT. It is
+    used by the main-loop sync and recovery paths; symbol-scoped callers keep
+    the legacy shape for compatibility.
+    """
     global LAST_POSITION_FETCH_STATUS
     if PAPER_MODE:
         status = "OPEN" if STATE.get("open") else "FLAT"
@@ -12565,7 +13421,19 @@ def fetch_position_tri_state(symbol=None):
         if result is None or not isinstance(result, (list, tuple)):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
-        open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
+        if strict_account_snapshot and not symbol:
+            from bingx_protection import validate_account_position_snapshot
+            status, strict_rows, reason, snapshot_diag = validate_account_position_snapshot(ex, result)
+            if status == "UNKNOWN":
+                LAST_POSITION_FETCH_STATUS = "UNKNOWN"
+                log_execution(
+                    f"[POS_SYNC] account-wide snapshot not authoritative: {reason} "
+                    f"rows={snapshot_diag.get('rows')} supported_markets={snapshot_diag.get('supported_markets')}",
+                    "ERROR", debounce_key=f"tri_state_snapshot_{reason}", debounce_sec=30)
+                return "UNKNOWN", None
+            open_positions = strict_rows
+        else:
+            open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
         if symbol:
             target = roro_canonical_symbol(symbol)
             matches = [p for p in open_positions if roro_canonical_symbol(_position_symbol(p)) == target]
@@ -13025,8 +13893,10 @@ def _persist_trade_journal_snapshot(force=False):
 def _recovery_hold(reason, *, symbol=None, trade_id=None, details=None):
     """Keep a real exchange exposure visible while prohibiting fabricated management."""
     reason = str(reason or "management_state_incomplete")
+    details = dict(details or {})
+    symbol_status = str(details.get("symbol_status") or ("MISSING" if not symbol else "PRESENT"))
     STATE.update({"open": True, "recovery_hold": True, "recovery_reason": reason,
-                  "native_sl_verified": False})
+                  "recovery_symbol_status": symbol_status, "native_sl_verified": False})
     if STATE.get("native_sl_status") not in {"MISSING", "UNKNOWN", "MISMATCH"}:
         STATE["native_sl_status"] = "RECOVERY_PENDING"
     if symbol:
@@ -13862,10 +14732,16 @@ def sync_all_states():
         RECOVERY_BLOCK_ENTRIES = False
         return
     symbol = STATE.get("current_symbol") if STATE.get("open") else None
+    _main_loop_blocked_phase(
+        "position_sync_start", "EXCHANGE_POSITION_SYNC",
+        symbol=str(symbol or "NO_SYMBOL"),
+    )
+    status = ""
     if symbol:
         sync_position_state(symbol)
+        status = str(MEMORY.get("position_status") or "")
     else:
-        status, positions = fetch_position_tri_state(None)
+        status, positions = fetch_position_tri_state(None, strict_account_snapshot=True)
         if status == "UNKNOWN":
             MEMORY["position_status"] = "UNKNOWN"
             MEMORY["current_position"] = None
@@ -13885,13 +14761,24 @@ def sync_all_states():
             else:
                 MEMORY["position_status"] = "MULTIPLE_OPEN"
                 RECOVERY_BLOCK_ENTRIES = True
-    symbol_for_pnl = symbol or DEFAULT_SYMBOL
-    try:
-        real_pnl, real_pnl_pct = get_realized_pnl(symbol_for_pnl)
-        MEMORY["total_pnl"] = real_pnl
-        MEMORY["total_pnl_pct"] = real_pnl_pct
-    except Exception:
-        pass
+    # A completed exchange sync is real progress even when the result is UNKNOWN.
+    _main_loop_progress("position_sync_complete", status=status or str(MEMORY.get("position_status") or ""))
+    if symbol:
+        _main_loop_blocked_phase(
+            "realized_pnl_start", "EXCHANGE_REALIZED_PNL", symbol=str(symbol),
+        )
+        try:
+            real_pnl, real_pnl_pct = get_realized_pnl(symbol)
+            MEMORY["total_pnl"] = real_pnl
+            MEMORY["total_pnl_pct"] = real_pnl_pct
+        except Exception as exc:
+            # A failed read is not a completed phase. Report the terminal outcome
+            # without advancing liveness; the next real iteration beat proves the
+            # loop is still running.
+            _main_loop_status("realized_pnl_failed", "EXCHANGE_REALIZED_PNL_FAILED",
+                              symbol=str(symbol), error=type(exc).__name__)
+            return
+        _main_loop_progress("realized_pnl_complete", symbol=str(symbol))
 
 
 # Serialize final entry authorization so one closed-candle trigger cannot
@@ -13909,8 +14796,57 @@ def execute_entry(*args, **kwargs):
         if result and STATE.get("open"):
             ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
             _persist_trade_journal_start(ctx.get("setup_type"))
+            trade_id = str(STATE.get("trade_id") or "")
+            entry_context = dict(ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {})
+            sizing_decision = dict(STATE.get("sizing_decision") or ctx.get("sizing_decision") or {})
+            # The handoff is frozen after fill verification: planned values come
+            # from the immutable sizing decision, actual values from the exchange
+            # result (or the verified PAPER fill).
+            entry_context.update({
+                "requested_entry_price": sizing_decision.get("entry_price"),
+                "requested_qty": sizing_decision.get("final_exchange_qty")
+                or sizing_decision.get("final_qty"),
+                "actual_entry_price": STATE.get("entry"),
+                "actual_filled_qty": STATE.get("initial_qty") or STATE.get("qty"),
+                "fill_source": "EXCHANGE_VERIFIED_FILL" if not PAPER_MODE else "PAPER_VERIFIED_FILL",
+            })
+            STATE["entry_context_snapshot"] = dict(entry_context)
+            if journal is not None and entry_context:
+                try:
+                    if not journal.persist_entry_context(trade_id, entry_context):
+                        STATE["entry_context_persistence_failed"] = True
+                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                        log_execution(
+                            f"[ENTRY_CONTEXT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                            "has no durable entry context; new entries blocked",
+                            "ERROR",
+                        )
+                except Exception as exc:
+                    STATE["entry_context_persistence_failed"] = True
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[ENTRY_CONTEXT] CRITICAL: persistence failed for {trade_id}: "
+                        f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
+                    )
+            cross_event_id = str(ctx.get("cross_event_id") or "").strip()
+            if cross_event_id and journal is not None:
+                try:
+                    if not journal.consume_cross_event(cross_event_id, trade_id):
+                        STATE["cross_event_persistence_failed"] = True
+                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                        log_execution(
+                            f"[CROSS_EVENT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                            f"but could not consume cross event {cross_event_id}; new entries blocked",
+                            "ERROR",
+                        )
+                except Exception as exc:
+                    STATE["cross_event_persistence_failed"] = True
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[CROSS_EVENT] CRITICAL: consumption failed for {cross_event_id}: "
+                        f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
+                    )
             if event_id and journal is not None:
-                trade_id = str(STATE.get("trade_id") or "")
                 try:
                     if not trade_id or not journal.consume_event(event_id, trade_id):
                         STATE["entry_event_persistence_failed"] = True

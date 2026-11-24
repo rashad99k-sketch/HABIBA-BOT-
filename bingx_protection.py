@@ -299,6 +299,171 @@ def native_order_identifiers(order: Dict[str, Any]) -> set[str]:
     return identifiers
 
 
+# The bot only trades BingX USDT-margined perpetual swaps ("BTC/USDT:USDT").
+# CCXT's bingx.fetch_positions(None) queries the swap position endpoint without a
+# symbol filter and returns the account-wide position structure list for that
+# contract family. Standard/fixed-term contract positions require a separate
+# endpoint/params and are outside the supported universe. A FLAT conclusion is
+# therefore only authoritative when the payload is a complete unified list, the
+# market metadata proves the supported swap universe was loaded, and every row
+# is a well-formed supported-swap position.
+SUPPORTED_POSITION_CONTRACT_TYPES = frozenset({"PERPETUAL", "SWAP"})
+SUPPORTED_POSITION_MARKET_TYPES = frozenset({"SWAP", "PERPETUAL", "LINEAR"})
+
+
+def _row_dict(value: Any) -> Optional[Dict[str, Any]]:
+    return value if isinstance(value, dict) else None
+
+
+def _position_amount(row: Dict[str, Any]) -> float:
+    info = _row_dict(row.get("info")) or {}
+    raw = row.get("contracts")
+    if raw in (None, ""):
+        raw = info.get("positionAmt", info.get("positionSize", info.get("availableAmt", 0)))
+    text = str(raw if raw is not None else 0).strip()
+    if not text:
+        return 0.0
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("non-finite position amount")
+    return abs(number)
+
+
+def _position_side(row: Dict[str, Any]) -> str:
+    info = _row_dict(row.get("info")) or {}
+    raw = row.get("side") or info.get("positionSide") or info.get("side")
+    return str(raw or "").strip().upper()
+
+
+def _supported_swap_market(exchange: Any, normalized: str) -> Optional[Dict[str, Any]]:
+    markets = getattr(exchange, "markets", None)
+    if not isinstance(markets, dict) or not markets:
+        return None
+    market = markets.get(normalized)
+    if market is None:
+        for key, value in markets.items():
+            if _canonical_symbol(key) == _canonical_symbol(normalized):
+                market = value
+                break
+    return _row_dict(market)
+
+
+def validate_account_position_snapshot(exchange: Any, payload: Any) -> tuple:
+    """Validate an account-wide BingX position snapshot before calling it FLAT.
+
+    Returns ``(status, positions, reason, diagnostics)``. ``status`` is FLAT only
+    for a complete authoritative swap snapshot with zero open rows. Every
+    partial, malformed, failed or ambiguous condition returns UNKNOWN so callers
+    keep UNKNOWN/Recovery Hold instead of fabricating a flat account.
+    """
+    diagnostics: Dict[str, Any] = {
+        "scope": "ACCOUNT_WIDE_USDT_SWAP",
+        "call": "fetch_positions(None)",
+        "rows": 0,
+        "supported_markets": 0,
+    }
+    has_meta = getattr(exchange, "has", None)
+    if isinstance(has_meta, dict) and has_meta.get("fetchPositions") is False:
+        return "UNKNOWN", [], "FETCH_POSITIONS_UNSUPPORTED", diagnostics
+
+    # CCXT routes `fetch_positions(None)` to either USDT-margined swaps, inverse
+    # swaps or standard contracts according to these options. Only the USDT
+    # swap route is part of this bot's supported trading universe.
+    options = getattr(exchange, "options", None)
+    fetch_options = options.get("fetchPositions") if isinstance(options, dict) else None
+    fetch_options = fetch_options if isinstance(fetch_options, dict) else {}
+    if fetch_options.get("standard") is True:
+        return "UNKNOWN", [], "UNSUPPORTED_POSITION_SCOPE_STANDARD", diagnostics
+    raw_sub_type = ""
+    if isinstance(options, dict):
+        raw_sub_type = (fetch_options.get("subType") or
+                        fetch_options.get("defaultSubType") or
+                        options.get("defaultSubType") or "")
+    configured_sub_type = str(raw_sub_type).strip().lower()
+    if configured_sub_type == "inverse":
+        return "UNKNOWN", [], "UNSUPPORTED_POSITION_SCOPE_INVERSE", diagnostics
+
+    markets = getattr(exchange, "markets", None)
+    if not isinstance(markets, dict) or not markets:
+        return "UNKNOWN", [], "MARKET_METADATA_UNAVAILABLE", diagnostics
+    supported_markets = []
+    for value in markets.values():
+        market = _row_dict(value)
+        if not market:
+            continue
+        market_type = str(market.get("type") or market.get("category") or "").strip().upper()
+        if market.get("swap") is True or (market_type and market_type in SUPPORTED_POSITION_MARKET_TYPES):
+            supported_markets.append(market)
+    diagnostics["supported_markets"] = len(supported_markets)
+    if not supported_markets:
+        return "UNKNOWN", [], "NO_SUPPORTED_SWAP_MARKETS", diagnostics
+
+    if not isinstance(payload, (list, tuple)):
+        diagnostics["payload_type"] = type(payload).__name__
+        return "UNKNOWN", [], "NON_LIST_POSITION_SNAPSHOT", diagnostics
+
+    rows = list(payload)
+    diagnostics["rows"] = len(rows)
+    seen = set()
+    opened = []
+    for index, raw_row in enumerate(rows):
+        row = _row_dict(raw_row)
+        if row is None:
+            diagnostics["malformed_row_index"] = index
+            return "UNKNOWN", [], "MALFORMED_POSITION_ROW", diagnostics
+
+        raw_symbol = str(row.get("symbol") or (_row_dict(row.get("info")) or {}).get("symbol") or "").strip()
+        # A spot-style unified symbol in a position payload is not a supported
+        # swap position. Real CCXT swap positions use BASE/QUOTE:SETTLE.
+        if "/" in raw_symbol and not raw_symbol.endswith(":USDT"):
+            diagnostics["malformed_row_index"] = index
+            return "UNKNOWN", [], "UNSUPPORTED_POSITION_SYMBOL", diagnostics
+        normalized = normalize_exchange_symbol(raw_symbol)
+        market = _supported_swap_market(exchange, normalized) if normalized else None
+        if not normalized or market is None:
+            diagnostics["malformed_row_index"] = index
+            return "UNKNOWN", [], "UNKNOWN_POSITION_SYMBOL", diagnostics
+
+        market_type = str(market.get("type") or market.get("category") or "").strip().upper()
+        if market.get("swap") is not True and market_type not in SUPPORTED_POSITION_MARKET_TYPES:
+            diagnostics["malformed_row_index"] = index
+            return "UNKNOWN", [], "UNSUPPORTED_MARKET_CONTRACT", diagnostics
+
+        info = _row_dict(row.get("info")) or {}
+        explicit_type = ""
+        for value in (row.get("contractType"), info.get("contractType"),
+                      info.get("contract_type"), info.get("type")):
+            if value not in (None, ""):
+                explicit_type = str(value).strip().upper().replace("-", "_")
+                break
+        if explicit_type and explicit_type not in SUPPORTED_POSITION_CONTRACT_TYPES:
+            diagnostics["malformed_row_index"] = index
+            return "UNKNOWN", [], "UNSUPPORTED_POSITION_CONTRACT_TYPE", diagnostics
+
+        try:
+            amount = _position_amount(row)
+        except (TypeError, ValueError, OverflowError):
+            diagnostics["malformed_row_index"] = index
+            return "UNKNOWN", [], "MALFORMED_POSITION_AMOUNT", diagnostics
+
+        side = _position_side(row)
+        if amount > 0:
+            if side not in {"LONG", "SHORT"}:
+                diagnostics["malformed_row_index"] = index
+                return "UNKNOWN", [], "AMBIGUOUS_POSITION_SIDE", diagnostics
+            key = (normalized, side)
+            if key in seen:
+                diagnostics["malformed_row_index"] = index
+                return "UNKNOWN", [], "DUPLICATE_POSITION_ROW", diagnostics
+            seen.add(key)
+            opened.append(dict(row))
+
+    if opened:
+        diagnostics["open_rows"] = len(opened)
+        return "OPEN", opened, "OPEN_POSITIONS_PRESENT", diagnostics
+    return "FLAT", [], "FLAT_VERIFIED_ACCOUNT_WIDE", diagnostics
+
+
 def native_stop_candidate_summary(order: Dict[str, Any]) -> Dict[str, Any]:
     """Return a secret-free diagnostic summary for a candidate protective order."""
     return {

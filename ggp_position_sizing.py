@@ -2,7 +2,8 @@
 
 Capital allocation policy (margin target, not loss-at-stop):
 
-    TRADE_ALLOCATION_PCT = 0.20   # medium trades: 20% of available balance
+    TRADE_ALLOCATION_PCT = 0.20   # standard trades: 20% of available balance
+    STRONG_TRADE_ALLOCATION_PCT = 0.30  # institutionally authorized strong trades
     LEVERAGE             = 20     # fixed
 
     target_margin   = available_balance * allocation_pct
@@ -75,7 +76,7 @@ def validate_trade_geometry(*, side: str, entry_price: float, stop_price: float,
         raise ValueError("SELL geometry requires TP2 < TP1 < Entry < SL")
 
 def effective_sizing_classification(requested: str, *, strong_tier_authorized: bool) -> str:
-    """Prevent caller labels/manual routes from receiving the 40% tier by themselves."""
+    """Prevent caller labels/manual routes from receiving the 30% tier by themselves."""
     label = str(requested or "TREND").strip().upper()
     if label in STRONG_CLASSIFICATIONS and not strong_tier_authorized:
         return "TREND"
@@ -103,6 +104,34 @@ class PositionSize:
     # Which limit set the final size, and how much of the margin target was reached.
     binding_constraint: str = "ALLOCATION"
     margin_achieved_ratio: float = 1.0
+
+    def as_dict(self) -> dict[str, Any]:
+        """Immutable snapshot of the single authoritative sizing calculation.
+
+        Callers may enrich this with execution context (balance basis, exchange
+        precision, fees/slippage assumptions, trade id), but must never recompute
+        or multiply the quantity downstream.
+        """
+        return {
+            "classification": self.classification,
+            "allocation_reason": self.allocation_reason,
+            "allocation_pct": self.allocation_pct,
+            "available_balance": self.available_balance,
+            "target_margin": self.target_margin,
+            "target_notional": self.target_notional,
+            "max_risk_usdt": self.max_risk_usdt,
+            "stop_distance": self.stop_distance,
+            "execution_buffer": self.execution_buffer,
+            "risk_limited_notional": self.risk_limited_notional,
+            "final_notional": self.final_notional,
+            "margin_required": self.margin_required,
+            "quantity": self.quantity,
+            "contract_size": self.contract_size,
+            "estimated_loss_at_stop": self.estimated_loss_at_stop,
+            "estimated_risk_pct": self.estimated_risk_pct,
+            "binding_constraint": self.binding_constraint,
+            "margin_achieved_ratio": self.margin_achieved_ratio,
+        }
 
 
 def calculate_position_size(

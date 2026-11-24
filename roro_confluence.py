@@ -355,6 +355,215 @@ def validate_dual_ema_vwap_entry_gate(
     return result
 
 
+def evaluate_post_cross_rejection_breakout(
+    df: pd.DataFrame,
+    side: str,
+    cross_event: Dict[str, Any],
+    *,
+    ema_fn: Callable,
+    timeframe_seconds: int = 900,
+    now_ms: Optional[int] = None,
+    max_chase_atr: float = 1.5,
+) -> Dict[str, Any]:
+    """Advance a confirmed cross through pullback -> rejection -> breakout.
+
+    This evaluator is deliberately separate from the fresh-cross gate: a cross
+    authorizes a durable event, but the entry is only valid after a later closed
+    rejection candle and a strictly later closed breakout of its recorded high
+    (BUY) or low (SELL). It never upgrades ranking-only scanner rows and never
+    reads an unfinished candle.
+    """
+    event = cross_event if isinstance(cross_event, dict) else {}
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    direction = str(event.get("side") or side or metadata.get("side") or "").upper()
+    if direction not in {"BUY", "SELL"}:
+        return {"phase": "WAITING_FOR_PULLBACK", "entry_ready": False,
+                "reason": "invalid_side", "lifecycle_schema": "CROSS_REJECTION_V1"}
+    now_value_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    closed = closed_candles(df, timeframe_seconds, now_ms=now_value_ms)
+    if len(closed) < max(20, 16):
+        return {"phase": "WAITING_FOR_PULLBACK", "entry_ready": False,
+                "reason": "insufficient_closed_candles", "lifecycle_schema": "CROSS_REJECTION_V1"}
+    try:
+        close = closed["close"].astype(float)
+        ema9 = pd.Series(ema_fn(close, 9), index=closed.index, dtype=float)
+        vwap = compute_session_vwap(closed, timeframe_seconds, now_ms=now_value_ms)
+        if vwap is None or len(ema9) != len(closed):
+            raise ValueError("indicator_length_mismatch")
+        tr = pd.concat([
+            (closed["high"] - closed["low"]).rename("hl"),
+            (closed["high"] - closed["close"].shift(1)).abs().rename("hc"),
+            (closed["low"] - closed["close"].shift(1)).abs().rename("lc"),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14, min_periods=14).mean()
+        if not np.isfinite(float(atr.iloc[-1])) or float(atr.iloc[-1]) <= 0:
+            raise ValueError("atr_unavailable")
+    except Exception as exc:
+        return {"phase": "WAITING_FOR_PULLBACK", "entry_ready": False,
+                "reason": f"indicator_failed:{type(exc).__name__}", "lifecycle_schema": "CROSS_REJECTION_V1"}
+
+    timestamps = closed["timestamp"].astype("int64").to_numpy()
+    cross_ts = int(event.get("signal_candle_timestamp")
+                   or metadata.get("signal_candle_timestamp") or 0)
+    matches = np.flatnonzero(timestamps == cross_ts)
+    if len(matches) == 0:
+        return {"phase": "WAITING_FOR_PULLBACK", "entry_ready": False,
+                "reason": "cross_candle_not_in_closed_frame",
+                "lifecycle_schema": "CROSS_REJECTION_V1"}
+    cross_idx = int(matches[0])
+    cross_price = float(metadata.get("cross_price")
+                        or event.get("cross_price") or close.iloc[cross_idx])
+    cross_atr = float(metadata.get("cross_atr") or event.get("cross_atr") or atr.iloc[cross_idx])
+    if not np.isfinite(cross_price) or cross_price <= 0 or not np.isfinite(cross_atr) or cross_atr <= 0:
+        return {"phase": "WAITING_FOR_PULLBACK", "entry_ready": False,
+                "reason": "invalid_cross_reference", "lifecycle_schema": "CROSS_REJECTION_V1"}
+    try:
+        chase_limit = max(0.25, min(3.0, float(max_chase_atr)))
+    except (TypeError, ValueError, OverflowError):
+        chase_limit = 1.5
+
+    result: Dict[str, Any] = {
+        "lifecycle_schema": "CROSS_REJECTION_V1",
+        "phase": str(metadata.get("phase") or "WAITING_FOR_PULLBACK").upper(),
+        "entry_ready": False,
+        "reason": "awaiting_post_cross_structure",
+        "side": direction,
+        "cross_candle_timestamp": cross_ts,
+        "cross_price": cross_price,
+        "cross_atr": cross_atr,
+        "max_chase_atr": chase_limit,
+        "latest_closed_timestamp": int(timestamps[-1]),
+        "ema9": float(ema9.iloc[-1]),
+        "vwap": float(vwap.iloc[-1]),
+        "atr": float(atr.iloc[-1]),
+    }
+    # A durable confirmation is final. Never let a later frame (or a missing
+    # candle) reinterpret an already-authorized breakout as unconfirmed.
+    if result["phase"] == "BREAKOUT_CONFIRMED" and metadata.get("entry_ready") is True:
+        result.update({
+            "entry_ready": True,
+            "authorization_state": "POST_CROSS_REJECTION_BREAKOUT_VALID",
+            "reason": "previous_breakout_confirmation_retained",
+        })
+        return result
+    if result["phase"] not in {"WAITING_FOR_PULLBACK", "PULLBACK_CONFIRMED",
+                               "REJECTION_RECORDED", "BREAKOUT_CONFIRMED"}:
+        result["reason"] = "invalid_lifecycle_phase"
+        return result
+
+    latest_age = now_value_ms - (int(timestamps[-1]) + timeframe_seconds * 1000)
+    if latest_age < 0 or latest_age > timeframe_seconds * 2000 / 1000:
+        result["reason"] = "breakout_frame_not_fresh"
+        return result
+
+    def _zone(index: int) -> tuple[float, float]:
+        ema_value = float(ema9.iloc[index])
+        vwap_value = float(vwap.iloc[index])
+        if not np.isfinite(ema_value) or not np.isfinite(vwap_value):
+            return (float("nan"), float("nan"))
+        return (min(ema_value, vwap_value), max(ema_value, vwap_value))
+
+    def _index_for(ts_value: Any) -> Optional[int]:
+        try:
+            matches = np.flatnonzero(timestamps == int(ts_value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return int(matches[0]) if len(matches) else None
+
+    stored_pullback_idx = _index_for(metadata.get("pullback_candle_timestamp"))
+    stored_rejection_idx = _index_for(metadata.get("rejection_candle_timestamp"))
+
+    if stored_pullback_idx is None and result["phase"] == "WAITING_FOR_PULLBACK":
+        for idx in range(cross_idx + 1, len(closed) - 1):
+            row = closed.iloc[idx]
+            zone_low, zone_high = _zone(idx)
+            if not np.isfinite(zone_low):
+                continue
+            tolerance = float(atr.iloc[idx]) * 0.10
+            touched = (float(row["low"]) <= zone_low + tolerance if direction == "BUY"
+                       else float(row["high"]) >= zone_high - tolerance)
+            if touched:
+                stored_pullback_idx = idx
+                result["pullback_candle_timestamp"] = int(timestamps[idx])
+                result["pullback_price"] = float(row["low"] if direction == "BUY" else row["high"])
+                result["phase"] = "PULLBACK_CONFIRMED"
+                result["reason"] = "pullback_or_retest_confirmed"
+                break
+    if stored_pullback_idx is None:
+        result["reason"] = "waiting_for_closed_pullback_or_retest"
+        return result
+    if stored_pullback_idx <= cross_idx or stored_pullback_idx >= len(closed) - 1:
+        result["reason"] = "pullback_window_invalid"
+        return result
+
+    if stored_rejection_idx is None:
+        for idx in range(stored_pullback_idx + 1, len(closed) - 1):
+            row = closed.iloc[idx]
+            zone_low, zone_high = _zone(idx)
+            if not np.isfinite(zone_low):
+                continue
+            candle_range = float(row["high"]) - float(row["low"])
+            if candle_range <= 0:
+                continue
+            open_price, close_price = float(row["open"]), float(row["close"])
+            wick = (min(open_price, close_price) - float(row["low"]) if direction == "BUY"
+                    else float(row["high"]) - max(open_price, close_price))
+            touched = (float(row["low"]) <= zone_low + 0.25 * float(atr.iloc[idx]) if direction == "BUY"
+                       else float(row["high"]) >= zone_high - 0.25 * float(atr.iloc[idx]))
+            directional_close = close_price > open_price if direction == "BUY" else close_price < open_price
+            midpoint = (float(row["high"]) + float(row["low"])) / 2.0
+            close_side = close_price > midpoint if direction == "BUY" else close_price < midpoint
+            if touched and wick / candle_range >= 0.30 and directional_close and close_side:
+                stored_rejection_idx = idx
+                result["rejection_candle_timestamp"] = int(timestamps[idx])
+                result["rejection_high"] = float(row["high"])
+                result["rejection_low"] = float(row["low"])
+                result["rejection_close"] = close_price
+                result["phase"] = "REJECTION_RECORDED"
+                result["reason"] = "rejection_candle_closed_and_recorded"
+                break
+    if stored_rejection_idx is None:
+        stored_rejection_idx = _index_for(metadata.get("rejection_candle_timestamp"))
+        if stored_rejection_idx is None:
+            result["reason"] = "waiting_for_closed_rejection_candle"
+            return result
+        result["rejection_candle_timestamp"] = int(timestamps[stored_rejection_idx])
+        result["rejection_high"] = float(metadata.get("rejection_high") or closed["high"].iloc[stored_rejection_idx])
+        result["rejection_low"] = float(metadata.get("rejection_low") or closed["low"].iloc[stored_rejection_idx])
+        result["phase"] = "REJECTION_RECORDED"
+    if stored_rejection_idx <= stored_pullback_idx or stored_rejection_idx >= len(closed) - 1:
+        result["reason"] = "awaiting_later_closed_breakout"
+        return result
+
+    rejection_high = float(result["rejection_high"])
+    rejection_low = float(result["rejection_low"])
+    breakout_close = float(close.iloc[-1])
+    directional_relationship = (float(ema9.iloc[-1]) > float(vwap.iloc[-1]) if direction == "BUY"
+                                else float(ema9.iloc[-1]) < float(vwap.iloc[-1]))
+    broke_level = breakout_close > rejection_high if direction == "BUY" else breakout_close < rejection_low
+    chase_distance = max(abs(breakout_close - cross_price),
+                         abs(breakout_close - (rejection_high if direction == "BUY" else rejection_low)))
+    chase_atr = chase_distance / max(cross_atr, float(atr.iloc[-1]))
+    result.update({
+        "breakout_candle_timestamp": int(timestamps[-1]),
+        "breakout_close": breakout_close,
+        "chase_atr": float(chase_atr),
+    })
+    if not broke_level or not directional_relationship:
+        result["reason"] = "no_valid_closed_breakout"
+        return result
+    if chase_atr > chase_limit:
+        result["reason"] = "breakout_exceeds_atr_chase_limit"
+        return result
+    result.update({
+        "phase": "BREAKOUT_CONFIRMED",
+        "entry_ready": True,
+        "authorization_state": "POST_CROSS_REJECTION_BREAKOUT_VALID",
+        "reason": "closed_rejection_high_low_breakout_confirmed",
+    })
+    return result
+
+
 def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
                         ema_len: int = 9, timeframe_seconds: int = 900,
                         now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:

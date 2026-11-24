@@ -11,15 +11,110 @@ from math import isfinite
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-# Price-move percentages (not leveraged ROE percentages).
-# At 20x these correspond approximately to 5%, 10%, 20% and 60% ROE,
-# before fees, funding and slippage.
+# PROFIT CONVENTION (explicit and authoritative):
+# RANGE_PROFIT_TARGETS_PCT, TREND_TP1_MOVE_PCT and TREND_TP2_MOVE_PCT are
+# UNLEVERAGED PRICE-MOVE percentages from the verified entry price. They are
+# NOT account allocations and NOT exchange ROE percentages.
+#
+#   target_price = entry * (1 +/- move_pct / 100)
+#   gross_roe_pct = move_pct * leverage          (20x => 5/10/20/40/60%)
+#   gross_pnl = (target_price - entry) * qty     (BUY; sign inverted for SELL)
+#
+# Gross ROE/PnL is never reported as net. The helpers below expose the
+# conservative fee/slippage conversion used for audit records; realized PnL
+# stays authoritative from the exchange in the execution layer.
 RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
 TREND_TP1_MOVE_PCT = 2.00
 TREND_TP2_MOVE_PCT = 3.00
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
+POLICY_LEVERAGE = 20
+# Conservative planning assumptions as percentages of traded notional per side.
+ESTIMATED_TAKER_FEE_PCT = 0.05
+ESTIMATED_SLIPPAGE_PCT = 0.02
+
+
+def profit_target_convention() -> Dict[str, Any]:
+    """Return the documented target/PnL convention used by the single brain."""
+    return {
+        "basis": "UNLEVERAGED_PRICE_MOVE_PCT_FROM_VERIFIED_ENTRY",
+        "range_targets_price_move_pct": list(RANGE_PROFIT_TARGETS_PCT),
+        "trend_tp1_price_move_pct": TREND_TP1_MOVE_PCT,
+        "trend_tp2_price_move_pct": TREND_TP2_MOVE_PCT,
+        "leverage": POLICY_LEVERAGE,
+        "gross_roe_multiplier": POLICY_LEVERAGE,
+        "gross_roe_pct": {
+            "0.25": 0.25 * POLICY_LEVERAGE,
+            "0.50": 0.50 * POLICY_LEVERAGE,
+            "1.00": 1.00 * POLICY_LEVERAGE,
+            "2.00": TREND_TP1_MOVE_PCT * POLICY_LEVERAGE,
+            "3.00": TREND_TP2_MOVE_PCT * POLICY_LEVERAGE,
+        },
+        "estimated_taker_fee_pct_each_side": ESTIMATED_TAKER_FEE_PCT,
+        "estimated_slippage_pct_each_side": ESTIMATED_SLIPPAGE_PCT,
+        "net_pnl_is_estimate": True,
+        "realized_pnl_authority": "EXCHANGE_REPORTED_REALIZED_PNL",
+    }
+
+
+def exchange_pnl_at_move(
+    *, side: str, entry_price: float, quantity: float, move_pct: float,
+    leverage: int = POLICY_LEVERAGE, contract_size: float = 1.0,
+    taker_fee_pct: float = ESTIMATED_TAKER_FEE_PCT,
+    slippage_pct: float = ESTIMATED_SLIPPAGE_PCT,
+) -> Dict[str, Any]:
+    """Convert a price-move target into gross and fee/slippage-adjusted PnL.
+
+    This is a pre-trade planning estimate. It must never be labelled as actual
+    exchange realized PnL; that remains exchange-reported in the execution path.
+    """
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    entry = float(entry_price)
+    qty = float(quantity)
+    move = float(move_pct)
+    contracts = float(contract_size)
+    lev = int(leverage)
+    if not all(map(isfinite, (entry, qty, move, contracts))) or min(entry, qty, contracts) <= 0:
+        raise ValueError("entry_price, quantity and contract_size must be finite and positive")
+    if lev <= 0:
+        raise ValueError("leverage must be positive")
+    if not isfinite(move) or move < 0:
+        raise ValueError("move_pct must be finite and non-negative")
+    if not isfinite(taker_fee_pct) or not isfinite(slippage_pct):
+        raise ValueError("cost assumptions must be finite")
+    fee_rate = max(0.0, float(taker_fee_pct)) / 100.0
+    slip_rate = max(0.0, float(slippage_pct)) / 100.0
+    signed_move = move / 100.0 if direction == "BUY" else -move / 100.0
+    target_price = entry * (1.0 + signed_move)
+    notional = entry * qty * contracts
+    margin = notional / lev if lev > 0 else 0.0
+    gross_pnl = (target_price - entry) * qty * contracts if direction == "BUY" else (entry - target_price) * qty * contracts
+    entry_fee = notional * fee_rate
+    exit_fee = target_price * qty * contracts * fee_rate
+    slippage_cost = (notional + target_price * qty * contracts) * slip_rate
+    total_costs = entry_fee + exit_fee + slippage_cost
+    net_pnl = gross_pnl - total_costs
+    return {
+        "side": direction,
+        "entry_price": entry,
+        "quantity": qty,
+        "contract_size": contracts,
+        "price_move_pct": move,
+        "target_price": target_price,
+        "leverage": lev,
+        "gross_roe_pct": move * lev,
+        "gross_pnl": gross_pnl,
+        "estimated_entry_fee": entry_fee,
+        "estimated_exit_fee": exit_fee,
+        "estimated_slippage_cost": slippage_cost,
+        "estimated_total_costs": total_costs,
+        "estimated_net_pnl": net_pnl,
+        "estimated_net_roe_pct": (net_pnl / margin * 100.0) if margin > 0 else 0.0,
+        "basis": "PRE_TRADE_ESTIMATE_NOT_REALIZED_PNL",
+    }
 
 
 def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -29,6 +124,74 @@ def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
     except (TypeError, ValueError, OverflowError):
         return default
 
+
+def _entry_context_evidence(context: Dict[str, Any], side: str) -> Dict[str, Any]:
+    """Normalize the immutable entry-time context for the one profit classifier.
+
+    Missing or ambiguous entry context never creates a positive classification.
+    It can only confirm the already-observed direction/thesis or stay neutral.
+    """
+    entry = context.get("entry_context") if isinstance(context, dict) else None
+    result: Dict[str, Any] = {
+        "available": False, "directional_cross": False, "opposing_cross": False,
+        "order_block_fresh": False, "zone_quality": None, "liquidity_aligned": False,
+        "structure_aligned": False, "relative_volume": None, "adx_di_known": False,
+        "adx_aligned": False, "ema_aligned": False, "regime_range": False,
+        "cross_direction": "",
+    }
+    if not isinstance(entry, dict) or not entry:
+        return result
+    result["available"] = True
+    expected = "BULLISH" if side == "BUY" else "BEARISH"
+    cross_direction = str(entry.get("cross_event_direction") or "").upper()
+    has_cross = bool(entry.get("cross_event_id") and cross_direction in {"BULLISH", "BEARISH"})
+    result["cross_direction"] = cross_direction if has_cross else ""
+    result["directional_cross"] = has_cross and cross_direction == expected
+    result["opposing_cross"] = has_cross and cross_direction != expected
+
+    zone = entry.get("entry_zone") if isinstance(entry.get("entry_zone"), dict) else {}
+    result["zone_quality"] = _number(zone.get("quality"))
+    ob = entry.get("order_block") if isinstance(entry.get("order_block"), dict) else {}
+    result["order_block_fresh"] = bool(
+        ob.get("valid") and str(ob.get("freshness") or "").upper() in {"FRESH", "UNTESTED", "VALID"}
+    )
+
+    liquidity = entry.get("liquidity") if isinstance(entry.get("liquidity"), dict) else {}
+    liquidity_direction = str(liquidity.get("direction") or "").upper()
+    liquidity_event = str(liquidity.get("event") or "").upper()
+    result["liquidity_aligned"] = bool(
+        liquidity_direction == expected
+        and liquidity_event not in {"", "UNKNOWN", "NONE"}
+    )
+
+    structure = entry.get("market_structure") if isinstance(entry.get("market_structure"), dict) else {}
+    mss = str(structure.get("mss") or "").upper()
+    result["structure_aligned"] = bool(
+        structure.get("confirmed")
+        and (
+            mss.startswith("BULLISH") if side == "BUY" else mss.startswith("BEARISH")
+        )
+    )
+
+    result["relative_volume"] = _number(entry.get("relative_volume"))
+    adx_di = entry.get("adx_di") if isinstance(entry.get("adx_di"), dict) else {}
+    entry_adx = _number(adx_di.get("adx"))
+    plus = _number(adx_di.get("di_plus"))
+    minus = _number(adx_di.get("di_minus"))
+    result["adx_di_known"] = entry_adx is not None and plus is not None and minus is not None
+    result["adx_aligned"] = bool(
+        result["adx_di_known"] and entry_adx >= 20.0
+        and ((side == "BUY" and plus > minus) or (side == "SELL" and minus > plus))
+    )
+    entry_ema = _number(entry.get("ema9"))
+    entry_vwap = _number(entry.get("vwap"))
+    result["ema_aligned"] = bool(
+        entry_ema is not None and entry_vwap is not None
+        and ((side == "BUY" and entry_ema > entry_vwap) or (side == "SELL" and entry_ema < entry_vwap))
+    )
+    entry_regime = str(entry.get("entry_regime") or "").upper()
+    result["regime_range"] = entry_regime in {"RANGE", "RANGE_CHOP", "CHOP", "CHOPPY", "COMPRESSION"}
+    return result
 
 
 def adaptive_trail_multiplier(base_multiplier: float, continuation_probability: float, adx: float,
@@ -129,6 +292,7 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     depth_usdt = _number(ctx.get("orderbook_depth_usdt"))
     liquidity_quality = str(ctx.get("liquidity_quality") or "UNKNOWN").upper()
     structure_broken = bool(ctx.get("structure_broken", False))
+    entry_evidence = _entry_context_evidence(ctx, side)
 
     di_known = plus is not None and minus is not None
     di_aligned = (plus > minus) if side == "BUY" and di_known else (minus > plus) if side == "SELL" and di_known else False
@@ -162,6 +326,20 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         evidence.append("thin_liquidity_evidence")
     if structure_broken:
         evidence.append("trend_structure_broken")
+    if entry_evidence["directional_cross"]:
+        evidence.append("entry_confirmed_directional_cross")
+    elif entry_evidence["opposing_cross"]:
+        evidence.append("entry_opposing_cross")
+    if entry_evidence["order_block_fresh"]:
+        evidence.append("entry_fresh_order_block")
+    if entry_evidence["liquidity_aligned"]:
+        evidence.append("entry_liquidity_context_aligned")
+    if entry_evidence["structure_aligned"]:
+        evidence.append("entry_market_structure_aligned")
+    if entry_evidence["relative_volume"] is not None and entry_evidence["relative_volume"] >= 1.0:
+        evidence.append("entry_relative_volume_confirmed")
+    if entry_evidence["adx_aligned"]:
+        evidence.append("entry_adx_di_aligned")
 
     # A fresh, direction-matched EMA9/VWAP or EMA50/VWAP cross is directional
     # evidence. It must not be mislabeled as a range scalp and fully closed at
@@ -187,10 +365,24 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         evidence.append("fresh_directional_ema_vwap_cross")
 
     # Trend riding requires several independent, side-aligned observations.
-    momentum_support = (momentum_strength is not None and momentum_strength >= 55.0) or bool(ctx.get("trend_expansion", False))
+    # The persisted entry context can supply causal/zone/volume support, but it
+    # cannot replace current regime, ADX, continuation or DI alignment.
+    entry_momentum_support = bool(
+        entry_evidence["directional_cross"]
+        and entry_evidence["ema_aligned"]
+        and (entry_evidence["order_block_fresh"] or (entry_evidence["zone_quality"] or 0.0) >= 50.0)
+        and (entry_evidence["relative_volume"] is None or entry_evidence["relative_volume"] >= 0.9)
+    )
+    momentum_support = (
+        (momentum_strength is not None and momentum_strength >= 55.0)
+        or bool(ctx.get("trend_expansion", False))
+        or entry_momentum_support
+    )
     regime_trend = regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or state in {"TREND_RIDE", "EXPANSION", "HEALTHY_PULLBACK"}
     confirmed_trend = (
         not structure_broken
+        and not entry_evidence["opposing_cross"]
+        and (not entry_evidence["adx_di_known"] or entry_evidence["adx_aligned"])
         and regime_trend
         and adx is not None and adx >= 22.0
         and adx_slope is not None and adx_slope >= -1.5
@@ -201,6 +393,23 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     if confirmed_trend:
         return TREND_MODE, "confirmed_directional_regime_and_continuation", tuple(evidence + ["directional_di_alignment"])
 
+    # A second, explicitly entry-context-driven trend path still requires live
+    # evidence to be non-weak and aligned. It never overrides a broken structure
+    # or an opposite-direction entry thesis.
+    entry_context_trend = bool(
+        entry_momentum_support
+        and not structure_broken
+        and not regime_range
+        and not entry_evidence["opposing_cross"]
+        and (not entry_evidence["adx_di_known"] or entry_evidence["adx_aligned"])
+        and (entry_evidence["liquidity_aligned"] or entry_evidence["structure_aligned"])
+        and adx is not None and not weak_adx
+        and continuation is not None and not weak_continuation
+        and di_aligned
+    )
+    if entry_context_trend:
+        return TREND_MODE, "entry_context_and_current_evidence_confirm_trend_ride", tuple(evidence + ["entry_context_trend_support"])
+
     weakness_count = sum((weak_adx, weak_continuation, low_volume, di_tangled, weak_momentum, thin_liquidity, structure_broken))
     # RANGE_SCALP requires an identifiable range/weak regime plus more than one
     # supporting weakness, OR explicit thin-liquidity evidence plus weak trend data.
@@ -209,13 +418,26 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
         weak_adx and weak_continuation and (low_volume or di_tangled or thin_liquidity)
     )
     thin_market_confirmed = thin_liquidity and (weak_adx or weak_continuation or low_volume) and weakness_count >= 2
-    if (range_confirmed or weak_market_confirmed or thin_market_confirmed) and not directional_vwap_cross:
+    # The immutable entry thesis also protects a confirmed directional cross from
+    # being reclassified as a one-shot scalp. Structural failure removes that veto.
+    entry_thesis_veto = bool(
+        entry_evidence["directional_cross"]
+        and not structure_broken
+        and (entry_evidence["order_block_fresh"] or (entry_evidence["zone_quality"] or 0.0) >= 50.0
+             or entry_evidence["liquidity_aligned"] or entry_evidence["structure_aligned"])
+    )
+    if ((range_confirmed or weak_market_confirmed or thin_market_confirmed)
+            and not directional_vwap_cross and not entry_thesis_veto):
         return RANGE_MODE, "confirmed_range_weak_market_or_thin_liquidity", tuple(evidence)
 
     # A fresh directional VWAP cross vetoes the one-shot scalp classification
     # until the market proves the new move has failed. Keep TP1/TP2 50/50.
+    # The persisted entry thesis provides the same protection after the original
+    # cross candle is no longer fresh.
     if directional_vwap_cross:
         return STANDARD_MODE, "fresh_directional_vwap_cross_keep_two_stage_50_50", tuple(evidence)
+    if entry_thesis_veto:
+        return STANDARD_MODE, "entry_confirmed_cross_keep_two_stage_50_50", tuple(evidence)
 
     # Crucial fail-safe: indicator/API gaps do not automatically force a short
     # scalp or a full-position exit. Keep the canonical 50/50 management model.
