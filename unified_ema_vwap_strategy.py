@@ -346,7 +346,9 @@ class UnifiedEMAVWAPPullbackEngine:
                 s.vwap = float(vwap_value) if _finite(vwap_value) else None
                 s.price = float(x.close.iloc[last_i])
                 s.closed_candles = int(len(x))
-                s.last_candle_ts = int(x.timestamp.iloc[last_i])
+                # Do not advance last_candle_ts here. For an existing Setup,
+                # s aliases old; advancing it before the lifecycle runs makes
+                # the idempotency guard below skip this candle entirely.
                 s.indicator_missing = [name for name, value in (
                     ("ema9", s.ema9), ("ema15", s.ema15), ("ema50", s.ema50),
                     ("atr14", s.atr14), ("vwap", s.vwap)) if value is None]
