@@ -329,7 +329,7 @@ def test_entry_readiness_never_presents_unknown_sl_as_ready():
     assert "STRUCTURAL_STOP_UNKNOWN" in out["entry_readiness"]["missing"]
 
 
-def test_dashboard_sections_are_separated_and_ranking_never_becomes_an_event():
+def test_projection_sections_are_separated_and_ranking_never_becomes_an_event():
     durable = _durable_record(phase="BREAKOUT_CONFIRMED", entry_ready=True)
     ranking = _ranking(symbol="ETH", exchange_symbol="ETH/USDT:USDT",
                        state="CROSS_CONFIRMED", cross_any="BULLISH", cross_ema9="BULLISH")
@@ -573,20 +573,55 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     assert trace[7]["journal_status"] == "ENTERED"
 
 
-def test_dashboard_html_and_data_expose_four_separated_sections(monkeypatch):
-    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {"BTC": _context_row()})
-    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [_durable_record()])
-    monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [
-        _ranking(symbol="ETH", exchange_symbol="ETH/USDT:USDT",
-                 state="CROSS_CONFIRMED", cross_any="BULLISH", cross_ema9="BULLISH"),
-    ])
+def _watchlist_card_row():
+    """One original Watchlist row carrying its already-produced diagnostics."""
+    row = _context_row()
+    row.update({
+        "symbol": CANONICAL,
+        "exchange_symbol": SYMBOL,
+        "side": "BUY",
+        "cross_event_id": "BTC:15m:BUY:card-test",
+        "cross_event_status": "ACTIVE",
+        "decision_state": "WAITING_FOR_RETEST",
+        "structural_stop": 98.0,
+        "rejection_reasons": ["closed_retest_not_confirmed"],
+        "decision_context": {
+            "decision_state": "WAITING_FOR_RETEST",
+            "setup_stage": "AWAIT_ZONE_RETEST",
+            "blocking_reasons": ["closed_retest_not_confirmed"],
+            "required_next_event": "CLOSED_INSTITUTIONAL_ZONE_RETEST",
+            "authority": "UNIFIED_ENTRY_AUTHORITY_UNCHANGED",
+            "cross_context": {
+                "cross_state": "CONFIRMED_BUY_CROSS",
+                "display_cross_state": "CONFIRMED_BUY_CROSS",
+                "durable_event": True,
+                "authoritative": True,
+                "role": proj.CONFIRMED_CROSS_ROLE,
+                "source_snapshot_id": "snap-btc-card",
+            },
+            "zone_context": {
+                "zone_quality_score": 82.0,
+                "supply_demand": {"valid": True},
+            },
+            "liquidity_context": {"state": "LIQUIDITY_SWEEP", "stage": "CONFIRMED"},
+            "structure_context": {"confirmation_status": "PENDING"},
+            "timeframe_view": {"market_regime": "STRONG_TREND", "trade_state": "POST_CROSS"},
+            "entry_readiness": {
+                "conditions_complete": False,
+                "sl_valid": True,
+                "missing": ["WAITING_FOR_RETEST"],
+                "authoritative_gate": "UNCHANGED_EXECUTE_ENTRY",
+            },
+        },
+    })
+    return row
+
+
+def _patch_dashboard_runtime(monkeypatch):
     monkeypatch.setitem(ggpbot.DASHBOARD_STATE, "live_trade_mode", False)
-    monkeypatch.setitem(ggpbot.MEMORY, "golden_buy", [])
-    monkeypatch.setitem(ggpbot.MEMORY, "golden_sell", [])
-    monkeypatch.setitem(ggpbot.MEMORY, "scanner_v2_buy", [])
-    monkeypatch.setitem(ggpbot.MEMORY, "scanner_v2_sell", [])
-    monkeypatch.setitem(ggpbot.MEMORY, "rf_dashboard", [])
-    monkeypatch.setitem(ggpbot.MEMORY, "no_entry_feed", [])
+    for key in ("golden_buy", "golden_sell", "scanner_v2_buy", "scanner_v2_sell",
+                "rf_dashboard", "no_entry_feed"):
+        monkeypatch.setitem(ggpbot.MEMORY, key, [])
     monkeypatch.setattr(ggpbot, "get_balance_safe", lambda: 1000.0)
     monkeypatch.setattr(ggpbot, "get_free_balance_safe", lambda: 1000.0)
     monkeypatch.setattr(ggpbot, "get_dashboard_metrics", lambda: {
@@ -595,31 +630,84 @@ def test_dashboard_html_and_data_expose_four_separated_sections(monkeypatch):
     monkeypatch.setattr(ggpbot, "cleanup_watchlist", lambda: None)
     monkeypatch.setattr(ggpbot, "naiso_health_snapshot", lambda: {"status": "TEST"})
 
+
+def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {
+        "BTC": _watchlist_card_row(),
+        "ETH": dict(_context_row(), symbol="ETH", exchange_symbol="ETH/USDT:USDT", side="SELL"),
+    })
+    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [_durable_record()])
+    monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [
+        _ranking(symbol="ETH", exchange_symbol="ETH/USDT:USDT",
+                 state="CROSS_CONFIRMED", cross_any="BULLISH", cross_ema9="BULLISH"),
+    ])
+    _patch_dashboard_runtime(monkeypatch)
+
     client = ggpbot.app.test_client()
     html = client.get("/").get_data(as_text=True)
-    assert "NAISO UNIFIED DECISION VIEW" in html
+    assert html.count("WATCHLIST / ACTIVE CANDIDATES") == 1
+    assert "watchlist-panel" in html
+    assert "NAISO UNIFIED DECISION VIEW" not in html
     for element in ("uni-confirmed-crosses", "uni-watchlist-ranking",
                     "uni-institutional-analysis", "uni-execution-readiness"):
-        assert element in html
-    assert "c.display_cross_state || c.cross_state" in html
-    assert "authoritative=${uniEsc(c.authoritative)}" in html
-    assert "STOP_INVALID_NOT_READY" in html
+        assert element not in html
+    for token in ("Decision projection (read-only)", "Cross:", "durable=", "role=",
+                  "Zone: quality=", "Liquidity:", "Confirmation:", "Pullback/Retest:",
+                  "Structural Stop:", "STOP_INVALID_NOT_READY", "Blocking:", "Next:",
+                  "UNCHANGED_EXECUTE_ENTRY"):
+        assert token in html
+    assert "cardDecision = w.decision_context" in html
+    assert 'if (!cardCrossDurable && String(cardCrossState).startsWith("CONFIRMED_"))' in html
+    assert "SL: UNKNOWN" not in html
     assert 'const slText = x.sl_valid ? "VALID" : "UNKNOWN";' not in html
 
     response = client.get("/data")
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["unified_decision_schema"] == proj.SCHEMA_VERSION
-    assert len(payload["confirmed_crosses"]) == 1
-    assert len(payload["watchlist_ranking"]) == 1
-    assert payload["watchlist_ranking"][0]["cross_context"]["authoritative"] is False
-    assert payload["watchlist_ranking"][0]["cross_state_display"] == \
-        "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
-    assert len(payload["institutional_analysis"]) == 1
-    assert len(payload["execution_readiness"]) == 1
-    readiness = payload["execution_readiness"][0]
-    assert "SL: UNKNOWN" not in str(readiness)
-    assert readiness["authoritative_gate"] == "UNCHANGED_EXECUTE_ENTRY"
+    assert set(payload["watchlist"]) == {"BTC", "ETH"}
+    for key in ("confirmed_crosses", "watchlist_ranking", "institutional_analysis",
+                "execution_readiness", "unified_decision_schema"):
+        assert key not in payload
+    decision = payload["watchlist"]["BTC"]["decision_context"]
+    assert decision["cross_context"]["durable_event"] is True
+    assert decision["cross_context"]["authoritative"] is True
+    assert decision["blocking_reasons"] == ["closed_retest_not_confirmed"]
+    assert decision["required_next_event"] == "CLOSED_INSTITUTIONAL_ZONE_RETEST"
+    assert decision["entry_readiness"]["sl_valid"] is True
+    assert decision["entry_readiness"]["conditions_complete"] is False
+    assert decision["entry_readiness"]["authoritative_gate"] == "UNCHANGED_EXECUTE_ENTRY"
+
+
+def test_dashboard_projection_adds_no_exchange_or_scanner_calls(monkeypatch):
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {"BTC": _watchlist_card_row()})
+    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [])
+    monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [])
+    _patch_dashboard_runtime(monkeypatch)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dashboard projection attempted a new exchange/scanner call")
+
+    for name in ("safe_api_call", "get_ohlcv_safe", "get_ticker_safe",
+                 "_integration_fetch_frame", "_detect_confirmed_cross_events",
+                 "refresh_unified_institutional_watchlist", "execute_entry"):
+        monkeypatch.setattr(ggpbot, name, forbidden)
+
+    client = ggpbot.app.test_client()
+    html = client.get("/").get_data(as_text=True)
+    payload = client.get("/data").get_json()
+    assert "WATCHLIST / ACTIVE CANDIDATES" in html
+    assert set(payload["watchlist"]) == {"BTC"}
+
+
+def test_dashboard_source_has_no_entry_or_scanner_path():
+    names = set(ggpbot.dashboard.__code__.co_names)
+    forbidden = {
+        "execute_entry", "TradeExecutionService", "place_order", "safe_api_call",
+        "fetch_ohlcv", "get_ohlcv_safe", "get_ticker_safe", "_integration_fetch_frame",
+        "_detect_confirmed_cross_events", "refresh_unified_institutional_watchlist",
+        "update_unified_watchlist", "record_watchlist_entry", "_project_dashboard_sections",
+    }
+    assert not names & forbidden
 
 
 def test_bridge_projection_preserves_legacy_protected_fields():

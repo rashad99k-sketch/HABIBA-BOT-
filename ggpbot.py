@@ -90,9 +90,7 @@ from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
 from location_authority import validate_location_zone
 from naiso_unified_decision import (classify_cross_state as _project_cross_state,
-                                    project_dashboard_sections as _project_dashboard_sections,
-                                    project_watchlist_row as _project_watchlist_row,
-                                    SCHEMA_VERSION as UNIFIED_DECISION_SCHEMA_VERSION)
+                                    project_watchlist_row as _project_watchlist_row)
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -10003,17 +10001,6 @@ def dashboard():
     </div>
     """
 
-    unified_panel_html = """
-    <div class="section smart-layer">
-      <div class="title">🧩 NAISO UNIFIED DECISION VIEW (PROJECTION ONLY · CLOSED CANDLES)</div>
-      <div id="uni-confirmed-crosses" class="card" style="font-size:12px;margin-bottom:8px;">Loading confirmed crosses...</div>
-      <div id="uni-watchlist-ranking" class="card" style="font-size:12px;margin-bottom:8px;">Loading watchlist/ranking...</div>
-      <div id="uni-institutional-analysis" class="card" style="font-size:12px;margin-bottom:8px;max-height:320px;overflow-y:auto;">Loading institutional analysis...</div>
-      <div id="uni-execution-readiness" class="card" style="font-size:12px;max-height:260px;overflow-y:auto;">Loading execution readiness...</div>
-      <small>Ranking rows are never cross events. SL UNKNOWN can never be presented as ready.</small>
-    </div>
-    """
-
     no_entry_feed_section_html = """
     <div class="section smart-layer"><div class="title">🚫 WHY NO ENTRY (Last 5)</div>
     <div id="no-entry-feed" class="card" style="font-size:12px;"></div>
@@ -10155,7 +10142,6 @@ body{{background:#0b0f14;color:#e6edf3;font-family:Consolas;margin:0}}
 <div class="section smart-layer"><div class="title">📡 RF SIGNALS (Trigger Candidates)</div>
 <div id="rfSignals" class="card">{rf_html}</div>
 </div>
-{unified_panel_html}
 {watchlist_panel_html}
 <div class="section"><div class="title">📜 EXECUTION LOG</div><div id="logs" class="card log"></div></div>
 <div class="section"><div class="title">🚨 SYSTEM ERRORS</div><div id="errors" class="card err"></div></div>
@@ -10352,6 +10338,29 @@ function updateUI(d) {{
             let lastTs = w.last_updated || w.last_update || 0;
             let lastUpdate = lastTs ? new Date(lastTs * 1000).toLocaleTimeString() : "UNKNOWN";
             let quality = w.data_quality || "UNKNOWN";
+            // Read-only projection of fields already produced for this same Watchlist
+            // record. No new scan, cache, event store or decision authority is used.
+            let cardDecision = w.decision_context || (w.unified_decision_context || {{}}).decision_context || {{}};
+            let cardCross = (w.unified_decision_context || {{}}).cross_context || cardDecision.cross_context || w.cross_context || {{}};
+            let cardZone = cardDecision.zone_context || (w.unified_decision_context || {{}}).zone_context || {{}};
+            let cardLiquidity = cardDecision.liquidity_context || (w.unified_decision_context || {{}}).liquidity_context || {{}};
+            let cardStructure = cardDecision.structure_context || (w.unified_decision_context || {{}}).structure_context || {{}};
+            let cardReadiness = cardDecision.entry_readiness || w.entry_readiness_context || (w.unified_decision_context || {{}}).entry_readiness || {{}};
+            let cardTimeframe = cardDecision.timeframe_view || (w.unified_decision_context || {{}}).timeframe_view || {{}};
+            let cardCrossDurable = cardCross.durable_event === true && cardCross.authoritative === true;
+            let cardCrossState = cardCross.display_cross_state || cardCross.cross_state || w.cross_state || "NO_CROSS";
+            if (!cardCrossDurable && String(cardCrossState).startsWith("CONFIRMED_")) {{
+                cardCrossState = "RANKING_ONLY_" + cardCrossState + "_OBSERVATION";
+            }}
+            let cardCrossRole = cardCross.role || (cardCrossDurable ? "CONFIRMED_CROSS_EVENT" : "RANKING_ONLY_NOT_ENTRY_GATE");
+            let cardStopState = cardReadiness.sl_valid === true ? "VALID" : "STOP_INVALID_NOT_READY";
+            let cardDecisionState = cardDecision.decision_state || w.projected_decision_state || state;
+            let cardReadyState = (cardReadiness.conditions_complete === true && cardReadiness.sl_valid === true) ? "ENTRY_READY" : "NOT_READY";
+            let cardBlocking = (cardDecision.blocking_reasons || []).join(", ")
+                || (cardReadiness.missing || []).join(", ")
+                || (w.rejection_reasons || []).join(", ")
+                || w.rejection_reason || "none";
+            let cardNextEvent = cardDecision.required_next_event || w.required_next_event || "SETUP_DIAGNOSTICS_REQUIRED";
             wHtml += `<div style="margin-bottom:10px;border:1px solid #26364a;border-radius:8px;padding:8px;background:#101a29;">
               <div><b>${{sideIcon}} ${{w.symbol || sym}}</b> | ${{w.decision_setup_type || w.setup_type || w.trade_type || "UNCLASSIFIED"}} | Score: ${{w.score ?? w.discovery_score ?? "-"}} | <span style="color:${{stateColor}}">${{state}}</span></div>
               <div style="font-size:17px;letter-spacing:2px;margin:4px 0;">${{iconRow}}</div>
@@ -10363,57 +10372,15 @@ function updateUI(d) {{
               <br><small>Trend Engine: ${{instTrend.state || "UNKNOWN"}} / Health ${{instTrend.health ?? "?"}} | Trade State: ${{w.trade_state || "UNKNOWN"}}</small>
               <br><small>SL: ${{stopText}} | Data: ${{quality}} | Updated: ${{lastUpdate}}</small>
               <br><small>EMA9/EMA50/VWAP: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
+              <br><small>Decision projection (read-only): ${{uniEsc(w.symbol || sym)}} / ${{uniEsc(w.side || "UNKNOWN")}} | Cross: ${{uniEsc(cardCrossState)}} | durable=${{uniEsc(cardCrossDurable)}} | role=${{uniEsc(cardCrossRole)}} | Context: ${{uniEsc(cardTimeframe.market_regime || w.market_regime || "UNKNOWN")}} / ${{uniEsc(cardTimeframe.trade_state || w.trade_state || "UNKNOWN")}}</small>
+              <br><small>Zone: quality=${{uniEsc(cardZone.zone_quality_score ?? w.zone_quality_score ?? "?")}}/100 | valid=${{uniEsc((cardZone.supply_demand || {{}}).valid ?? "UNKNOWN")}} | Liquidity: ${{uniEsc(cardLiquidity.state || "UNKNOWN")}} / ${{uniEsc(cardLiquidity.stage || "UNKNOWN")}} | Confirmation: ${{uniEsc(cardStructure.confirmation_status || "UNKNOWN")}} | Pullback/Retest: ${{uniEsc(cardDecision.setup_stage || "UNKNOWN")}}</small>
+              <br><small>Structural Stop: ${{uniEsc(cardStopState)}} | Final decision: ${{uniEsc(cardDecisionState)}} (${{uniEsc(cardReadyState)}}) | Blocking: ${{uniEsc(cardBlocking)}} | Next: ${{uniEsc(cardNextEvent)}} | authority=${{uniEsc(cardReadiness.authoritative_gate || "UNCHANGED_EXECUTE_ENTRY")}}</small>
             </div>`;
         }}
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
     }} else {{
         document.getElementById("watchlist-panel").innerHTML = "No watchlist data";
     }}
-    const confirmedCrossRows = d.confirmed_crosses || [];
-    document.getElementById("uni-confirmed-crosses").innerHTML =
-        "<b>1) CONFIRMED CROSSES</b><br>" + (confirmedCrossRows.map(x => {{
-            const c = x.cross_context || {{}};
-            const mark = c.cross_state === "CONFIRMED_BUY_CROSS" ? "🟢" : c.cross_state === "CONFIRMED_SELL_CROSS" ? "🔴" : "⛔";
-            return `<div>${{mark}} ${{uniEsc(c.symbol || x.symbol)}} ${{uniEsc(c.cross_state)}} | durable=${{uniEsc(c.durable_event)}} | phase=${{uniEsc(c.cross_event_phase)}} | lifecycle=${{uniEsc(c.cross_lifecycle_status)}} | snapshot=${{uniEsc(c.source_snapshot_id)}}</div>`;
-        }}).join("") || "No durable confirmed cross events");
-    const rankingRows = d.watchlist_ranking || [];
-    document.getElementById("uni-watchlist-ranking").innerHTML =
-        "<b>2) WATCHLIST / RANKING</b><br>" + (rankingRows.map(x => {{
-            const c = x.cross_context || {{}};
-            return `<div>${{uniEsc(x.symbol)}} | ${{uniEsc(c.display_cross_state || c.cross_state)}} | ${{uniEsc(x.side)}} | role=${{uniEsc(c.role)}} | durable=${{uniEsc(c.durable_event)}} | authoritative=${{uniEsc(c.authoritative)}} | snapshot=${{uniEsc(x.source_snapshot_id)}} <small>(ranking only, never an event)</small></div>`;
-        }}).join("") || "No ranking-only cross observations");
-    const institutionalRows = d.institutional_analysis || [];
-    document.getElementById("uni-institutional-analysis").innerHTML =
-        "<b>3) INSTITUTIONAL ANALYSIS</b><br>" + (institutionalRows.map(x => {{
-            const dc = x.decision_context || {{}};
-            const tv = dc.timeframe_view || {{}};
-            const mc = dc.market_context || {{}};
-            const lc = dc.liquidity_context || {{}};
-            const sc = dc.structure_context || {{}};
-            const zc = dc.zone_context || {{}};
-            const mom = mc.momentum || {{}};
-            const conflict = tv.timeframe_conflict === "PRESENT" ? "⚠️ TIMEFRAME CONFLICT: " + (tv.conflict_reasons || []).join(", ") : "No timeframe conflict";
-            return `<div style="border-bottom:1px solid #26364a;padding:5px 0;">
-              <b>${{uniEsc(x.symbol)}} ${{uniEsc(x.side)}}</b> | state=<span style="color:${{dc.decision_state === "ENTRY_READY" ? "#2ecc71" : "#f1c40f"}}">${{uniEsc(dc.decision_state)}}</span> | stage=${{uniEsc(dc.setup_stage)}} | next=${{uniEsc(dc.required_next_event)}}
-              <br><small>Primary: ${{uniEsc(dc.primary_reason)}} | Secondary: ${{uniEsc((dc.secondary_reasons || []).join(", "))}} | Blocking: ${{uniEsc((dc.blocking_reasons || []).join(", "))}}</small>
-              <br><small>Regime: ${{uniEsc(tv.market_regime)}} | Trend: ${{uniEsc(tv.trend_direction)}} / ${{uniEsc(tv.trend_strength)}} | Trade State: ${{uniEsc(tv.trade_state)}} | Local Structure: ${{uniEsc(tv.local_structure)}} | HTF Bias: ${{uniEsc(tv.higher_timeframe_bias)}} | ${{uniEsc(conflict)}}</small>
-              <br><small>EMA50: ${{uniEsc(mc.ema50_direction)}} | VWAP: ${{uniEsc(mc.vwap_position)}} | ADX: ${{uniEsc(mc.adx)}} (DI+ ${{uniEsc(mc.di_plus)}} / DI- ${{uniEsc(mc.di_minus)}}, ${{uniEsc(mc.di_dominant)}}) | Momentum: ${{uniEsc(mom.flow_bias)}} / ${{uniEsc(mom.continuation_strength)}}</small>
-              <br><small>Liquidity: ${{uniEsc(lc.state)}} (${{uniEsc(lc.stage)}}) | Structure: ${{uniEsc(sc.confirmation_status)}} | Zone Quality: ${{uniEsc(zc.zone_quality_score)}}/100 | Context Quality: ${{uniEsc(zc.context_quality_score)}}/100 | Freshness: ${{uniEsc(dc.data_freshness)}}</small>
-              <br><small>OB: valid=${{uniEsc((zc.order_block || {{}}).valid)}} fresh=${{uniEsc((zc.order_block || {{}}).freshness)}} mit=${{uniEsc((zc.order_block || {{}}).mitigation_pct)}}% distATR=${{uniEsc((zc.order_block || {{}}).distance_atr)}} inside=${{uniEsc((zc.order_block || {{}}).inside_zone)}} | FVG: ${{uniEsc((zc.fvg || {{}}).lower)}}–${{uniEsc((zc.fvg || {{}}).upper)}} fill=${{uniEsc((zc.fvg || {{}}).fill_pct)}}% fresh=${{uniEsc((zc.fvg || {{}}).freshness)}} overlap=${{uniEsc((zc.fvg || {{}}).overlap_with_order_block)}} | Zone: ${{uniEsc((zc.supply_demand || {{}}).zone_type)}}/${{uniEsc((zc.supply_demand || {{}}).valid)}}</small>
-              <br><small>Snapshot: ${{uniEsc(dc.source_snapshot_id)}} | Event ts: ${{uniEsc(dc.event_timestamp)}}</small>
-            </div>`;
-        }}).join("") || "No institutional analysis rows");
-    const readinessRows = d.execution_readiness || [];
-    document.getElementById("uni-execution-readiness").innerHTML =
-        "<b>4) EXECUTION READINESS</b><br>" + (readinessRows.map(x => {{
-            const missing = (x.missing || []).join(", ");
-            const slText = x.sl_valid ? "VALID" : "STOP_INVALID_NOT_READY";
-            const color = x.conditions_complete ? "#2ecc71" : "#e74c3c";
-            return `<div style="border-bottom:1px solid #26364a;padding:4px 0;">
-              <b>${{uniEsc(x.symbol)}} ${{uniEsc(x.side)}}</b> | <span style="color:${{color}}">${{x.conditions_complete ? "✅ ENTRY_READY" : "⛔ NOT_READY"}}</span> | SL State: ${{slText}} | state=${{uniEsc(x.decision_state)}} | next=${{uniEsc(x.required_next_event)}}
-              <br><small>Missing: ${{uniEsc(missing || "none")}} | authority=${{uniEsc(x.authoritative_gate)}}</small>
-            </div>`;
-        }}).join("") || "No execution readiness rows");
     let noEntryHtml = "";
     if(d.no_entry_feed) {{
         d.no_entry_feed.forEach(item => {{
@@ -10642,11 +10609,6 @@ def data():
                 "smart_money_dominant": STATE["smart_money"].get("smart_money_dominant", False)
             }
 
-        unified_sections = _project_dashboard_sections(
-            watchlist_data,
-            MEMORY.get("confirmed_cross_events", []),
-            MEMORY.get("ema9_vwap_proximity_scanner", [])[:30],
-        )
         payload = {
             "balance": bal,
             "free_balance": free_bal,
@@ -10692,11 +10654,6 @@ def data():
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "naiso_health": naiso_health_snapshot(),
-            "unified_decision_schema": UNIFIED_DECISION_SCHEMA_VERSION,
-            "confirmed_crosses": unified_sections["confirmed_crosses"],
-            "watchlist_ranking": unified_sections["watchlist_ranking"],
-            "institutional_analysis": unified_sections["institutional_analysis"],
-            "execution_readiness": unified_sections["execution_readiness"],
             **live_data
         }
         safe_payload = safe_json(payload)
