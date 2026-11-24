@@ -160,6 +160,14 @@ def test_rejection_and_confirmation_must_be_separate_closed_candles(tmp_path):
     assert rejection["status"] == "WAITING_FOR_CONFIRMATION"
     assert rejection["rejection_ts"] == ts
     assert rejection["confirmation_ts"] is None
+
+    # A repeated poll of the same closed candle must be idempotent: it must
+    # retain the rejection event and must not advance to confirmation.
+    duplicate = engine.evaluate("SEQ", f, now_ms=ts + 900_000)
+    assert duplicate["status"] == "WAITING_FOR_CONFIRMATION"
+    assert duplicate["rejection_ts"] == ts
+    assert duplicate["confirmation_ts"] is None
+
     next_close = np.r_[closes, 111.0]
     f2 = frame(71, start=int(f.timestamp.iloc[0]), close=next_close)
     f2.loc[70, ["open", "high", "low", "close"]] = [110.0, 111.2, 109.9, 111.0]
