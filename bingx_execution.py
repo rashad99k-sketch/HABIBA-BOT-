@@ -41,6 +41,23 @@ class StopMoveResult:
         return self.outcome in {"MOVED", "RETAINED"}
 
 
+@dataclass(frozen=True)
+class StopEnsureResult:
+    """Tri-state result of an idempotent native-stop recovery repair.
+
+    VERIFIED_ADOPTED / PLACED_VERIFIED prove protection with a fresh exchange
+    read. HOLD never clears a recovery gate and never places a duplicate stop.
+    """
+    outcome: str
+    order_id: Optional[str] = None
+    reason: str = ""
+    verified_price: Optional[float] = None
+
+    @property
+    def verified(self) -> bool:
+        return self.outcome in {"VERIFIED_ADOPTED", "PLACED_VERIFIED"}
+
+
 class PositionMode(str, Enum):
     ONE_WAY = "ONE_WAY"
     HEDGE = "HEDGE"
@@ -432,6 +449,140 @@ class TradeExecutionService:
             return order_id
         self.logger(f"native stop verification exhausted read-back attempts for order_id={order_id}")
         return None
+
+    def ensure_native_stop(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: float,
+        trigger_price: float,
+        mode: PositionMode,
+        position_side: str,
+    ) -> StopEnsureResult:
+        """Idempotently restore protection from a journal-proven stop level.
+
+        Ordering is intentionally fail-closed:
+          1. Adopt an existing active stop only when it strictly matches the
+             journaled level and covers the exchange-confirmed quantity.
+          2. If any active stop exists at another level, HOLD instead of creating
+             a second protective order.
+          3. If the conditional-order query failed, HOLD: absence was not proven.
+          4. Only when queries succeeded and returned no active stop do we place
+             one, and only a fresh read-back can turn that into VERIFIED.
+        """
+        from bingx_protection import (
+            extract_open_order_records, is_matching_native_stop_order, native_order_identifiers,
+        )
+
+        close_side = "sell" if str(side).upper() == "BUY" else "buy"
+        qty = float(quantity)
+        price = float(trigger_price)
+        if qty <= 0 or not math.isfinite(price) or price <= 0:
+            return StopEnsureResult("HOLD", reason="INVALID_JOURNALLED_PROTECTION")
+        rows, query_succeeded = self._collect_native_stop_rows(
+            symbol=symbol, close_side=close_side.upper(), position_side=str(position_side).upper())
+        if not query_succeeded:
+            return StopEnsureResult("HOLD", reason="CONDITIONAL_QUERY_UNKNOWN")
+        rounding_delta = 0.0
+        price_to_precision = getattr(self.exchange, "price_to_precision", None)
+        if callable(price_to_precision):
+            try:
+                exchange_price = float(price_to_precision(symbol, price))
+                if exchange_price > 0:
+                    rounding_delta = abs(price - exchange_price) + 1e-12
+            except Exception:
+                pass
+        for row in rows:
+            if is_matching_native_stop_order(
+                row, symbol=symbol, position_side=str(position_side).upper(),
+                close_side=close_side.upper(), trigger_price=price,
+                required_qty=qty, price_tolerance_abs=rounding_delta,
+            ):
+                ids = native_order_identifiers(row)
+                order_id = next(iter(ids)) if ids else None
+                return StopEnsureResult("VERIFIED_ADOPTED", order_id=order_id,
+                                        reason="EXISTING_STOP_VERIFIED", verified_price=price)
+        if self._has_active_stop_for_scope(rows, symbol=symbol, close_side=close_side.upper(),
+                                           position_side=str(position_side).upper()):
+            return StopEnsureResult("HOLD", reason="ACTIVE_STOP_AT_UNPROVEN_LEVEL")
+        params = build_position_order_params(
+            mode, "SELL" if close_side == "sell" else "BUY", opening=False, closing=True,
+            reduce_only_required=(mode is PositionMode.ONE_WAY))
+        params.update({"stopPrice": price, "workingType": "MARK_PRICE"})
+        try:
+            order = self.exchange.create_order(symbol, "STOP_MARKET", close_side, qty, None, params)
+        except Exception as exc:
+            self.logger(f"ensure_native_stop placement uncertain: {type(exc).__name__}: {exc}")
+            return StopEnsureResult("HOLD", reason="ORDER_SUBMISSION_UNCERTAIN")
+        order_id = _order_id(order)
+        if not order_id:
+            return StopEnsureResult("HOLD", reason="ORDER_ID_UNAVAILABLE")
+        verified = self._read_back_native_stop(
+            symbol=symbol, close_side=close_side.upper(), position_side=str(position_side).upper(),
+            trigger_price=price, quantity=qty)
+        if not verified:
+            return StopEnsureResult("HOLD", order_id=order_id, reason="PLACED_READBACK_UNVERIFIED")
+        return StopEnsureResult("PLACED_VERIFIED", order_id=verified,
+                                reason="NEW_STOP_VERIFIED", verified_price=price)
+
+    def _collect_native_stop_rows(self, *, symbol: str, close_side: str,
+                                  position_side: str):
+        """Return (rows, query_succeeded); an empty result is not proof of absence."""
+        from bingx_protection import extract_open_order_records
+        rows = []
+        succeeded = False
+        fetch_open = getattr(self.exchange, "fetch_open_orders", None)
+        if callable(fetch_open):
+            for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
+                try:
+                    candidate = fetch_open(*args)
+                    if candidate is not None:
+                        succeeded = True
+                        rows.extend(extract_open_order_records(candidate))
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    self.logger(f"ensure_native_stop open-order query failed: {type(exc).__name__}: {exc}")
+        try:
+            market_id = (self.exchange.market(symbol) or {}).get("id") or symbol
+        except Exception:
+            market_id = symbol
+        raw_method = getattr(self.exchange, "swapV2PrivateGetTradeOpenOrders", None)
+        if callable(raw_method):
+            for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
+                try:
+                    raw = raw_method({"symbol": market_id, "type": native_type})
+                    if raw is not None:
+                        succeeded = True
+                        rows.extend(extract_open_order_records(raw))
+                except Exception as exc:
+                    self.logger(f"ensure_native_stop {native_type} query failed: {type(exc).__name__}: {exc}")
+        return rows, succeeded
+
+    @staticmethod
+    def _has_active_stop_for_scope(rows, *, symbol: str, close_side: str,
+                                   position_side: str) -> bool:
+        """True for any active conditional stop in this scope, regardless of price."""
+        from bingx_protection import _first_text, _values, _canonical_symbol
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            types = {str(v).strip().upper().replace("-", "_")
+                     for v in _values(row, ("type", "orderType", "origType"))}
+            if not (types & {"STOP_MARKET", "TRIGGER_MARKET"}):
+                continue
+            if _canonical_symbol(_first_text(row, ("symbol", "market", "contract"))) != _canonical_symbol(symbol):
+                continue
+            if str(_first_text(row, ("side", "orderSide")) or "").upper() != str(close_side).upper():
+                continue
+            actual_position_side = str(_first_text(row, ("positionSide", "posSide", "position_side")) or "").upper()
+            if actual_position_side and actual_position_side != str(position_side).upper():
+                continue
+            status = str(_first_text(row, ("status", "state", "orderStatus")) or "").upper().replace(" ", "_")
+            if status in {"NEW", "OPEN", "PENDING", "PARTIALLY_FILLED", "PARTIALLYFILLED", "WORKING"}:
+                return True
+        return False
 
     def _read_back_native_stop(self, *, symbol: str, close_side: str, position_side: str,
                                trigger_price: float, quantity: float) -> Optional[str]:
