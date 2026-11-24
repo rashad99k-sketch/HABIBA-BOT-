@@ -9203,7 +9203,7 @@ def _refresh_ema_vwap_setups(watchlist):
             closed = roro_validate_closed_frame(
                 frame, now_ms=int(time.time() * 1000), timeframe_s=_roro_timeframe_seconds(INTERVAL)
             )
-            result = EMA_VWAP_ENTRY_ENGINE.evaluate(str(canonical), closed, now_ms=int(time.time() * 1000))
+            result = EMA_VWAP_ENTRY_ENGINE.evaluate_direct_cross(str(canonical), closed, now_ms=int(time.time() * 1000))
             result["diagnostics"] = {
                 "snapshot_age_seconds": round(snapshot_age, 2) if snapshot_age is not None else None,
                 "closed_candles": int(len(closed)),
@@ -9342,23 +9342,15 @@ def smart_opportunity_selection():
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "insufficient_fresh_closed_ohlcv"
                 continue
-            # Evaluate both institutional sides independently for structural context.
-            # Neither side result can override or veto the EMA/VWAP direction.
-            fresh = roro_analyze_symbol_both(
-                exchange_sym, closed_df,
-                now_ms=int(time.time() * 1000),
-                side_hints=["BUY", "SELL"],
-            )
-            fresh.update(_enrich_with_existing_gpp_engines(closed_df, side, fresh))
-            institutional_state = fresh.get("decision_state")
-            item.update(fresh)
-            item["institutional_decision_state"] = institutional_state
-            # A fresh institutional ENTRY_READY must never overwrite a stale or
-            # invalidated EMA/VWAP setup. The strategy engine owns entry direction/state.
+            # Direct-cross entry uses a deliberately small decision set:
+            # closed EMA9/EMA15 cross + VWAP side + valid ATR/fresh data.
+            # Institutional engines remain available to the live manager after fill;
+            # they are not an extra entry gate here.
+            item["institutional_decision_state"] = item.get("institutional_decision_state")
             item["ema_vwap_strategy"] = strategy_snapshot
             item["strategy_status"] = strategy_snapshot.get("status", "UNKNOWN")
             item["decision_state"] = strategy_snapshot.get("status", "UNKNOWN")
-            item["decision_authority"] = "EMA_VWAP_PULLBACK_ENGINE"
+            item["decision_authority"] = "EMA9_EMA15_CROSS_VWAP_GATE"
             item["source"] = item.get("source") or "unified_watchlist"
             item["side"] = side
             event_id = str(item.get("event_id") or "")
@@ -9373,30 +9365,36 @@ def smart_opportunity_selection():
                 continue
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
-            setup = str(item.get("decision_setup_type") or item.get("setup_type") or "EMA_VWAP_CAUSAL_ZONE").upper()
-            classification = "REVERSAL" if "REVERSAL" in setup else "TREND"
-            # Stop is anchored to the same causal zone that produced the retest.
-            # An institutional stop may be reused only when it is beyond that zone.
+            setup = "EMA9_EMA15_CROSS"
+            classification = "TREND"
+            # Prefer a valid causal-zone stop when one exists; direct crossover
+            # entries without a zone use the existing ATR-based SL/TP calculator.
             setup_obj = EMA_VWAP_ENTRY_ENGINE.get(canonical)
-            if not setup_obj or not all(np.isfinite(float(v)) for v in (
-                    setup_obj.causal_zone_low, setup_obj.causal_zone_high, atr_value)):
+            zone_valid = bool(setup_obj and all(
+                v is not None and np.isfinite(float(v))
+                for v in (setup_obj.causal_zone_low, setup_obj.causal_zone_high)
+            ) and float(setup_obj.causal_zone_low) < float(setup_obj.causal_zone_high))
+            zone_low = float(setup_obj.causal_zone_low) if zone_valid else None
+            zone_high = float(setup_obj.causal_zone_high) if zone_valid else None
+            if zone_valid:
+                buffer = 0.15 * float(atr_value)
+                sl = zone_low - buffer if side == "BUY" else zone_high + buffer
+                institutional_sl = item.get("structural_stop")
+                if institutional_sl is not None and np.isfinite(float(institutional_sl)):
+                    candidate_sl = float(institutional_sl)
+                    if (side == "BUY" and candidate_sl < zone_low) or (side == "SELL" and candidate_sl > zone_high):
+                        sl = candidate_sl
+                _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
+                item["stop_source"] = "CAUSAL_ZONE"
+            else:
+                sl, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
+                item["stop_source"] = "ATR_FALLBACK_NO_CAUSAL_ZONE"
+            if (not np.isfinite(float(sl)) or float(sl) <= 0
+                    or (side == "BUY" and float(sl) >= price)
+                    or (side == "SELL" and float(sl) <= price)):
                 item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "causal_zone_missing_for_stop"
+                item["rejection_reason"] = "stop_loss_geometry_invalid"
                 continue
-            zone_low, zone_high = float(setup_obj.causal_zone_low), float(setup_obj.causal_zone_high)
-            buffer = 0.15 * float(atr_value)
-            proposed_sl = zone_low - buffer if side == "BUY" else zone_high + buffer
-            institutional_sl = item.get("structural_stop")
-            if institutional_sl is not None and np.isfinite(float(institutional_sl)):
-                candidate_sl = float(institutional_sl)
-                if (side == "BUY" and candidate_sl < zone_low) or (side == "SELL" and candidate_sl > zone_high):
-                    proposed_sl = candidate_sl
-            sl = proposed_sl
-            if not np.isfinite(sl) or sl <= 0 or (side == "BUY" and sl >= price) or (side == "SELL" and sl <= price):
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "causal_zone_stop_geometry_invalid"
-                continue
-            _, tp1, tp2 = compute_sl_tp(price, side, classification, float(atr_value), closed_df)
             # Use chart-derived directional liquidity to refine trend targets only.
             # The causal-zone structural SL is never changed by target planning.
             target_liquidity_levels = []
@@ -9449,21 +9447,21 @@ def smart_opportunity_selection():
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "event_id": event_id or None,
-                "causal_zone_type": setup_obj.causal_zone_type,
+                "causal_zone_type": setup_obj.causal_zone_type if zone_valid else None,
                 "causal_zone_low": zone_low,
                 "causal_zone_high": zone_high,
-                "causal_zone_ts": setup_obj.causal_zone_ts,
+                "causal_zone_ts": setup_obj.causal_zone_ts if zone_valid else None,
                 "evidence": evidence,
                 "structural_stop": float(sl),
-                "pullback_type": str(getattr(setup_obj, "entry_path", None) or getattr(setup_obj, "pullback_type", None) or "UNKNOWN"),
+                "pullback_type": str(getattr(setup_obj, "entry_path", None) or getattr(setup_obj, "pullback_type", None) or "DIRECT_CROSS"),
                 "entry_crossover_ts": setup_obj.crossover_ts,
                 "entry_rejection_ts": setup_obj.rejection_ts,
                 "entry_confirmation_ts": setup_obj.confirmation_ts,
                 "entry_zone_strength": (setup_obj.trend_evidence or {}).get("zone_status", "UNKNOWN"),
                 "entry_trend_evidence": dict(setup_obj.trend_evidence or {}),
                 "exchange_symbol": exchange_sym,
-                # This handoff token is created only after authorize() accepted the
-                # closed-bar EMA9/Session-VWAP cross + causal-zone pullback/rejection/confirmation.
+                # This handoff token is created only after authorize() accepted a
+                # fresh closed-bar EMA9/EMA15 cross with VWAP directional alignment.
                 "ema_vwap_authorized": True,
                 "canonical_symbol": canonical,
                 "side": side,
