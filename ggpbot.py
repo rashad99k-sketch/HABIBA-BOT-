@@ -10380,7 +10380,7 @@ function updateUI(d) {{
     document.getElementById("uni-watchlist-ranking").innerHTML =
         "<b>2) WATCHLIST / RANKING</b><br>" + (rankingRows.map(x => {{
             const c = x.cross_context || {{}};
-            return `<div>${{uniEsc(x.symbol)}} | ${{uniEsc(c.cross_state)}} | ${{uniEsc(x.side)}} | role=${{uniEsc(c.role)}} | snapshot=${{uniEsc(x.source_snapshot_id)}} <small>(ranking only, never an event)</small></div>`;
+            return `<div>${{uniEsc(x.symbol)}} | ${{uniEsc(c.display_cross_state || c.cross_state)}} | ${{uniEsc(x.side)}} | role=${{uniEsc(c.role)}} | durable=${{uniEsc(c.durable_event)}} | authoritative=${{uniEsc(c.authoritative)}} | snapshot=${{uniEsc(x.source_snapshot_id)}} <small>(ranking only, never an event)</small></div>`;
         }}).join("") || "No ranking-only cross observations");
     const institutionalRows = d.institutional_analysis || [];
     document.getElementById("uni-institutional-analysis").innerHTML =
@@ -10407,10 +10407,10 @@ function updateUI(d) {{
     document.getElementById("uni-execution-readiness").innerHTML =
         "<b>4) EXECUTION READINESS</b><br>" + (readinessRows.map(x => {{
             const missing = (x.missing || []).join(", ");
-            const slText = x.sl_valid ? "VALID" : "UNKNOWN";
+            const slText = x.sl_valid ? "VALID" : "STOP_INVALID_NOT_READY";
             const color = x.conditions_complete ? "#2ecc71" : "#e74c3c";
             return `<div style="border-bottom:1px solid #26364a;padding:4px 0;">
-              <b>${{uniEsc(x.symbol)}} ${{uniEsc(x.side)}}</b> | <span style="color:${{color}}">${{x.conditions_complete ? "✅ ENTRY_READY" : "⛔ NOT_READY"}}</span> | SL: ${{slText}} | state=${{uniEsc(x.decision_state)}} | next=${{uniEsc(x.required_next_event)}}
+              <b>${{uniEsc(x.symbol)}} ${{uniEsc(x.side)}}</b> | <span style="color:${{color}}">${{x.conditions_complete ? "✅ ENTRY_READY" : "⛔ NOT_READY"}}</span> | SL State: ${{slText}} | state=${{uniEsc(x.decision_state)}} | next=${{uniEsc(x.required_next_event)}}
               <br><small>Missing: ${{uniEsc(missing || "none")}} | authority=${{uniEsc(x.authoritative_gate)}}</small>
             </div>`;
         }}).join("") || "No execution readiness rows");

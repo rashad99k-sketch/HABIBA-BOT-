@@ -91,6 +91,8 @@ def test_confirmed_buy_and_sell_cross_states(side, expected):
     (_durable_record(status="INVALIDATED"), {}, "NO_CROSS", False, "INVALIDATED"),
     (_durable_record(status="INACTIVE"), {}, "NO_CROSS", False, "EXPIRED"),
     (_durable_record(expires_ts=FIXED_NOW - 1.0), {}, "NO_CROSS", False, "EXPIRED"),
+    ({**_durable_record(), "expires_ts": None, "cross_event_expires_ts": FIXED_NOW - 1.0},
+     {}, "NO_CROSS", False, "EXPIRED"),
     ({}, {}, "NO_CROSS", False, "ACTIVE"),
 ])
 def test_cross_state_matrix(record, proximity, expected, authoritative, stage):
@@ -101,6 +103,30 @@ def test_cross_state_matrix(record, proximity, expected, authoritative, stage):
     if out["role"] == proj.RANKING_ONLY_ROLE:
         assert out["durable_event"] is False
         assert out["authoritative"] is False
+
+
+def test_expired_synced_memory_cross_is_not_authoritative():
+    stale_memory_row = {
+        "symbol": CANONICAL,
+        "exchange_symbol": SYMBOL,
+        "side": "BUY",
+        "cross_event_id": "BTC:15m:BUY:expired-memory",
+        "cross_event_status": "ACTIVE",
+        "cross_event_direction": "BUY",
+        "cross_event_timestamp": 1_790_000_000_000,
+        "cross_event_timeframe": "15m",
+        "cross_event_expires_ts": FIXED_NOW - 10.0,
+        "cross_context": {"cross_state": "CONFIRMED_BUY_CROSS", "authoritative": True},
+        "role": "CONFIRMED_CROSS_EVENT",
+    }
+    classified = proj.classify_cross_state(stale_memory_row, now_ts=FIXED_NOW)
+    assert classified["cross_state"] == "NO_CROSS"
+    assert classified["cross_lifecycle_status"] == "EXPIRED"
+    assert classified["authoritative"] is False
+    sections = proj.project_dashboard_sections(
+        confirmed_crosses=[stale_memory_row], now_ts=FIXED_NOW,
+    )
+    assert sections["confirmed_crosses"] == []
 
 
 def test_cross_event_is_unique_and_never_reusable(tmp_path, monkeypatch):
@@ -226,6 +252,15 @@ def test_liquidity_states_distinguish_sweep_grab_failed_auction_and_reclaim(
         assert out["pending_reason"] == "valid_data_no_recent_event"
 
 
+def test_generic_liquidity_context_gap_is_data_incomplete_not_fake_wait():
+    row = _context_row(decision_reason="liquidity_context_unavailable")
+    out = proj.project_decision_context(row, now_ts=FIXED_NOW)
+    assert out["analysis_status"] == "DATA_INCOMPLETE"
+    assert out["decision_state"] == "DATA_INCOMPLETE"
+    assert out["required_next_event"] == "COMPLETE_CLOSED_CANDLE_FRAME_REQUIRED"
+    assert out["entry_readiness"]["conditions_complete"] is False
+
+
 def _decision_case(state):
     base = _context_row()
     cases = {
@@ -275,8 +310,9 @@ def test_entry_readiness_never_presents_unknown_sl_as_ready():
     row = _decision_case("ENTRY_READY")
     row.pop("structural_stop", None)
     out = proj.project_decision_context(row, now_ts=FIXED_NOW)
-    if out["decision_state"] == "ENTRY_READY":
-        assert out["entry_readiness"]["conditions_complete"] is False
+    assert out["decision_state"] != "ENTRY_READY"
+    assert out["entry_readiness"]["state"] == "NOT_READY"
+    assert out["entry_readiness"]["conditions_complete"] is False
     assert out["entry_readiness"]["sl_valid"] is False
     assert "STRUCTURAL_STOP_UNKNOWN" in out["entry_readiness"]["missing"]
 
@@ -296,9 +332,13 @@ def test_dashboard_sections_are_separated_and_ranking_never_becomes_an_event():
     assert out["confirmed_crosses"][0]["cross_context"]["durable_event"] is True
     assert len(out["watchlist_ranking"]) == 1
     ranking_cross = out["watchlist_ranking"][0]["cross_context"]
+    assert ranking_cross["cross_state"] == "CONFIRMED_BUY_CROSS"
+    assert ranking_cross["display_cross_state"] == "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
+    assert out["watchlist_ranking"][0]["cross_state_display"] == "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
     assert ranking_cross["durable_event"] is False
     assert ranking_cross["authoritative"] is False
     assert ranking_cross["role"] == proj.RANKING_ONLY_ROLE
+    assert out["confirmed_crosses"][0]["cross_context"]["display_cross_state"] == "CONFIRMED_BUY_CROSS"
     assert all(row["symbol"] != "ETH" for row in out["execution_readiness"])
     assert any(row["conditions_complete"] is True for row in out["execution_readiness"])
 
@@ -399,6 +439,14 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
         "closed_candle_timestamp": int(frame["timestamp"].iloc[-1]),
     }
+    # A deliberately spoofed projection claiming ENTRY_READY must not change the
+    # unchanged authority: the durable gate is still WAITING_FOR_PULLBACK.
+    ctx["unified_decision_context"] = {
+        "schema": proj.SCHEMA_VERSION,
+        "decision_state": "ENTRY_READY",
+        "entry_readiness": {"conditions_complete": True, "sl_valid": True},
+        "authority": "SPOOFED_PROJECTION_MUST_BE_IGNORED",
+    }
     monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", ctx)
     premature = ggpbot.execute_entry(
         "BUY", SYMBOL, price, price - 2.0, price * 1.008, price * 1.02, 80,
@@ -408,7 +456,7 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     assert ggpbot.paper.get("position") is None
     assert journal.get_cross_event(event["event_id"])["status"] == "ACTIVE"
     step("ENTRY_BLOCKED_BEFORE_BREAKOUT", reason="cross_phase_waiting_for_pullback",
-         journal_status="ACTIVE", paper_position=None)
+         spoofed_projection_ready=True, journal_status="ACTIVE", paper_position=None)
 
     # 5) Later closed candles complete the durable rejection lifecycle.
     frames["current"] = _lifecycle_frame("BUY")
@@ -538,6 +586,10 @@ def test_dashboard_html_and_data_expose_four_separated_sections(monkeypatch):
     for element in ("uni-confirmed-crosses", "uni-watchlist-ranking",
                     "uni-institutional-analysis", "uni-execution-readiness"):
         assert element in html
+    assert "c.display_cross_state || c.cross_state" in html
+    assert "authoritative=${uniEsc(c.authoritative)}" in html
+    assert "STOP_INVALID_NOT_READY" in html
+    assert 'const slText = x.sl_valid ? "VALID" : "UNKNOWN";' not in html
 
     response = client.get("/data")
     assert response.status_code == 200
@@ -546,11 +598,44 @@ def test_dashboard_html_and_data_expose_four_separated_sections(monkeypatch):
     assert len(payload["confirmed_crosses"]) == 1
     assert len(payload["watchlist_ranking"]) == 1
     assert payload["watchlist_ranking"][0]["cross_context"]["authoritative"] is False
+    assert payload["watchlist_ranking"][0]["cross_state_display"] == \
+        "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
     assert len(payload["institutional_analysis"]) == 1
     assert len(payload["execution_readiness"]) == 1
     readiness = payload["execution_readiness"][0]
     assert "SL: UNKNOWN" not in str(readiness)
     assert readiness["authoritative_gate"] == "UNCHANGED_EXECUTE_ENTRY"
+
+
+def test_bridge_projection_preserves_legacy_protected_fields():
+    legacy = {
+        "symbol": CANONICAL,
+        "exchange_symbol": SYMBOL,
+        "side": "BUY",
+        "decision_state": "ENTRY_READY",
+        "entry_status": "ENTRY_READY",
+        "decision_reason": "closed_rejection_breakout_confirmed",
+        "structural_stop": 98.0,
+        "entry_readiness": {"conditions_complete": True, "sl_valid": True},
+        "position_size_pct": 20.0,
+        "leverage": 20,
+        "risk_pct": 0.2,
+        "tp1_pct": 5.0,
+        "tp2_pct": 10.0,
+        "golden_zone": {"score": 85},
+    }
+    before = dict(legacy)
+    before["entry_readiness"] = dict(legacy["entry_readiness"])
+    before["golden_zone"] = dict(legacy["golden_zone"])
+
+    out = bridge._with_projected_decision(legacy)
+    for key, value in before.items():
+        assert out[key] == value, key
+    assert out["entry_readiness"] is legacy["entry_readiness"]
+    assert out["decision_context"]["schema"] == proj.SCHEMA_VERSION
+    assert out["projected_decision_state"] == out["decision_context"]["decision_state"]
+    assert out["required_next_event"] == out["decision_context"]["required_next_event"]
+    assert out["decision_context"]["authority"] == "UNIFIED_ENTRY_AUTHORITY_UNCHANGED"
 
 
 def test_projection_adds_no_exchange_or_snapshot_calls(monkeypatch):

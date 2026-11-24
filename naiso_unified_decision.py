@@ -111,7 +111,15 @@ _INVALID_ZONE_TOKENS = (
     "outside_institutional_zone", "structural_stop_missing",
 )
 _INVALIDATED_TOKENS = ("invalidated", "post_sweep_invalidated", "cross_event_invalidated")
-_LIQUIDITY_TOKENS = ("liquidity", "sweep", "grab", "failed_auction", "equal_high", "equal_low")
+_LIQUIDITY_TOKENS = (
+    "liquidity_sweep", "liquidity_grab", "liquidity_confirm", "waiting_liquidity",
+    "liquidity_event", "sweep_confirm", "grab_confirm", "failed_auction",
+    "equal_high", "equal_low", "reclaim",
+)
+_DATA_GAP_TOKENS = (
+    "liquidity_context_unavailable", "context_unavailable", "data_gap",
+    "missing_closed", "insufficient_closed",
+)
 _MSS_TOKENS = ("mss", "choch", "structure_shift", "post_sweep_structure")
 _REJECTION_TOKENS = ("rejection", "wick", "displacement_candle")
 _BREAK_TOKENS = ("breakout", "break_confirm", "broke_level", "break_level")
@@ -271,7 +279,10 @@ def classify_cross_state(record: Any = None, *, proximity: Any = None, gate: Any
         return base
 
     if event_id and not is_ranking:
-        expires = _number(row.get("expires_ts"))
+        # Scanner/journal rows use ``expires_ts``; the synced Watchlist feed uses
+        # ``cross_event_expires_ts``. Both must expire an event identically.
+        expires = _number(row.get("expires_ts") or row.get("cross_event_expires_ts")
+                          or row.get("cross_event_expiry_ts"))
         if base["consumed"] or status == "ENTERED":
             base.update({"cross_state": "CROSS_ALREADY_CONSUMED", "authoritative": False,
                          "reason": "cross_event_consumed_once"})
@@ -614,9 +625,10 @@ def _map_decision_state(row: Dict[str, Any], cross: Dict[str, Any], zones: Dict[
         return "WAITING_FOR_BREAK_CONFIRMATION"
     if any(token in reason_blob for token in _RETEST_TOKENS):
         return "WAITING_FOR_RETEST"
-    if any(token in reason_blob for token in _LIQUIDITY_TOKENS) or liquidity["state"] in {
+    liquidity_pending = (liquidity["state"] in {
         "LIQUIDITY_SWEEP", "LIQUIDITY_GRAB", "FAILED_AUCTION", "RECLAIM"
-    } and liquidity["stage"] in {"DETECTED", "PENDING"}:
+    } and liquidity["stage"] in {"DETECTED", "PENDING"})
+    if any(token in reason_blob for token in _LIQUIDITY_TOKENS) or liquidity_pending:
         return "WAITING_FOR_LIQUIDITY_CONFIRMATION"
     if any(token in reason_blob for token in _MSS_TOKENS):
         return "WAITING_FOR_MSS"
@@ -650,7 +662,8 @@ def project_decision_context(record: Any, *, cross: Any = None, now_ts: Optional
     analysis_status = "FRESH"
     if freshness in {"STALE", "STALE_DATA", "DATA_STALE"} or "stale" in blob:
         analysis_status = "DATA_STALE"
-    elif "insufficient" in data_quality.lower() or "insufficient" in blob or data_quality == "DATA_UNAVAILABLE":
+    elif ("insufficient" in data_quality.lower() or "insufficient" in blob
+          or data_quality == "DATA_UNAVAILABLE" or any(token in blob for token in _DATA_GAP_TOKENS)):
         analysis_status = "DATA_INCOMPLETE"
 
     if analysis_status != "FRESH":
@@ -708,11 +721,16 @@ def project_watchlist_row(record: Any, *, now_ts: Optional[float] = None,
     row = _mapping(record)
     cross = classify_cross_state(row, now_ts=now_ts, ranking_only=ranking_only)
     decision = project_decision_context(row, cross=cross, now_ts=now_ts, ranking=ranking_only)
+    display_state = cross["cross_state"]
+    if ranking_only and display_state in {"CONFIRMED_BUY_CROSS", "CONFIRMED_SELL_CROSS"}:
+        display_state = f"RANKING_ONLY_{display_state}_OBSERVATION"
+    cross["display_cross_state"] = display_state
     return {
         "schema": SCHEMA_VERSION,
         "symbol": row.get("symbol") or "",
         "exchange_symbol": row.get("exchange_symbol") or "",
         "side": _upper(row.get("side") or row.get("direction")),
+        "cross_state_display": display_state,
         "cross_context": cross,
         "decision_context": decision,
         "liquidity_context": decision["liquidity_context"],
