@@ -187,3 +187,41 @@ def test_effective_watchlist_cleanup_uses_copy_snapshot():
     )
     source = ast.get_source_segment(SOURCE, fn)
     assert "wl.copy().items()" in source
+
+
+
+def test_scanner_runtime_is_exclusive_while_position_is_open():
+    mode = _function("_position_management_mode")
+    mode_names = {node.id for node in ast.walk(mode) if isinstance(node, ast.Name)}
+    assert {"STATE", "TRADE_STATE"}.issubset(mode_names)
+
+    dispatch = _function("dispatch_scanner_task")
+    dispatch_source = ast.get_source_segment(SOURCE, dispatch)
+    assert "_position_management_mode()" in dispatch_source
+    assert "PAUSED_FOR_POSITION" in dispatch_source
+
+    refresh = _function("_refresh_ema_vwap_setups")
+    refresh_source = ast.get_source_segment(SOURCE, refresh)
+    assert "_position_management_mode()" in refresh_source
+
+    updater = _function("live_institutional_updater")
+    updater_source = ast.get_source_segment(SOURCE, updater)
+    assert "_position_management_mode()" in updater_source
+
+    loop = _function("main_loop_sniper")
+    loop_source = ast.get_source_segment(SOURCE, loop)
+    assert "POSITION_MANAGEMENT_ONLY" in loop_source
+    assert "manage_live_trade" in loop_source
+
+
+def test_scanner_snapshot_cache_uses_canonical_key_and_last_valid_fallback():
+    key_fn = _function("_scanner_frame_key")
+    key_source = ast.get_source_segment(SOURCE, key_fn)
+    assert "roro_canonical_symbol" in key_source
+    fetch_fn = _function("_get_scanner_frame")
+    fetch_source = ast.get_source_segment(SOURCE, fetch_fn)
+    assert "_SCANNER_FRAME_LAST_VALID" in fetch_source
+    peek_fn = _function("_peek_scanner_frame")
+    peek_source = ast.get_source_segment(SOURCE, peek_fn)
+    assert "include_stale" in peek_source
+    assert "_SCANNER_FRAME_LAST_VALID" in peek_source
