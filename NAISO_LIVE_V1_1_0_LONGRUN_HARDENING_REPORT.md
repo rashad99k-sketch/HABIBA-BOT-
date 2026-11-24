@@ -3,6 +3,8 @@
 Date: 2026-11-24  
 Branch: `fix/naiso-live-v1.1.0-longrun-hardening`  
 Base: `origin/main` at `a2d446c`  
+Commit: `20cfd3c` on `fix/naiso-live-v1.1.0-longrun-hardening`  
+Pull request: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/9  
 Status: implementation complete on an isolated branch; **not merged to `main` and not approved for deployment**.
 
 ## 1. Safety boundary
