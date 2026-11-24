@@ -287,12 +287,16 @@ def _patch_direct_cross_indicators(monkeypatch, side="BUY", aligned=True):
     if side == "BUY":
         ema9 = np.array([99.0] * 69 + [101.0])
         ema15 = np.array([100.0] * 70)
+        vwap_values = np.full(70, 100.0)
         vwap = 100.0 if aligned else 103.0
+        vwap_values[-1] = vwap
         price = 102.0
     else:
         ema9 = np.array([101.0] * 69 + [99.0])
         ema15 = np.array([100.0] * 70)
+        vwap_values = np.full(70, 100.0)
         vwap = 100.0 if aligned else 97.0
+        vwap_values[-1] = vwap
         price = 98.0
     monkeypatch.setattr(module, "indicator_series", lambda _frame: {
         "valid": True,
@@ -300,14 +304,14 @@ def _patch_direct_cross_indicators(monkeypatch, side="BUY", aligned=True):
         "ema15": pd.Series(ema15),
         "ema50": pd.Series(np.full(70, 99.0)),
         "atr14": pd.Series(np.ones(70)),
-        "vwap_series": pd.Series(np.full(70, vwap)),
+        "vwap_series": pd.Series(vwap_values),
         "utc_session": pd.Series(["2026-11-24"] * 70),
     })
     monkeypatch.setattr(module, "indicators", lambda _frame: {"valid": True, "reason": ""})
     return price
 
 
-def test_direct_ema9_ema15_cross_authorizes_buy_and_sell_without_pullback(monkeypatch, tmp_path):
+def test_direct_ema9_vwap_cross_authorizes_buy_and_sell_without_pullback(monkeypatch, tmp_path):
     from unified_ema_vwap_strategy import execution_handoff_allowed
 
     for side in ("BUY", "SELL"):
@@ -320,7 +324,7 @@ def test_direct_ema9_ema15_cross_authorizes_buy_and_sell_without_pullback(monkey
         result = engine.evaluate_direct_cross("TEST", data, now_ms=now)
         assert result["status"] == "ENTRY_READY"
         assert result["direction"] == side
-        assert result["entry_path"] == "DIRECT_EMA9_EMA15_CROSS"
+        assert result["entry_path"] == "DIRECT_EMA9_VWAP_CROSS"
         assert result["rejection_ts"] is None
         assert result["confirmation_ts"] is None
 
@@ -332,14 +336,14 @@ def test_direct_ema9_ema15_cross_authorizes_buy_and_sell_without_pullback(monkey
         assert execution_handoff_allowed(engine, "TEST", side, price, target, context)
 
 
-def test_direct_cross_blocks_when_vwap_direction_disagrees(monkeypatch, tmp_path):
+def test_direct_cross_blocks_when_price_is_on_wrong_side_of_vwap(monkeypatch, tmp_path):
     _patch_direct_cross_indicators(monkeypatch, side="BUY", aligned=False)
     data = _direct_cross_test_frame()
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "misaligned.json"))
     result = engine.evaluate_direct_cross("TEST", data, now_ms=int(data.timestamp.iloc[-1] + 900_000))
     assert result["status"] == "INVALIDATED"
     assert result["direction"] == "BUY"
-    assert result["reason"] == "ema9_ema15_cross_vwap_direction_mismatch"
+    assert result["reason"] == "ema9_vwap_cross_vwap_direction_mismatch"
 
 
 def test_direct_cross_is_idempotent_on_same_closed_candle(monkeypatch, tmp_path):
@@ -360,7 +364,7 @@ def test_direct_cross_can_scan_same_symbol_again_after_position_closes(monkeypat
     engine = UnifiedEMAVWAPPullbackEngine(str(tmp_path / "after-close.json"))
     engine._persist(Setup(
         symbol="TEST", status="TRADE_OPEN", direction="BUY",
-        entry_path="DIRECT_EMA9_EMA15_CROSS",
+        entry_path="DIRECT_EMA9_VWAP_CROSS",
         crossover_ts=int(data.timestamp.iloc[-2]),
         last_candle_ts=int(data.timestamp.iloc[-2]),
     ))
@@ -376,4 +380,4 @@ def test_direct_cross_can_scan_same_symbol_again_after_position_closes(monkeypat
     monkeypatch.setattr(module, "indicators", lambda _frame: {"valid": True, "reason": ""})
     result = engine.evaluate_direct_cross("TEST", data, now_ms=int(data.timestamp.iloc[-1] + 900_000))
     assert result["status"] == "DISCOVERED"
-    assert result["reason"] == "no_new_closed_ema9_ema15_cross"
+    assert result["reason"] == "no_new_closed_ema9_vwap_cross"
