@@ -1,9 +1,10 @@
 # PR #9 Review Fixes — NAISO-LIVE v1.1.0
 
-Date: 2026-11-24  
-Base of this work: PR #9 head `58159bd` (`fix/naiso-live-v1.1.0-longrun-hardening`)  
-New branch: `fix/naiso-pr9-review-hardening`  
-Safety: **no merge to `main`, no `LIVE_TRADING`, no real BingX keys, no live orders.**
+Date: 2026-11-24
+Base of this work: PR #9 head `58159bd` (`fix/naiso-live-v1.1.0-longrun-hardening`)
+New branch: `fix/naiso-pr9-review-hardening`
+Integration: merged into the PR #9 branch in commit `4155421` before promotion to `main`.
+Safety: **paper-safe; no `LIVE_TRADING`, no real BingX keys, no live orders.**
 
 The GitHub API returned no issue, review or inline comments on PR #9, so the
 eight critical notes supplied in the task were treated as the review comments
