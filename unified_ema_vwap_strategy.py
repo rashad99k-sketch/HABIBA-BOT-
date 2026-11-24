@@ -257,6 +257,8 @@ class UnifiedEMAVWAPPullbackEngine:
             if setup.entry_path == "DIRECT_EMA9_EMA15_CROSS":
                 if setup.crossover_ts is None or setup.last_candle_ts != setup.crossover_ts:
                     return reject("direct_cross_not_on_latest_closed_candle")
+                if not all(_finite(v) for v in (setup.vwap, setup.ema9)):
+                    return reject("direct_cross_vwap_or_ema_missing")
                 if setup.direction == "BUY" and (entry <= float(setup.vwap) or float(setup.ema9) <= float(setup.vwap)):
                     return reject("buy_vwap_alignment_lost")
                 if setup.direction == "SELL" and (entry >= float(setup.vwap) or float(setup.ema9) >= float(setup.vwap)):
@@ -346,7 +348,10 @@ class UnifiedEMAVWAPPullbackEngine:
         x = _clean_closed(frame, now_ms, self.timeframe_s)
         with self._lock:
             old = self.get(symbol)
-            if old and old.status in {"ENTRY_EXECUTING", "TRADE_OPEN"}:
+            # ENTRY_EXECUTING remains fail-closed until execution is reconciled.
+            # TRADE_OPEN is allowed to reset here because this evaluator is called
+            # only after the runtime has confirmed the account is flat and scanning resumed.
+            if old and old.status == "ENTRY_EXECUTING":
                 return self._persist(old)
             if len(x) < 51:
                 setup = old or Setup(str(symbol))
