@@ -1,6 +1,7 @@
 """Persistent, execution-free EMA9/EMA15 crossover strategy with Session-VWAP bias.
 
-Direct entry consumes closed OHLCV bars; the legacy causal-zone pullback evaluator remains available.\nSession VWAP uses OHLC4 and actual
+Direct entry consumes closed OHLCV bars; the legacy causal-zone pullback evaluator remains available.
+Session VWAP uses OHLC4 and actual
 provided volume, resetting at 00:00 UTC (explicit calendar-day session convention
 for 24/7 markets). This module never submits or manages orders.
 """
