@@ -114,7 +114,8 @@ _INVALIDATED_TOKENS = ("invalidated", "post_sweep_invalidated", "cross_event_inv
 _LIQUIDITY_TOKENS = (
     "liquidity_sweep", "liquidity_grab", "liquidity_confirm", "waiting_liquidity",
     "liquidity_event", "sweep_confirm", "grab_confirm", "failed_auction",
-    "equal_high", "equal_low", "reclaim",
+    "sweep_equal_high", "sweep_equal_low", "liquidity_equal_high", "liquidity_equal_low",
+    "reclaim_confirm", "waiting_reclaim",
 )
 _DATA_GAP_TOKENS = (
     "liquidity_context_unavailable", "context_unavailable", "data_gap",
@@ -720,11 +721,13 @@ def project_watchlist_row(record: Any, *, now_ts: Optional[float] = None,
     """Project one watchlist/ranking row into the unified dashboard-facing schema."""
     row = _mapping(record)
     cross = classify_cross_state(row, now_ts=now_ts, ranking_only=ranking_only)
-    decision = project_decision_context(row, cross=cross, now_ts=now_ts, ranking=ranking_only)
     display_state = cross["cross_state"]
     if ranking_only and display_state in {"CONFIRMED_BUY_CROSS", "CONFIRMED_SELL_CROSS"}:
         display_state = f"RANKING_ONLY_{display_state}_OBSERVATION"
     cross["display_cross_state"] = display_state
+    # project_decision_context() shallow-copies the cross map, so set the display
+    # label first to keep the nested decision_context schema consistent.
+    decision = project_decision_context(row, cross=cross, now_ts=now_ts, ranking=ranking_only)
     return {
         "schema": SCHEMA_VERSION,
         "symbol": row.get("symbol") or "",

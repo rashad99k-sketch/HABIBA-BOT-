@@ -261,6 +261,18 @@ def test_generic_liquidity_context_gap_is_data_incomplete_not_fake_wait():
     assert out["entry_readiness"]["conditions_complete"] is False
 
 
+def test_confirmed_reclaim_is_not_a_fake_wait():
+    row = _context_row(
+        decision_reason="reclaimed_equal_low",
+        liquidity={"event": "NONE", "direction": "BULLISH", "candle_timestamp": 2,
+                   "confidence": 0.0, "reasons": ["reclaimed_equal_low"]},
+    )
+    out = proj.project_decision_context(row, now_ts=FIXED_NOW)
+    assert out["liquidity_context"]["state"] == "RECLAIM"
+    assert out["liquidity_context"]["stage"] == "RECLAIMED"
+    assert out["decision_state"] != "WAITING_FOR_LIQUIDITY_CONFIRMATION"
+
+
 def _decision_case(state):
     base = _context_row()
     cases = {
@@ -335,10 +347,13 @@ def test_dashboard_sections_are_separated_and_ranking_never_becomes_an_event():
     assert ranking_cross["cross_state"] == "CONFIRMED_BUY_CROSS"
     assert ranking_cross["display_cross_state"] == "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
     assert out["watchlist_ranking"][0]["cross_state_display"] == "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
+    assert out["watchlist_ranking"][0]["decision_context"]["cross_context"]["display_cross_state"] == \
+        "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
     assert ranking_cross["durable_event"] is False
     assert ranking_cross["authoritative"] is False
     assert ranking_cross["role"] == proj.RANKING_ONLY_ROLE
     assert out["confirmed_crosses"][0]["cross_context"]["display_cross_state"] == "CONFIRMED_BUY_CROSS"
+    assert out["confirmed_crosses"][0]["decision_context"]["cross_context"]["display_cross_state"] == "CONFIRMED_BUY_CROSS"
     assert all(row["symbol"] != "ETH" for row in out["execution_readiness"])
     assert any(row["conditions_complete"] is True for row in out["execution_readiness"])
 
