@@ -109,3 +109,29 @@ def test_realized_pnl_uses_one_shot_reads_and_one_shot_balance(monkeypatch):
     assert pnl_pct == -100.0
     assert calls == [("fetch_my_trades", 1)]
     assert balance_calls == [{"api_max_attempts": 1}]
+
+
+def test_render_service_identity_is_accepted_as_process_supervisor(monkeypatch):
+    import threading
+
+    monkeypatch.setenv("RENDER", "")
+    monkeypatch.setenv("RENDER_SERVICE_ID", "srv-test")
+    monkeypatch.delenv("RENDER_INSTANCE_ID", raising=False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", raising=False)
+    monkeypatch.setattr(
+        ggpbot, "_main_loop_owner",
+        lambda: {"thread_id": threading.current_thread().ident,
+                 "thread_name": "MainThread", "registered": True},
+    )
+    monkeypatch.setattr(ggpbot, "_main_loop_owner_alive", lambda: True)
+    monkeypatch.setattr(ggpbot, "_recovery_exit_gate", lambda _reason: True)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_args, **_kwargs: None)
+    exits = []
+    monkeypatch.setattr(ggpbot.os, "_exit", lambda code: exits.append(code))
+
+    context = {}
+    assert ggpbot._restart_main_loop_process_after_stall(context) is True
+    assert context["process_supervisor_detected"] is True
+    assert context["process_supervisor_kind"] == "RENDER"
+    assert exits == [ggpbot.EXIT_RECOVERY_EXHAUSTED]
