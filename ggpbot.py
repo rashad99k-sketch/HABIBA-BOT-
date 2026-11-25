@@ -15147,12 +15147,14 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
             _finish_scanner_task(name, "FAILED", reason="EXCEPTION", error=error)
             finished = True
         finally:
-            if not finished:
-                _finish_scanner_task(name, "FAILED", reason="UNEXPECTED_EXIT",
-                                     error="worker exited without a result")
-            lock.release()
-            if entry_task_lock_acquired:
-                _ENTRY_DISCOVERY_TASK_LOCK.release()
+            try:
+                if not finished:
+                    _finish_scanner_task(name, "FAILED", reason="UNEXPECTED_EXIT",
+                                         error="worker exited without a result")
+            finally:
+                lock.release()
+                if entry_task_lock_acquired:
+                    _ENTRY_DISCOVERY_TASK_LOCK.release()
 
     watchdog = globals().get("NAISO_WATCHDOG")
     watchdog_name = f"scanner:{name}"
