@@ -34,9 +34,9 @@ def test_safe_api_call_one_attempt_override_bounds_retrying_reads(monkeypatch):
 
     metrics = resilience.metrics()
     assert calls == ["fetch_positions"]
-    assert metrics["requests"] == 1
-    assert metrics["retries"] == 0
-    assert metrics["timeouts"] == 1
+    assert metrics["counters"]["requests"] == 1
+    assert metrics["counters"]["retries"] == 0
+    assert metrics["counters"]["timeouts"] == 1
 
 
 def test_api_attempt_override_cannot_exceed_global_retry_budget(monkeypatch):
@@ -59,7 +59,7 @@ def test_api_attempt_override_cannot_exceed_global_retry_budget(monkeypatch):
         ggpbot.safe_api_call(Exchange().fetch_positions, _api_max_attempts=99)
 
     assert len(calls) == 2
-    assert resilience.metrics()["retries"] == 1
+    assert resilience.metrics()["counters"]["retries"] == 1
 
 
 def test_position_snapshot_timeout_returns_unknown_after_one_physical_attempt(monkeypatch):
@@ -96,7 +96,12 @@ def test_realized_pnl_uses_one_shot_reads_and_one_shot_balance(monkeypatch):
         calls.append((getattr(func, "__name__", ""), kwargs.get("_api_max_attempts")))
         return [{"side": "buy", "amount": 1.0, "price": 100.0}]
 
+    class Exchange:
+        def fetch_my_trades(self, *args, **kwargs):
+            return [{"side": "buy", "amount": 1.0, "price": 100.0}]
+
     balance_calls = []
+    monkeypatch.setattr(ggpbot, "ex", Exchange())
     monkeypatch.setattr(ggpbot, "safe_api_call", safe_api_spy)
     monkeypatch.setattr(
         ggpbot, "get_balance_safe",
