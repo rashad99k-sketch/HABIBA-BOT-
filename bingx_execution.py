@@ -183,9 +183,11 @@ def _weighted_trade_average(trades: Iterable[Dict[str, Any]]) -> Optional[float]
 class BingXPositionModeAdapter:
     """Read-only account-mode adapter; it never calls set_position_mode."""
 
-    def __init__(self, exchange: Any, logger: Optional[Callable[[str], None]] = None):
+    def __init__(self, exchange: Any, logger: Optional[Callable[[str], None]] = None,
+                 api_caller: Optional[Callable] = None):
         self.exchange = exchange
         self.logger = logger or (lambda _message: None)
+        self._api_caller = api_caller
 
     def read(self, symbol: Optional[str] = None) -> ModeResult:
         method = getattr(self.exchange, "fetch_position_mode", None)
@@ -193,9 +195,12 @@ class BingXPositionModeAdapter:
             return ModeResult(PositionMode.UNKNOWN, "fetch_position_mode unavailable")
         try:
             try:
-                raw = method(symbol) if symbol is not None else method()
+                if self._api_caller is not None:
+                    raw = self._api_caller(method, symbol) if symbol is not None else self._api_caller(method)
+                else:
+                    raw = method(symbol) if symbol is not None else method()
             except TypeError:
-                raw = method()
+                raw = self._api_caller(method) if self._api_caller is not None else method()
         except Exception as exc:
             return ModeResult(PositionMode.UNKNOWN, f"position mode query failed: {type(exc).__name__}: {exc}")
         values = []
@@ -253,10 +258,12 @@ class TradeExecutionService:
         self.exchange = exchange
         self.journal = journal
         self.logger = logger or (lambda _message: None)
-        self.mode_adapter = BingXPositionModeAdapter(exchange, logger=self.logger)
         # Runtime callers inject ggpbot.safe_api_call so every protective-order
         # read/write obeys the same central rate limiter and API governor.
         self._api_caller = api_caller
+        self.mode_adapter = BingXPositionModeAdapter(
+            exchange, logger=self.logger, api_caller=self.api_call
+        )
 
     def api_call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
         """Route an exchange call through the injected governor when present."""
@@ -273,10 +280,10 @@ class TradeExecutionService:
         if not callable(fetch):
             return None
         try:
-            return fetch(order_id or client_order_id, symbol, {"clientOrderId": client_order_id})
+            return self.api_call(fetch, order_id or client_order_id, symbol, {"clientOrderId": client_order_id})
         except TypeError:
             try:
-                return fetch(order_id or client_order_id, symbol)
+                return self.api_call(fetch, order_id or client_order_id, symbol)
             except Exception:
                 return None
         except Exception:
@@ -369,14 +376,15 @@ class TradeExecutionService:
         try:
             if not callable(getattr(self.exchange, "set_leverage", None)):
                 raise RuntimeError("set_leverage unavailable")
-            self.exchange.set_leverage(int(leverage), symbol, leverage_params(mode_result.mode, position_side))
+            self.api_call(self.exchange.set_leverage, int(leverage), symbol,
+                          leverage_params(mode_result.mode, position_side))
             fetch_lev = getattr(self.exchange, "fetch_leverage", None)
             if not callable(fetch_lev):
                 raise RuntimeError("fetch_leverage unavailable; leverage cannot be verified")
             try:
-                lev_raw = fetch_lev(symbol, leverage_params(mode_result.mode, position_side))
+                lev_raw = self.api_call(fetch_lev, symbol, leverage_params(mode_result.mode, position_side))
             except TypeError:
-                lev_raw = fetch_lev(symbol)
+                lev_raw = self.api_call(fetch_lev, symbol)
             observed = extract_leverage_value(
                 lev_raw,
                 position_side=(position_side if mode_result.mode is PositionMode.HEDGE else None),
@@ -394,7 +402,9 @@ class TradeExecutionService:
                               requested_qty=requested, entry_ts=time.time(), status="ENTRY_PENDING",
                               structural_stop=structural_stop, management_state=management_state)
         try:
-            order = self.exchange.create_order(symbol, "market", side.lower(), requested, None, params)
+            order = self.api_call(
+                self.exchange.create_order, symbol, "market", side.lower(), requested, None, params
+            )
         except Exception as exc:
             reconciled = self._find_order(symbol, None, client_order_id)
             if reconciled is None:
@@ -411,7 +421,7 @@ class TradeExecutionService:
             trades = []
             fetch_trades = getattr(self.exchange, "fetch_my_trades", None)
             if callable(fetch_trades):
-                try: trades = fetch_trades(symbol, None, 100, {"orderId": order_id})
+                try: trades = self.api_call(fetch_trades, symbol, None, 100, {"orderId": order_id})
                 except Exception: pass
             average = _weighted_trade_average(trades)
         position = self._position(symbol, params["positionSide"], side)
@@ -449,7 +459,9 @@ class TradeExecutionService:
                                              opening=False, closing=True,
                                              reduce_only_required=(mode is PositionMode.ONE_WAY))
         params.update({"stopPrice": float(trigger_price), "workingType": "MARK_PRICE"})
-        order = self.exchange.create_order(symbol, "STOP_MARKET", close_side, float(quantity), None, params)
+        order = self.api_call(
+            self.exchange.create_order, symbol, "STOP_MARKET", close_side, float(quantity), None, params
+        )
         order_id = _order_id(order)
         if not order_id:
             return None
@@ -634,7 +646,7 @@ class TradeExecutionService:
             if callable(fetch_open):
                 for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                     try:
-                        candidate = fetch_open(*args)
+                        candidate = self.api_call(fetch_open, *args)
                         if isinstance(candidate, list):
                             rows.extend(candidate)
                     except TypeError:
@@ -645,7 +657,7 @@ class TradeExecutionService:
             if callable(raw_method):
                 for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                     try:
-                        raw = raw_method({"symbol": market_id, "type": native_type})
+                        raw = self.api_call(raw_method, {"symbol": market_id, "type": native_type})
                         rows.extend(extract_open_order_records(raw))
                     except Exception as exc:
                         self.logger(f"native stop {native_type} read-back attempt={attempt} failed: {type(exc).__name__}: {exc}")
@@ -689,7 +701,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self.api_call(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                 except Exception:
@@ -698,7 +710,9 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self.api_call(
+                        raw_method, {"symbol": market_id, "type": native_type}
+                    )))
                 except Exception:
                     continue
         want_symbol = str(symbol).upper().replace("/", "-").split(":")[0]
@@ -755,7 +769,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self.api_call(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                 except Exception:
@@ -764,7 +778,9 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self.api_call(
+                        raw_method, {"symbol": market_id, "type": native_type}
+                    )))
                 except Exception:
                     continue
         seen = set()
@@ -818,7 +834,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self.api_call(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                         ok = True
@@ -830,7 +846,9 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self.api_call(
+                        raw_method, {"symbol": market_id, "type": native_type}
+                    )))
                     ok = True
                 except Exception:
                     continue
@@ -945,7 +963,7 @@ class TradeExecutionService:
         # Market price for directional sanity of the new stop.
         mark = 0.0
         try:
-            ticker = self.exchange.fetch_ticker(symbol)
+            ticker = self.api_call(self.exchange.fetch_ticker, symbol)
             if isinstance(ticker, dict):
                 mark = _first_number(ticker.get("last"), ticker.get("close")) or 0.0
         except Exception:
@@ -984,7 +1002,7 @@ class TradeExecutionService:
         if callable(fetch_open):
             for args in ((symbol,), (symbol, None, None, {"type": "STOP_MARKET"})):
                 try:
-                    candidate = fetch_open(*args)
+                    candidate = self.api_call(fetch_open, *args)
                     if isinstance(candidate, list):
                         rows.extend(candidate)
                 except Exception:
@@ -993,7 +1011,9 @@ class TradeExecutionService:
         if callable(raw_method):
             for native_type in ("STOP_MARKET", "TRIGGER_MARKET"):
                 try:
-                    rows.extend(extract_open_order_records(raw_method({"symbol": market_id, "type": native_type})))
+                    rows.extend(extract_open_order_records(self.api_call(
+                        raw_method, {"symbol": market_id, "type": native_type}
+                    )))
                 except Exception:
                     continue
         count = 0
@@ -1085,7 +1105,7 @@ class TradeExecutionService:
                     self.logger(f"a non-matching stop {stale} is active and cannot be cancelled; not placing")
                     return None
                 try:
-                    cancel(str(stale), symbol)
+                    self.api_call(cancel, str(stale), symbol)
                 except Exception as exc:
                     self.logger(f"could not cancel non-matching stop {stale}: {type(exc).__name__}: {exc}")
                     return None
@@ -1098,7 +1118,9 @@ class TradeExecutionService:
             try:
                 stop_params = dict(params)
                 stop_params["stopPrice"] = float(trigger)
-                self.exchange.create_order(symbol, "STOP_MARKET", close_side, float(qty), None, stop_params)
+                self.api_call(
+                    self.exchange.create_order, symbol, "STOP_MARKET", close_side, float(qty), None, stop_params
+                )
             except Exception as exc:
                 self.logger(f"native stop place failed at {trigger}: {type(exc).__name__}: {exc}")
                 return None
@@ -1132,7 +1154,7 @@ class TradeExecutionService:
             cancel_replace_ambiguous = False
             cancel_replace_rejected = False
             try:
-                response = cancel_replace(request)
+                response = self.api_call(cancel_replace, request)
                 if isinstance(response, dict):
                     data = response.get("data") if isinstance(response.get("data"), dict) else {}
                     replace_result = str(data.get("replaceResult", "")).lower()
@@ -1191,7 +1213,7 @@ class TradeExecutionService:
                 return StopMoveResult("RETAINED", retained) if retained else StopMoveResult("LOST")
             cancel_ambiguous = False
             try:
-                cancel(str(previous_order_id), symbol)
+                self.api_call(cancel, str(previous_order_id), symbol)
             except Exception as exc:
                 cancel_ambiguous = True
                 self.logger(f"native stop cancel failed for {previous_order_id}: {type(exc).__name__}: {exc}")
