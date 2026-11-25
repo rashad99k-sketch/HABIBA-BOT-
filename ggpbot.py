@@ -14568,9 +14568,6 @@ def smart_opportunity_selection():
     run on MainThread because candidate revalidation performs market-data reads.
     """
     global _INSTITUTIONAL_ENTRY_CONTEXT
-    if threading.current_thread() is threading.main_thread():
-        log_execution("[ENTRY_REVALIDATION] Refusing synchronous MainThread execution", "ERROR")
-        return False
     _scanner_progress("institutional_entry_revalidation", "candidate_cycle_start")
     # Hard exposure/recovery gates run before any balance or market-data read so
     # an unresolved exchange state can never trigger an unnecessary API call.
