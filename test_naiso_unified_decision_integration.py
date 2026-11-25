@@ -637,10 +637,13 @@ def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
         "ETH": dict(_context_row(), symbol="ETH", exchange_symbol="ETH/USDT:USDT", side="SELL"),
     })
     monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [_durable_record()])
-    monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [
-        _ranking(symbol="ETH", exchange_symbol="ETH/USDT:USDT",
-                 state="CROSS_CONFIRMED", cross_any="BULLISH", cross_ema9="BULLISH"),
-    ])
+    ranking_row = _ranking(symbol="ETH", exchange_symbol="ETH/USDT:USDT",
+                           state="CROSS_CONFIRMED", cross_any="BULLISH", cross_ema9="BULLISH")
+    ranking_projection = proj.project_watchlist_row(ranking_row, ranking_only=True)
+    ranking_row["cross_state"] = ranking_projection["cross_context"]["cross_state"]
+    ranking_row["cross_context"] = ranking_projection["cross_context"]
+    ranking_row["cross_state_display"] = ranking_projection["cross_state_display"]
+    monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [ranking_row])
     _patch_dashboard_runtime(monkeypatch)
 
     client = ggpbot.app.test_client()
@@ -660,6 +663,8 @@ def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
     assert 'if (!cardCrossDurable && String(cardCrossState).startsWith("CONFIRMED_"))' in html
     assert "SL: UNKNOWN" not in html
     assert 'const slText = x.sl_valid ? "VALID" : "UNKNOWN";' not in html
+    assert 'item.cross_state_display || item.state || "UNKNOWN"' in html
+    assert '${item.state || "UNKNOWN"}' not in html
 
     response = client.get("/data")
     assert response.status_code == 200
@@ -668,6 +673,11 @@ def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
     for key in ("confirmed_crosses", "watchlist_ranking", "institutional_analysis",
                 "execution_readiness", "unified_decision_schema"):
         assert key not in payload
+    proximity = payload["ema9_vwap_proximity_scanner"][0]
+    assert proximity["state"] == "CROSS_CONFIRMED"
+    assert proximity["cross_state_display"] == "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
+    assert proximity["cross_context"]["durable_event"] is False
+    assert proximity["cross_context"]["authoritative"] is False
     decision = payload["watchlist"]["BTC"]["decision_context"]
     assert decision["cross_context"]["durable_event"] is True
     assert decision["cross_context"]["authoritative"] is True

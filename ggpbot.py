@@ -10303,7 +10303,7 @@ function updateUI(d) {{
         let pHtml = "";
         d.ema9_vwap_proximity_scanner.forEach(item => {{
             let icon = item.cross ? "⚡" : (item.state === "NEAR_CROSS" || item.state === "CONVERGING" ? "🟡" : item.direction === "BUY" ? "📈" : item.direction === "SELL" ? "📉" : "⚪");
-            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} | Cross: ${{item.cross_trigger || "NONE"}} <small>· Closed candle · Ranking only</small></div>`;
+            pHtml += `<div style="padding:6px;border-bottom:1px solid #26364a;">${{icon}} <b>${{item.symbol}}</b> | ${{item.direction || "UNKNOWN"}} | ${{item.cross_state_display || item.state || "UNKNOWN"}} | Score: ${{item.score ?? "-"}} | Gap ATR: ${{item.gap_atr ?? "-"}} | EMA9: ${{item.ema9 ?? "-"}} | EMA50: ${{item.ema50 ?? "-"}} | VWAP: ${{item.vwap ?? "-"}} | Cross: ${{item.cross_trigger || "NONE"}} <small>· Closed candle · Ranking only</small></div>`;
         }});
         let pm = d.ema9_vwap_proximity_scanner_meta || {{}};
         document.getElementById("proximity-scanner-panel").innerHTML = (pHtml || "No proximity candidates") + `<small>Batch: ${{pm.observed_this_batch ?? 0}} | Pool: ${{pm.symbols ?? 0}} | Updated: ${{pm.updated_at ? new Date(pm.updated_at*1000).toLocaleTimeString() : "-"}} | Role: ${{pm.role || "RANKING_ONLY"}}</small>`;
@@ -12667,9 +12667,16 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                         "data_quality": "CLOSED_CANDLES",
                         "role": "RANKING_ONLY_NOT_ENTRY_GATE",
                     }
-                    _ranking_cross = _project_cross_state(proximity_item, ranking_only=True)
+                    _ranking_projection = _project_watchlist_row(
+                        proximity_item, now_ts=_observed_at, ranking_only=True
+                    )
+                    _ranking_cross = _ranking_projection["cross_context"]
                     proximity_item["cross_state"] = _ranking_cross["cross_state"]
                     proximity_item["cross_context"] = _ranking_cross
+                    # Scanner rows are ranking observations. Publish the already
+                    # projected non-durable label so the dashboard cannot show a
+                    # bare CROSS_CONFIRMED next to a durable cross event.
+                    proximity_item["cross_state_display"] = _ranking_projection["cross_state_display"]
                     rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
                     rows = [x for x in rows if x.get("symbol") != symbol_key]
                     rows.append(proximity_item)
