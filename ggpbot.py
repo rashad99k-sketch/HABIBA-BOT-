@@ -628,7 +628,9 @@ _API_METHOD_MIN_INTERVALS = {
     "cancel_orders": BINGX_TRADE_WRITE_MIN_INTERVAL,
     # Leverage, margin and position-mode configuration: 2/s.
     "set_leverage": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "fetch_margin_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "set_margin_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "fetch_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "set_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "add_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "reduce_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
