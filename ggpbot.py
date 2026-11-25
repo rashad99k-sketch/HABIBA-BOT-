@@ -14208,6 +14208,7 @@ def _watchlist_worker_health_snapshot():
 def _run_unified_institutional_watchlist_refresh():
     """Run market-data discovery off MainThread with observable bounded progress."""
     global _last_unified_watchlist_refresh
+    success = False
     try:
         MEMORY["_proximity_batch_updates"] = 0
         _watchlist_worker_progress("CROSS_EVENT_SYNC")
@@ -14255,9 +14256,9 @@ def _run_unified_institutional_watchlist_refresh():
             "closed_candles_only": True,
         })
         _last_unified_watchlist_refresh = time.time()
-        MEMORY["_unified_watchlist_refresh_ok"] = True
         with state["lock"]:
             state["last_error"] = ""
+        success = True
         if INSTITUTIONAL_RESOURCE_MANAGER:
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
@@ -14272,12 +14273,18 @@ def _run_unified_institutional_watchlist_refresh():
     finally:
         state = _UNIFIED_WATCHLIST_REFRESH_STATE
         with state["lock"]:
+            timed_out = bool(state.get("timed_out"))
             state["in_progress"] = False
             state["worker_name"] = ""
             state["last_completed_monotonic"] = time.monotonic()
-            if not state.get("timed_out"):
+            if success and not timed_out:
+                # Publish readiness only after the worker is marked complete
+                # under the same lock used by the foreground scheduler.
                 state["phase"] = "IDLE"
                 state["current_symbol"] = ""
+                MEMORY["_unified_watchlist_refresh_ok"] = True
+            else:
+                MEMORY["_unified_watchlist_refresh_ok"] = False
 
 
 def refresh_unified_institutional_watchlist(force=False):
