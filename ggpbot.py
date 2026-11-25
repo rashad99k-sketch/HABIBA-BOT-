@@ -3131,9 +3131,10 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             mode_result.mode, close_side.upper(), opening=False, closing=True,
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
-        # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
-        order = ex.create_order(sym, "market", close_side, requested,
-                                params=close_params)
+        # safe_api_call treats order writes as one-shot: it applies the shared
+        # API governor and records uncertainty, but never retries an ambiguous MARKET order.
+        order = safe_api_call(ex.create_order, sym, "market", close_side, requested,
+                              params=close_params)
         if not isinstance(order, dict):
             return _close_failure("BingX returned no structured close-order response")
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
