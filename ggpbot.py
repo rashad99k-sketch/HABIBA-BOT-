@@ -12325,10 +12325,15 @@ def sniper_engine_v2():
             "state": "RUNNING", "last_scan": time.time(), "symbols_scanned": 0,
             "zones_waiting": 0, "zones_ready": 0, "last_error": None,
         })
-        for symbol in symbols:
+        _scanner_progress("sniper_v2", "universe_ready", symbols=len(symbols))
+        for symbol_index, symbol in enumerate(symbols, start=1):
             if STATE.get("open") or TRADE_STATE.get("in_position"):
+                _scanner_progress("sniper_v2", "yielded_to_open_position", symbol=symbol)
                 break
+            _scanner_progress("sniper_v2", "symbol_start", symbol=symbol, index=symbol_index)
             raw_frame = _get_scanner_frame(symbol, 150)
+            _scanner_progress("sniper_v2", "ohlcv_complete", symbol=symbol,
+                              available=bool(raw_frame is not None))
             if raw_frame is None or not validate_dataframe(raw_frame, 80):
                 continue
             closed = roro_validate_closed_frame(
@@ -12378,6 +12383,8 @@ def sniper_engine_v2():
             authority = roro_analyze_symbol_both(
                 symbol, closed, now_ms=int(time.time() * 1000), side_hints=[side]
             )
+            _scanner_progress("sniper_v2", "roro_authority_complete", symbol=symbol,
+                              decision=str(authority.get("decision_state") or "UNKNOWN"))
             if authority.get("decision_state") != "ENTRY_READY" or str(authority.get("side")).upper() != side:
                 log_execution(
                     f"[SNIPER_V2] {key} blocked by RORO authority: "
@@ -12436,6 +12443,7 @@ def sniper_engine_v2():
                 "timeframe_ms": _roro_timeframe_seconds(INTERVAL) * 1000.0,
             }
             try:
+                _scanner_progress("sniper_v2", "entry_authorization", symbol=symbol, side=side)
                 ok = execute_entry(
                     side, symbol, price, structural_stop, float(tp1), float(tp2), 9.0,
                     f"SNIPER_V2 {zone['type']} PIVOT_RETEST confirmation={count} "
@@ -12443,6 +12451,8 @@ def sniper_engine_v2():
                     atr_value, trade_type="SNIPER_V2", entry_type="SNIPER_V2",
                     classification="SNIPER_V2",
                 )
+                _scanner_progress("sniper_v2", "entry_execution_complete",
+                                  symbol=symbol, executed=bool(ok))
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
@@ -12474,15 +12484,17 @@ def sniper_engine_v2():
 
 
 def _run_sniper_scan_if_due():
-    """Run synchronously inside the supervisor; avoid racing the other entry path."""
+    """Dispatch Sniper discovery off MainThread; execution still uses unified entry authority."""
     global _SNIPER_V2_LAST_SCAN
     if not SNIPER_V2_ENABLED:
         return False
     now = time.time()
     if now - _SNIPER_V2_LAST_SCAN < SNIPER_V2_SCAN_INTERVAL:
         return False
-    _SNIPER_V2_LAST_SCAN = now
-    return sniper_engine_v2()
+    dispatched = dispatch_scanner_task("sniper_v2", sniper_engine_v2)
+    if dispatched:
+        _SNIPER_V2_LAST_SCAN = now
+    return dispatched
 
 
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
@@ -12799,7 +12811,7 @@ def main_loop_sniper():
                     # Sniper is an entry-only candidate engine; it never runs while
                     # a position is open and uses the same bounded scanner cache.
                     if _run_sniper_scan_if_due():
-                        _main_loop_progress("sniper_scan_complete")
+                        _main_loop_progress("sniper_scan_dispatched")
                     time.sleep(1)
                 else:
                     time.sleep(1)
