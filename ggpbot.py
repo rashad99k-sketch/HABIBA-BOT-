@@ -13310,10 +13310,12 @@ def _restart_main_loop_process_after_stall(context=None):
         or os.getenv("RENDER_SERVICE_ID", "").strip()
         or os.getenv("RENDER_INSTANCE_ID", "").strip()
     )
-    # DigitalOcean App Platform exposes APP_ID as a runtime bindable variable.
-    # A Droplet does not provide this signal; it must opt in only when a real
-    # process supervisor (for example systemd) is configured to restart the bot.
-    digitalocean_app_platform_detected = bool(os.getenv("APP_ID", "").strip())
+    # DigitalOcean bindable APP_ID is not automatically injected unless the
+    # app component maps it to a runtime env var. Support both the direct name
+    # and an explicit DIGITALOCEAN_APP_ID mapping from ${APP_ID}.
+    digitalocean_app_platform_detected = bool(
+        os.getenv("APP_ID", "").strip() or os.getenv("DIGITALOCEAN_APP_ID", "").strip()
+    )
     railway_detected = bool(os.getenv("RAILWAY_ENVIRONMENT", "").strip())
     explicit_restart_opt_in = bool(
         os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
