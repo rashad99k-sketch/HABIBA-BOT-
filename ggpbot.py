@@ -6243,6 +6243,14 @@ def _system_error_record(message, severity, timestamp):
         error_type = "WATCHDOG_RESTART_FAILED"
         component = "main_loop" if "MAIN_LOOP" in upper else "WATCHDOG_COMPONENT"
         cause = "In-process recovery did not restore component liveness; inspect restart_guard and the captured stack."
+    elif "[WATCHDOG]" in upper and (
+        "PROCESS RESTART BLOCKED" in upper
+        or "PROCESS RESTART DEFERRED" in upper
+        or "NO EXTERNAL PROCESS SUPERVISOR" in upper
+    ):
+        error_type = "WATCHDOG_RECOVERY_BLOCKED"
+        component = "main_loop"
+        cause = raw[:1600]
     elif "CRITICAL EXCEPTION" in upper:
         error_type = "MAIN_LOOP_EXCEPTION"
         component = "main_loop"
