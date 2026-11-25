@@ -587,11 +587,24 @@ CACHE = {
 }
 _last_api_call = 0.0
 MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
-# BingX documents the USDT-M swap kline endpoint at 1 request/second per IP.
-# Keep the slower market-data endpoint pacing distinct from the generic
-# account/management request scheduler and serialize it across all workers.
+# BingX documents several public USDT-M swap market-data endpoints at
+# 1 request/second per IP (klines, depth, recent trades, ticker, bookTicker,
+# and contract metadata). Keep this pacing distinct from account/order UID
+# limits, and share the same scheduler across all workers.
 BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.0, 2.0)
-_API_METHOD_MIN_INTERVALS = {"fetch_ohlcv": BINGX_KLINE_MIN_INTERVAL}
+BINGX_PUBLIC_MARKET_MIN_INTERVAL = _env_float_range(
+    "BINGX_PUBLIC_MARKET_MIN_INTERVAL", BINGX_KLINE_MIN_INTERVAL, 1.0, 2.0
+)
+_API_METHOD_MIN_INTERVALS = {
+    "fetch_ohlcv": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_order_book": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_trades": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_ticker": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_tickers": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_bids_asks": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_funding_rate_history": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_markets": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+}
 _API_RATE_LOCK = threading.Lock()
 # Never let API scheduler contention pin MainThread indefinitely. A timeout is
 # fail-closed: the exchange call is not sent and the next loop can try again.
