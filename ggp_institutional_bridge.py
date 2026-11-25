@@ -479,24 +479,35 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 if event_side in {"BUY", "SELL"}:
                     existing_event_id = str(entry.get("cross_event_id") or "")
                     incoming_event_id = str(item.get("cross_event_id") or "")
-                    if not existing_event_id or existing_event_id == incoming_event_id:
-                        entry["cross_event_id"] = incoming_event_id
-                        entry["cross_event_side"] = event_side
-                        for field in (
-                            "cross_event_source", "cross_event_direction",
-                            "cross_event_timestamp", "cross_event_status",
-                            "cross_event_timeframe", "cross_event_lifecycle_status",
-                            "cross_event_phase", "cross_event_lifecycle_schema",
-                            "cross_event_entry_ready", "cross_event_rejection_high",
-                            "cross_event_rejection_low", "cross_event_rejection_timestamp",
-                            "cross_event_breakout_timestamp", "cross_event_breakout_close",
-                            "cross_event_chase_atr",
-                        ):
-                            if item.get(field) not in (None, "", "UNKNOWN"):
-                                entry[field] = item[field]
-                    else:
+                    existing_event_side = str(entry.get("cross_event_side") or "").upper()
+                    if existing_event_id and existing_event_side in {"BUY", "SELL"} and existing_event_side != event_side:
                         entry["cross_event_conflict"] = True
-                        entry.setdefault("cross_event_ids", [existing_event_id]).append(incoming_event_id)
+                        ids = entry.setdefault("cross_event_ids", [existing_event_id])
+                        if incoming_event_id and incoming_event_id not in ids:
+                            ids.append(incoming_event_id)
+                    else:
+                        existing_ts = entry.get("cross_event_timestamp")
+                        incoming_ts = item.get("cross_event_timestamp")
+                        try:
+                            prefer_incoming = (not existing_event_id or existing_event_id == incoming_event_id or
+                                (incoming_ts is not None and (existing_ts is None or int(incoming_ts) >= int(existing_ts))))
+                        except (TypeError, ValueError, OverflowError):
+                            prefer_incoming = not existing_event_id or existing_event_id == incoming_event_id
+                        if prefer_incoming:
+                            entry["cross_event_id"] = incoming_event_id
+                            entry["cross_event_side"] = event_side
+                            for field in (
+                                "cross_event_source", "cross_event_direction",
+                                "cross_event_timestamp", "cross_event_status",
+                                "cross_event_timeframe", "cross_event_lifecycle_status",
+                                "cross_event_phase", "cross_event_lifecycle_schema",
+                                "cross_event_entry_ready", "cross_event_rejection_high",
+                                "cross_event_rejection_low", "cross_event_rejection_timestamp",
+                                "cross_event_breakout_timestamp", "cross_event_breakout_close",
+                                "cross_event_chase_atr",
+                            ):
+                                if item.get(field) not in (None, "", "UNKNOWN"):
+                                    entry[field] = item[field]
             try:
                 entry["score"] = max(float(entry["score"]), float(item.get("score", 0) or 0))
             except (TypeError, ValueError):
