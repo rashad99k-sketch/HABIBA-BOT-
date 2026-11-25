@@ -13042,8 +13042,8 @@ def _restart_main_loop_process_after_stall(context=None):
     context["process_restart_required"] = True
     context["process_restart_owner"] = str(owner.get("thread_name") or "UNKNOWN")
     supervisor_available = bool(
-        os.getenv("RENDER")
-        or os.getenv("RAILWAY_ENVIRONMENT")
+        os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
+        or os.getenv("RAILWAY_ENVIRONMENT", "").strip()
         or os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
            in {"1", "true", "yes", "on"}
     )
