@@ -13152,12 +13152,25 @@ def _restart_main_loop_process_after_stall(context=None):
     owner_alive = bool(_main_loop_owner_alive())
     context["process_restart_required"] = True
     context["process_restart_owner"] = str(owner.get("thread_name") or "UNKNOWN")
-    supervisor_available = bool(
+    render_detected = bool(
         os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
-        or os.getenv("RAILWAY_ENVIRONMENT", "").strip()
-        or os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
-           in {"1", "true", "yes", "on"}
+        or os.getenv("RENDER_SERVICE_ID", "").strip()
+        or os.getenv("RENDER_INSTANCE_ID", "").strip()
     )
+    railway_detected = bool(os.getenv("RAILWAY_ENVIRONMENT", "").strip())
+    explicit_restart_opt_in = bool(
+        os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    supervisor_kind = (
+        "RENDER" if render_detected else
+        "RAILWAY" if railway_detected else
+        "EXPLICIT_OPT_IN" if explicit_restart_opt_in else
+        "NONE"
+    )
+    supervisor_available = supervisor_kind != "NONE"
+    context["process_supervisor_detected"] = supervisor_available
+    context["process_supervisor_kind"] = supervisor_kind
     if not supervisor_available:
         context["engine_resumed"] = False
         context["process_restart_blocked_reason"] = "EXTERNAL_PROCESS_SUPERVISOR_NOT_DETECTED"
