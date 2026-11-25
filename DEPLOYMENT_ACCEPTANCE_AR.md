@@ -108,3 +108,24 @@ envs:
 ```
 
 This is the supervisor identity consumed by the bot's process-restart guard. Without it, the bot deliberately refuses an automatic process exit because it cannot prove that an external supervisor will bring the service back. Preserve all existing environment variables and secrets when applying this change.
+
+
+## BingX Futures endpoint rate policy (source audit 2026-11-25)
+
+Do not derive a request rate from an IP-group identifier. BingX's API reference distinguishes the shared public market-data budget from endpoint-specific annotations; the separate rate-limits guide explicitly warns against treating a group ID as a requests-per-second value.
+
+The current endpoint reference annotates 1 request/second per IP for the following public swap methods: contracts, depth, recent trades, klines, historical funding rate, open interest, 24h ticker, and book ticker. The public market-data shared budget is separately documented as 500 requests per 10 seconds per IP. The bot applies 1.05 seconds only to the individually annotated methods, not to premiumIndex or mark-price klines, whose reference states 500/10s.
+
+For authenticated USDT-M Futures endpoints, BingX publishes:
+- Balance, positions, order queries, and open orders: 5 requests/second per UID.
+- Place order: 10/s ordinary user, 1/s Trader tier.
+- Cancel order: 5/s ordinary user, 1/s Trader tier.
+- Leverage/margin-mode/position-mode changes: 2/s.
+- Close all positions and cancel all orders: 5/s.
+
+Because the account's ordinary-vs-Trader entitlement is not visible from this repository, the code uses a conservative 1.05-second default for individual order writes and 0.55 seconds for leverage/margin/position-mode changes. The generic scheduler remains at 0.35 seconds, below the 5/s UID endpoints. These are safety ceilings, not throughput targets. Do not lower them without verifying the account's actual entitlement and current BingX documentation.
+
+Sources:
+- BingX official rate announcement: https://bingx.com/en/support/articles/31103871611289
+- BingX endpoint-level swap reference: https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-market/api-reference.md
+- BingX rate-limit semantics and group-ID warning: https://github.com/BingX-API/api-ai-skills/blob/main/skills/references/rate-limits.md
