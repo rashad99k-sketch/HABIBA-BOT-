@@ -587,8 +587,11 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         else "BEARISH" if ema50_prev_gap is not None and ema50_gap is not None and ema50_prev_gap >= 0 > ema50_gap
         else None
     )
-    cross_conflict = bool(crossed and crossed50 and crossed != crossed50)
-    any_cross = None if cross_conflict else (crossed or crossed50)
+    # Scanner/entry cross identity is EMA9 versus Session VWAP only.
+    # EMA50/VWAP remains visible as context but can never create or conflict
+    # with an EMA9/VWAP cross event.
+    cross_conflict = False
+    any_cross = crossed
     gap_pct = abs(gap) / vwap_now * 100.0
     gap_atr = abs(gap) / atr_proxy
     latest_closed_ts = int(closed["timestamp"].iloc[-1])
@@ -631,7 +634,7 @@ def ema9_vwap_proximity(df: pd.DataFrame, ema_fn: Callable,
         "cross_ema50": crossed50,
         "cross_any": any_cross,
         "cross_conflict": cross_conflict,
-        "cross_trigger": "CONFLICT" if cross_conflict else "EMA9_VWAP" if crossed else "EMA50_VWAP" if crossed50 else "NONE",
+        "cross_trigger": "EMA9_SESSION_VWAP" if crossed else "NONE",
         "ema50_direction": "BUY" if ema50_gap is not None and ema50_gap > 0 else "SELL" if ema50_gap is not None and ema50_gap < 0 else "NEUTRAL",
         "state": state,
         "score": round(score, 2),
