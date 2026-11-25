@@ -9,6 +9,12 @@ on:
     branches:
       - main
 
+# Keep one authoritative CI run per PR/branch. Rapid repair commits must not
+# launch many competing full-regression suites and starve the newest revision.
+concurrency:
+  group: sniper-v2-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
