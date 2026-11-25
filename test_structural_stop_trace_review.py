@@ -114,6 +114,7 @@ def test_dashboard_and_data_expose_the_same_missing_stop_reason(monkeypatch):
     exposed = payload["watchlist"]["IOTX"]
     assert exposed["structural_stop"] is None
     assert exposed["diagnostics"]["stop_valid"] is False
+    assert exposed["diagnostics"]["stop_validation"] == "missing_or_non_positive"
     assert exposed["stop_status"] == "missing_or_non_positive"
 
 
