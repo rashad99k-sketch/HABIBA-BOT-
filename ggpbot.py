@@ -596,9 +596,12 @@ BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.
 BINGX_PUBLIC_MARKET_MIN_INTERVAL = _env_float_range(
     "BINGX_PUBLIC_MARKET_MIN_INTERVAL", BINGX_KLINE_MIN_INTERVAL, 1.0, 2.0
 )
-# BingX Futures publishes a 1/s Trader tier for individual order writes and
-# 2/s for leverage/margin/position-mode changes. Use the conservative tier
-# unless the account's current entitlement is explicitly verified.
+# Local safety caps, not BingX-published rate limits:
+# - Order placement/cancellation is locally capped at 1 request/second even
+#   though the current BingX swap order endpoint is documented at 10/s per UID.
+# - Leverage/margin/position-mode writes are locally capped at 2 requests/second.
+# Keep these caps conservative until end-to-end latency and account-tier behavior
+# are measured in BingX Demo; never describe them as exchange limits.
 BINGX_TRADE_WRITE_MIN_INTERVAL = _env_float_range(
     "BINGX_TRADE_WRITE_MIN_INTERVAL", 1.05, 1.0, 2.0
 )
@@ -616,7 +619,7 @@ _API_METHOD_MIN_INTERVALS = {
     "fetch_funding_rate_history": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
     "fetch_markets": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
     "fetch_open_interest": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
-    # Order writes: 1/s is the most restrictive published Trader tier.
+    # Order writes use a conservative local 1/s cap (not the exchange limit).
     "create_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
     "create_market_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
     "create_limit_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
@@ -629,7 +632,7 @@ _API_METHOD_MIN_INTERVALS = {
     "set_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "add_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "reduce_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
-    "cancel_all_orders_after": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    # BingX cancelAllAfter is documented at 1/s per UID; retain local 1/s cap.\n    "cancel_all_orders_after": BINGX_TRADE_WRITE_MIN_INTERVAL,
 }
 _API_RATE_LOCK = threading.Lock()
 # Never let API scheduler contention pin MainThread indefinitely. A timeout is
