@@ -467,3 +467,53 @@ def test_native_sl_does_not_accept_price_beyond_exchange_quantization_delta():
         trigger_price=8.223214285714286, required_qty=1,
         price_tolerance_abs=0.000214285715,
     )
+
+
+def test_production_api_caller_wraps_entry_mode_leverage_order_and_position_reads():
+    exchange = FakeExchange()
+    dispatched = []
+
+    def api_caller(func, *args, **kwargs):
+        dispatched.append(getattr(func, "__name__", type(func).__name__))
+        return func(*args, **kwargs)
+
+    service = TradeExecutionService(exchange, api_caller=api_caller)
+    result = service.submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2,
+        leverage=20, trade_id="t-central-api-governor",
+    )
+
+    assert result.state is ExecutionState.FILLED
+    assert {
+        "fetch_position_mode", "set_leverage", "fetch_leverage",
+        "create_order", "fetch_order", "fetch_positions",
+    }.issubset(set(dispatched))
+
+
+def test_native_conditional_stop_evidence_uses_the_injected_api_caller():
+    class RawFakeExchange(FakeExchange):
+        def __init__(self):
+            super().__init__()
+            self.raw_open_order_calls = []
+
+        def swapV2PrivateGetTradeOpenOrders(self, params):
+            self.raw_open_order_calls.append(dict(params))
+            return {"code": 0, "data": []}
+
+    exchange = RawFakeExchange()
+    dispatched = []
+
+    def api_caller(func, *args, **kwargs):
+        dispatched.append(getattr(func, "__name__", type(func).__name__))
+        return func(*args, **kwargs)
+
+    service = TradeExecutionService(exchange, api_caller=api_caller)
+    rows, authoritative_ok, details = service._collect_native_stop_rows(
+        symbol="BTC/USDT:USDT", close_side="sell", position_side="BOTH",
+    )
+
+    assert rows == []
+    assert authoritative_ok is True
+    assert details["authoritative_ok"] is True
+    assert "fetch_open_orders" in dispatched
+    assert dispatched.count("swapV2PrivateGetTradeOpenOrders") == 2
