@@ -23,6 +23,42 @@ from naiso_health import HealthWatchdog, RestartPolicy
 SYMBOL = "BTC/USDT:USDT"
 
 
+def _healthy_runtime(monkeypatch):
+    """Install an isolated, genuinely progressing runtime for health-route tests."""
+    clock = [100.0]
+    wall_now = 1_700_000_000.0
+    monkeypatch.setattr(ggpbot, "time", SimpleNamespace(
+        time=lambda: wall_now, monotonic=lambda: clock[0], sleep=lambda _s: None))
+    watchdog = HealthWatchdog(
+        restart_policy=RestartPolicy(max_attempts=3, monotonic_fn=lambda: clock[0]),
+        monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None,
+        alert_fn=lambda *_a, **_k: None)
+    watchdog.register("main_loop", interval_sec=5.0, grace_sec=60.0,
+                      critical=True, restartable=True)
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", watchdog)
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "recovery_hold": False, "execution_unresolved": False,
+        "close_reconciliation_required": False, "current_symbol": None})
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"recovery_status": "READY"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "API_RESILIENCE", None)
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STATE", {"until": 0.0})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_RESTART_STATE", {
+        "in_progress": False, "attempts": 0, "last_reason": "",
+        "supervisor_exhausted": False})
+    thread = threading.current_thread()
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_OWNER", {
+        "thread_id": thread.ident, "thread_name": thread.name, "registered": True})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_PROGRESS_SEQ", 1)
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_LAST_OWNER_PROGRESS", {
+        "seq": 1, "ts": clock[0], "thread_id": thread.ident,
+        "thread_name": thread.name})
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start", progress=True)
+    return watchdog, clock
+
+
 def _watchdog(clock, alerts, *, safety_gate=None, **kwargs):
     return HealthWatchdog(
         restart_policy=RestartPolicy(max_attempts=3, monotonic_fn=lambda: clock[0]),
