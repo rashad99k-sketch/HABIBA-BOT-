@@ -824,10 +824,16 @@ def test_verified_full_close_retains_lock_if_recovery_gate_remains(monkeypatch, 
         ggpbot._ACTIVE_TRADE = False
 
 
-def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch):
+def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch, tmp_path):
     _fresh_state()
-    # This test isolates the in-process trade lock; the broader recovery gate
-    # is exercised separately and would otherwise return before the lock check.
+    # The six-slot allocator is now the capacity authority; saturate the
+    # technical class so the execution boundary must report a held lock.
+    from portfolio_allocator import PortfolioAllocator
+    allocator = PortfolioAllocator(str(tmp_path / "held-lock.sqlite3"))
+    for index in range(5):
+        result = allocator.reserve(f"SYM{index}", f"held-{index}", "TECHNICAL")
+        assert result.ok, result.reason
+    monkeypatch.setattr(ggpbot, "PORTFOLIO_ALLOCATOR", allocator)
     ggpbot.RECOVERY_BLOCK_ENTRIES = False
     monkeypatch.setitem(ggpbot.MEMORY, "position_status", "FLAT")
     monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)

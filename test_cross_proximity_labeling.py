@@ -12,7 +12,10 @@ import pandas as pd
 
 import ggpbot
 import naiso_unified_decision as proj
-from roro_confluence import ema9_vwap_proximity, validate_dual_ema_vwap_entry_gate
+from roro_confluence import (
+    AUTH_EMA9_EMA15_TRIGGER_VALID, ema9_vwap_proximity,
+    validate_dual_ema_vwap_entry_gate,
+)
 from roro_trade_journal import TradeJournal
 from test_dual_scanner_dashboard import _sample_session_frame
 
@@ -131,10 +134,11 @@ def test_ema50_only_cross_is_ranking_and_never_creates_durable_event(tmp_path, m
         frame, _ema, ema_len=9, timeframe_seconds=900, now_ms=now_ms,
     )
     assert gate["ema9_cross"] is None
+    assert gate["ema9_15_cross"] is None
     assert gate["ema50_cross"] == "BULLISH"
     assert gate["ready"] is False
-    assert gate.get("authorization_state") != "EMA9_TRIGGER_VALID"
-    assert gate["reason"] == "missing_fresh_directional_ema9_vwap_cross"
+    assert gate.get("authorization_state") != AUTH_EMA9_EMA15_TRIGGER_VALID
+    assert gate["reason"] == "missing_fresh_directional_ema9_ema15_cross"
     assert proximity["state"] == "CROSS_CONFIRMED"
     assert proximity["cross_ema9"] is None
     assert proximity["cross_ema50"] == "BULLISH"

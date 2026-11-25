@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from ggp_market_intelligence import normalize_entry_type
 from ggp_institutional_strategy import build_institutional_report
+from roro_confluence import AUTH_EMA9_EMA15_TRIGGER_VALID
 
 SCHEMA_VERSION = "NAISO_UNIFIED_DECISION_CONTEXT_V1"
 
@@ -318,8 +319,15 @@ def classify_cross_state(record: Any = None, *, proximity: Any = None, gate: Any
         base.update({"cross_state": _confirmed_state(direction), "reason": "durable_closed_cross_event"})
         return base
 
+    # Read-only projection. The strategy branch authorizes only the new
+    # EMA9/EMA15 state; the legacy token is retained here solely so historical
+    # rows still classify as observations. Neither can become authoritative
+    # without a durable, unconsumed cross event.
+    _OBSERVED_AUTHORIZATION_STATES = {
+        _upper(AUTH_EMA9_EMA15_TRIGGER_VALID), "EMA9_TRIGGER_VALID",
+    }
     gate_confirmed = bool(gate_map.get("ready") is True
-                          and _upper(gate_map.get("authorization_state")) == "EMA9_TRIGGER_VALID")
+                          and _upper(gate_map.get("authorization_state")) in _OBSERVED_AUTHORIZATION_STATES)
     prox_confirmed = bool(prox.get("cross_any") or prox.get("cross_ema9") or prox.get("cross_ema50"))
     if prox.get("cross_conflict") is True or prox_state == "CROSS_CONFLICT":
         base.update({"cross_state": "INVALID_DATA", "reason": "cross_conflict",

@@ -5,13 +5,20 @@ Older reports that mention 40% allocation, 10x leverage, or a 1% wallet-risk mod
 are historical and are superseded by `CAPITAL_ALLOCATION_POLICY_AR.md` and this
 document.
 
+For the strategy changes on `strategy/ema15-rf-reentry-six-slots-20261125`, the
+three deliberately changed requirements are governed by
+`STRATEGY_SPEC_EMA15_RF_SIX_SLOTS.md`: EMA9/EMA15 closed-candle confirmation with
+Session VWAP direction, RF opposite-signal re-entry wait, and six-slot portfolio
+capacity. Those requirements override the older single-trigger/single-position
+statements in this note only for that branch.
+
 ## Single authorities
 
 | Concern | Single authority | Notes |
 | --- | --- | --- |
 | Position size | `ggp_position_sizing.calculate_position_size()` | One calculation. Exchange precision only rounds the result; no downstream resize. |
 | Trade management | `TradeManagementBoard` / `LiveTradeManager` | No second manager. TP1 is exactly 50% of the verified filled quantity. |
-| Entry trigger | `roro_confluence.validate_dual_ema_vwap_entry_gate()` | M15 closed-candle EMA9 / Session VWAP cross only. RF/V2/radar/proximity are ranking-only. |
+| Entry trigger | `roro_confluence.validate_dual_ema_vwap_entry_gate()` | On `main`: M15 closed-candle EMA9 / Session VWAP cross only. On the strategy branch: M15 closed-candle EMA9/EMA15 cross plus Session VWAP direction confirmation. RF/V2/radar/proximity remain ranking-only. EMA50 is advisory and never an automatic veto. |
 | Post-cross entry | `roro_confluence.evaluate_post_cross_rejection_breakout()` | Pullback/retest → closed rejection candle → strictly later closed breakout. |
 | Durable state | `TradeJournal` | Cross events, immutable sizing decisions, entry context, fills and recovery state. |
 
@@ -54,7 +61,7 @@ exchange-reported. Gross ROE/PnL is never presented as net.
 
 ## Entry lifecycle
 
-1. Strict M15 closed-candle cross creates one durable `confirmed_cross_events` row.
+1. Strict M15 closed-candle cross creates one durable `confirmed_cross_events` row. On the strategy branch this is the EMA9/EMA15 cross with Session VWAP confirmation, not the legacy EMA9/VWAP trigger.
 2. The event is projected into the unified Watchlist with ranking-only sources kept distinct.
 3. Later closed candles must show a pullback/retest of the cross zone.
 4. A later **closed** rejection candle must record its high and low.
@@ -65,16 +72,21 @@ exchange-reported. Gross ROE/PnL is never presented as net.
 
 The handoff includes the cross event identity, direction/timestamp, zone/quality,
 Order Block, supply/demand, liquidity, structure, relative volume, ADX/DI, ATR,
-EMA9/EMA50/VWAP, regime, rejection high/low, planned and actual entry price, and
+EMA9/EMA15/EMA50/VWAP, regime, rejection high/low, planned and actual entry price, and
 actual filled quantity.
 
 ## Safety invariants
 
 UNKNOWN is never FLAT. Recovery Hold blocks entries but never stops management of an
-open trade. Native stops are verified by readback and never duplicated. API Governor,
-bounded retries, no uncertain order-write retries, watchdog/recovery, main-loop
-progress, Global Discovery lifecycle, shared OHLCV cache, strict close verification,
-reconciliation, dashboard/Telegram, and Flask/Render health checks remain unchanged.
+open trade. Native stops are verified by readback and never duplicated. On the
+strategy branch, portfolio capacity is six positions (maximum five
+Technical/Institutional plus exactly one News Trading), allocated centrally before
+order submission, and an RF opposite-signal close blocks re-entry until a strictly
+later closed candle produces a valid signal; consumed events are never reused. API
+Governor, bounded retries, no uncertain order-write retries, watchdog/recovery,
+main-loop progress, Global Discovery lifecycle, shared OHLCV cache, strict close
+verification, reconciliation, dashboard/Telegram, and Flask/Render health checks
+remain unchanged.
 
 ## Verification
 

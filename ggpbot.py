@@ -6,6 +6,8 @@
 # ====================================================================
 
 import os
+import sys
+import tempfile
 import time
 import json
 import signal
@@ -100,6 +102,8 @@ from ggp_market_intelligence import (
 from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
 from location_authority import validate_location_zone
+import portfolio_allocator
+from portfolio_runtime import PortfolioRuntime
 from naiso_unified_decision import (classify_cross_state as _project_cross_state,
                                     project_dashboard_sections as _project_dashboard_sections,
                                     project_watchlist_row as _project_watchlist_row)
@@ -6839,11 +6843,10 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
     # are not trusted to be the only route into this non-idempotent operation.
     blocked_position_state = str(MEMORY.get("position_status") or "").upper()
     if (
-        STATE.get("open") or TRADE_STATE.get("in_position")
-        or STATE.get("execution_unresolved") or STATE.get("recovery_hold")
+        STATE.get("execution_unresolved") or STATE.get("recovery_hold")
         or STATE.get("close_reconciliation_required")
         or RECOVERY_BLOCK_ENTRIES
-        or blocked_position_state in {"UNKNOWN", "OPEN", "MULTIPLE_OPEN"}
+        or blocked_position_state == "UNKNOWN"
     ):
         log_execution(
             f"[ENTRY_BLOCKED] {sym}: execution boundary exposure/recovery gate "
@@ -6855,12 +6858,15 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             "WARN", debounce_key=f"entry_boundary_hold:{sym}", debounce_sec=10,
         )
         return None
+    portfolio_reservation_created = False
     with _TRADE_LOCK:
-        if _ACTIVE_TRADE:
-            # Keep the single-position gate closed, but make the reason visible.
-            # Only verified-flat finalization/reconciliation may release it.
+        trade_id, reservation, portfolio_reservation_created = _portfolio_ensure_open_reservation(
+            trade_id, sym, management_state
+        )
+        if reservation is None:
+            # Capacity is now authority: _ACTIVE_TRADE is only an aggregate view.
             log_execution(
-                f"[ENTRY_LOCKED] {sym}: active trade lock is held "
+                f"[ENTRY_LOCKED] {sym}: no six-slot reservation available "
                 f"| state_open={bool(STATE.get('open'))} "
                 f"| trade_state_open={bool(TRADE_STATE.get('in_position'))} "
                 f"| recovery_hold={bool(STATE.get('recovery_hold'))} "
@@ -7054,6 +7060,10 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
         if order is None and not STATE.get("execution_unresolved"):
             with _TRADE_LOCK:
                 _ACTIVE_TRADE = False
+                if portfolio_reservation_created:
+                    _portfolio_release_reservation(
+                        trade_id, sym, "PRE_ORDER_FAILURE_NO_EXPOSURE"
+                    )
     return None
 
 
@@ -7472,6 +7482,7 @@ def _validate_selected_entry_zone(zone, side, *, price, atr, latest_timestamp, t
 
 
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
+    _portfolio_ensure_test_scope()
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] drawdown cooldown active; {symbol} {side} rejected", "WARN",
                       debounce_key=f"loss_cooldown_entry:{symbol}", debounce_sec=15)
@@ -7670,6 +7681,20 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 f"for {entry_event_id}: {type(event_exc).__name__}: {event_exc}", "ERROR",
             )
             return False
+    # A verified RF-opposite close can only be re-entered on a STRICTLY later
+    # closed-candle signal. This runs after the consumed-event guard so a reused
+    # signal can never satisfy the wait, and before sizing/order submission.
+    rf_allowed, rf_reason = _rf_reentry_block_permission(
+        symbol, side, gate_result, cross_event_id=cross_event_id,
+    )
+    if not rf_allowed:
+        log_execution(
+            f"[RF_REENTRY] BLOCKED {symbol} {side}: {rf_reason}",
+            "WARN", debounce_key=f"rf_reentry_wait:{symbol}:{side}:{rf_reason}", debounce_sec=15,
+        )
+        return False
+    gate_result["rf_reentry_signal_timestamp"] = _rf_reentry_signal_timestamp(
+        gate_result, cross_event_id)
     log_execution(
         f"[VWAP_ENTRY_GATE] PASSED {symbol} {side} "
         f"EMA9_cross_ts={gate_result.get('ema9_cross_timestamp')} "
@@ -7918,8 +7943,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "entry_event_id": str(entry_event_id or ""),
             "profit_target_convention": profit_target_convention(),
         }
-        STATE["sizing_decision"] = dict(sizing_decision)
         institutional_entry_ctx["sizing_decision"] = dict(sizing_decision)
+        # Candidate globals are withheld until the durable slot is reserved. Keep
+        # this audit data local until the execution boundary is authorized.
+        entry_risk_plan = {}
+        initial_mode_report = {}
+        management_mode_history = []
+        sizing_decision_persistence_failed = False
         # One pre-trade risk record from the frozen sizing decision. This does
         # not size, approve or execute anything; it makes leverage, margin,
         # net return, liquidation distance and R/R explicit before the order.
@@ -7930,7 +7960,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 contract_size=contract_size, leverage=LEVERAGE,
                 sizing_decision=sizing_decision,
             )
-            STATE["entry_risk_plan"] = risk_plan
+            entry_risk_plan = dict(risk_plan)
             institutional_entry_ctx["entry_risk_plan"] = risk_plan
             persistent_ctx = institutional_entry_ctx.get("persistent_entry_context")
             if isinstance(persistent_ctx, dict):
@@ -7942,9 +7972,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 reason="pending_first_closed_candle_management_classification",
                 evidence=(),
             )
-            STATE["management_mode"] = initial_mode_report["management_mode"]
-            STATE["management_mode_report"] = initial_mode_report
-            STATE["management_mode_history"] = [{
+            management_mode_history = [{
                 "at": time.time(), "candle_ts": 0.0,
                 "management_mode": initial_mode_report["management_mode"],
                 "canonical_profit_mode": initial_mode_report["canonical_profit_mode"],
@@ -7972,18 +8000,20 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                         f"[SIZING_DECISION] BLOCKED LIVE entry {trade_id}: durable decision unavailable", "ERROR",
                     )
                     return False
-                STATE["sizing_decision_persistence_failed"] = True
+                sizing_decision_persistence_failed = True
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
     # Freeze the pre-trade audit record once. Both successful fill paths must
     # carry these fields into the open-trade state instead of resetting them.
     frozen_entry_trace = {
-        "entry_risk_plan": dict(STATE.get("entry_risk_plan") or {}),
-        "management_mode": str(STATE.get("management_mode") or "STANDARD"),
-        "management_mode_report": dict(STATE.get("management_mode_report") or {}),
-        "management_mode_history": list(STATE.get("management_mode_history") or []),
+        "sizing_decision": dict(sizing_decision),
+        "entry_risk_plan": dict(entry_risk_plan),
+        "management_mode": str(initial_mode_report.get("management_mode") or "STANDARD"),
+        "management_mode_report": dict(initial_mode_report),
+        "management_mode_history": list(management_mode_history),
         "institutional_report": dict(institutional_entry_ctx.get("institutional_report") or {}),
+        "sizing_decision_persistence_failed": bool(sizing_decision_persistence_failed),
     }
     institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
     if not PAPER_MODE and MODE_LIVE and institutional_ctx:
@@ -8074,6 +8104,40 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             body = abs(last['close'] - last['open'])
             if body > atr_val * 0.6:
                 counter_displacement = body / atr_val
+    # Durable six-slot boundary: classify centrally and reserve BEFORE any
+    # candidate global is written or any PAPER/LIVE order is submitted.
+    if _portfolio_uncertain():
+        log_execution(
+            f"[PORTFOLIO_BLOCKED] {symbol}: unresolved/recovery exposure; no new order",
+            "ERROR", debounce_key=f"portfolio_uncertain:{symbol}", debounce_sec=10,
+        )
+        return False
+    try:
+        portfolio_hint = _portfolio_trusted_hint(institutional_entry_ctx)
+        reservation = PORTFOLIO_ALLOCATOR.reserve(
+            str(sym or normalize_symbol(symbol)), trade_id,
+            class_hint=portfolio_hint,
+            metadata={"side": side, "reason": str(reason or "")[:200]},
+        )
+    except Exception as reserve_exc:
+        log_execution(
+            f"[PORTFOLIO_RESERVE] {trade_id}: {type(reserve_exc).__name__}: {reserve_exc}",
+            "ERROR",
+        )
+        return False
+    if not reservation.ok:
+        log_execution(
+            f"[PORTFOLIO_BLOCKED] {symbol}: no slot available ({reservation.reason})",
+            "WARN", debounce_key=f"portfolio_full:{reservation.reason}", debounce_sec=10,
+        )
+        return False
+    # Publish the frozen candidate audit only after the durable slot is held.
+    STATE["sizing_decision"] = dict(sizing_decision)
+    STATE["entry_risk_plan"] = dict(entry_risk_plan)
+    STATE["management_mode"] = str(initial_mode_report.get("management_mode") or "STANDARD")
+    STATE["management_mode_report"] = dict(initial_mode_report)
+    STATE["management_mode_history"] = list(management_mode_history)
+    STATE["sizing_decision_persistence_failed"] = bool(sizing_decision_persistence_failed)
     market_state = {
         "adx": adx_val,
         "regime": MEMORY.get("regime", "UNKNOWN"),
@@ -8208,14 +8272,19 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
         })
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2)
+        if not _portfolio_adopt_candidate(trade_id, sym, portfolio_hint):
+            _portfolio_release_reservation(trade_id, sym, "ADOPT_FAILED_NO_EXPOSURE")
+            return False
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
+        _recompute_portfolio_globals()
         return True
 
     sym = normalize_symbol(symbol)
     if not PAPER_MODE and not market:
         log_execution(f"[SIZING_REJECT] LIVE market metadata unavailable for {sym}", "ERROR")
+        _portfolio_release_reservation(trade_id, sym, "PRE_ORDER_METADATA_MISSING")
         return False
     pending_management_state = {
         "trade_id": trade_id, "current_symbol": symbol, "side": side,
@@ -8230,6 +8299,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     }
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
+        _portfolio_release_reservation(trade_id, sym, "PRE_ORDER_COOLDOWN")
         return False
     order = open_position(side, qty, symbol, stop_loss=sl, trade_id=trade_id,
                           management_state=pending_management_state)
@@ -8242,6 +8312,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                           "execution_unresolved": True})
             globals()["RECOVERY_BLOCK_ENTRIES"] = True
             log_execution("[RECOVERY_HOLD] Exchange acknowledged exposure but actual fill quantity/price is unavailable", "ERROR")
+            _portfolio_adopt_candidate(trade_id, sym, portfolio_hint)
+            _recompute_portfolio_globals()
             return False
         qty = actual_filled_qty
         price = actual_entry_price
@@ -8377,6 +8449,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             globals()["RECOVERY_BLOCK_ENTRIES"] = False
             MEMORY["recovery_status"] = "NATIVE_SL_VERIFIED"
             log_execution(f"[LIVE_SAFETY] Native STOP_MARKET verified for {symbol} qty={qty}", "SUCCESS")
+        # Exposure is real here; an adoption failure must never release the slot.
+        _portfolio_adopt_candidate(trade_id, sym, portfolio_hint)
+        _recompute_portfolio_globals()
         _persist_trade_journal_start(setup_type=trade_type)
         _persist_trade_journal_snapshot(force=True)
         update_position_dashboard(symbol, side, price, qty)
@@ -8384,8 +8459,17 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type, tp2=tp2, qty=qty, leverage=LEVERAGE, trade_id=trade_id)
         time.sleep(1)
         sync_position_state(symbol)
+        _recompute_portfolio_globals()
         return True
     else:
+        if (
+            STATE.get("execution_unresolved") or STATE.get("recovery_hold")
+            or STATE.get("close_reconciliation_required") or _portfolio_uncertain()
+        ):
+            _portfolio_adopt_candidate(trade_id, sym, portfolio_hint)
+            _recompute_portfolio_globals()
+        else:
+            _portfolio_release_reservation(trade_id, sym, "ORDER_REJECTED_NO_EXPOSURE")
         return False
 
 def dynamic_spread_tolerance(symbol):
@@ -8640,9 +8724,12 @@ def _detect_confirmed_cross_events(symbols):
                 )
             except Exception:
                 continue
-            if not gate.get("ready") or str(gate.get("authorization_state") or "") != "EMA9_TRIGGER_VALID":
+            authorization_state = str(gate.get("authorization_state") or "")
+            if not gate.get("ready") or authorization_state != str(_AUTH_EMA9_EMA15_TRIGGER_VALID):
                 continue
-            direction = str(gate.get("ema9_cross") or "").upper()
+            # The authoritative new trigger is the strict EMA9/EMA15 cross. The
+            # legacy EMA9/VWAP-only gate is no longer accepted as authorization.
+            direction = str(gate.get("ema9_15_cross") or "").upper()
             expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
             if direction != expected_direction:
                 continue
@@ -8818,7 +8905,7 @@ def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, at
         "side": str(side or "").upper(),
         "cross_event_id": str(_first(source.get("cross_event_id"), gate.get("durable_event_id")) or ""),
         "cross_event_source": str(_first(source.get("cross_event_source"), CONFIRMED_CROSS_EVENT_SOURCE)),
-        "cross_event_direction": str(_first(source.get("cross_event_direction"), gate.get("ema9_cross")) or "").upper(),
+        "cross_event_direction": str(_first(source.get("cross_event_direction"), gate.get("ema9_15_cross"), gate.get("ema9_cross")) or "").upper(),
         "cross_event_timestamp": _first(source.get("cross_event_timestamp"), gate.get("signal_candle_timestamp")) or 0,
         "cross_event_timeframe": str(_first(source.get("cross_event_timeframe"), gate.get("timeframe")) or INTERVAL),
         "cross_event_status": str(_first(source.get("cross_event_status"), "ACTIVE")),
@@ -10274,8 +10361,8 @@ def stop_hit(current_price):
         return True
     return False
 
-def finalize_trade_with_reality(symbol, close_reason=None):
-    """Finalize once, only after a verified flat state; never infer PnL from a stale mark."""
+def _finalize_trade_with_reality_in_focus(symbol, close_reason=None, trade_id=None):
+    """Finalize the focused trade once, only after verified flat evidence."""
     if not STATE.get("open"):
         return None, None
     if not STATE.get("close_verified"):
@@ -10299,6 +10386,7 @@ def finalize_trade_with_reality(symbol, close_reason=None):
     else:
         pnl_pct = None
 
+    focused_trade_id = str(trade_id or STATE.get("trade_id") or "")
     trade_id = STATE.get("trade_id")
     reason = str(close_reason or STATE.get("last_close_reason") or "BOT_CLOSE_VERIFIED")
     journal_finalized = True
@@ -10318,6 +10406,11 @@ def finalize_trade_with_reality(symbol, close_reason=None):
             log_execution(f"[FINALIZE] Trade {trade_id} already finalized; local state will still be cleared without duplicate performance update", "WARN")
         else:
             log_execution(f"[FINALIZE] Journal finalization for {trade_id} was not confirmed; clearing only exchange-confirmed flat exposure", "ERROR")
+
+    # An RF-opposite close must leave a durable re-entry block even if the
+    # journal finalization itself failed. External close reasons never reach
+    # this branch because they carry no trusted RF close context.
+    _persist_rf_reentry_block_from_close(symbol, reason, STATE)
 
     if not already_finalized:
         if pnl_known and pnl_pct is not None:
@@ -10372,7 +10465,7 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                   "range_target_move_pct": 0.0, "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0,
                   "last_close_verified": False, "last_close_order_id": None,
                   "last_close_filled_qty": 0.0, "last_close_realized_pnl": 0.0,
-                  "last_close_pnl_complete": True, "bot_close_order_ids": []})
+                  "last_close_pnl_complete": True, "bot_close_order_ids": [], "rf_opposite_close": None})
     STATE.update(preserved)
     # This finalizer is gated by close_verified=True: publish the verified flat
     # exposure to the runtime memory consumed by dashboard/synchronization.
@@ -10398,25 +10491,69 @@ def finalize_trade_with_reality(symbol, close_reason=None):
         release_reasons.append("RECOVERY_HOLD")
     if recovery_block_entries:
         release_reasons.append("RECOVERY_BLOCK_ENTRIES")
-    global _ACTIVE_TRADE
-    with _TRADE_LOCK:
-        if not release_reasons:
-            _ACTIVE_TRADE = False
+    if not release_reasons:
+        if _portfolio_release_reservation(
+            focused_trade_id, symbol, f"VERIFIED_FLAT:{reason}"
+        ):
             log_execution(
-                f"[ENTRY_LOCK_RELEASED] {symbol}: verified full close finalized; next discovery cycle may authorize an entry",
+                f"[ENTRY_LOCK_RELEASED] {symbol}: verified full close finalized; slot released",
                 "SUCCESS",
             )
         else:
-            _ACTIVE_TRADE = True
             log_execution(
-                f"[ENTRY_LOCK_RETAINED] {symbol}: unresolved safety gates: {','.join(release_reasons)}",
-                "ERROR",
+                f"[PORTFOLIO_RELEASE] focused trade {focused_trade_id} did not own an active reservation",
+                "WARN",
             )
+    else:
+        log_execution(
+            f"[ENTRY_LOCK_RETAINED] {symbol}: unresolved safety gates: {','.join(release_reasons)}",
+            "ERROR",
+        )
+    _recompute_portfolio_globals()
 
     _live_manager.lifecycle_state = TradeLifecycleState.CLOSED
-    DASHBOARD_STATE["live_trade_mode"] = False
-    clear_position_dashboard()
+    _recompute_portfolio_globals()
     return pnl_usdt, pnl_pct
+
+
+def finalize_trade_with_reality(symbol, close_reason=None, trade_id=None):
+    """Finalize one trade in isolation, then rebuild portfolio-level views.
+
+    ``trade_id`` is explicit because callers may finalize a non-focused trade
+    during portfolio reconciliation. Legacy callers without an id continue to
+    finalize the focused trade.
+    """
+    _portfolio_ensure_test_scope()
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    focused_id = str(trade_id or (runtime or None) and getattr(runtime, "_focused_trade_id", None) or "")
+    if not focused_id:
+        focused_id = _portfolio_trade_id_for_symbol(symbol)
+    already_focused = bool(
+        runtime is not None
+        and getattr(runtime, "_focus_stack", None)
+        and getattr(runtime, "_focus_stack", [None])[-1] == focused_id
+    )
+    if (
+        runtime is not None and not already_focused and focused_id
+        and focused_id in getattr(runtime, "_positions", {})
+    ):
+        try:
+            with runtime.focus(focused_id):
+                result = _finalize_trade_with_reality_in_focus(
+                    symbol, close_reason=close_reason, trade_id=focused_id
+                )
+        except Exception as exc:
+            log_execution(
+                f"[FINALIZE] {focused_id}: {type(exc).__name__}: {exc}", "ERROR"
+            )
+            result = None, None
+    else:
+        result = _finalize_trade_with_reality_in_focus(
+            symbol, close_reason=close_reason, trade_id=focused_id
+        )
+    _recompute_portfolio_globals()
+    return result
+
 
 def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, trade_state=None):
     # This function is now deprecated; kept for compatibility.
@@ -12942,6 +13079,441 @@ MEMORY = {
     "no_entry_feed": []
 }
 
+# ========== SIX-SLOT PORTFOLIO INTEGRATION ==========
+# All globals above (STATE / TRADE_STATE / DASHBOARD_STATE / MEMORY) and the
+# singleton manager now exist, so the durable allocator and the isolated runtime
+# registry can be bound once per process. Both share _TRADE_LOCK with the rest
+# of the execution boundary.
+_PORTFOLIO_TRUSTED_HINT_KEYS = (
+    "strategy", "source", "strategy_name", "source_name", "entry_source",
+    "signal_source", "signal_origin", "trade_type", "setup_type", "setup",
+    "engine", "origin",
+)
+_PORTFOLIO_RAW_LABEL_KEYS = frozenset({
+    "classification", "slot_class", "class_label", "label", "slot", "portfolio_class",
+    "class_hint", "portfolio_slot", "slot_label",
+})
+_PORTFOLIO_UNCERTAIN_FLAGS = (
+    "execution_unresolved", "close_reconciliation_required", "recovery_hold",
+)
+_PORTFOLIO_PENDING_ENTRY = None
+
+
+def _portfolio_allocator_path():
+    configured = str(os.environ.get("PORTFOLIO_ALLOCATOR_DB") or "").strip()
+    if configured:
+        return configured if os.path.isabs(configured) else os.path.join(ENV_DIR, configured)
+    if "pytest" in sys.modules:
+        # Tests must never inherit real durable slot state from a previous run.
+        return os.path.join(tempfile.gettempdir(), f"ggpbot-portfolio-{os.getpid()}.sqlite3")
+    return os.path.join(ENV_DIR, "data", "portfolio_allocator.sqlite3")
+
+
+PORTFOLIO_ALLOCATOR = portfolio_allocator.PortfolioAllocator(_portfolio_allocator_path())
+PORTFOLIO_RUNTIME = PortfolioRuntime(
+    STATE, TRADE_STATE, DASHBOARD_STATE, _live_manager, lock=_TRADE_LOCK
+)
+
+
+def _portfolio_trusted_hint(context=None):
+    """Derive one class hint from trusted strategy/source fields only.
+
+    Raw caller labels (``classification``, ``slot_class``, ``label``, ...) are
+    never copied into the hint. Unknown source tokens are ignored and fall back
+    to the central TECHNICAL default; conflicting tokens fail closed through
+    ``classify_slot``.
+    """
+    source = context if isinstance(context, dict) else {}
+    recognized = {}
+    for key in _PORTFOLIO_TRUSTED_HINT_KEYS:
+        if key in _PORTFOLIO_RAW_LABEL_KEYS or key not in source:
+            continue
+        value = source[key]
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            portfolio_allocator.classify_slot(text)
+        except portfolio_allocator.UnknownClassHintError as exc:
+            if "ambiguous" in str(exc):
+                raise
+            continue
+        recognized[key] = text
+    if not recognized:
+        recognized["strategy"] = "TECHNICAL"
+    # One central call: conflicting trusted fields cannot silently pick a winner.
+    portfolio_allocator.classify_slot(recognized)
+    return recognized
+
+
+def _portfolio_flat_evidence(symbol, source):
+    """Strict, structured verified-flat evidence accepted by the allocator."""
+    return {
+        "verified_flat": True,
+        "qty": 0,
+        "status": "FLAT",
+        "source": str(source),
+        "snapshot": {str(symbol): 0.0},
+    }
+
+
+def _portfolio_uncertain():
+    state = globals().get("STATE") or {}
+    return any(bool(state.get(key)) for key in _PORTFOLIO_UNCERTAIN_FLAGS)
+
+
+def _portfolio_active_ids():
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    try:
+        return {str(item["trade_id"]) for item in runtime.status().get("active", [])}
+    except Exception:
+        return set()
+
+
+def _portfolio_release_reservation(trade_id, symbol, source):
+    allocator = globals().get("PORTFOLIO_ALLOCATOR")
+    if allocator is None or not trade_id:
+        return False
+    try:
+        result = allocator.release(
+            str(trade_id), require_flat=True,
+            verified_flat=_portfolio_flat_evidence(symbol, source),
+        )
+    except Exception as exc:
+        log_execution(f"[PORTFOLIO_RELEASE] {trade_id}: {type(exc).__name__}: {exc}", "ERROR")
+        return False
+    # already_released is the idempotent exactly-once path, not a new release.
+    if not result.ok and result.reason not in {"already_released"}:
+        log_execution(
+            f"[PORTFOLIO_RELEASE] {trade_id}: slot retained ({result.reason})", "ERROR"
+        )
+    return bool(result.ok) or result.reason == "already_released"
+
+
+def _recompute_portfolio_globals(*, clear_recovery=False):
+    """Publish allocator + registry state as aggregate flags and views."""
+    global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    allocator = globals().get("PORTFOLIO_ALLOCATOR")
+    active_ids = _portfolio_active_ids()
+    try:
+        allocator_total = int(allocator.counts().get("TOTAL", 0)) if allocator else 0
+    except Exception:
+        allocator_total = 0
+    has_positions = bool(active_ids or allocator_total)
+    uncertain = _portfolio_uncertain()
+    entries = getattr(runtime, "_positions", {}) if runtime is not None else {}
+    try:
+        for entry in list(entries.values()):
+            if any(bool(entry.state.get(key)) for key in _PORTFOLIO_UNCERTAIN_FLAGS):
+                uncertain = True
+    except Exception:
+        uncertain = True
+    if clear_recovery:
+        RECOVERY_BLOCK_ENTRIES = bool(uncertain)
+    else:
+        RECOVERY_BLOCK_ENTRIES = bool(globals().get("RECOVERY_BLOCK_ENTRIES", False) or uncertain)
+    state = globals().get("STATE") or {}
+    trade_state = globals().get("TRADE_STATE") or {}
+    _ACTIVE_TRADE = bool(
+        has_positions or uncertain or state.get("open") or trade_state.get("in_position")
+    )
+    memory = globals().get("MEMORY")
+    if isinstance(memory, dict):
+        memory["position_status"] = "OPEN" if has_positions else (
+            "UNKNOWN" if uncertain else "FLAT"
+        )
+    dashboard = globals().get("DASHBOARD_STATE")
+    if isinstance(dashboard, dict):
+        dashboard["live_trade_mode"] = bool(has_positions)
+        try:
+            dashboard["portfolio_counts"] = {
+                key: int(allocator.counts().get(key, 0))
+                for key in ("TECHNICAL", "NEWS_TRADING", "TOTAL")
+            } if allocator else {"TECHNICAL": 0, "NEWS_TRADING": 0, "TOTAL": 0}
+        except Exception:
+            dashboard["portfolio_counts"] = {"TECHNICAL": 0, "NEWS_TRADING": 0, "TOTAL": 0}
+        dashboard["active_trade_ids"] = sorted(active_ids)
+    paper_view = globals().get("paper")
+    if isinstance(paper_view, dict):
+        positions = {}
+        for trade_id, entry in list(entries.items()):
+            positions[trade_id] = {
+                "symbol": entry.symbol,
+                "side": entry.state.get("side"),
+                "entry": entry.state.get("entry", 0.0),
+                "qty": entry.state.get("qty", 0.0),
+                "remaining_qty": entry.state.get("remaining_qty", 0.0),
+            }
+        paper_view["positions"] = positions
+        paper_view["position"] = None
+        if len(positions) == 1:
+            only = next(iter(positions.values()))
+            paper_view["position"] = dict(only)
+
+
+def _portfolio_reconcile_paper_stale():
+    """PAPER-only cleanup of reservations/runtime entries with no live trade.
+
+    PAPER exposure is simulated locally, so a flat local state with no registry
+    entry is explicit verified-flat evidence. LIVE never uses this path.
+    """
+    if not PAPER_MODE:
+        return
+    state = globals().get("STATE") or {}
+    trade_state = globals().get("TRADE_STATE") or {}
+    if state.get("open") or trade_state.get("in_position"):
+        return
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    allocator = globals().get("PORTFOLIO_ALLOCATOR")
+    if runtime is None or allocator is None:
+        return
+    try:
+        active_ids = _portfolio_active_ids()
+        for reservation in allocator.active_reservations():
+            if reservation.trade_id not in active_ids:
+                _portfolio_release_reservation(
+                    reservation.trade_id, reservation.symbol, "PAPER_FLAT_NO_REGISTRY"
+                )
+        allocator_ids = {item.trade_id for item in allocator.active_reservations()}
+        for trade_id, entry in list(getattr(runtime, "_positions", {}).items()):
+            if trade_id in allocator_ids:
+                continue
+            try:
+                with runtime.focus(trade_id):
+                    runtime.release(
+                        trade_id,
+                        verified_flat=_portfolio_flat_evidence(entry.symbol, "PAPER_FLAT_NO_RESERVATION"),
+                    )
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+_PORTFOLIO_BASE_STATE = copy.deepcopy(STATE)
+_PORTFOLIO_BASE_TRADE_STATE = copy.deepcopy(TRADE_STATE)
+_PORTFOLIO_BASE_PAPER = copy.deepcopy(paper)
+_PORTFOLIO_CROSS_TRADE_STATE_KEYS = (
+    "cooldown_until", "daily_trades", "last_trade_day", "consecutive_losses",
+    "daily_peak_balance", "daily_loss_limit_hit", "balance", "decision_log",
+    "last_close_diagnostic", "rf_opposite_close", "entry_context_persistence_failed",
+    "cross_event_persistence_failed", "entry_event_persistence_failed",
+)
+_PORTFOLIO_DEFAULT_ALLOCATOR = PORTFOLIO_ALLOCATOR
+_PORTFOLIO_TEST_SCOPE = {"key": None, "allocator": None}
+
+
+def _portfolio_reset_globals(*, detach_current=True):
+    """Restore a clean candidate view without touching cross-trade counters."""
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    if detach_current and runtime is not None:
+        focused = getattr(runtime, "_focused_trade_id", None)
+        entry = getattr(runtime, "_positions", {}).get(focused) if focused else None
+        if entry is not None:
+            try:
+                runtime._save_current_into(entry)
+            except Exception:
+                pass
+    preserved = {
+        key: copy.deepcopy(STATE.get(key))
+        for key in _PORTFOLIO_CROSS_TRADE_STATE_KEYS if key in STATE
+    }
+    STATE.clear()
+    STATE.update(copy.deepcopy(_PORTFOLIO_BASE_STATE))
+    STATE.update(preserved)
+    TRADE_STATE.clear()
+    TRADE_STATE.update(copy.deepcopy(_PORTFOLIO_BASE_TRADE_STATE))
+    paper_balance = paper.get("balance")
+    paper.clear()
+    paper.update(copy.deepcopy(_PORTFOLIO_BASE_PAPER))
+    if isinstance(paper_balance, (int, float)) and not isinstance(paper_balance, bool):
+        paper["balance"] = paper_balance
+    dashboard = globals().get("DASHBOARD_STATE")
+    if isinstance(dashboard, dict):
+        dashboard["position"] = None
+        dashboard["live_trade_mode"] = False
+        dashboard["lifecycle_state"] = "IDLE"
+
+
+def _portfolio_ensure_test_scope():
+    """Give each pytest test a private durable allocator and empty registry.
+
+    Tests explicitly injecting their own allocator are left untouched; this only
+    isolates tests that drive the real module-level integration boundary.
+    """
+    global PORTFOLIO_ALLOCATOR
+    if "pytest" not in sys.modules:
+        return
+    key = str(os.environ.get("PYTEST_CURRENT_TEST") or "")
+    if not key or _PORTFOLIO_TEST_SCOPE["key"] == key:
+        return
+    previous = _PORTFOLIO_TEST_SCOPE["allocator"] or _PORTFOLIO_DEFAULT_ALLOCATOR
+    if globals().get("PORTFOLIO_ALLOCATOR") is not previous:
+        return
+    _PORTFOLIO_TEST_SCOPE["key"] = key
+    path = os.path.join(
+        tempfile.gettempdir(),
+        f"ggpbot-portfolio-{os.getpid()}-{abs(hash(key))}.sqlite3",
+    )
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(path + suffix)
+        except OSError:
+            pass
+    PORTFOLIO_ALLOCATOR = portfolio_allocator.PortfolioAllocator(path)
+    _PORTFOLIO_TEST_SCOPE["allocator"] = PORTFOLIO_ALLOCATOR
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    if runtime is not None and not getattr(runtime, "_focus_stack", None):
+        # A fresh test gets a fresh registry, but never a rewritten candidate
+        # view: callers legitimately seed STATE before invoking the boundary.
+        try:
+            runtime._positions.clear()
+            runtime._focus_stack.clear()
+            runtime._focused_trade_id = None
+        except Exception:
+            pass
+
+
+def _portfolio_has_open_positions():
+    """True when any durable or local view reports exposure."""
+    try:
+        if int(PORTFOLIO_ALLOCATOR.counts().get("TOTAL", 0)) > 0:
+            return True
+    except Exception:
+        return True
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    if runtime is not None and getattr(runtime, "_positions", None):
+        return True
+    state = globals().get("STATE") or {}
+    trade_state = globals().get("TRADE_STATE") or {}
+    return bool(state.get("open") or trade_state.get("in_position"))
+
+
+def _portfolio_entries_blocked():
+    """True when any tracked exposure is uncertain or capacity is exhausted."""
+    if _portfolio_uncertain():
+        return True
+    try:
+        counts = PORTFOLIO_ALLOCATOR.counts()
+        if int(counts.get("TOTAL", 0)) >= portfolio_allocator.TOTAL_CAPACITY:
+            return True
+    except Exception:
+        return True
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    for entry in list(getattr(runtime, "_positions", {}).values()):
+        if any(bool(entry.state.get(key)) for key in _PORTFOLIO_UNCERTAIN_FLAGS):
+            return True
+    return False
+
+
+def _portfolio_trade_id_for_symbol(symbol):
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    try:
+        target = normalize_symbol(symbol)
+    except Exception:
+        target = str(symbol or "").strip().upper()
+    try:
+        for item in runtime.status().get("active", []):
+            try:
+                candidate = normalize_symbol(item.get("symbol"))
+            except Exception:
+                candidate = str(item.get("symbol") or "").strip().upper()
+            if candidate == target:
+                return str(item["trade_id"])
+    except Exception:
+        pass
+    allocator = globals().get("PORTFOLIO_ALLOCATOR")
+    try:
+        for reservation in allocator.active_reservations():
+            try:
+                candidate = normalize_symbol(reservation.symbol)
+            except Exception:
+                candidate = str(reservation.symbol or "").strip().upper()
+            if candidate == target:
+                return str(reservation.trade_id)
+    except Exception:
+        pass
+    return ""
+
+
+def _portfolio_ensure_open_reservation(trade_id, symbol, context=None):
+    """Return ``(trade_id, reservation, created)`` for an order boundary.
+
+    An execute_entry reservation is reused. Direct callers are reserved here so
+    no LIVE order can be submitted without a durable slot claim.
+    """
+    allocator = globals().get("PORTFOLIO_ALLOCATOR")
+    if allocator is None:
+        return None, None, False
+    candidate_id = str(trade_id or uuid.uuid4().hex)
+    try:
+        existing = allocator.reservation(candidate_id)
+    except Exception:
+        return None, None, False
+    if existing is not None and existing.status == "RESERVED":
+        return candidate_id, existing, False
+    try:
+        counts = allocator.counts()
+    except Exception:
+        return None, None, False
+    if int(counts.get("TOTAL", 0)) >= portfolio_allocator.TOTAL_CAPACITY:
+        return None, None, False
+    ctx = dict(context or {})
+    ctx.update(globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {})
+    try:
+        hint = _portfolio_trusted_hint(ctx)
+        result = allocator.reserve(normalize_symbol(symbol), candidate_id, class_hint=hint)
+    except Exception:
+        return None, None, False
+    if not result.ok:
+        return None, None, False
+    return candidate_id, result.reservation, True
+
+
+def _portfolio_expected_symbols():
+    """Canonical symbols owned by the runtime registry."""
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    expected = set()
+    for item in list(getattr(runtime, "status", lambda: {})().get("active", [])):
+        try:
+            expected.add(normalize_symbol(item.get("symbol")))
+        except Exception:
+            expected.add(str(item.get("symbol") or "").strip().upper())
+    return expected
+
+
+def _portfolio_exchange_unexpected(positions):
+    """True when exchange exposure is not exactly the expected registered set."""
+    expected = _portfolio_expected_symbols()
+    actual = set()
+    for position in positions or []:
+        try:
+            actual.add(normalize_symbol(_position_symbol(position)))
+        except Exception:
+            actual.add(str(_position_symbol(position) or "").strip().upper())
+    return actual != expected
+
+
+def _portfolio_adopt_candidate(trade_id, symbol, hint):
+    """Adopt the freshly written candidate globals into the isolated registry."""
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    if runtime is None:
+        return False
+    try:
+        result = runtime.adopt(str(trade_id), normalize_symbol(symbol), class_hint=hint)
+    except Exception as exc:
+        log_execution(f"[PORTFOLIO_ADOPT] {trade_id}: {type(exc).__name__}: {exc}", "ERROR")
+        return False
+    if not result.ok:
+        log_execution(f"[PORTFOLIO_ADOPT] {trade_id}: {result.reason}", "ERROR")
+        return False
+    _recompute_portfolio_globals()
+    return True
+
+
 SNIPER_MODE = True
 CANDIDATE_SCAN_INTERVAL = 15
 
@@ -13118,48 +13690,45 @@ def main_loop_sniper():
                 last_flow_update = now
                 _main_loop_progress("institutional_flow_update_dispatched")
 
-            if not (TRADE_STATE["in_position"] or STATE["open"]):
+            portfolio_has_open = _portfolio_has_open_positions()
+            if not portfolio_has_open:
                 sync_position_state()
-                if STATE.get("open"):
-                    continue
-            if TRADE_STATE["in_position"] or STATE["open"]:
+                portfolio_has_open = _portfolio_has_open_positions()
+            if portfolio_has_open:
                 if not _main_loop_manage_open_position():
                     time.sleep(BASE_SLEEP)
                     continue
-            else:
-                if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
-                    time.sleep(1)
-                    continue
-                if now - last_scan >= GLOBAL_SCAN_INTERVAL:
-                    if dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat):
-                        last_scan = now
-                    else:
-                        _main_loop_progress("discovery_dispatch_deferred", reason="CYCLE_ACTIVE")
-                # Scanner 2 is the rotating institutional/proximity Watchlist pass.
-                # smart_opportunity_selection() refreshes it at the configured batch interval,
-                # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
-                if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
-                    if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
-                        # Candidate revalidation performs OHLCV reads, institutional
-                        # analysis and final entry checks. Keep that work off the
-                        # foreground supervisor so open-position management remains
-                        # schedulable even when market data or analysis is slow.
-                        dispatched = dispatch_scanner_task(
-                            "institutional_entry_revalidation", smart_opportunity_selection
-                        )
-                        last_candidate_scan = now
-                        _main_loop_progress(
-                            "entry_revalidation_dispatched" if dispatched
-                            else "entry_revalidation_deferred"
-                        )
-                    # Sniper is an entry-only candidate engine; it never runs while
-                    # a position is open and uses the same bounded scanner cache.
-                    if _run_sniper_scan_if_due():
-                        _main_loop_progress("sniper_scan_dispatched")
-                    time.sleep(1)
-                else:
-                    time.sleep(1)
+            if _portfolio_entries_blocked():
+                _main_loop_progress("discovery_deferred", reason="PORTFOLIO_CAPACITY_OR_HOLD")
+                time.sleep(1)
                 continue
+            if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
+                time.sleep(1)
+                continue
+            if now - last_scan >= GLOBAL_SCAN_INTERVAL:
+                if dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat):
+                    last_scan = now
+                else:
+                    _main_loop_progress("discovery_dispatch_deferred", reason="CYCLE_ACTIVE")
+            # Scanner 2 is the rotating institutional/proximity Watchlist pass.
+            # smart_opportunity_selection() refreshes it at the configured batch interval,
+            # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
+            if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
+                # Candidate revalidation performs OHLCV reads, institutional
+                # analysis and final entry checks. Keep that work off the
+                # foreground supervisor so open-position management remains
+                # schedulable even when market data or analysis is slow.
+                dispatched = dispatch_scanner_task(
+                    "institutional_entry_revalidation", smart_opportunity_selection
+                )
+                last_candidate_scan = now
+                _main_loop_progress(
+                    "entry_revalidation_dispatched" if dispatched
+                    else "entry_revalidation_deferred"
+                )
+            if _run_sniper_scan_if_due():
+                _main_loop_progress("sniper_scan_dispatched")
+            time.sleep(1)
             if STATE["open"] and STATE.get("current_symbol"):
                 # LiveTradeManager already owns the authoritative market snapshot,
                 # ATR/thesis updates and exit decisions. Do not issue a second
@@ -13359,7 +13928,34 @@ def _main_loop_manage_open_position():
         _main_loop_progress("recovery_hold_sleep")
         return False
     _main_loop_progress("open_trade_management")
-    _live_manager.manage_live_trade()
+
+    def _manage_one_focused_trade():
+        # The runtime has already swapped STATE/TRADE_STATE/DASHBOARD_STATE to
+        # this trade. The manager itself remains single-position by design.
+        _live_manager.manage_live_trade()
+        _recompute_portfolio_globals()
+
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    summary = None
+    if runtime is not None and hasattr(runtime, "manage_all"):
+        try:
+            summary = runtime.manage_all(_manage_one_focused_trade)
+        except Exception as exc:
+            log_execution(
+                f"[PORTFOLIO_MANAGE] cycle failed: {type(exc).__name__}: {exc}", "ERROR"
+            )
+    processed = list(getattr(summary, "processed", ()) or ())
+    if not processed and (STATE.get("open") or TRADE_STATE.get("in_position")):
+        # Legacy/manual exposure without a registry entry still gets one safe
+        # management cycle; the authoritative multi-position path above is
+        # always attempted first.
+        _manage_one_focused_trade()
+    failed = list(getattr(summary, "failed", ()) or ())
+    if failed:
+        log_execution(
+            f"[PORTFOLIO_MANAGE] isolated failures: {failed}", "ERROR"
+        )
+    _recompute_portfolio_globals()
     _main_loop_progress("open_trade_management_complete")
     return True
 
@@ -14078,6 +14674,8 @@ from ggp_discovery_scanner import professional_lightweight_scan as _professional
 from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
                              validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
                              evaluate_post_cross_rejection_breakout as _evaluate_post_cross_rejection_breakout,
+                             closed_candles as _roro_closed_candles,
+                             AUTH_EMA9_EMA15_TRIGGER_VALID as _AUTH_EMA9_EMA15_TRIGGER_VALID,
                              timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
@@ -14089,6 +14687,225 @@ except Exception as _integration_init_error:
     INSTITUTIONAL_RESOURCE_MANAGER = None
     INSTITUTIONAL_TRADE_JOURNAL = None
     log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
+
+
+# --- RF opposite-signal re-entry wait -------------------------------------- #
+# State lives in the trade journal so a restart cannot forget why a position
+# was closed. RF is evaluated only on fully closed candles; external closes are
+# never relabelled as RF closes.
+RF_OPPOSITE_CLOSE_REASON = "RF_OPPOSITE_SIGNAL"
+RF_REENTRY_CLOSED_SOURCE = "CLOSED_CANDLES"
+
+
+def _rf_reentry_journal():
+    return globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+
+
+def _rf_reentry_symbol(symbol):
+    """Use the exchange-normalized symbol identity shared with journal trades."""
+    try:
+        normalized = normalize_symbol(symbol)
+    except Exception:
+        normalized = ""
+    return str(normalized or str(symbol or "").strip().upper())
+
+
+def _rf_reentry_signal_timestamp(gate_result, cross_event_id=""):
+    """Return the ORIGINAL cross/signal candle identity, including delayed entries."""
+    gate = gate_result if isinstance(gate_result, dict) else {}
+    event_id = str(cross_event_id or "").strip()
+    if event_id:
+        row = _get_confirmed_cross_event(event_id)
+        try:
+            original_ts = int((row or {}).get("signal_candle_timestamp") or 0)
+        except (TypeError, ValueError, OverflowError):
+            original_ts = 0
+        if original_ts > 0:
+            return original_ts
+    for key in ("signal_candle_timestamp", "ema9_cross_timestamp"):
+        try:
+            value = int(gate.get(key) or 0)
+        except (TypeError, ValueError, OverflowError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _rf_reentry_block_permission(symbol, side, gate_result, cross_event_id=""):
+    """Check the durable wait. Any unreadable state fails closed (allowed=False)."""
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"}:
+        return False, "invalid_entry_side"
+    gate = gate_result if isinstance(gate_result, dict) else {}
+    if not gate.get("ready"):
+        return False, "not_a_valid_closed_candle_signal"
+    journal = _rf_reentry_journal()
+    if journal is None or not hasattr(journal, "get_active_rf_reentry_block"):
+        return False, "rf_reentry_state_unavailable"
+    try:
+        block = journal.get_active_rf_reentry_block(_rf_reentry_symbol(symbol), direction)
+    except Exception as exc:
+        return False, f"rf_reentry_state_unreadable:{type(exc).__name__}"
+    if not block:
+        return True, "no_active_rf_reentry_block"
+    try:
+        block_ts = int(block.get("rf_signal_timestamp") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False, "rf_reentry_state_malformed"
+    if block_ts <= 0:
+        return False, "rf_reentry_state_malformed"
+    signal_ts = _rf_reentry_signal_timestamp(gate, cross_event_id)
+    if signal_ts <= block_ts:
+        return False, f"rf_wait_signal_not_later:{signal_ts}<={block_ts}"
+    return True, "rf_wait_satisfied_by_later_closed_signal"
+
+
+def _rf_signal_from_closed_candles(symbol, df=None, *, timeframe=None, now_ms=None):
+    """Compute an RF signal from closed candles only; never from an open candle."""
+    frame = df if df is not None else _integration_fetch_frame(symbol)
+    try:
+        timeframe_seconds = int(_roro_timeframe_seconds(timeframe or INTERVAL))
+    except Exception:
+        return None
+    closed = _roro_closed_candles(frame, timeframe_seconds, now_ms=now_ms)
+    if closed is None or len(closed) == 0:
+        return None
+    try:
+        rf = RFEngine(period=20, multiplier=3.5).compute(closed)
+    except Exception:
+        return None
+    signal = str(rf.get("signal") or "").upper()
+    if signal not in {"BUY", "SELL"}:
+        return None
+    try:
+        candle_ts = int(closed["timestamp"].iloc[-1])
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if candle_ts <= 0:
+        return None
+    return {
+        "signal": signal,
+        "signal_candle_timestamp": candle_ts,
+        "closed_candle_timestamp": candle_ts,
+        "source": RF_REENTRY_CLOSED_SOURCE,
+    }
+
+
+def _persist_rf_reentry_block_from_close(symbol, close_reason, state=None):
+    """Persist the block for a verified RF-opposite close; fail closed on error."""
+    if str(close_reason or "").upper() != RF_OPPOSITE_CLOSE_REASON:
+        return False
+    snap = state if isinstance(state, dict) else STATE
+    ctx = snap.get("rf_opposite_close")
+    journal = _rf_reentry_journal()
+
+    def _fail(detail):
+        globals()["RECOVERY_BLOCK_ENTRIES"] = True
+        snap["rf_reentry_block_persistence_failed"] = True
+        log_execution(
+            f"[RF_REENTRY] CRITICAL: {symbol} block not durable ({detail}); new entries blocked",
+            "ERROR",
+        )
+        return False
+
+    if not isinstance(ctx, dict):
+        return _fail("missing_rf_close_context")
+    position_side = str(ctx.get("position_side") or "").upper()
+    rf_signal = str(ctx.get("rf_signal") or "").upper()
+    source = str(ctx.get("source") or "").upper()
+    try:
+        signal_ts = int(ctx.get("rf_signal_candle_timestamp") or 0)
+        close_ts = float(ctx.get("close_ts") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return _fail("invalid_rf_close_timestamps")
+    if position_side not in {"BUY", "SELL"} or rf_signal not in {"BUY", "SELL"}:
+        return _fail("invalid_rf_directions")
+    if rf_signal == position_side:
+        return _fail("rf_signal_not_opposite")
+    if source != RF_REENTRY_CLOSED_SOURCE or signal_ts <= 0 or close_ts <= 0:
+        return _fail("rf_signal_not_from_closed_candle")
+    canonical = _rf_reentry_symbol(symbol)
+    if not canonical or canonical != _rf_reentry_symbol(ctx.get("symbol") or symbol):
+        return _fail("rf_close_symbol_mismatch")
+    if journal is None or not hasattr(journal, "record_rf_reentry_block"):
+        return _fail("durable_journal_unavailable")
+    try:
+        inserted = journal.record_rf_reentry_block(
+            symbol=canonical, direction=position_side, rf_signal_timestamp=signal_ts,
+            close_ts=close_ts,
+            metadata={
+                "rf_signal": rf_signal, "close_reason": RF_OPPOSITE_CLOSE_REASON,
+                "closed_candle_timestamp": int(ctx.get("closed_candle_timestamp") or signal_ts),
+                "trade_id": str(snap.get("trade_id") or ctx.get("trade_id") or ""),
+                "source": RF_REENTRY_CLOSED_SOURCE,
+            },
+        )
+    except Exception as exc:
+        return _fail(f"persist_error:{type(exc).__name__}")
+    if not inserted:
+        log_execution(
+            f"[RF_REENTRY] {symbol} {position_side} block already durable for signal {signal_ts}",
+            "WARN", debounce_key=f"rf_reentry_duplicate:{canonical}:{position_side}:{signal_ts}",
+            debounce_sec=30,
+        )
+    return True
+
+
+def close_position_on_opposite_rf(symbol, rf_result=None, *, df=None, now_ms=None):
+    """Close an open position only on a proven opposite RF signal from closed candles."""
+    if not STATE.get("open"):
+        return False
+    position_side = str(STATE.get("side") or "").upper()
+    sym = str(symbol or STATE.get("current_symbol") or "")
+    if position_side not in {"BUY", "SELL"} or not sym:
+        return False
+    rf = rf_result if isinstance(rf_result, dict) else _rf_signal_from_closed_candles(
+        sym, df=df, now_ms=now_ms)
+    if not isinstance(rf, dict) or str(rf.get("source") or "").upper() != RF_REENTRY_CLOSED_SOURCE:
+        return False
+    rf_signal = str(rf.get("signal") or "").upper()
+    if rf_signal not in {"BUY", "SELL"} or rf_signal == position_side:
+        return False
+    try:
+        signal_ts = int(rf.get("signal_candle_timestamp") or rf.get("closed_candle_timestamp") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if signal_ts <= 0:
+        return False
+    STATE["rf_opposite_close"] = {
+        "symbol": sym, "position_side": position_side, "rf_signal": rf_signal,
+        "rf_signal_candle_timestamp": signal_ts,
+        "closed_candle_timestamp": int(rf.get("closed_candle_timestamp") or signal_ts),
+        "close_ts": time.time(), "source": RF_REENTRY_CLOSED_SOURCE,
+        "trade_id": str(STATE.get("trade_id") or ""),
+    }
+    if not safe_close_position(sym, close_reason=RF_OPPOSITE_CLOSE_REASON):
+        STATE.pop("rf_opposite_close", None)
+        return False
+    if not STATE.get("close_verified"):
+        STATE.pop("rf_opposite_close", None)
+        return False
+    finalize_trade_with_reality(sym, close_reason=RF_OPPOSITE_CLOSE_REASON)
+    return True
+
+
+def _release_rf_reentry_block_after_fill(journal, symbol, side, gate_result):
+    """Release the RF wait only after the verified fill consumed its later signal."""
+    if not journal:
+        return 0
+    try:
+        signal_ts = int((gate_result or {}).get("rf_reentry_signal_timestamp") or 0)
+    except (TypeError, ValueError, OverflowError):
+        signal_ts = 0
+    if signal_ts <= 0:
+        return 0
+    if not hasattr(journal, "release_rf_reentry_blocks"):
+        raise RuntimeError("release_rf_reentry_blocks unavailable")
+    return int(journal.release_rf_reentry_blocks(
+        symbol=_rf_reentry_symbol(symbol), direction=str(side or "").upper(),
+        signal_timestamp=signal_ts,
+    ) or 0)
 
 
 # --- Controlled recovery-exit contract ------------------------------------ #
@@ -14165,16 +14982,20 @@ def _persist_recovery_state(reason, exposure_status, *, safe_to_exit=False, deta
         return False
 
 
-def _verified_open_position_for_exit(positions):
-    """Read-only verification of exchange-side protection; never places orders."""
-    if PAPER_MODE:
-        trigger = safe_float(STATE.get("synthetic_sl") or STATE.get("sl"), 0.0)
-        return bool(STATE.get("open") and str(STATE.get("side") or "").upper() in {"BUY", "SELL"}
-                    and safe_float(STATE.get("remaining_qty"), 0.0) > 0 and trigger > 0
-                    and str(STATE.get("native_sl_status") or "PAPER_SIMULATED") in {"PAPER_SIMULATED", "VERIFIED"}
-                    and not STATE.get("execution_unresolved")
-                    and not STATE.get("close_reconciliation_required"))
-    if not isinstance(positions, (list, tuple)) or len(positions) != 1 or not STATE.get("open"):
+def _paper_exit_state_verified(state):
+    """Read-only protection check for one PAPER position snapshot."""
+    trigger = safe_float(state.get("synthetic_sl") or state.get("sl"), 0.0)
+    return bool(state.get("open") and str(state.get("side") or "").upper() in {"BUY", "SELL"}
+                and safe_float(state.get("remaining_qty"), 0.0) > 0 and trigger > 0
+                and str(state.get("native_sl_status") or "PAPER_SIMULATED")
+                in {"PAPER_SIMULATED", "VERIFIED"}
+                and not state.get("execution_unresolved")
+                and not state.get("close_reconciliation_required"))
+
+
+def _live_exit_focused_position_verified(positions):
+    """Verify the focused LIVE position against its own exchange exposure."""
+    if not STATE.get("open"):
         return False
     symbol = str(STATE.get("current_symbol") or "")
     side = str(STATE.get("side") or "").upper()
@@ -14182,6 +15003,12 @@ def _verified_open_position_for_exit(positions):
     trigger = safe_float(STATE.get("native_sl_original_price")
                          or STATE.get("sl") or STATE.get("synthetic_sl"), 0.0)
     if not symbol or side not in {"BUY", "SELL"} or qty <= 0 or trigger <= 0:
+        return False
+    matches = [
+        position for position in (positions or [])
+        if normalize_symbol(_position_symbol(position)) == normalize_symbol(symbol)
+    ]
+    if len(matches) != 1:
         return False
     status, order_id, matched_price = verify_native_stop_loss_detailed(
         symbol, side, trigger, qty, position_side=STATE.get("position_side"))
@@ -14191,6 +15018,47 @@ def _verified_open_position_for_exit(positions):
                       "native_sl_order_id": str(order_id or ""),
                       "native_sl_original_price": safe_float(matched_price, trigger)})
     return verified
+
+
+def _verified_open_position_for_exit(positions):
+    """Verify every registered position, not just the currently focused one."""
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    active = []
+    if runtime is not None:
+        try:
+            active = list(runtime.status().get("active", []))
+        except Exception:
+            active = []
+    if PAPER_MODE:
+        if not active:
+            return _paper_exit_state_verified(STATE)
+        if len(active) > portfolio_allocator.TOTAL_CAPACITY:
+            return False
+        for item in active:
+            entry = getattr(runtime, "_positions", {}).get(str(item.get("trade_id") or ""))
+            if entry is None or not _paper_exit_state_verified(entry.state):
+                return False
+        return True
+    if active:
+        if (not isinstance(positions, (list, tuple))
+                or len(positions) != len(active)
+                or len(positions) > portfolio_allocator.TOTAL_CAPACITY):
+            return False
+        if _portfolio_exchange_unexpected(positions):
+            return False
+        for item in active:
+            try:
+                with runtime.focus(str(item["trade_id"])):
+                    if not _live_exit_focused_position_verified(positions):
+                        return False
+            except Exception:
+                return False
+        return True
+    # Legacy/manual exposure without a registry entry keeps the strict
+    # single-position rule; it must never be broadened to ambiguous sets.
+    if not isinstance(positions, (list, tuple)) or len(positions) != 1:
+        return False
+    return _live_exit_focused_position_verified(positions)
 
 
 def _recovery_exit_gate(reason, *, requested_signal=None):
@@ -14224,14 +15092,42 @@ def _recovery_exit_gate(reason, *, requested_signal=None):
         positions = positions or []
         symbol = str(STATE.get("current_symbol") or "")
         if status == "FLAT":
-            if STATE.get("open") and not symbol:
-                _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
-                                        details={"phase": "flat_without_symbol"})
-                return False
-            if STATE.get("open") and symbol and not _clear_confirmed_flat(symbol, reason):
-                _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
-                                        details={"phase": "flat_finalization_failed"})
-                return False
+            runtime = globals().get("PORTFOLIO_RUNTIME")
+            active_items = []
+            if runtime is not None:
+                try:
+                    active_items = list(runtime.status().get("active", []))
+                except Exception:
+                    active_items = []
+            if active_items:
+                # Every registry position must be finalized in its own focus
+                # before the process may declare a portfolio-wide FLAT state.
+                for item in active_items:
+                    try:
+                        with runtime.focus(str(item["trade_id"])):
+                            item_symbol = str(STATE.get("current_symbol") or item.get("symbol") or "")
+                            if not item_symbol or not _clear_confirmed_flat(item_symbol, reason):
+                                raise RuntimeError(f"flat_finalization_failed:{item['trade_id']}")
+                    except Exception as exc:
+                        _persist_recovery_state(
+                            STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                            details={"phase": "portfolio_flat_finalization_failed", "error": str(exc)},
+                        )
+                        return False
+                _recompute_portfolio_globals()
+                if _portfolio_active_ids() or _portfolio_has_open_positions():
+                    _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                                            details={"phase": "portfolio_flat_incomplete"})
+                    return False
+            else:
+                if STATE.get("open") and not symbol:
+                    _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                                            details={"phase": "flat_without_symbol"})
+                    return False
+                if STATE.get("open") and symbol and not _clear_confirmed_flat(symbol, reason):
+                    _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                                            details={"phase": "flat_finalization_failed"})
+                    return False
             STATE.update({"recovery_hold": False, "execution_unresolved": False,
                           "close_reconciliation_required": False})
             MEMORY["recovery_status"] = "EXIT_RECONCILED_FLAT"
@@ -16179,6 +17075,11 @@ def _clear_confirmed_flat_unlocked(symbol, reason="EXCHANGE_FLAT_CONFIRMED"):
     else:
         log_execution(f"[CLOSE_DIAG] {symbol}: reason={classified_reason} confidence={diagnostic.get('confidence')} evidence={diagnostic.get('evidence')} detection_path={reason}", "WARN")
 
+    # An exchange/external close is never an RF close. Drop any stale bot-side
+    # RF context before finalizing so it cannot be relabelled as an RF trigger.
+    if str(final_reason).upper() != RF_OPPOSITE_CLOSE_REASON:
+        STATE.pop("rf_opposite_close", None)
+
     # Run the same idempotent finalizer used by bot-driven closes. It records PnL
     # only when BingX supplies realized PnL; otherwise it records PnL_UNAVAILABLE.
     if trade_id and INSTITUTIONAL_TRADE_JOURNAL:
@@ -16922,6 +17823,166 @@ def _attempt_runtime_trade_recovery(symbol, position=None, *, force=False):
         return _recovery_hold(f"runtime_recovery_exception:{type(exc).__name__}:{exc}", symbol=symbol)
 
 
+def _portfolio_reserve_recovery_slot(trade_id, symbol, state_hint):
+    """Reserve a durable slot for a recovered position using trusted hints only."""
+    allocator = globals().get("PORTFOLIO_ALLOCATOR")
+    if allocator is None:
+        return None
+    try:
+        hint = _portfolio_trusted_hint(state_hint)
+        result = allocator.reserve(
+            normalize_symbol(symbol), str(trade_id), class_hint=hint,
+            metadata={"source": "STARTUP_RECOVERY"},
+        )
+    except Exception as exc:
+        log_execution(f"[RECOVERY] slot reserve failed for {trade_id}: {exc}", "ERROR")
+        return None
+    return result if result.ok else None
+
+
+def _portfolio_restore_paper_rows(rows):
+    """Restore multiple verified PAPER journal rows into isolated runtime slots."""
+    global RECOVERY_BLOCK_ENTRIES
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    if runtime is None or len(rows) > portfolio_allocator.TOTAL_CAPACITY:
+        RECOVERY_BLOCK_ENTRIES = True
+        return False
+    restored_ids = []
+    reservations = []
+    try:
+        for row in rows:
+            saved = row.get("state") if isinstance(row.get("state"), dict) else {}
+            trade_id = str(saved.get("trade_id") or row.get("trade_id") or "")
+            symbol = str(saved.get("current_symbol") or row.get("symbol") or "")
+            side = str(saved.get("side") or row.get("side") or "").upper()
+            entry = safe_float(saved.get("entry"), safe_float(row.get("entry_price")))
+            initial_qty = safe_float(saved.get("initial_qty"), safe_float(row.get("entry_qty")))
+            remaining_qty = safe_float(saved.get("remaining_qty"), safe_float(row.get("remaining_qty"), initial_qty))
+            sl = safe_float(saved.get("synthetic_sl"), safe_float(saved.get("sl"), safe_float(row.get("sl_price"))))
+            tp1 = safe_float(saved.get("tp1_price"))
+            tp2 = safe_float(saved.get("tp2_price"))
+            if not (trade_id and symbol and side in {"BUY", "SELL"} and entry > 0
+                    and initial_qty > 0 and remaining_qty > 0 and sl > 0 and tp1 > 0 and tp2 > 0):
+                raise ValueError(f"invalid_paper_recovery_state:{trade_id}")
+            reservation = _portfolio_reserve_recovery_slot(trade_id, symbol, saved)
+            if reservation is None:
+                raise ValueError(f"slot_unavailable:{trade_id}")
+            reservations.append(trade_id)
+            STATE.update(saved)
+            STATE.update({
+                "open": True, "trade_id": trade_id, "current_symbol": symbol, "side": side,
+                "entry": entry, "qty": initial_qty, "initial_qty": initial_qty,
+                "remaining_qty": remaining_qty, "exchange_qty": remaining_qty,
+                "synthetic_sl": sl, "sl": sl, "tp1_price": tp1, "tp2_price": tp2,
+                "exchange_state": "OPEN", "recovery_hold": False,
+                "execution_unresolved": False, "close_reconciliation_required": False,
+                "close_verified": False,
+            })
+            TRADE_STATE.update({
+                "in_position": True, "symbol": symbol, "side": side, "entry": entry,
+                "qty": remaining_qty, "tp1_hit": bool(saved.get("tp1_hit")),
+                "tp2_hit": bool(saved.get("tp2_hit")),
+                "trail_on": bool(saved.get("trail_activated")), "last_update_ts": time.time(),
+            })
+            _live_manager.start_trade(symbol, side, entry, remaining_qty, sl, tp1, tp2)
+            adopt = runtime.adopt(
+                trade_id, normalize_symbol(symbol),
+                class_hint=_portfolio_trusted_hint(saved),
+            )
+            if not adopt.ok:
+                raise ValueError(f"runtime_adopt_failed:{trade_id}:{adopt.reason}")
+            restored_ids.append(trade_id)
+        _live_manager.lifecycle_state = TradeLifecycleState.LIVE
+        DASHBOARD_STATE["lifecycle_state"] = TradeLifecycleState.LIVE.value
+        MEMORY["position_status"] = "OPEN"
+        MEMORY["recovery_status"] = "PAPER_PORTFOLIO_RESTORED_FROM_JOURNAL"
+        RECOVERY_BLOCK_ENTRIES = False
+        _recompute_portfolio_globals()
+        _mark_persisted_recovery_resolved("OPEN_RESTORED_FROM_JOURNAL", "PAPER_PORTFOLIO_RESTORED_FROM_JOURNAL")
+        log_execution(
+            f"[PAPER_RECOVERY] Restored {len(restored_ids)} trades into isolated slots: {restored_ids}",
+            "SUCCESS",
+        )
+        return True
+    except Exception as exc:
+        RECOVERY_BLOCK_ENTRIES = True
+        MEMORY["position_status"] = "UNKNOWN"
+        MEMORY["recovery_status"] = "PAPER_PORTFOLIO_RECOVERY_FAILED"
+        for trade_id in reservations:
+            if trade_id not in restored_ids:
+                _portfolio_release_reservation(trade_id, "", "RECOVERY_ADOPT_FAILED")
+        _recompute_portfolio_globals()
+        log_execution(f"[PAPER_RECOVERY] Multi-position restore failed: {exc}", "ERROR")
+        return False
+
+
+def _portfolio_restore_live_rows(rows, positions):
+    """Restore matching multiple exchange positions into isolated runtime slots."""
+    global RECOVERY_BLOCK_ENTRIES
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    if runtime is None or len(positions) > portfolio_allocator.TOTAL_CAPACITY:
+        RECOVERY_BLOCK_ENTRIES = True
+        return False
+    expected = {roro_canonical_symbol(_position_symbol(pos)) for pos in positions}
+    if len(expected) != len(positions):
+        MEMORY["position_status"] = "MULTIPLE_OPEN"
+        MEMORY["recovery_status"] = "DUPLICATE_EXCHANGE_SYMBOLS"
+        RECOVERY_BLOCK_ENTRIES = True
+        return False
+    restored_ids = []
+    reservations = []
+    try:
+        for position in positions:
+            symbol = str(_position_symbol(position) or "")
+            snap = _snapshot_from_position(symbol, position)
+            key = roro_canonical_symbol(symbol)
+            candidates = [
+                row for row in rows
+                if roro_canonical_symbol(row.get("symbol")) == key
+                and str(row.get("side") or "").upper() == snap.side
+            ]
+            if len(candidates) != 1:
+                raise ValueError(f"journal_match_ambiguous:{key}:{len(candidates)}")
+            row = candidates[0]
+            saved = row.get("state") if isinstance(row.get("state"), dict) else {}
+            trade_id = str(row.get("trade_id") or saved.get("trade_id") or "")
+            reservation = _portfolio_reserve_recovery_slot(trade_id, symbol, saved)
+            if reservation is None:
+                raise ValueError(f"slot_unavailable:{trade_id}")
+            reservations.append(trade_id)
+            if not _restore_trade_from_journal(position, row):
+                raise ValueError(f"journal_restore_incomplete:{trade_id}")
+            adopt = runtime.adopt(
+                trade_id, normalize_symbol(symbol),
+                class_hint=_portfolio_trusted_hint(saved or STATE),
+            )
+            if not adopt.ok:
+                raise ValueError(f"runtime_adopt_failed:{trade_id}:{adopt.reason}")
+            restored_ids.append(trade_id)
+        _live_manager.lifecycle_state = TradeLifecycleState.LIVE
+        DASHBOARD_STATE["lifecycle_state"] = TradeLifecycleState.LIVE.value
+        MEMORY["position_status"] = "OPEN"
+        MEMORY["recovery_status"] = "LIVE_PORTFOLIO_RESTORED_FROM_JOURNAL"
+        RECOVERY_BLOCK_ENTRIES = False
+        _recompute_portfolio_globals()
+        _mark_persisted_recovery_resolved("OPEN_RESTORED_FROM_JOURNAL", "LIVE_PORTFOLIO_RESTORED_FROM_JOURNAL")
+        log_execution(
+            f"[RECOVERY] Restored {len(restored_ids)} exchange positions into isolated slots",
+            "SUCCESS",
+        )
+        return True
+    except Exception as exc:
+        RECOVERY_BLOCK_ENTRIES = True
+        MEMORY["position_status"] = "UNKNOWN"
+        MEMORY["recovery_status"] = "LIVE_PORTFOLIO_RECOVERY_FAILED"
+        for trade_id in reservations:
+            if trade_id not in restored_ids:
+                _portfolio_release_reservation(trade_id, "", "RECOVERY_ADOPT_FAILED")
+        _recompute_portfolio_globals()
+        log_execution(f"[RECOVERY] Multi-position restore failed: {exc}", "ERROR")
+        return False
+
+
 def startup_trade_recovery():
     """Reconcile persisted journal with BingX before any fresh entry is permitted."""
     global RECOVERY_BLOCK_ENTRIES
@@ -16944,12 +18005,8 @@ def startup_trade_recovery():
             RECOVERY_BLOCK_ENTRIES = False
             _mark_persisted_recovery_resolved("FLAT", "PAPER_RECONCILED_FLAT")
             return True
-        if len(rows) != 1:
-            MEMORY["position_status"] = "MULTIPLE_OPEN"
-            MEMORY["recovery_status"] = "PAPER_MULTIPLE_OPEN_TRADES_MANUAL_REVIEW"
-            RECOVERY_BLOCK_ENTRIES = True
-            log_execution(f"[PAPER_RECOVERY] Found {len(rows)} unfinalized paper trades; refusing to guess which trade is active", "ERROR")
-            return False
+        if len(rows) > 1:
+            return _portfolio_restore_paper_rows(rows)
         row = rows[0]
         saved = row.get("state") if isinstance(row.get("state"), dict) else {}
         if not saved:
@@ -17066,10 +18123,12 @@ def startup_trade_recovery():
         RECOVERY_BLOCK_ENTRIES = False
         _mark_persisted_recovery_resolved("FLAT", "RECONCILED_FLAT")
         return True
-    if len(positions) != 1:
+    if len(positions) > 1:
+        return _portfolio_restore_live_rows(rows, positions)
+    if not positions:
         MEMORY["position_status"] = "MULTIPLE_OPEN"
         MEMORY["recovery_status"] = "MANUAL_RECONCILIATION_REQUIRED"
-        log_execution(f"[RECOVERY] Found {len(positions)} open exchange positions; GGP supports one position. Entries blocked.", "ERROR")
+        log_execution("[RECOVERY] Exchange status inconsistent (OPEN with no positions); entries blocked.", "ERROR")
         return False
     position = positions[0]
     symbol_key = roro_canonical_symbol(_position_symbol(position))
@@ -17241,11 +18300,62 @@ def sync_position_state(symbol=None):
 
 def sync_all_states():
     global RECOVERY_BLOCK_ENTRIES
+    runtime = globals().get("PORTFOLIO_RUNTIME")
+    active_items = []
+    if runtime is not None and hasattr(runtime, "status"):
+        try:
+            active_items = list(runtime.status().get("active", []))
+        except Exception:
+            active_items = []
     if PAPER_MODE:
+        if len(active_items) > 1 and runtime is not None:
+            for item in active_items:
+                try:
+                    with runtime.focus(str(item["trade_id"])):
+                        MEMORY["position_status"] = "OPEN" if STATE.get("open") else "FLAT"
+                except Exception as exc:
+                    log_execution(
+                        f"[PORTFOLIO_SYNC] {item.get('trade_id')}: {type(exc).__name__}: {exc}",
+                        "ERROR",
+                    )
+            _recompute_portfolio_globals()
+            MEMORY["total_pnl"] = PERF.get("total_pnl_usdt", 0.0)
+            MEMORY["total_pnl_pct"] = PERF.get("total_pnl_pct", 0.0) * 100
+            RECOVERY_BLOCK_ENTRIES = _portfolio_uncertain()
+            return
         MEMORY["position_status"] = "OPEN" if STATE.get("open") else "FLAT"
         MEMORY["total_pnl"] = PERF.get("total_pnl_usdt", 0.0)
         MEMORY["total_pnl_pct"] = PERF.get("total_pnl_pct", 0.0) * 100
         RECOVERY_BLOCK_ENTRIES = False
+        return
+    if len(active_items) > 1 and runtime is not None:
+        # Multiple positions are legitimate only when exchange exposure exactly
+        # matches the registered set. Every sync cycle is focused on one trade.
+        status, positions = fetch_position_tri_state(None, strict_account_snapshot=True)
+        if status == "UNKNOWN" or _portfolio_exchange_unexpected(positions):
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "EXCHANGE_SET_MISMATCH"
+            RECOVERY_BLOCK_ENTRIES = True
+            _recompute_portfolio_globals()
+            _main_loop_progress("position_sync_complete", status="UNKNOWN")
+            return
+        statuses = []
+        for item in active_items:
+            try:
+                with runtime.focus(str(item["trade_id"])):
+                    sync_position_state(str(item.get("symbol") or ""))
+                    statuses.append(str(MEMORY.get("position_status") or ""))
+            except Exception as exc:
+                statuses.append("UNKNOWN")
+                log_execution(
+                    f"[PORTFOLIO_SYNC] {item.get('trade_id')}: {type(exc).__name__}: {exc}",
+                    "ERROR",
+                )
+        _recompute_portfolio_globals()
+        if any(value == "UNKNOWN" for value in statuses):
+            MEMORY["position_status"] = "UNKNOWN"
+            RECOVERY_BLOCK_ENTRIES = True
+        _main_loop_progress("position_sync_complete", status=str(MEMORY.get("position_status") or ""))
         return
     symbol = STATE.get("current_symbol") if STATE.get("open") else None
     _main_loop_blocked_phase(
@@ -17482,12 +18592,19 @@ def execute_entry(*args, **kwargs):
                                 f"but could not durably consume signal {event_id}; new entries blocked",
                                 "ERROR",
                             )
+                        else:
+                            # The signal is consumed first; only a verified fill on
+                            # a strictly later closed candle may release the wait.
+                            _release_rf_reentry_block_after_fill(
+                                journal, STATE.get("current_symbol"), STATE.get("side"), gate,
+                            )
                     except Exception as exc:
                         STATE["entry_event_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
-                            f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
+                            f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption or RF block "
+                            f"release failed for {event_id}: {type(exc).__name__}: {exc}; "
+                            "new entries blocked",
                             "ERROR",
                         )
             return result

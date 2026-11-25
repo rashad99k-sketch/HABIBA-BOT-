@@ -25,7 +25,8 @@ from ggp_profit_brain import (
 )
 from ggpbot import TradeDecisionType
 from roro_confluence import (
-    evaluate_post_cross_rejection_breakout, validate_dual_ema_vwap_entry_gate,
+    AUTH_EMA9_EMA15_TRIGGER_VALID, evaluate_post_cross_rejection_breakout,
+    validate_dual_ema_vwap_entry_gate,
 )
 from roro_trade_journal import TradeJournal
 
@@ -46,7 +47,7 @@ def _ema(series, period):
 
 
 def _cross_frame(side="BUY"):
-    """A real closed-candle EMA9/Session-VWAP cross with 80 valid bars."""
+    """A real closed-candle EMA9/EMA15 cross with Session VWAP confirmation."""
     n = BASE_BARS
     closes = 99.0 + (-0.01 if side == "BUY" else 0.01) * np.arange(n)
     closes[-1] = closes[-2] + (4.0 if side == "BUY" else -4.0)
@@ -136,7 +137,7 @@ def _payload(event_id="BTC:15m:BUY:1795203900000", expires_ts=None):
         "expires_ts": expires_ts if expires_ts is not None else time.time() + 14_400.0,
         "metadata": {
             "ready": True,
-            "authorization_state": "EMA9_TRIGGER_VALID",
+            "authorization_state": AUTH_EMA9_EMA15_TRIGGER_VALID,
             "detection_method": "validate_dual_ema_vwap_entry_gate",
             "lookback_candles": 2,
         },
@@ -385,7 +386,10 @@ def test_supplementary_scanner_rows_cannot_create_cross_events(tmp_path, monkeyp
     frame = _cross_frame("BUY")
     gate = _gate(frame, "BUY")
     assert gate["ready"] is True
-    assert gate["authorization_state"] == "EMA9_TRIGGER_VALID"
+    assert gate["trigger"] == "EMA9_EMA15"
+    assert gate["ema9_15_cross"] == "BULLISH"
+    assert gate["ema9_15_cross_timestamp"] == gate["signal_candle_timestamp"]
+    assert gate["authorization_state"] == AUTH_EMA9_EMA15_TRIGGER_VALID
     monkeypatch.setattr(ggpbot.time, "time", lambda: NOW_SEC)
     monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame)
 

@@ -14,6 +14,7 @@ import pytest
 import ggpbot
 import ggp_institutional_bridge as bridge
 import naiso_unified_decision as proj
+from roro_confluence import AUTH_EMA9_EMA15_TRIGGER_VALID
 from roro_trade_journal import TradeJournal
 from test_cross_driven_discovery_integration import (
     CANONICAL,
@@ -104,6 +105,37 @@ def test_cross_state_matrix(record, proximity, expected, authoritative, stage):
     if out["role"] == proj.RANKING_ONLY_ROLE:
         assert out["durable_event"] is False
         assert out["authoritative"] is False
+
+
+def test_ema9_ema15_authorization_state_is_recognized_as_observation():
+    out = proj.classify_cross_state({}, gate={
+        "ready": True,
+        "authorization_state": AUTH_EMA9_EMA15_TRIGGER_VALID,
+        "ema9_cross": "BULLISH",
+    }, now_ts=FIXED_NOW)
+    assert out["cross_state"] == "CONFIRMED_BUY_CROSS"
+    assert out["reason"] == "observation_only_durable_event_required"
+    assert out["durable_event"] is False
+    assert out["authoritative"] is False
+
+
+def test_stale_legacy_authorization_state_stays_non_authoritative():
+    out = proj.classify_cross_state({}, gate={
+        "ready": True,
+        "authorization_state": "EMA9_TRIGGER_VALID",
+        "ema9_cross": "BULLISH",
+    }, now_ts=FIXED_NOW)
+    assert out["durable_event"] is False
+    assert out["authoritative"] is False
+
+
+def test_unready_ema15_authorization_is_not_confirmed():
+    out = proj.classify_cross_state({"side": "BUY"}, gate={
+        "ready": False,
+        "authorization_state": AUTH_EMA9_EMA15_TRIGGER_VALID,
+    }, now_ts=FIXED_NOW)
+    assert out["cross_state"] == "NO_CROSS"
+    assert out["authoritative"] is False
 
 
 def test_expired_synced_memory_cross_is_not_authoritative():
