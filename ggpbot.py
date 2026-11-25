@@ -1043,7 +1043,9 @@ ex = ccxt.bingx({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "timeout": _env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 60000),
+    # Keep one-shot foreground reconciliation reads bounded below the
+    # watchdog grace window; slow reads become UNKNOWN and retry next cycle.
+    "timeout": _env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 15000),
     "options": {"defaultType": "swap"}
 })
 
