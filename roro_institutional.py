@@ -50,6 +50,9 @@ class InstitutionalDecision:
     invalidation_level: Optional[float] = None
     structural_stop: Optional[float] = None
     score: float = 0.0
+    # Exact validated zone that produced the post-structure retest. None means
+    # no execution-ready location was selected.
+    entry_zone: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -481,7 +484,8 @@ class ReversalEngine:
         )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, setup_name, side,
                                      "reversal_sequence_confirmed", evidence + (zone_trace,), (),
-                                     location_event_id, ts, level, stop, min(100.0, score))
+                                     location_event_id, ts, level, stop, min(100.0, score),
+                                     entry_zone=selected_zone or None)
 
 
 class ContinuationEngine:
@@ -685,7 +689,8 @@ class ContinuationEngine:
         )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, "TREND_CONTINUATION_RETEST", side,
                                      "continuation_sequence_confirmed", evidence + (zone_trace,), (),
-                                     location_event_id, ts, broken_level, stop, min(100.0, score))
+                                     location_event_id, ts, broken_level, stop, min(100.0, score),
+                                     entry_zone=selected_zone or None)
 
 
 class UnifiedEntryAuthority:
