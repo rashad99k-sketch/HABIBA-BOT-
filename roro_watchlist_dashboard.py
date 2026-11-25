@@ -67,7 +67,8 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
         missing_stop = readiness.get("missing")
         stop_default = (
             "missing_or_non_positive"
-            if isinstance(missing_stop, (list, tuple)) and "STRUCTURAL_STOP_UNKNOWN" in missing_stop
+            if row.get("structural_stop") is None
+            or (isinstance(missing_stop, (list, tuple)) and "STRUCTURAL_STOP_UNKNOWN" in missing_stop)
             else "invalid_or_unverified" if readiness.get("sl_valid") is False
             else "UNSPECIFIED"
         )
