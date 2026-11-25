@@ -258,6 +258,10 @@ def test_bingx_public_market_reads_share_documented_one_second_ip_pacing():
         ggpbot._API_METHOD_MIN_INTERVALS[name] >= 1.0
         for name in expected
     )
+    assert ggpbot._API_METHOD_MIN_INTERVALS["create_order"] >= 1.0
+    assert ggpbot._API_METHOD_MIN_INTERVALS["cancel_order"] >= 1.0
+    assert ggpbot._API_METHOD_MIN_INTERVALS["set_leverage"] >= 0.5
+    assert ggpbot._API_METHOD_MIN_INTERVALS["set_margin_mode"] >= 0.5
 
 
 def _valid_ohlcv_rows(count=100):
