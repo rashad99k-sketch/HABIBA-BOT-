@@ -470,13 +470,20 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 side = str(item.get("side_hint") or implied_side or "").upper()
             if side in {"BUY", "SELL"}:
                 entry["sides"].add(side)
-            # A durable EMA9/VWAP event carries its own immutable direction.
-            # Keep that direction separate from soft scanner hints so the
-            # institutional analyzer cannot select the opposite hypothesis
-            # and accidentally inherit this event identity.
+            # Durable cross identity belongs exclusively to the journal feed.
+            # Scanner hints (or stale projections copied into scanner rows) may
+            # never create, replace, or conflict with an authoritative event.
             if source == "confirmed_cross_events" and item.get("cross_event_id"):
+                entry.setdefault("cross_event_conflict", False)
+                event_status = str(
+                    item.get("cross_event_status")
+                    or item.get("status")
+                    or item.get("cross_event_lifecycle_status")
+                    or item.get("lifecycle_status")
+                    or "ACTIVE"
+                ).upper()
                 event_side = str(item.get("side") or "").upper()
-                if event_side in {"BUY", "SELL"}:
+                if event_status == "ACTIVE" and event_side in {"BUY", "SELL"}:
                     existing_event_id = str(entry.get("cross_event_id") or "")
                     incoming_event_id = str(item.get("cross_event_id") or "")
                     existing_event_side = str(entry.get("cross_event_side") or "").upper()
@@ -516,7 +523,7 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             if "/" in original:
                 entry["exchange_symbol"] = exchange
             for k, v in item.items():
-                if k in {"symbol", "side", "rf_signal", "score"}:
+                if k in {"symbol", "side", "rf_signal", "score"} or k.startswith("cross_event_"):
                     continue
                 if k not in entry or entry[k] in (None, "", "UNKNOWN"):
                     entry[k] = v
