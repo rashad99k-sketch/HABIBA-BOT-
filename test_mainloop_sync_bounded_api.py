@@ -245,3 +245,15 @@ def test_scheduler_contention_is_not_classified_as_exchange_failure():
     )
     assert failure.kind == "LOCAL_SCHEDULER_CONTENTION"
     assert failure.retryable is False
+
+
+def test_bingx_public_market_reads_share_documented_one_second_ip_pacing():
+    expected = {
+        "fetch_ohlcv", "fetch_order_book", "fetch_trades", "fetch_ticker",
+        "fetch_tickers", "fetch_bids_asks", "fetch_funding_rate_history", "fetch_markets",
+    }
+    assert expected.issubset(set(ggpbot._API_METHOD_MIN_INTERVALS))
+    assert all(
+        ggpbot._API_METHOD_MIN_INTERVALS[name] >= 1.0
+        for name in expected
+    )
