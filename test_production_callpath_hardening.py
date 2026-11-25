@@ -393,3 +393,26 @@ def test_verified_flat_snapshot_releases_only_a_resolved_local_state(monkeypatch
     assert ggpbot.STATE["recovery_hold"] is False
     assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
     assert ggpbot.MEMORY["position_status"] == "FLAT"
+
+
+def test_entry_producing_scanner_tasks_share_one_single_flight_lock(monkeypatch):
+    import threading
+
+    shared = threading.Lock()
+    shared.acquire()
+    monkeypatch.setattr(ggpbot, "_ENTRY_DISCOVERY_TASK_LOCK", shared)
+    monkeypatch.setattr(ggpbot, "_SCANNER_TASKS_LOCK", threading.Lock())
+    monkeypatch.setattr(ggpbot, "_SCANNER_TASK_LOCKS", {})
+
+    assert ggpbot.dispatch_scanner_task("sniper_v2", lambda: None) is False
+    assert "sniper_v2" in ggpbot._SCANNER_TASK_LOCKS
+    assert ggpbot._SCANNER_TASK_LOCKS["sniper_v2"].locked() is False
+    assert shared.locked() is True
+    shared.release()
+
+
+def test_manual_entry_does_not_reuse_a_scanner_global_context():
+    source = inspect.getsource(ggpbot.manual_trade)
+    assert '_ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)' in source
+    assert 'globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = None' in source
+    assert 'previous_entry_context' in source
