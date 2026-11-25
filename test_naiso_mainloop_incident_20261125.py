@@ -8,6 +8,7 @@ threshold changes are involved.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -1070,3 +1071,63 @@ def test_closed_frame_validator_filters_only_the_still_open_candle():
     closed = validate_closed_frame(frame, now_ms=now_ms, timeframe_s=900)
     assert len(closed) == 59
     assert int(closed.timestamp.iloc[-1]) == int(frame.timestamp.iloc[-2])
+
+
+def test_dashboard_uses_single_process_waitress_and_closes_cleanly(monkeypatch):
+    created = []
+
+    class FakeServer:
+        def __init__(self, app, host, port, threads):
+            self.app = app
+            self.host = host
+            self.port = port
+            self.threads = threads
+            self.closed = False
+
+        def run(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class FakeThread:
+        def __init__(self, target, daemon, name):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.started = False
+            self.joined = False
+
+        def start(self):
+            self.started = True
+
+        def join(self, timeout=None):
+            self.joined = True
+
+    def fake_create_server(app, host, port, threads):
+        server = FakeServer(app, host, port, threads)
+        created.append(server)
+        return server
+
+    monkeypatch.setitem(sys.modules, "waitress", SimpleNamespace(create_server=fake_create_server))
+    monkeypatch.setattr(ggpbot, "threading", SimpleNamespace(Thread=FakeThread))
+    monkeypatch.setattr(ggpbot, "DASHBOARD_SERVERS", [])
+    monkeypatch.setattr(ggpbot, "DASHBOARD_ACTIVE_PORTS", [])
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setenv("PORT", "8080")
+
+    assert ggpbot.start_dashboard_servers() == [8080]
+    assert len(created) == 1
+    server, thread = ggpbot.DASHBOARD_SERVERS[0]
+    assert server is created[0]
+    assert server.app is ggpbot.app
+    assert server.host == "0.0.0.0"
+    assert server.port == 8080
+    assert server.threads == 8
+    assert thread.target == server.run
+    assert thread.started is True
+
+    ggpbot._stop_runtime_services()
+    assert server.closed is True
+    assert thread.joined is True
