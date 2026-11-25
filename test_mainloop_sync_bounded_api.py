@@ -146,3 +146,30 @@ def test_exchange_timeout_configuration_has_a_hard_15_second_ceiling(monkeypatch
     monkeypatch.setenv("EXCHANGE_HTTP_TIMEOUT_MS", "60000")
     bounded = ggpbot._env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 15000)
     assert bounded == 15000
+
+
+def test_digitalocean_app_platform_identity_is_accepted_as_supervisor(monkeypatch):
+    import threading
+
+    monkeypatch.delenv("RENDER", raising=False)
+    monkeypatch.delenv("RENDER_SERVICE_ID", raising=False)
+    monkeypatch.delenv("RENDER_INSTANCE_ID", raising=False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("APP_ID", "digitalocean-app-test")
+    monkeypatch.delenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", raising=False)
+    monkeypatch.setattr(
+        ggpbot, "_main_loop_owner",
+        lambda: {"thread_id": threading.current_thread().ident,
+                 "thread_name": "MainThread", "registered": True},
+    )
+    monkeypatch.setattr(ggpbot, "_main_loop_owner_alive", lambda: True)
+    monkeypatch.setattr(ggpbot, "_recovery_exit_gate", lambda _reason: True)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_args, **_kwargs: None)
+    exits = []
+    monkeypatch.setattr(ggpbot.os, "_exit", lambda code: exits.append(code))
+
+    context = {}
+    assert ggpbot._restart_main_loop_process_after_stall(context) is True
+    assert context["process_supervisor_detected"] is True
+    assert context["process_supervisor_kind"] == "DIGITALOCEAN_APP_PLATFORM"
+    assert exits == [ggpbot.EXIT_RECOVERY_EXHAUSTED]
