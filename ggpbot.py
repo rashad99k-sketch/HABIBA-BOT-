@@ -16987,13 +16987,23 @@ def sync_all_states():
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]
-                if STATE.get("execution_unresolved") and STATE.get("entry_client_order_id") and not STATE.get("entry_order_terminal"):
-                    terminal, order_status = _cancel_and_verify_entry_order_terminal(
-                        str(_position_symbol(position)),
-                        STATE.get("entry_exchange_order_id"),
-                        STATE.get("entry_client_order_id"),
-                        cancel_if_open=False,
-                    )
+                entry_order_unresolved = bool(
+                    STATE.get("execution_unresolved")
+                    and str(STATE.get("entry_execution_state") or "").upper() in {
+                        "EXECUTION_UNCERTAIN", "PARTIAL_FILL", "ENTRY_PRICE_UNKNOWN", "PROTECTION_HOLD",
+                    }
+                    and not STATE.get("entry_order_terminal")
+                )
+                if entry_order_unresolved:
+                    if STATE.get("entry_client_order_id") or STATE.get("entry_exchange_order_id"):
+                        terminal, order_status = _cancel_and_verify_entry_order_terminal(
+                            str(_position_symbol(position)),
+                            STATE.get("entry_exchange_order_id"),
+                            STATE.get("entry_client_order_id"),
+                            cancel_if_open=False,
+                        )
+                    else:
+                        terminal, order_status = False, "ENTRY_ORDER_ID_UNAVAILABLE"
                     if terminal:
                         STATE["entry_order_terminal"] = True
                         STATE["entry_order_status"] = order_status
