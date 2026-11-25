@@ -603,16 +603,54 @@ class ContinuationEngine:
             pullback_type = None
             retest_zone = None
             retest_zone_ts = None
-        if retest_idx is None and not context.get("location_first_required"):
-            # Legacy micro-pullback fallback remains available only outside strict location-first mode.
+        if retest_idx is None and zones:
+            # Strict location-first mode may use a genuine micro-pullback without
+            # requiring a full OB/FVG retest, but a fresh validated directional
+            # location must still exist nearby. The micro structure itself must
+            # remain shallow, protected, brief and quieter than the impulse.
             begin = max(bos_idx + 1, len(x) - 4)
             segment = x.iloc[begin:-1]
-            if len(segment) >= 1:
-                counter = all((float(c.close) <= float(c.open) if bullish else float(c.close) >= float(c.open)) and abs(float(c.close)-float(c.open)) <= 0.45 * atr for _, c in segment.iterrows())
-                protected = min(float(v) for v in x.low.iloc[begin:-1]) > float(x.low.iloc[bos_idx]) if bullish else max(float(v) for v in x.high.iloc[begin:-1]) < float(x.high.iloc[bos_idx])
-                trigger = (float(last.close) > float(x.high.iloc[-2]) and float(last.close) > float(last.open)) if bullish else (float(last.close) < float(x.low.iloc[-2]) and float(last.close) < float(last.open))
-                if counter and protected and trigger:
+            if 1 <= len(segment) <= 3:
+                counter = all(
+                    (float(c.close) <= float(c.open) if bullish else float(c.close) >= float(c.open))
+                    and abs(float(c.close) - float(c.open)) <= 0.45 * atr
+                    for _, c in segment.iterrows()
+                )
+                protected = (
+                    min(float(v) for v in segment.low) > float(x.low.iloc[bos_idx])
+                    if bullish else max(float(v) for v in segment.high) < float(x.high.iloc[bos_idx])
+                )
+                impulse_high = float(x.high.iloc[bos_idx:-1].max())
+                impulse_low = float(x.low.iloc[bos_idx:-1].min())
+                pullback_low = float(segment.low.min())
+                pullback_high = float(segment.high.max())
+                pullback_depth_atr = (
+                    (impulse_high - pullback_low) / atr
+                    if bullish else (pullback_high - impulse_low) / atr
+                )
+                pullback_volume = float(segment.volume.mean())
+                micro_volume_ok = pullback_volume <= max(float(x.volume.iloc[bos_idx]) * 0.85, 0.0)
+                trigger = (
+                    float(last.close) > float(x.high.iloc[-2]) and float(last.close) > float(last.open)
+                    if bullish else
+                    float(last.close) < float(x.low.iloc[-2]) and float(last.close) < float(last.open)
+                )
+                if counter and protected and 0 < pullback_depth_atr <= 0.65 and micro_volume_ok and trigger:
                     retest_idx, pullback_type, retest_zone = len(x) - 2, "MICRO_PULLBACK", "MICRO_STRUCTURE"
+                    # Keep the nearest validated institutional location as context;
+                    # it is not falsely marked as a zone retest.
+                    nearest_zone = min(
+                        zones,
+                        key=lambda z: max(float(z[0]) - float(last.close), 0.0, float(last.close) - float(z[1])),
+                    )
+                    zlow, zhigh, zname, available_ts = nearest_zone
+                    retest_zone_ts = available_ts
+                    selected_zone = _zone_metadata_for_retest(
+                        context, side, zname, available_ts, zlow, zhigh
+                    )
+                    selected_zone["retest_confirmed"] = False
+                    selected_zone["entry_pattern"] = "MICRO_PULLBACK"
+                    selected_zone["pullback_depth_atr"] = round(pullback_depth_atr, 4)
         if retest_idx is None:
             # Measure distance from the causal zone and the broken structure. A trend
             # setup remains alive, but the engine must not chase an extended move.
@@ -684,9 +722,15 @@ class ContinuationEngine:
         location_event_id = (
             _location_event_id(symbol, side, retest_zone, retest_zone_ts, ts)
             if context.get("location_first_required") and retest_zone_ts is not None
+            and pullback_type != "MICRO_PULLBACK"
             else _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts)
         )
         zone_trace = (
+            f"entry_location_context:{selected_zone.get('zone_direction', 'UNKNOWN')}:"
+            f"{retest_zone}:{selected_zone.get('low')}:{selected_zone.get('high')}:"
+            f"{selected_zone.get('available_timestamp')}"
+            if pullback_type == "MICRO_PULLBACK"
+            else
             f"entry_zone:{selected_zone.get('zone_direction', 'UNKNOWN')}:"
             f"{retest_zone}:{selected_zone.get('low')}:{selected_zone.get('high')}:"
             f"{selected_zone.get('available_timestamp')}"
