@@ -131,6 +131,35 @@ def test_entry_classification_aliases_are_evidence_based_and_advisory(raw, expec
     assert report["execution_authority"] == "UNIFIED_ENTRY_AUTHORITY_UNCHANGED"
 
 
+def test_immediate_entry_label_never_overrides_opposing_zone_block():
+    now = time.time()
+    row = _base_row(
+        side="BUY", price=100.0, now=now,
+        entry_behavior="IMMEDIATE_ENTRY",
+        entry_behavior_reasons=["closed_candle_momentum"],
+        entry_behavior_confidence=0.9,
+        resistances=[_zone("RESISTANCE", 100.1, 100.4, strength=8.0)],
+    )
+    report = build_institutional_report(row, now_ts=now)
+    assert report["entry_classification"]["entry_type"] == "IMMEDIATE_ENTRY"
+    assert report["entry_classification"]["recommendation_only"] is True
+    assert report["location_gate"]["state"] == "BLOCKED"
+    decision = validate_institutional_location(report)
+    assert decision["allowed"] is False
+    assert decision["blocking_reason"]
+
+
+def test_immediate_entry_label_does_not_replace_fresh_closed_data_requirement():
+    now = time.time()
+    row = _base_row(now=now, entry_behavior="IMMEDIATE_ENTRY",
+                    entry_behavior_reasons=["closed_candle_momentum"])
+    row["data_freshness"] = "STALE"
+    row["last_updated"] = now - 10_000
+    report = build_institutional_report(row, now_ts=now)
+    assert report["entry_classification"]["entry_type"] == "IMMEDIATE_ENTRY"
+    assert report["location_gate"]["state"] == "INSUFFICIENT_DATA"
+    assert validate_institutional_location(report)["allowed"] is False
+
 def test_wait_for_structure_is_never_presented_as_an_entry_classification():
     row = _base_row(entry_behavior="WAIT_FOR_STRUCTURE", entry_behavior_confidence=0.6)
     report = build_institutional_report(row, now_ts=row["last_updated"])
