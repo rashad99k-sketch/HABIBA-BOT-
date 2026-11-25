@@ -120,7 +120,8 @@ For authenticated USDT-M Futures endpoints, BingX publishes:
 - Balance, positions, order queries, and open orders: 5 requests/second per UID.
 - Place order: 10/s ordinary user, 1/s Trader tier.
 - Cancel order: 5/s ordinary user, 1/s Trader tier.
-- Leverage/margin-mode/position-mode changes: 2/s.
+- Leverage reads: 5/s; leverage changes: 2/s.
+- Margin-mode and position-mode reads/changes: 2/s.
 - Close all positions and cancel all orders: 5/s.
 - Cancel-all-after countdown: the current endpoint-level reference says 1/s per UID; the older rate announcement table says 2/s. The implementation keeps the stricter 1.05-second local interval until BingX confirms which current policy applies.
 
