@@ -6277,6 +6277,55 @@ def _system_error_record(message, severity, timestamp):
     }
 
 
+_SYSTEM_ERROR_STATE_KEY = "dashboard_system_errors_v1"
+_SYSTEM_ERROR_LOCK = threading.RLock()
+
+
+def _persist_system_errors():
+    """Persist the bounded dashboard incident ring in the existing trade journal."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    setter = getattr(journal, "set_runtime_state", None)
+    if not callable(setter):
+        return False
+    with _SYSTEM_ERROR_LOCK:
+        records = list(DASHBOARD_STATE.get("system_errors", []))[-50:]
+        payload = {"version": 1, "records": records}
+    try:
+        setter(_SYSTEM_ERROR_STATE_KEY, payload)
+        return True
+    except Exception:
+        # Incident persistence must never interrupt trade management or recovery.
+        return False
+
+
+def _restore_system_errors():
+    """Restore recent incidents after a process restart so Dashboard retains history."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    getter = getattr(journal, "get_runtime_state", None)
+    if not callable(getter):
+        return 0
+    try:
+        payload = getter(_SYSTEM_ERROR_STATE_KEY, default={})
+    except TypeError:
+        try:
+            payload = getter(_SYSTEM_ERROR_STATE_KEY)
+        except Exception:
+            return 0
+    except Exception:
+        return 0
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return 0
+    valid = [row for row in records[-50:] if isinstance(row, dict)]
+    with _SYSTEM_ERROR_LOCK:
+        DASHBOARD_STATE["system_errors"] = valid
+        DASHBOARD_STATE["errors"] = [
+            f"[{row.get('timestamp', '-')}] {row.get('message', '')}"
+            for row in valid
+        ][-50:]
+    return len(valid)
+
+
 def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
     level_name = str(level or "INFO").upper()
     if debounce_key:
@@ -6320,6 +6369,7 @@ def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
         )
         if len(DASHBOARD_STATE["system_errors"]) > 50:
             DASHBOARD_STATE["system_errors"].pop(0)
+        _persist_system_errors()
         # Watchdog alerts have one canonical path to both Dashboard and Telegram.
         error_type = "NAISO_HEALTH" if "[WATCHDOG]" in str(msg).upper() else level_name
         tg_error(msg, error_type)
@@ -13087,6 +13137,11 @@ def _restart_main_loop_process_after_stall(context=None):
         "CRITICAL", debounce_key="main_loop_verified_process_restart", debounce_sec=30,
     )
     context["engine_resumed"] = True
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
     os._exit(EXIT_RECOVERY_EXHAUSTED)
     return True
 
@@ -13289,6 +13344,7 @@ try:
     from roro_trade_journal import TradeJournal
     INSTITUTIONAL_RESOURCE_MANAGER = ResourceManager(max_cache_items=5000, max_history=2000)
     INSTITUTIONAL_TRADE_JOURNAL = TradeJournal(os.getenv("TRADE_JOURNAL_PATH", "data/ggp_trade_journal.sqlite3"))
+    _restore_system_errors()
 except Exception as _integration_init_error:
     INSTITUTIONAL_RESOURCE_MANAGER = None
     INSTITUTIONAL_TRADE_JOURNAL = None
