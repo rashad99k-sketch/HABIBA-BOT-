@@ -14098,14 +14098,19 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
     return result
 
 _last_unified_watchlist_refresh = 0.0
-def refresh_unified_institutional_watchlist(force=False):
+_UNIFIED_WATCHLIST_REFRESH_STATE = {
+    "lock": threading.Lock(), "in_progress": False, "last_attempt": 0.0,
+    "last_error": "", "worker_name": "",
+}
+
+
+def _run_unified_institutional_watchlist_refresh():
+    """Run market-data discovery off the MainThread; publish entry readiness only on success."""
     global _last_unified_watchlist_refresh
-    now = time.time()
-    if not force and now - _last_unified_watchlist_refresh < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
-        return MEMORY.setdefault("watchlist", {})
     try:
         MEMORY["_proximity_batch_updates"] = 0
-        # Persisted cross events survive scanner cycles and process restarts.
+        # Cross-event lifecycle advancement can itself fetch OHLCV; keep the
+        # entire refresh pipeline on this single bounded background worker.
         _sync_confirmed_cross_events()
         result = update_unified_watchlist(
             MEMORY, _integration_fetch_frame,
@@ -14122,19 +14127,62 @@ def refresh_unified_institutional_watchlist(force=False):
             "refresh_seconds": INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS,
             "closed_candles_only": True,
         })
-        _last_unified_watchlist_refresh = now
+        _last_unified_watchlist_refresh = time.time()
         MEMORY["_unified_watchlist_refresh_ok"] = True
+        _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = ""
         if INSTITUTIONAL_RESOURCE_MANAGER:
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
-        return result
     except Exception as exc:
         MEMORY["_unified_watchlist_refresh_ok"] = False
+        _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
         log_execution(
             f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\\n{traceback.format_exc()}",
             "ERROR",
         )
-        return MEMORY.setdefault("watchlist", {})
+    finally:
+        with _UNIFIED_WATCHLIST_REFRESH_STATE["lock"]:
+            _UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] = False
+            _UNIFIED_WATCHLIST_REFRESH_STATE["worker_name"] = ""
+
+
+def refresh_unified_institutional_watchlist(force=False):
+    """Schedule one background refresh and return immediately to the trading loop.
+
+    Entry authorization remains fail-closed while the refresh is running or has
+    failed. The main loop never waits for scanner OHLCV, bridge analysis, or
+    cross-event lifecycle fetches.
+    """
+    now = time.time()
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        if state["in_progress"]:
+            MEMORY["_unified_watchlist_refresh_ok"] = False
+            return MEMORY.setdefault("watchlist", {})
+        last_attempt = float(state.get("last_attempt") or 0.0)
+        last_success = float(_last_unified_watchlist_refresh or 0.0)
+        last_completed = max(last_attempt, last_success)
+        if not force and now - last_completed < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
+            return MEMORY.setdefault("watchlist", {})
+        state["in_progress"] = True
+        state["last_attempt"] = now
+        state["worker_name"] = "unified-institutional-watchlist"
+        MEMORY["_unified_watchlist_refresh_ok"] = False
+
+    try:
+        worker = threading.Thread(
+            target=_run_unified_institutional_watchlist_refresh,
+            name="unified-institutional-watchlist", daemon=True,
+        )
+        worker.start()
+    except Exception as exc:
+        with state["lock"]:
+            state["in_progress"] = False
+            state["worker_name"] = ""
+            state["last_error"] = f"worker_start_failed:{type(exc).__name__}"
+        MEMORY["_unified_watchlist_refresh_ok"] = False
+        log_execution(f"[INTEGRATION] watchlist worker start failed: {type(exc).__name__}: {exc}", "ERROR")
+    return MEMORY.setdefault("watchlist", {})
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None, source="ggp"):
     key = roro_canonical_symbol(symbol)
