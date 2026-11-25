@@ -615,3 +615,103 @@ def test_restart_attempt_uids_are_unique_when_recovery_is_deferred():
     assert deferred.uid != real.uid, "diagnostic attempt identity must be unique"
     rows = policy.records("main_loop")
     assert [row["uid"] for row in rows] == [deferred.uid, real.uid]
+
+
+# --- Background Watchlist refresh: never run discovery OHLCV on MainThread -- #
+
+def test_unified_watchlist_refresh_schedules_one_background_worker_and_fails_closed(monkeypatch):
+    calls = []
+    workers = []
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            workers.append(self)
+
+        def start(self):
+            calls.append(("start", self.name, self.daemon))
+
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
+    monkeypatch.setattr(ggpbot, "_last_unified_watchlist_refresh", 0.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_BATCH_SIZE", 4)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 30)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot.threading, "Thread", FakeThread)
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", {
+        "lock": __import__("threading").Lock(), "in_progress": False,
+        "last_attempt": 0.0, "last_error": "", "worker_name": "",
+    })
+
+    def sync_cross_events():
+        calls.append(("sync",))
+
+    def update(memory, fetch_frame, **kwargs):
+        calls.append(("update", kwargs["batch_size"], kwargs["max_items"]))
+        return {"BTC": {"decision_state": "WAITING_FOR_CONFIRMATION"}}
+
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", sync_cross_events)
+    monkeypatch.setattr(ggpbot, "update_unified_watchlist", update)
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
+
+    returned = ggpbot.refresh_unified_institutional_watchlist()
+
+    # The foreground call only starts a daemon worker; it never runs data fetches.
+    assert returned == {}
+    assert calls == [("start", "unified-institutional-watchlist", True)]
+    assert len(workers) == 1
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is True
+
+    # Re-entry while the worker is active must not create a second worker.
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(workers) == 1
+
+    # Run the captured worker body deterministically and verify publication.
+    workers[0].target()
+    assert calls[1:] == [("sync",), ("update", 4, 30)]
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is True
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is False
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] == ""
+
+
+def test_unified_watchlist_worker_failure_keeps_entry_gate_closed_and_backs_off(monkeypatch):
+    workers = []
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            workers.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {"BTC": {"decision_state": "ENTRY_READY"}}})
+    monkeypatch.setattr(ggpbot, "_last_unified_watchlist_refresh", 0.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot.threading, "Thread", FakeThread)
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", {
+        "lock": __import__("threading").Lock(), "in_progress": False,
+        "last_attempt": 0.0, "last_error": "", "worker_name": "",
+    })
+    monkeypatch.setattr(
+        ggpbot, "_sync_confirmed_cross_events",
+        lambda: (_ for _ in ()).throw(RuntimeError("simulated market-data failure")),
+    )
+
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(workers) == 1
+    workers[0].target()
+
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+    assert "simulated market-data failure" in ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["last_error"]
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is False
+
+    # Failed refresh is not retried on every main-loop iteration.
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(workers) == 1
