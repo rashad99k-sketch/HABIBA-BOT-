@@ -19,6 +19,13 @@ class WatchlistDashboardProjectionTests(unittest.TestCase):
         self.assertEqual(len(result), 10)
         self.assertIn("READY", result)
 
+    def test_cross_projection_keeps_durable_display_label(self):
+        source = {"ETH": {"symbol": "ETH", "decision_state": "WAITING_FOR_RETEST",
+                          "cross_context": {"display_cross_state": "CONFIRMED_BUY_CROSS",
+                                            "durable_event": True, "authoritative": True}}}
+        row = build_watchlist_dashboard_payload(source)["ETH"]
+        self.assertEqual(row["cross"], "CONFIRMED_BUY_CROSS")
+        self.assertTrue(row["durable"])
     def test_non_mapping_input_returns_empty_payload(self):
         self.assertEqual(build_watchlist_dashboard_payload(None), {})
 
