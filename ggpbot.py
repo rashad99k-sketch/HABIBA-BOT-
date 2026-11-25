@@ -11544,6 +11544,26 @@ def naiso_health():
     return jsonify(safe_json(payload)), int(report["http_status"])
 
 
+@app.route("/liveness")
+def liveness():
+    """DigitalOcean liveness probe; restart only after the exchange exit gate approved it."""
+    snapshot = naiso_health_snapshot()
+    report = _health_readiness(snapshot)
+    recovery = snapshot.get("recovery") if isinstance(snapshot.get("recovery"), dict) else {}
+    verified_exit_states = {"EXIT_RECONCILED_FLAT", "EXIT_VERIFIED_PROTECTED_OPEN"}
+    restart_authorized = str(recovery.get("status") or "").upper() in verified_exit_states
+    should_restart = bool(report.get("process_failures")) and restart_authorized
+    payload = {
+        "ok": not should_restart,
+        "process": report.get("process"),
+        "main_loop": report.get("main_loop"),
+        "watchlist_worker": report.get("watchlist_worker", {}),
+        "restart_authorized_by_exchange_reconciliation": restart_authorized,
+        "process_failures": report.get("process_failures", []),
+    }
+    return jsonify(safe_json(payload)), 503 if should_restart else 200
+
+
 @app.route("/health")
 def health():
     snapshot = naiso_health_snapshot()
