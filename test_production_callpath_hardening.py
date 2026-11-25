@@ -275,3 +275,38 @@ def test_open_position_boundary_refuses_unknown_account_before_api_calls(monkeyp
     assert ggpbot.open_position("BUY", 1.0, "BTC/USDT:USDT", stop_loss=90.0) is None
     assert calls == []
     assert ggpbot._ACTIVE_TRADE is False
+
+
+def test_open_position_market_data_reads_are_one_shot_per_management_cycle(monkeypatch):
+    rows = [
+        [1_700_000_000_000 + i * 900_000, 100.0, 101.0, 99.0, 100.5, 10.0]
+        for i in range(100)
+    ]
+    calls = []
+
+    class Exchange:
+        def fetch_ohlcv(self, *_args, **_kwargs):
+            return rows
+        def fetch_ticker(self, *_args, **_kwargs):
+            return {"last": 100.5}
+
+    def governed(func, *args, **kwargs):
+        calls.append((func.__name__, kwargs.get("_api_max_attempts")))
+        return func(*args, **{k: v for k, v in kwargs.items() if k != "_api_max_attempts"})
+
+    monkeypatch.setattr(ggpbot, "STATE", {"open": True})
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": True})
+    monkeypatch.setattr(ggpbot, "ex", Exchange())
+    monkeypatch.setattr(ggpbot, "safe_api_call", governed)
+    monkeypatch.setattr(ggpbot, "_ohlcv_rate_limit_cooldown_remaining", lambda _symbol: 0.0)
+    monkeypatch.setattr(ggpbot, "OHLCV_FETCH_DIAGNOSTICS", {})
+    monkeypatch.setattr(ggpbot, "_LAST_API_RATE_LIMIT", {"ts": 0.0, "method": "", "message": ""})
+    monkeypatch.setattr(ggpbot, "INTERVAL", "15m")
+    monkeypatch.setattr(ggpbot, "normalize_symbol", lambda symbol: symbol)
+
+    frame = ggpbot.fetch_ohlcv("BTC/USDT:USDT")
+    ticker = ggpbot.fetch_ticker("BTC/USDT:USDT")
+
+    assert frame is not None and len(frame) == 100
+    assert ticker["last"] == 100.5
+    assert calls == [("fetch_ohlcv", 1), ("fetch_ticker", 1)]
