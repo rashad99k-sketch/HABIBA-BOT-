@@ -14507,13 +14507,17 @@ def _finalize_cross_watchlist_delivery_after_publish():
     delivered_at = time.time()
     marked = _mark_cross_events_watchlist_delivered(delivered_ids, delivered_at)
     delivery = dict(delivery)
+    all_delivered = len(delivered_ids) == len(pending_ids)
     delivery.update({
         "delivered_at": delivered_at,
         "delivered_ids": delivered_ids,
         "lifecycle_marked": list(marked or []),
-        "delivered": len(delivered_ids) == len(pending_ids),
+        "delivered": all_delivered,
         "same_cycle": False,
-        "reason": "ACTIVE_WATCHLIST_DELIVERED" if len(delivered_ids) == len(pending_ids)
+        "lifecycle_status": ACTIVE_WATCHLIST_LIFECYCLE if all_delivered
+                            else delivery.get("lifecycle_status", CROSS_WATCHLIST_LIFECYCLE),
+        "refresh_seconds": round(delivered_at - float(delivery.get("detected_at", delivered_at)), 3),
+        "reason": "ACTIVE_WATCHLIST_DELIVERED" if all_delivered
                   else "PARTIAL_WATCHLIST_DELIVERY",
     })
     MEMORY["_cross_watchlist_delivery"] = delivery
