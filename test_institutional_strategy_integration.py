@@ -517,3 +517,118 @@ def test_real_execute_entry_preserves_trace_into_dashboard_and_decision(monkeypa
     assert decision["management_mode"] == "STANDARD"
     assert decision["selected_target_gross_roe_pct"] == pytest.approx(5.0)
     assert decision["entry_risk_plan"]["leverage"] == 20
+
+
+def _selected_zone(side="BUY", **overrides):
+    zone = {
+        "kind": "ORDER_BLOCK",
+        "side": side,
+        "zone_direction": "DEMAND" if side == "BUY" else "SUPPLY",
+        "low": 99.0 if side == "BUY" else 100.5,
+        "high": 100.0 if side == "BUY" else 101.5,
+        "zone_definition": "BULLISH_LOW_TO_OPEN" if side == "BUY" else "BEARISH_OPEN_TO_HIGH",
+        "strength": 8.0,
+        "available_timestamp": 1_799_999_100_000,
+    }
+    zone.update(overrides)
+    return zone
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_final_live_institutional_zone_gate_accepts_directional_ob(side):
+    zone = _selected_zone(side)
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, side, price=99.5 if side == "BUY" else 101.0,
+        atr=1.0, latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is True
+    assert reason == "selected_entry_zone_validated"
+
+
+def test_final_live_institutional_zone_gate_rejects_buy_from_supply():
+    zone = _selected_zone("BUY", zone_direction="SUPPLY")
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "BUY", price=99.5, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "entry_zone_direction_mismatch"
+
+
+def test_final_live_institutional_zone_gate_rejects_sell_from_demand():
+    zone = _selected_zone("SELL", zone_direction="DEMAND")
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "SELL", price=101.0, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "entry_zone_direction_mismatch"
+
+
+def test_final_live_institutional_zone_gate_rejects_missing_zone():
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        None, "BUY", price=99.5, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "missing_selected_entry_zone"
+
+
+def test_final_live_institutional_zone_gate_rejects_stale_zone():
+    zone = _selected_zone("BUY", available_timestamp=1_799_900_000_000)
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "BUY", price=99.5, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "entry_zone_stale"
+
+
+def test_final_live_institutional_zone_gate_rejects_wrong_ob_definition():
+    zone = _selected_zone("BUY", zone_definition="BEARISH_OPEN_TO_HIGH")
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "BUY", price=99.5, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "entry_zone_order_block_definition_mismatch"
+
+
+def test_final_live_institutional_zone_gate_rejects_out_of_range_zone():
+    zone = _selected_zone("BUY", low=104.0, high=105.0)
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "BUY", price=100.0, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "entry_zone_outside_no_chase_distance"
+
+
+def test_final_live_institutional_zone_gate_accepts_unfilled_directional_fvg():
+    zone = {
+        "kind": "FVG", "side": "BUY", "zone_direction": "DEMAND",
+        "low": 99.0, "high": 100.0, "direction": "BULLISH",
+        "status": "UNFILLED", "size_atr": 0.20,
+        "available_timestamp": 1_799_999_100_000,
+    }
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "BUY", price=99.5, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is True
+    assert reason == "selected_entry_zone_validated"
+
+
+def test_final_live_institutional_zone_gate_rejects_fully_filled_fvg():
+    zone = {
+        "kind": "FVG", "side": "BUY", "zone_direction": "DEMAND",
+        "low": 99.0, "high": 100.0, "direction": "BULLISH",
+        "status": "FULLY_FILLED", "size_atr": 0.20,
+        "available_timestamp": 1_799_999_100_000,
+    }
+    ok, reason = ggpbot._validate_selected_entry_zone(
+        zone, "BUY", price=99.5, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert ok is False
+    assert reason == "entry_zone_fvg_not_actionable"
