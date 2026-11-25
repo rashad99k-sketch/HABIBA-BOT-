@@ -312,3 +312,28 @@ def test_fetch_ohlcv_keeps_valid_closed_candle_frame(monkeypatch):
     assert frame is not None
     assert len(frame) == 100
     assert list(frame.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_digitalocean_explicit_bindable_app_id_enables_supervisor_detection(monkeypatch):
+    import threading
+
+    for key in ("RENDER", "RENDER_SERVICE_ID", "RENDER_INSTANCE_ID",
+                "RAILWAY_ENVIRONMENT", "APP_ID", "NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DIGITALOCEAN_APP_ID", "digitalocean-app-test")
+    monkeypatch.setattr(
+        ggpbot, "_main_loop_owner",
+        lambda: {"thread_id": threading.current_thread().ident,
+                 "thread_name": "MainThread", "registered": True},
+    )
+    monkeypatch.setattr(ggpbot, "_main_loop_owner_alive", lambda: True)
+    monkeypatch.setattr(ggpbot, "_recovery_exit_gate", lambda _reason: True)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_args, **_kwargs: None)
+    exits = []
+    monkeypatch.setattr(ggpbot.os, "_exit", lambda code: exits.append(code))
+
+    context = {}
+    assert ggpbot._restart_main_loop_process_after_stall(context) is True
+    assert context["process_supervisor_detected"] is True
+    assert context["process_supervisor_kind"] == "DIGITALOCEAN_APP_PLATFORM"
+    assert exits == [ggpbot.EXIT_RECOVERY_EXHAUSTED]
