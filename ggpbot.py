@@ -7968,19 +7968,36 @@ def _confirmed_cross_event_id(symbol, timeframe, gate_result):
     return f"{event_symbol}:{timeframe}:{raw_signal_id}"
 
 
-def _advance_cross_event_lifecycles(rows):
-    """Advance active cross events using closed candles only, never a live bar."""
+def _advance_cross_event_lifecycles(rows, progress_callback=None, max_items=None):
+    """Advance a rotating bounded batch of active cross events on closed candles."""
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     evaluator = globals().get("_evaluate_post_cross_rejection_breakout")
     if journal is None or not callable(evaluator):
         return 0
-    advanced = 0
-    for row in list(rows or []):
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        if str(metadata.get("lifecycle_schema") or "") != CROSS_LIFECYCLE_SCHEMA:
-            continue
+    eligible = [
+        row for row in list(rows or [])
+        if isinstance(row, dict)
+        and str((row.get("metadata") or {}).get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA
+    ]
+    if not eligible:
+        return 0
+    if max_items is not None:
         try:
-            frame = _get_scanner_frame(row.get("exchange_symbol") or row.get("symbol"))
+            batch_limit = max(1, min(len(eligible), int(max_items)))
+        except (TypeError, ValueError, OverflowError):
+            batch_limit = len(eligible)
+        cursor = int(MEMORY.get("_cross_event_lifecycle_cursor", 0) or 0) % len(eligible)
+        selected = [eligible[(cursor + offset) % len(eligible)] for offset in range(batch_limit)]
+        MEMORY["_cross_event_lifecycle_cursor"] = (cursor + batch_limit) % len(eligible)
+    else:
+        selected = eligible
+    advanced = 0
+    for row in selected:
+        symbol = row.get("exchange_symbol") or row.get("symbol")
+        try:
+            if callable(progress_callback):
+                progress_callback("CROSS_EVENT_LIFECYCLE_FETCH", symbol)
+            frame = _get_scanner_frame(symbol)
             lifecycle = evaluator(
                 frame, str(row.get("side") or ""), row,
                 ema_fn=ema, timeframe_seconds=_roro_timeframe_seconds(row.get("timeframe") or INTERVAL),
@@ -7996,6 +8013,9 @@ def _advance_cross_event_lifecycles(rows):
                 f"{type(exc).__name__}: {exc}", "ERROR",
                 debounce_key=f"cross_lifecycle:{row.get('event_id')}", debounce_sec=10,
             )
+        finally:
+            if callable(progress_callback):
+                progress_callback("CROSS_EVENT_LIFECYCLE_COMPLETE", symbol)
     return advanced
 
 
@@ -8004,15 +8024,17 @@ def _project_confirmed_cross_row(row):
     return _project_cross_state(row, now_ts=time.time())
 
 
-def _sync_confirmed_cross_events():
-    """Reload active cross events from the journal into the Watchlist feed."""
+def _sync_confirmed_cross_events(progress_callback=None, lifecycle_max_items=None):
+    """Reload active cross events; optionally advance a bounded rotating lifecycle batch."""
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     rows = []
     if journal is not None:
         try:
             journal.expire_cross_events()
             rows = journal.list_cross_events(statuses=("ACTIVE",))
-            if _advance_cross_event_lifecycles(rows):
+            if _advance_cross_event_lifecycles(
+                rows, progress_callback=progress_callback, max_items=lifecycle_max_items
+            ):
                 rows = journal.list_cross_events(statuses=("ACTIVE",))
         except Exception as exc:
             log_execution(f"[CROSS_EVENT] sync failed: {type(exc).__name__}: {exc}", "ERROR")
@@ -14168,7 +14190,10 @@ def _run_unified_institutional_watchlist_refresh():
     try:
         MEMORY["_proximity_batch_updates"] = 0
         _watchlist_worker_progress("CROSS_EVENT_SYNC")
-        _sync_confirmed_cross_events()
+        _sync_confirmed_cross_events(
+            progress_callback=_watchlist_worker_progress,
+            lifecycle_max_items=INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
+        )
 
         def tracked_fetch_frame(symbol):
             _watchlist_worker_progress("OHLCV_FETCH", symbol)
