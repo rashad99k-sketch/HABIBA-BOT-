@@ -31,7 +31,7 @@ class _ResilienceProbe:
 
 
 def test_close_order_path_uses_shared_one_shot_api_governor():
-    source = inspect.getsource(ggpbot.safe_close_position)
+    source = inspect.getsource(ggpbot._verified_market_reduce)
     assert "safe_api_call(ex.create_order" in source
     assert "ex.create_order(sym, \"market\"" not in source
 
