@@ -7506,7 +7506,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         if gate_frame is None:
             gate_frame = _integration_fetch_frame(symbol)
             gate_frame_source = "SHARED_SCANNER_FRAME_FALLBACK"
-        gate_result = _validate_dual_ema_vwap_entry_gate(
+        gate_result = _validate_ema9_vwap_entry_gate(
             gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
             now_ms=int(time.time() * 1000), lookback_candles=2,
         )
@@ -8725,11 +8725,11 @@ def _detect_confirmed_cross_events(symbols):
             except Exception:
                 continue
             authorization_state = str(gate.get("authorization_state") or "")
-            if not gate.get("ready") or authorization_state != str(_AUTH_EMA9_EMA15_TRIGGER_VALID):
+            if not gate.get("ready") or authorization_state != str(_AUTH_EMA9_VWAP_TRIGGER_VALID):
                 continue
-            # The authoritative new trigger is the strict EMA9/EMA15 cross. The
-            # legacy EMA9/VWAP-only gate is no longer accepted as authorization.
-            direction = str(gate.get("ema9_15_cross") or "").upper()
+            # The authoritative trigger is the strict EMA9/Session-VWAP cross.
+            # EMA15 is deliberately not part of scanner authorization.
+            direction = str(gate.get("ema9_vwap_cross") or gate.get("ema9_cross") or "").upper()
             expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
             if direction != expected_direction:
                 continue
@@ -8739,7 +8739,7 @@ def _detect_confirmed_cross_events(symbols):
             metadata = dict(gate)
             metadata.update({
                 "source": CONFIRMED_CROSS_EVENT_SOURCE,
-                "detection_method": "validate_dual_ema_vwap_entry_gate",
+                "detection_method": "validate_ema9_vwap_entry_gate",
                 "lookback_candles": 2,
                 "lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
                 "lifecycle_status": CROSS_WATCHLIST_LIFECYCLE,
@@ -14672,10 +14672,10 @@ from ggp_institutional_bridge import (
 )
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
-                             validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             validate_ema9_vwap_entry_gate as _validate_ema9_vwap_entry_gate,
                              evaluate_post_cross_rejection_breakout as _evaluate_post_cross_rejection_breakout,
                              closed_candles as _roro_closed_candles,
-                             AUTH_EMA9_EMA15_TRIGGER_VALID as _AUTH_EMA9_EMA15_TRIGGER_VALID,
+                             AUTH_EMA9_VWAP_TRIGGER_VALID as _AUTH_EMA9_VWAP_TRIGGER_VALID,
                              timeframe_seconds as _roro_timeframe_seconds)
 try:
     from roro_resource_manager import ResourceManager
