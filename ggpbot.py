@@ -6555,7 +6555,7 @@ def update_stats(pnl_pct):
     total = DASHBOARD_STATE["stats"]["trades"]
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
-def _cancel_and_verify_entry_order_terminal(symbol, order_id=None, client_order_id=None):
+def _cancel_and_verify_entry_order_terminal(symbol, order_id=None, client_order_id=None, *, cancel_if_open=True):
     """Cancel an unfilled market-order remainder once, then require terminal read-back."""
     lookup_id = str(order_id or client_order_id or "").strip()
     client_id = str(client_order_id or "").strip()
@@ -6598,6 +6598,8 @@ def _cancel_and_verify_entry_order_terminal(symbol, order_id=None, client_order_
     remaining = details.get("remaining") if isinstance(details, dict) else None
     if remaining is None or remaining <= 1e-12:
         return False, f"ORDER_REMAINING_UNKNOWN:{status}"
+    if not cancel_if_open:
+        return False, f"ORDER_STILL_OPEN:{status}"
     canceler = getattr(ex, "cancel_order", None)
     if not callable(canceler):
         return False, "CANCEL_ORDER_UNAVAILABLE"
@@ -16985,8 +16987,35 @@ def sync_all_states():
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]
-                key = roro_canonical_symbol(_position_symbol(position))
-                _attempt_runtime_trade_recovery(_position_symbol(position), position=position, force=False)
+                if STATE.get("execution_unresolved") and STATE.get("entry_client_order_id") and not STATE.get("entry_order_terminal"):
+                    terminal, order_status = _cancel_and_verify_entry_order_terminal(
+                        str(_position_symbol(position)),
+                        STATE.get("entry_exchange_order_id"),
+                        STATE.get("entry_client_order_id"),
+                        cancel_if_open=False,
+                    )
+                    if terminal:
+                        STATE["entry_order_terminal"] = True
+                        STATE["entry_order_status"] = order_status
+                        _attempt_runtime_trade_recovery(
+                            _position_symbol(position), position=position, force=False,
+                        )
+                    else:
+                        MEMORY["position_status"] = "UNKNOWN"
+                        MEMORY["current_position"] = position
+                        MEMORY["recovery_status"] = "ENTRY_ORDER_REMAINDER_UNRESOLVED"
+                        STATE["recovery_hold"] = True
+                        STATE["recovery_reason"] = str(order_status)
+                        RECOVERY_BLOCK_ENTRIES = True
+                        log_execution(
+                            f"[RECOVERY] Position exists but entry order is not terminal "
+                            f"({order_status}); holding management handoff and new entries",
+                            "CRITICAL", debounce_key="entry_order_remainder_unresolved", debounce_sec=30,
+                        )
+                else:
+                    _attempt_runtime_trade_recovery(
+                        _position_symbol(position), position=position, force=False,
+                    )
             else:
                 MEMORY["position_status"] = "MULTIPLE_OPEN"
                 RECOVERY_BLOCK_ENTRIES = True
