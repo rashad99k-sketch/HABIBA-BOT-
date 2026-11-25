@@ -131,3 +131,8 @@ Sources:
 - BingX official rate announcement: https://bingx.com/en/support/articles/31103871611289
 - BingX endpoint-level swap reference: https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-market/api-reference.md
 - BingX rate-limit semantics and group-ID warning: https://github.com/BingX-API/api-ai-skills/blob/main/skills/references/rate-limits.md
+
+
+## Production HTTP server
+
+The Dashboard now uses Waitress 3.0.2 as its WSGI server, started inside the existing single bot process with eight request threads. The trade supervisor remains on the foreground thread and the instance lock still guards the one order-submitting process. Do not replace this with a multi-worker Gunicorn configuration: process forking could create duplicate trading engines and order authorities. The Waitress server is closed during the controlled shutdown path.
