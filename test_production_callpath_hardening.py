@@ -469,3 +469,11 @@ def test_global_discovery_does_not_overwrite_newer_async_cross_delivery_ack():
     assert 'existing_delivery = MEMORY.get("_cross_watchlist_delivery")' in source
     assert 'existing_delivery.get("delivered")' in source
     assert 'WATCHLIST_REFRESH_SCHEDULED' in source
+
+
+def test_foreground_trade_supervisor_does_not_duplicate_market_reads_after_management():
+    source = inspect.getsource(ggpbot._original_main_loop_sniper)
+    assert 'get_ticker_safe(sym)' not in source
+    assert 'get_ohlcv_safe(sym, 50)' not in source
+    assert 'scaling_logic(sym, df, None)' not in source
+    assert 'open_trade_state_projection_complete' in source
