@@ -138,7 +138,7 @@ def test_same_direction_durable_cross_events_select_newest_event(monkeypatch):
     assert seen == ["BUY"]
     assert len(fetches) == 1
     assert out["ETH"]["cross_event_id"] == "new-buy"
-    assert out["ETH"]["cross_event_conflict"] is not True
+    assert out["ETH"]["cross_event_conflict"] is False
 
 
 def test_opposite_direction_durable_cross_events_fail_closed(monkeypatch):
