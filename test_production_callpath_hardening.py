@@ -127,7 +127,7 @@ def test_live_trade_execution_service_instances_use_shared_api_governor():
     for function in (
         ggpbot.open_position,
         ggpbot._move_native_stop_verified,
-        ggpbot._repair_native_stop_from_journal,
+        ggpbot._repair_native_sl_from_journal,
     ):
         source = inspect.getsource(function)
         if "TradeExecutionService(" in source:
