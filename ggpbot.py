@@ -118,7 +118,7 @@ def record_trade_management_event(event_type, status="INFO", *, log_level=None,
     logger = globals().get("log_execution")
     if logger and (log_level or event_type not in {"BOARD_DECISION"}):
         details = []
-        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "entry_mode", "entry_behavior", "reason", "order_id"):
+        for key in ("symbol", "side", "price", "roe_pct", "qty_closed", "remaining_qty", "profit_mode", "management_mode", "selected_target_roe_pct", "target_convention_basis", "entry_mode", "entry_behavior", "reason", "order_id"):
             value = event.get(key)
             if value not in (None, ""):
                 details.append(f"{key}={value}")
@@ -2677,6 +2677,8 @@ from ggp_profit_brain import (classify_profit_mode, range_target_price, target_r
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               trend_target_prices, profit_target_convention,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
+from ggp_institutional_strategy import (build_institutional_report, validate_institutional_location,
+                                        build_management_mode_report, build_entry_risk_plan)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2720,6 +2722,13 @@ class TradeManagementBoard:
         trade_state = str(ctx.get("trade_state") or "UNKNOWN").upper()
         profit_mode = str(ctx.get("profit_mode") or "TWO_STAGE_50_50").upper()
         entry_ctx = ctx.get("entry_context") if isinstance(ctx.get("entry_context"), dict) else {}
+        # Additive reporting only: the canonical profit mode still comes from the
+        # single profit brain and the TradeManagementBoard remains the authority.
+        mode_report = build_management_mode_report(
+            ctx, profit_mode=profit_mode,
+            reason=ctx.get("profit_mode_reason") or "",
+            evidence=ctx.get("profit_mode_evidence") or (),
+        )
 
         def decision(action, reason, **params):
             result = TradeDecision(action, params=params, reason=reason)
@@ -2732,6 +2741,17 @@ class TradeManagementBoard:
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
                 "profit_mode": profit_mode,
+                "management_mode": mode_report.get("management_mode"),
+                "management_mode_reason": mode_report.get("classification_reason"),
+                "selected_target_roe_pct": mode_report.get("selected_target_gross_roe_pct"),
+                "selected_target_price_move_pct": mode_report.get("selected_target_price_move_pct"),
+                "target_convention_basis": (mode_report.get("target_convention") or {}).get("basis"),
+                "actual_exit_reason": (
+                    str(params.get("close_reason") or reason)
+                    if action in {TradeDecisionType.FULL_CLOSE, TradeDecisionType.THESIS_FAILURE_EXIT,
+                                  TradeDecisionType.EMERGENCY_EXIT, TradeDecisionType.PARTIAL_CLOSE}
+                    else ""
+                ),
                 "entry_context_available": bool(entry_ctx),
                 "entry_cross_event_id": str(entry_ctx.get("cross_event_id") or ""),
                 "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
@@ -4113,6 +4133,11 @@ class LiveTradeManager:
             # independent weakness/thin-liquidity observations. Missing data is NOT range.
             mode_context = {
                 "side": side, "regime": regime, "trade_state": trade_state,
+                "entry": entry,
+                "tp1_price": safe_float(STATE.get("tp1_price", STATE.get("synthetic_tp1", 0)), 0.0),
+                "tp2_price": safe_float(STATE.get("tp2_price", 0), 0.0),
+                "range_target_price": safe_float(STATE.get("scalp_target_price", STATE.get("range_target_price", 0)), 0.0),
+                "range_target_move_pct": safe_float(STATE.get("scalp_target_selected_pct", 0), 0.0),
                 "entry_context": dict(STATE.get("entry_context_snapshot") or {}),
                 "market_intelligence": {
                 **(STATE.get("market_intelligence") or {}),
@@ -4185,6 +4210,40 @@ class LiveTradeManager:
                         STATE["profit_mode_candidate_count"] = 0
                 STATE["profit_mode_reason"] = candidate_reason
                 STATE["profit_mode_evidence"] = list(candidate_evidence)
+                # Additive management-mode trace. The classifier above remains the
+                # only mode decision; this only labels and records transitions.
+                mode_report = build_management_mode_report(
+                    mode_context, profit_mode=current_mode,
+                    reason=candidate_reason, evidence=candidate_evidence,
+                )
+                STATE["management_mode"] = mode_report["management_mode"]
+                STATE["management_mode_report"] = mode_report
+                previous_mode = ""
+                history = STATE.get("management_mode_history")
+                if not isinstance(history, list):
+                    history = []
+                if history:
+                    previous_mode = str((history[-1] or {}).get("management_mode") or "")
+                if previous_mode != mode_report["management_mode"]:
+                    change_record = {
+                        "at": time.time(), "candle_ts": closed_candle_ts,
+                        "management_mode": mode_report["management_mode"],
+                        "canonical_profit_mode": mode_report["canonical_profit_mode"],
+                        "reason": mode_report["classification_reason"],
+                        "selected_target_gross_roe_pct": mode_report["selected_target_gross_roe_pct"],
+                    }
+                    history = list(history)
+                    history.append(change_record)
+                    STATE["management_mode_history"] = history[-20:]
+                    STATE["management_mode_last_change_ts"] = closed_candle_ts
+                    record_trade_management_event(
+                        "MODE_CHANGE", "DECIDED", dedupe_key=f"mode:{STATE.get('current_symbol')}:{closed_candle_ts}",
+                        dedupe_seconds=1, symbol=STATE.get("current_symbol"), side=side,
+                        profit_mode=current_mode, management_mode=mode_report["management_mode"],
+                        reason=mode_report["classification_reason"],
+                        selected_target_roe_pct=mode_report["selected_target_gross_roe_pct"],
+                        target_convention_basis=(mode_report.get("target_convention") or {}).get("basis"),
+                    )
                 # Build one opposing-liquidity snapshot from completed candles per candle.
                 if closed_candle_ts > safe_float(STATE.get("opposing_liquidity_timestamp"), 0.0):
                     try:
@@ -6081,6 +6140,8 @@ STATE = {
     "ema_profit_state": "INSUFFICIENT_DATA",
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
+    "management_mode": "STANDARD", "management_mode_report": {}, "management_mode_history": [],
+    "management_mode_last_change_ts": 0.0, "entry_risk_plan": {}, "institutional_report": {},
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
 
     "opposing_liquidity_status": "UNKNOWN",
@@ -6758,6 +6819,34 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             debounce_sec=5,
         )
         return False
+    # Final location enforcement lives in the single executor so no Watchlist,
+    # Sniper or legacy caller can bypass a strong opposing supply/demand zone.
+    # Missing evidence is neutral here; only observed insufficient room blocks.
+    report = institutional_entry_ctx.get("institutional_report")
+    if not isinstance(report, dict) or not report:
+        report = build_institutional_report({
+            "side": side,
+            "price": price,
+            "atr": atr_val,
+            "support_resistance": institutional_entry_ctx.get("support_resistance"),
+            "market_regime": institutional_entry_ctx.get("market_regime"),
+            "liquidity": institutional_entry_ctx.get("liquidity"),
+            "ema9": gate_result.get("ema9"),
+            "vwap": gate_result.get("vwap"),
+            "cross_state": str(gate_result.get("ema9_cross") or "").upper(),
+            "cross_event_id": cross_event_id,
+            "data_freshness": institutional_entry_ctx.get("data_freshness", "FRESH"),
+            "data_quality": "VALID_CLOSED_CANDLES",
+        }, side=side, now_ts=time.time())
+    location_gate = validate_institutional_location(report)
+    institutional_entry_ctx["institutional_report"] = report
+    institutional_entry_ctx["institutional_location_gate"] = location_gate
+    if location_gate["state"] == "BLOCKED":
+        log_execution(
+            f"[INSTITUTIONAL_LOCATION] BLOCKED {symbol} {side}: {location_gate['blocking_reason']}",
+            "WARN", debounce_key=f"institutional_location_executor:{symbol}:{side}", debounce_sec=10,
+        )
+        return False
     # Every executed entry must be traceable to a durable confirmed-cross event,
     # even when an older caller did not carry the Watchlist event id. The row is
     # created only from the strict gate result above; scanner rows can never
@@ -7067,6 +7156,43 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         }
         STATE["sizing_decision"] = dict(sizing_decision)
         institutional_entry_ctx["sizing_decision"] = dict(sizing_decision)
+        # One pre-trade risk record from the frozen sizing decision. This does
+        # not size, approve or execute anything; it makes leverage, margin,
+        # net return, liquidation distance and R/R explicit before the order.
+        try:
+            risk_plan = build_entry_risk_plan(
+                side=side, entry_price=reference_price, stop_price=structural_stop,
+                quantity=qty, target_price=tp1, account_equity=balance,
+                contract_size=contract_size, leverage=LEVERAGE,
+                sizing_decision=sizing_decision,
+            )
+            STATE["entry_risk_plan"] = risk_plan
+            institutional_entry_ctx["entry_risk_plan"] = risk_plan
+            persistent_ctx = institutional_entry_ctx.get("persistent_entry_context")
+            if isinstance(persistent_ctx, dict):
+                persistent_ctx["entry_risk_plan"] = risk_plan
+            initial_mode_report = build_management_mode_report(
+                {"side": side, "entry": reference_price, "tp1_price": tp1, "tp2_price": tp2,
+                 "range_target_price": STATE.get("range_target_price")},
+                profit_mode=STANDARD_MODE,
+                reason="pending_first_closed_candle_management_classification",
+                evidence=(),
+            )
+            STATE["management_mode"] = initial_mode_report["management_mode"]
+            STATE["management_mode_report"] = initial_mode_report
+            STATE["management_mode_history"] = [{
+                "at": time.time(), "candle_ts": 0.0,
+                "management_mode": initial_mode_report["management_mode"],
+                "canonical_profit_mode": initial_mode_report["canonical_profit_mode"],
+                "reason": initial_mode_report["classification_reason"],
+                "selected_target_gross_roe_pct": initial_mode_report["selected_target_gross_roe_pct"],
+            }]
+        except Exception as risk_plan_exc:
+            log_execution(
+                f"[RISK_PLAN] BLOCKED {symbol} {side}: pre-trade risk record unavailable "
+                f"{type(risk_plan_exc).__name__}: {risk_plan_exc}", "ERROR",
+            )
+            return False
         if gate_journal is not None:
             try:
                 persisted_decision = gate_journal.persist_sizing_decision(trade_id, sizing_decision)
@@ -7277,6 +7403,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "trade_id": trade_id,
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
+            "management_mode": "STANDARD", "management_mode_report": {}, "management_mode_history": [],
+            "management_mode_last_change_ts": 0.0, "entry_risk_plan": {}, "institutional_report": {},
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
@@ -7417,6 +7545,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "execution_unresolved": bool(order.get("protection_unverified", False)),
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
+            "management_mode": "STANDARD", "management_mode_report": {}, "management_mode_history": [],
+            "management_mode_last_change_ts": 0.0, "entry_risk_plan": {}, "institutional_report": {},
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
@@ -7954,6 +8084,9 @@ def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, at
         ),
         "entry_behavior_context": (dict(source["entry_behavior_context"])
                                    if isinstance(source.get("entry_behavior_context"), dict) else {}),
+        "institutional_report": dict(source.get("institutional_report") or {}),
+        "institutional_location_gate": dict(source.get("institutional_location_gate") or {}),
+        "entry_risk_plan": dict(source.get("entry_risk_plan") or {}),
         "lifecycle_status": _first(source.get("lifecycle_status"), source.get("cross_event_lifecycle_status"), "CROSS_DETECTED"),
         "entry_behavior_confidence": _number(source.get("entry_behavior_confidence"), 0.0),
         "evidence": list(source.get("evidence") or []),
@@ -10261,6 +10394,7 @@ function updateUI(d) {{
             <div>Narrative: ${{d.position.narrative_classification}} (Conf: ${{d.position.narrative_confidence}}) | Conf Level: ${{d.position.confidence_level}}</div>
             <div>Current Confidence: ${{d.position.current_confidence}} | Regime: ${{d.position.market_regime}} | Cont. Pressure: ${{d.position.continuation_pressure}}</div>
             <div>Trade State: ${{d.position.trade_state}} | Trail Mult: ${{d.position.trail_multiplier}} | Delay TP1: ${{d.position.delay_tp1}}</div>
+            <div>Management: ${{d.position.management_mode}} | Selected Target ROE: ${{d.position.selected_target_gross_roe_pct ?? "-"}}% | Net Risk: ${{d.position.entry_risk_plan?.estimated_net_loss ?? "-"}} USDT | R/R(net): ${{d.position.entry_risk_plan?.risk_reward_net ?? "-"}} | Liq. Dist.: ${{d.position.entry_risk_plan?.idealized_liquidation_distance_pct ?? "-"}}% | Mode Changes: ${{d.position.management_mode_history?.length || 0}}</div>
         `;
     }} else {{
         document.getElementById("pos").innerHTML = "No active trade";
@@ -10406,6 +10540,10 @@ function updateUI(d) {{
             let cardTimeframe = cardDecision.timeframe_view || (w.unified_decision_context || {{}}).timeframe_view || {{}};
             let cardBehavior = cardDecision.entry_behavior_context || w.entry_behavior_context || {{}};
             let cardLifecycle = cardDecision.lifecycle_context || w.lifecycle_context || {{}};
+            let cardInstitutional = w.institutional_report || (w.unified_decision_context || {{}}).institutional_report || {{}};
+            let cardClassification = cardInstitutional.entry_classification || {{}};
+            let cardCrossZone = cardInstitutional.location_gate || {{}};
+            let cardRoom = cardInstitutional.available_price_room || {{}};
             let cardDelivery = d.cross_watchlist_delivery || {{}};
             let cardCrossDurable = cardCross.durable_event === true && cardCross.authoritative === true;
             let cardCrossState = cardCross.display_cross_state || cardCross.cross_state || w.cross_state || "NO_CROSS";
@@ -10436,6 +10574,8 @@ function updateUI(d) {{
               <br><small>Zone: quality=${{uniEsc(cardZone.zone_quality_score ?? w.zone_quality_score ?? "?")}}/100 | valid=${{uniEsc((cardZone.supply_demand || {{}}).valid ?? "UNKNOWN")}} | Liquidity: ${{uniEsc(cardLiquidity.state || "UNKNOWN")}} / ${{uniEsc(cardLiquidity.stage || "UNKNOWN")}} | Confirmation: ${{uniEsc(cardStructure.confirmation_status || "UNKNOWN")}} | Pullback/Retest: ${{uniEsc(cardDecision.setup_stage || "UNKNOWN")}}</small>
               <br><small>Structural Stop: ${{uniEsc(cardStopState)}} | Validation: ${{uniEsc(w.structural_stop_status || cardDecision.stop_validation_status || "UNSPECIFIED")}} | Final decision: ${{uniEsc(cardDecisionState)}} (${{uniEsc(cardReadyState)}}) | Gate: ${{uniEsc(cardDecision.execution_gate_state || cardReadyState)}} | Blocking: ${{uniEsc(cardBlocking)}} | Next: ${{uniEsc(cardNextEvent)}} | authority=${{uniEsc(cardReadiness.authoritative_gate || "UNCHANGED_EXECUTE_ENTRY")}}</small>
               <br><small>Entry type: ${{uniEsc(cardBehavior.entry_type || w.entry_type || "NOT_CLASSIFIED")}} | reason: ${{uniEsc(cardBehavior.reason || "none")}} | confirmation: ${{uniEsc(cardBehavior.confirmation ?? "?")}} | invalidation: ${{uniEsc((cardBehavior.invalidation || []).join(", ") || "none")}} | source: ${{uniEsc(cardBehavior.classification_source || "NONE")}}</small>
+              <br><small>Institutional report: cross=${{uniEsc((cardInstitutional.cross_location || {{}}).state || "UNKNOWN")}} | regime=${{uniEsc((cardInstitutional.market_regime || {{}}).state || "UNKNOWN")}} | zone=${{uniEsc((cardInstitutional.institutional_zone || {{}}).state || "UNKNOWN")}} | structure=${{uniEsc((cardInstitutional.structure_bias || {{}}).state || "UNKNOWN")}} | liquidity=${{uniEsc((cardInstitutional.liquidity_context || {{}}).event || "UNKNOWN")}}/${{uniEsc((cardInstitutional.liquidity_context || {{}}).direction || "UNKNOWN")}} | volume=${{uniEsc((cardInstitutional.volume_confirmation || {{}}).state || "UNKNOWN")}} | trend=${{uniEsc((cardInstitutional.trend_strength || {{}}).state || "UNKNOWN")}} | room=${{uniEsc(cardRoom.room_price_pct ?? "?")}}% (${{uniEsc(cardRoom.status || "UNKNOWN")}}) | invalidation=${{uniEsc((cardInstitutional.structural_invalidation || {{}}).valid ? "VALID" : "INVALID")}} | freshness=${{uniEsc((cardInstitutional.data_freshness || {{}}).state || "UNKNOWN")}} | confidence=${{uniEsc((cardInstitutional.analysis_confidence || {{}}).score ?? "?")}}</small>
+              <br><small>Entry classification: ${{uniEsc(cardClassification.entry_type || "NOT_CLASSIFIED")}} | reason: ${{uniEsc((cardClassification.reason_codes || []).join(", ") || "none")}} | cross-zone: ${{uniEsc(cardCrossZone.state || "UNKNOWN")}} (${{uniEsc((cardCrossZone.reasons || []).join(", ") || "none")}}) | authority: ${{uniEsc(cardClassification.final_authority || "UNIFIED_ENTRY_AUTHORITY_UNCHANGED")}}</small>
               <br><small>Lifecycle: ${{uniEsc(cardDecision.lifecycle_status || cardLifecycle.lifecycle_status || "INSTITUTIONAL_ANALYSIS")}} | waiting: ${{uniEsc(cardDecision.waiting_condition || cardLifecycle.waiting_condition || "none")}} | analysis: ${{uniEsc(cardLifecycle.analysis_status || "PENDING")}} | durable=${{uniEsc(cardCrossDurable)}} | role=${{uniEsc(cardCrossRole)}}</small>
               <br><small>Cross delivery: same_cycle=${{uniEsc(cardDelivery.same_cycle ?? false)}} | detected=${{uniEsc(cardDelivery.detected_at ?? 0)}} | delivered=${{uniEsc(cardDelivery.delivered_at ?? 0)}} | refresh_s=${{uniEsc(cardDelivery.refresh_seconds ?? 0)}} | new=${{uniEsc(cardDelivery.new_events ?? 0)}} | status=${{uniEsc(cardDelivery.reason || "NO_NEW_CROSS_EVENT")}}</small>
             </div>`;
@@ -10482,7 +10622,7 @@ async function loadDecision() {{
     const active = json.active_trade || {{open:false}};
     if (summary) {{
       summary.textContent = active.open
-        ? `🧠 ${{json.authority || 'Unified Manager'}} | ${{json.mode || '-'}} | ${{active.symbol || '-'}} ${{active.side || ''}} | ${{active.profit_mode || '-'}} | TP1: ${{active.tp1_hit ? '✅' : '⏳'}} | TP2: ${{active.tp2_hit ? '✅' : '⏳'}} | SL: ${{active.native_sl_status || 'UNKNOWN'}}`
+        ? `🧠 ${{json.authority || 'Unified Manager'}} | ${{json.mode || '-'}} | ${{active.symbol || '-'}} ${{active.side || ''}} | ${{active.profit_mode || '-'}} | Mgmt: ${{active.management_mode || '-'}} | Target ROE: ${{active.selected_target_gross_roe_pct ?? '-'}}% | TP1: ${{active.tp1_hit ? '✅' : '⏳'}} | TP2: ${{active.tp2_hit ? '✅' : '⏳'}} | SL: ${{active.native_sl_status || 'UNKNOWN'}}`
         : `🧠 ${{json.authority || 'Unified Manager'}} | ${{json.mode || '-'}} | No active trade`;
     }}
     container.replaceChildren();
@@ -10507,6 +10647,10 @@ async function loadDecision() {{
       const parts = [];
       if (item.symbol) parts.push(`${{item.symbol}} ${{item.side || ''}}`);
       if (item.profit_mode) parts.push(`Mode: ${{item.profit_mode}}`);
+      if (item.management_mode) parts.push(`Mgmt: ${{item.management_mode}}`);
+      if (item.selected_target_roe_pct !== undefined && item.selected_target_roe_pct !== null) parts.push(`Target ROE: ${{item.selected_target_roe_pct}}%`);
+      if (item.target_convention_basis) parts.push(`Basis: ${{item.target_convention_basis}}`);
+      if (item.entry_mode) parts.push(`Entry: ${{item.entry_mode}}`);
       if (item.price !== undefined && item.price !== null) parts.push(`Price: ${{item.price}}`);
       if (item.roe_pct !== undefined && item.roe_pct !== null) parts.push(`ROE: ${{item.roe_pct}}%`);
       if (item.qty_closed !== undefined && item.qty_closed !== null) parts.push(`Closed: ${{item.qty_closed}}`);
@@ -10518,7 +10662,7 @@ async function loadDecision() {{
       const reason = document.createElement('div');
       reason.style.fontSize = '12px';
       reason.style.color = '#94a3b8';
-      reason.textContent = item.reason || item.close_reason || '';
+      reason.textContent = item.actual_exit_reason || item.reason || item.close_reason || '';
       const date = document.createElement('div');
       date.style.fontSize = '10px';
       date.style.color = '#64748b';
@@ -10553,6 +10697,12 @@ def decision_feed():
                 "symbol": STATE.get("current_symbol"),
                 "side": STATE.get("side"),
                 "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
+                "management_mode": STATE.get("management_mode") or "STANDARD",
+                "management_mode_report": dict(STATE.get("management_mode_report") or {}),
+                "management_mode_history": list(STATE.get("management_mode_history") or [])[-20:],
+                "selected_target_gross_roe_pct": (STATE.get("management_mode_report") or {}).get("selected_target_gross_roe_pct"),
+                "entry_risk_plan": dict(STATE.get("entry_risk_plan") or {}),
+                "actual_exit_reason": STATE.get("last_close_reason") or STATE.get("pending_close_reason") or "",
                 "tp1_hit": bool(STATE.get("tp1_hit")),
                 "tp2_hit": bool(STATE.get("tp2_hit")),
                 "remaining_qty": safe_float(STATE.get("remaining_qty")),
@@ -10618,7 +10768,13 @@ def data():
                 "continuation_pressure": STATE.get("continuation_pressure", 50),
                 "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
                 "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
+                "delay_tp1": STATE.get("delay_tp1", False),
+                "management_mode": STATE.get("management_mode") or "STANDARD",
+                "management_mode_report": dict(STATE.get("management_mode_report") or {}),
+                "management_mode_history": list(STATE.get("management_mode_history") or [])[-20:],
+                "selected_target_gross_roe_pct": (STATE.get("management_mode_report") or {}).get("selected_target_gross_roe_pct"),
+                "entry_risk_plan": dict(STATE.get("entry_risk_plan") or {}),
+                "actual_exit_reason": STATE.get("last_close_reason") or STATE.get("pending_close_reason") or ""
             }
         else:
             pos = DASHBOARD_STATE["position"]
@@ -10655,7 +10811,12 @@ def data():
                 "reclaim_risk": STATE.get("reclaim_risk", 0),
                 "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
                 "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
+                "delay_tp1": STATE.get("delay_tp1", False),
+                "management_mode": STATE.get("management_mode") or "STANDARD",
+                "selected_target_gross_roe_pct": (STATE.get("management_mode_report") or {}).get("selected_target_gross_roe_pct"),
+                "estimated_net_loss": (STATE.get("entry_risk_plan") or {}).get("estimated_net_loss"),
+                "risk_reward_net": (STATE.get("entry_risk_plan") or {}).get("risk_reward_net"),
+                "idealized_liquidation_distance_pct": (STATE.get("entry_risk_plan") or {}).get("idealized_liquidation_distance_pct")
             }
             live_data["live_trade_mode"] = True
             live_data["supervisor"] = supervisor_data
@@ -13556,7 +13717,14 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
         # One read-only projection over fields already produced above. It never
         # alters decision_state, entry_readiness, authority, SL/TP or sizing.
         try:
-            projected = _project_watchlist_row({**analysis, **result}, now_ts=now_ms / 1000.0)
+            combined_row = {**analysis, **result}
+            projected = _project_watchlist_row(combined_row, now_ts=now_ms / 1000.0)
+            # Additive evidence report over the same closed-candle row. It adds no
+            # scan, no cache entry and no authority; it only makes the existing
+            # institutional evidence auditable in the Watchlist/dashboard.
+            result["institutional_report"] = build_institutional_report(
+                combined_row, side=str(analysis.get("side") or "").upper(), now_ts=now_ms / 1000.0,
+            )
             result["unified_decision_context"] = projected
             result["cross_state"] = projected["cross_context"]["cross_state"]
             result["projected_decision_state"] = projected["decision_context"]["decision_state"]
@@ -13759,6 +13927,26 @@ def smart_opportunity_selection():
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "no_unambiguous_authorized_side"
                 continue
+            institutional_report = item.get("institutional_report")
+            if not isinstance(institutional_report, dict) or not institutional_report:
+                institutional_report = build_institutional_report(item, side=side, now_ts=time.time())
+            location_gate = validate_institutional_location(institutional_report)
+            item["institutional_report"] = institutional_report
+            item["institutional_location_gate"] = location_gate
+            if location_gate["state"] == "BLOCKED":
+                reason = location_gate["blocking_reason"] or "strong_opposing_zone_requires_wait"
+                item["decision_state"] = "NO_CHASE"
+                item["rejection_reason"] = reason
+                MEMORY.setdefault("no_entry_feed", []).append({
+                    "time": time.time(), "symbol": exchange_sym, "side": side,
+                    "reason": reason, "score": float(item.get("score", 0) or 0),
+                })
+                MEMORY["no_entry_feed"] = MEMORY["no_entry_feed"][-20:]
+                log_execution(
+                    f"[INSTITUTIONAL_LOCATION] {exchange_sym} {side} held: {reason}",
+                    "WARN", debounce_key=f"institutional_location:{exchange_sym}:{side}:{reason}", debounce_sec=10,
+                )
+                continue
             event_id = str(item.get("event_id") or "")
             if not event_id:
                 item["decision_state"] = "REJECTED"
@@ -13870,6 +14058,8 @@ def smart_opportunity_selection():
                 "zone_quality": item.get("zone_quality"),
                 "zone_type": item.get("zone_type"),
                 "market_structure": dict(item.get("market_structure") or {}),
+                "institutional_report": dict(institutional_report),
+                "institutional_location_gate": dict(location_gate),
                 "volume_ratio": item.get("volume_ratio"),
                 "adx": item.get("adx"),
                 "adx_di": dict(item.get("adx_di") or {}),

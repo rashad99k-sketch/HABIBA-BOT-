@@ -19,6 +19,7 @@ import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from ggp_market_intelligence import normalize_entry_type
+from ggp_institutional_strategy import build_institutional_report
 
 SCHEMA_VERSION = "NAISO_UNIFIED_DECISION_CONTEXT_V1"
 
@@ -801,6 +802,17 @@ def project_decision_context(record: Any, *, cross: Any = None, now_ts: Optional
                  or row.get("closed_candle_timestamp") or row.get("latest_closed_timestamp")
                  or row.get("candle_timestamp") or 0)
     timeframe_view = project_timeframe_view(row, ranking=ranking)
+    # Read-only institutional evidence report. Reuse the report already produced
+    # by Watchlist enrichment when present; otherwise build the same pure report
+    # from the closed-candle row and its projected cross context. No API, cache,
+    # journal, order or authority is involved.
+    institutional_report = row.get("institutional_report")
+    if not isinstance(institutional_report, dict) or not institutional_report:
+        report_row = dict(row)
+        report_row["cross_context"] = cross_map
+        institutional_report = build_institutional_report(
+            report_row, side=_upper(row.get("side") or row.get("direction")), now_ts=now_ts,
+        )
     market_context = {
         **timeframe_view,
         "liquidity": liquidity,
@@ -834,6 +846,7 @@ def project_decision_context(record: Any, *, cross: Any = None, now_ts: Optional
         "market_context": market_context,
         "entry_readiness": readiness,
         "entry_behavior_context": entry_behavior_context,
+        "institutional_report": institutional_report,
         "entry_type": entry_behavior_context["entry_type"],
         "lifecycle_status": lifecycle_context["lifecycle_status"],
         "lifecycle_context": lifecycle_context,
@@ -872,6 +885,8 @@ def project_watchlist_row(record: Any, *, now_ts: Optional[float] = None,
         "timeframe_view": decision["timeframe_view"],
         "entry_readiness": decision["entry_readiness"],
         "entry_behavior_context": decision["entry_behavior_context"],
+        "institutional_report": decision["institutional_report"],
+        "institutional_location_gate": dict(decision["institutional_report"].get("location_gate") or {}),
         "entry_type": decision["entry_type"],
         "lifecycle_status": decision["lifecycle_status"],
         "lifecycle_context": decision["lifecycle_context"],
@@ -931,6 +946,7 @@ def project_dashboard_sections(watchlist: Any = None, confirmed_crosses: Any = N
         "confirmed_crosses": confirmed_rows,
         "watchlist_ranking": ranking_rows,
         "institutional_analysis": institutional_rows,
+        "institutional_report": [row["institutional_report"] for row in institutional_rows],
         "execution_readiness": execution_rows,
         "cross_delivery": dict(_mapping(cross_delivery)),
         "note": "Projection only. No new authority, order path, indicator or API call.",
