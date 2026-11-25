@@ -373,8 +373,18 @@ class HealthWatchdog:
 
     @staticmethod
     def _main_thread_stack_excerpt(diagnostics: Dict[str, Any], limit: int = 2600) -> str:
-        """Return the captured foreground stack for incident alerts and reports."""
+        """Return the captured foreground stack for incident alerts and reports.
+
+        Prefer the explicitly identified MainThread stack. Older or partial
+        diagnostic payloads may only contain possible_stacks, so fall back to
+        the current process MainThread identifier when it is available.
+        """
         stack = diagnostics.get("main_thread_stack")
+        if not isinstance(stack, str) or not stack:
+            stacks = diagnostics.get("possible_stacks")
+            if isinstance(stacks, dict):
+                current_main = threading.main_thread()
+                stack = stacks.get(str(current_main.ident), "")
         if not isinstance(stack, str) or not stack:
             return ""
         return stack[-max(200, int(limit)):]
