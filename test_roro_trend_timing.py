@@ -136,3 +136,13 @@ def test_invalid_side_fails_closed():
     result = evaluate_early_trend_timing(make_starting_trend(), "HOLD")
     assert result["valid"] is False
     assert result["reason"] == "invalid_side"
+
+
+def test_early_trend_timing_rejects_infinite_values_anywhere_in_ohlcv_frame():
+    frame = make_starting_trend("BUY")
+    frame.loc[10, "high"] = np.inf
+
+    result = evaluate_early_trend_timing(frame, "BUY")
+
+    assert result["valid"] is False
+    assert result["reason"] == "invalid_or_non_monotonic_closed_candles"

@@ -15,6 +15,7 @@ import math
 import gc
 import random
 import uuid
+import copy
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
@@ -77,6 +78,13 @@ from ggp_position_sizing import (
 from bingx_execution import (TradeExecutionService, BingXPositionModeAdapter,
                               ExecutionState, PositionMode, build_position_order_params,
                               leverage_params)
+try:
+    from naiso_api_resilience import ORDER_WRITE_METHODS as _ORDER_WRITE_METHODS
+except Exception:  # pragma: no cover - fallback keeps the governor self-contained
+    _ORDER_WRITE_METHODS = frozenset({
+        "create_order", "create_market_order", "create_limit_order",
+        "cancel_order", "cancel_all_orders", "swapV1PrivatePostTradeCancelReplace",
+    })
 from ggp_recovery import resolve_position_identity, build_restored_management_state
 from ggp_market_data import (
     REQUIRED_CLOSED_CANDLES,
@@ -587,25 +595,210 @@ CACHE = {
 }
 _last_api_call = 0.0
 MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
-# BingX documents the USDT-M swap kline endpoint at 1 request/second per IP.
-# Keep the slower market-data endpoint pacing distinct from the generic
-# account/management request scheduler and serialize it across all workers.
+# BingX documents a shared public market-data IP budget of 500/10s.
+# The current swap endpoint reference separately annotates 1/s for specific
+# endpoints (contracts, depth, recent trades, klines, funding history, ticker,
+# bookTicker and open interest). Apply 1.05s only to those verified methods;
+# do not infer a rate from an IP-group identifier.
 BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.0, 2.0)
-_API_METHOD_MIN_INTERVALS = {"fetch_ohlcv": BINGX_KLINE_MIN_INTERVAL}
+BINGX_PUBLIC_MARKET_MIN_INTERVAL = _env_float_range(
+    "BINGX_PUBLIC_MARKET_MIN_INTERVAL", BINGX_KLINE_MIN_INTERVAL, 1.0, 2.0
+)
+# BingX's official Futures rate table distinguishes Ordinary and Trader tiers:
+# - Place order: 10/s Ordinary, 1/s Trader; cancel order: 5/s Ordinary, 1/s Trader.
+# - Account tier is not available from this process, so use the restrictive
+#   published Trader ceiling locally (1.05s); this is not an assertion of tier.
+# - Leverage/margin/position-mode writes use a conservative local 2/s ceiling.
+# The official cancelAllAfter reference is also conservatively paced at 1/s.
+BINGX_TRADE_WRITE_MIN_INTERVAL = _env_float_range(
+    "BINGX_TRADE_WRITE_MIN_INTERVAL", 1.05, 1.0, 2.0
+)
+BINGX_CONFIG_WRITE_MIN_INTERVAL = _env_float_range(
+    "BINGX_CONFIG_WRITE_MIN_INTERVAL", 0.55, 0.5, 2.0
+)
+_API_METHOD_MIN_INTERVALS = {
+    # Public swap endpoints individually annotated at 1/s per IP.
+    "fetch_ohlcv": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_order_book": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_trades": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_ticker": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_tickers": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_bids_asks": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_funding_rate_history": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_markets": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    "fetch_open_interest": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    # Order writes use a conservative local 1/s cap (not the exchange limit).
+    "create_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "create_market_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "create_limit_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "create_orders": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "cancel_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "cancel_orders": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    # Leverage, margin and position-mode configuration: 2/s.
+    "set_leverage": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "fetch_margin_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "set_margin_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "fetch_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "set_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "add_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "reduce_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    # BingX cancelAllAfter is documented at 1/s per UID; retain local 1/s cap.
+    "cancel_all_orders_after": BINGX_TRADE_WRITE_MIN_INTERVAL,
+}
 _API_RATE_LOCK = threading.Lock()
+# Never let API scheduler contention pin MainThread indefinitely. A timeout is
+# fail-closed: the exchange call is not sent and the next loop can try again.
+API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC = _env_float_range(
+    "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.75, 0.05, 2.0
+)
+_API_RATE_LOCK_OWNER = {
+    "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
+}
 _LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
+# Overall pacing budget. The old loop only bounded each lock acquisition, so a
+# tiny remaining wait or a wedged clock could spin forever. Both a logical
+# (possibly injected) deadline and a captured real-time deadline are enforced.
+API_RATE_WAIT_TIMEOUT_SEC = _env_float_range("API_RATE_WAIT_TIMEOUT_SEC", 5.0, 0.05, 30.0)
+API_RATE_MIN_SLEEP_SEC = _env_float_range("API_RATE_MIN_SLEEP_SEC", 0.001, 0.000001, 0.05)
+API_RATE_MAX_WAIT_ITERATIONS = _env_int_range("API_RATE_MAX_WAIT_ITERATIONS", 4096, 8, 100000)
+_HARD_MONOTONIC = time.monotonic
+
+
+class ApiRateLockTimeout(RuntimeError):
+    """Raised when the shared API scheduler cannot reserve a request start."""
+
+
 def rate_limit(func=None):
-    """Serialize API request starts, applying endpoint-specific minimum spacing."""
+    """Reserve the next request start with bounded, progress-checked pacing.
+
+    The lock is held only while reading/reserving ``_last_api_call``; pacing
+    sleeps always happen after release. Every acquisition and the complete wait
+    are bounded by both the logical clock and a real monotonic clock captured
+    before any test can replace ``ggpbot.time``. A clock that makes no progress
+    fails closed instead of spinning in a zero-progress sleep loop.
+    """
     global _last_api_call
     method_name = getattr(func, "__name__", "") if func is not None else ""
-    min_interval = max(MIN_API_INTERVAL, _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL))
-    with _API_RATE_LOCK:
-        now = time.monotonic()
-        elapsed = now - _last_api_call
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        _last_api_call = time.monotonic()
+
+    def _finite(value):
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    configured_interval = _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL)
+    if not (_finite(MIN_API_INTERVAL) and _finite(configured_interval)):
+        raise ApiRateLockTimeout(
+            f"API_RATE rejected non-finite interval for {method_name or 'unknown'}; "
+            f"base={MIN_API_INTERVAL!r} endpoint={configured_interval!r}"
+        )
+    min_interval = max(MIN_API_INTERVAL, configured_interval)
+
+    # Non-finite clock values are never a reason to sleep or reserve a request
+    # start. Fail closed before acquiring the shared lock so no exchange call
+    # can be dispatched from an undefined pacing state.
+    real_now = _HARD_MONOTONIC()
+    logical_now = time.monotonic()
+    if not (_finite(real_now) and _finite(logical_now)
+            and _finite(min_interval) and _finite(_last_api_call)):
+        raise ApiRateLockTimeout(
+            f"API_RATE rejected non-finite pacing state for {method_name or 'unknown'}; "
+            f"real={real_now!r} logical={logical_now!r} interval={min_interval!r} "
+            f"last_call={_last_api_call!r}"
+        )
+
+    # Two independent budgets: the logical clock may be replaced by tests, but
+    # real elapsed time is captured from the original monotonic function so a
+    # frozen/injected clock can never remove the hard termination guarantee.
+    real_deadline = real_now + API_RATE_WAIT_TIMEOUT_SEC
+    logical_deadline = logical_now + API_RATE_WAIT_TIMEOUT_SEC
+    # A reservation within one float ULP of its due time is already on time;
+    # this prevents sub-ULP residue from producing an endless one-nanosecond
+    # sleep loop.
+    interval_tolerance = max(1e-12, min_interval * 1e-9)
+
+    for _iteration in range(API_RATE_MAX_WAIT_ITERATIONS):
+        remaining_real = real_deadline - _HARD_MONOTONIC()
+        remaining_logical = logical_deadline - time.monotonic()
+        if remaining_real <= 0.0 or remaining_logical <= 0.0:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing deadline exceeded for {method_name or 'unknown'}; "
+                f"remaining_logical={remaining_logical:.6f}s "
+                f"remaining_real={remaining_real:.6f}s"
+            )
+
+        acquire_timeout = max(
+            0.0,
+            min(API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC, remaining_real, remaining_logical),
+        )
+        acquired = _API_RATE_LOCK.acquire(timeout=acquire_timeout)
+        if not acquired:
+            owner = dict(_API_RATE_LOCK_OWNER)
+            owner_since = float(owner.get("since_monotonic") or 0.0)
+            held_for = max(0.0, time.monotonic() - owner_since) if owner_since > 0 else 0.0
+            raise ApiRateLockTimeout(
+                f"API_RATE_LOCK acquisition timed out after "
+                f"{acquire_timeout:.2f}s for {method_name or 'unknown'}; "
+                f"owner_thread={owner.get('thread_name') or 'unknown'} "
+                f"owner_id={owner.get('thread_id')} held_for={held_for:.2f}s "
+                f"owner_method={owner.get('method') or 'unknown'}"
+            )
+
+        wait_seconds = 0.0
+        owner_now = time.monotonic()
+        _API_RATE_LOCK_OWNER.update({
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+            "since_monotonic": owner_now,
+            "method": method_name,
+        })
+        try:
+            now = time.monotonic()
+            if not _finite(now):
+                raise ApiRateLockTimeout(
+                    f"API_RATE rejected non-finite logical clock for {method_name or 'unknown'}"
+                )
+            due = float(_last_api_call) + min_interval
+            if not _finite(due):
+                raise ApiRateLockTimeout(
+                    f"API_RATE rejected non-finite reservation deadline for {method_name or 'unknown'}"
+                )
+            if now + interval_tolerance >= due:
+                # Reserve at the exact due time so repeated small sleeps cannot
+                # accumulate drift across a high-iteration stress run.
+                _last_api_call = max(now, due)
+                return
+            remaining_real = real_deadline - _HARD_MONOTONIC()
+            remaining_logical = logical_deadline - now
+            wait_seconds = min(due - now, remaining_real, remaining_logical)
+        finally:
+            _API_RATE_LOCK_OWNER.update({
+                "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
+            })
+            _API_RATE_LOCK.release()
+
+        if wait_seconds <= 0.0:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing budget exhausted before reservation for "
+                f"{method_name or 'unknown'}"
+            )
+
+        # Every sleep is strictly positive and at least one quantum. A coarse
+        # clock may not tick for a tiny sleep; that is safe because both the
+        # deadline and the iteration budget still bound the loop.
+        sleep_for = max(float(wait_seconds), API_RATE_MIN_SLEEP_SEC)
+        if sleep_for > remaining_real or sleep_for > remaining_logical:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing deadline would be exceeded by sleep for "
+                f"{method_name or 'unknown'}"
+            )
+        time.sleep(sleep_for)
+
+    raise ApiRateLockTimeout(
+        f"API_RATE pacing iteration budget ({API_RATE_MAX_WAIT_ITERATIONS}) "
+        f"exhausted for {method_name or 'unknown'}"
+    )
 
 CACHE_LOCK = threading.RLock()
 CACHE_MAX_ITEMS = _env_int_range("CACHE_MAX_ITEMS", 2500, 100, 10000)
@@ -727,19 +920,22 @@ def safe_api_call(func, *args, **kwargs):
     requested_attempts = kwargs.pop("_api_max_attempts", None)
     # Order creation is non-idempotent. Never automatically retry a timed-out
     # create_order call: BingX may have accepted the first request already.
-    method_name = getattr(func, "__name__", "exchange_call")
+    # functools.wraps wrappers must not hide an order write behind a lambda name.
+    unwrapped = func
+    for _ in range(8):
+        candidate = getattr(unwrapped, "__wrapped__", None)
+        if candidate is None:
+            break
+        unwrapped = candidate
+    method_name = getattr(unwrapped, "__name__", getattr(func, "__name__", "exchange_call"))
     # Cancellations and cancel-replace are order mutations too. A timeout may
     # have been applied by BingX, so retrying can duplicate or escalate an
     # uncertain order-state change; reconciliation must decide, not the retry loop.
-    is_order_write = method_name in {
-        "create_order", "create_market_order", "create_limit_order",
-        "cancel_order", "cancel_all_orders", "swapV1PrivatePostTradeCancelReplace",
-    }
+    is_order_write = method_name in _ORDER_WRITE_METHODS
     resilience = globals().get("API_RESILIENCE")
     if is_order_write and resilience is not None:
         try:
             resilience.before_call(method_name)
-            resilience.count_request()
         except CircuitOpenError:
             if "MEMORY" in globals():
                 MEMORY["api_circuit_state"] = "OPEN"
@@ -747,7 +943,14 @@ def safe_api_call(func, *args, **kwargs):
                           debounce_key=f"api_circuit_{method_name}", debounce_sec=30)
             raise
     if is_order_write:
-        rate_limit(func)
+        try:
+            rate_limit(func)
+        except ApiRateLockTimeout as exc:
+            if resilience is not None:
+                resilience.record_failure(method_name, exc)
+            raise
+        if resilience is not None:
+            resilience.count_request()
         try:
             result = func(*args, **kwargs)
         except Exception as exc:
@@ -791,18 +994,37 @@ def safe_api_call(func, *args, **kwargs):
                         f"[API_CIRCUIT] {method_name} temporarily fenced on retry {attempt + 1}/{attempts}; no request sent",
                         "WARN", debounce_key=f"api_circuit_{method_name}", debounce_sec=30)
                     raise
-                resilience.count_request()
+            # Local scheduler contention is classified once by the outer
+            # exception handler; it is not an exchange request and is never retried.
             rate_limit(func)
+            if resilience is not None:
+                resilience.count_request()
             result = func(*args, **kwargs)
             if resilience is not None:
                 resilience.record_success(method_name)
             return result
         except CircuitOpenError:
             raise
+        except ApiRateLockTimeout as exc:
+            # Local scheduling is never an exchange failure. Even when the
+            # optional resilience module is disabled, fail closed without
+            # retrying, backing off, or sending a request.
+            if resilience is not None:
+                resilience.record_failure(method_name, exc)
+            raise
         except Exception as e:
             failure_kind = None
             if resilience is not None:
                 failure_kind = resilience.record_failure(method_name, e)
+            else:
+                # Absence of the optional circuit breaker must not turn a
+                # business/configuration failure into a retryable read.
+                fallback_classifier = globals().get("classify_api_error")
+                if callable(fallback_classifier):
+                    try:
+                        failure_kind = fallback_classifier(e, method=method_name)
+                    except Exception:
+                        failure_kind = None
             is_rate_limited = (("rate limit" in str(e).lower() or "100410" in str(e))
                                if failure_kind is None else failure_kind.kind == "RATE_LIMITED")
             if is_rate_limited:
@@ -1174,7 +1396,12 @@ def fetch_ohlcv(symbol, limit=150):
                 detail=f"endpoint cooldown active for {cooldown:.2f}s; no request sent",
             )
             return None
-        data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
+        # Position management is a latency-critical foreground responsibility.
+        # One physical read per cycle is safer than exhausting the watchdog budget
+        # with retries; the next management cycle performs the next reconciliation.
+        api_attempts = 1 if (STATE.get("open") or TRADE_STATE.get("in_position")) else None
+        data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit,
+                             _api_max_attempts=api_attempts)
         if not data:
             rate = _LAST_API_RATE_LIMIT
             rate_limited = (
@@ -1191,28 +1418,52 @@ def fetch_ohlcv(symbol, limit=150):
                 detail=f"fetcher minimum is 100 rows; received {len(data)}",
             )
             return None
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        try:
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        except (TypeError, ValueError):
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(data), detail="invalid OHLCV row shape",
+            )
+            return None
         for col in ["timestamp", "open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
-        if len(df) < 100:
+        if df.isna().any().any():
             _record_ohlcv_fetch_diagnostic(
-                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
-                detail=f"only {len(df)} complete OHLCV rows remained after validation",
+                sym, "OHLCV_MALFORMED", received=len(df), detail="missing or non-numeric OHLCV value",
             )
             return None
-        if (df[["close", "high", "low"]] <= 0).any().any():
+        numeric = df[["timestamp", "open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+        if not np.isfinite(numeric).all():
             _record_ohlcv_fetch_diagnostic(
-                sym, "OHLCV_EMPTY", received=len(df), detail="non-positive OHLC value",
+                sym, "OHLCV_MALFORMED", received=len(df), detail="non-finite OHLCV value",
             )
             return None
-        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-        if len(df) < 100:
+        timestamps = df["timestamp"].to_numpy(dtype=float)
+        if ((timestamps <= 0).any()
+                or not np.equal(timestamps, np.floor(timestamps)).all()
+                or not df["timestamp"].is_monotonic_increasing
+                or df["timestamp"].duplicated().any()):
             _record_ohlcv_fetch_diagnostic(
-                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
-                detail=f"only {len(df)} unique OHLCV rows remained",
+                sym, "OHLCV_MALFORMED", received=len(df),
+                detail="timestamps must be positive integer milliseconds, strictly increasing and unique",
             )
             return None
+        if (df["volume"] < 0).any() or (df[["open", "high", "low", "close"]] <= 0).any().any():
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(df), detail="non-positive price or negative volume",
+            )
+            return None
+        malformed = (
+            (df["high"] < df[["open", "close", "low"]].max(axis=1))
+            | (df["low"] > df[["open", "close", "high"]].min(axis=1))
+        )
+        if bool(malformed.any()):
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(df),
+                detail=f"{int(malformed.sum())} rows violate OHLC bounds",
+            )
+            return None
+        df = df.reset_index(drop=True)
         _record_ohlcv_fetch_diagnostic(sym, "OK", received=len(df))
         return df
     except Exception as e:
@@ -1229,22 +1480,41 @@ def fetch_ohlcv(symbol, limit=150):
 def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
     try:
         sym = normalize_symbol(symbol)
-        data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit)
+        api_attempts = 1 if (STATE.get("open") or TRADE_STATE.get("in_position")) else None
+        data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit,
+                             _api_max_attempts=api_attempts)
         if not data or len(data) < 30:
             return None
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-        df = df.dropna()
-        if len(df) < 30:
+        try:
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        except (TypeError, ValueError):
             return None
-        df = df.sort_index().drop_duplicates().ffill().bfill()
-        return df
-    except Exception as e:
+        for col in ["timestamp", "open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df.isna().any().any():
+            return None
+        numeric = df[["timestamp", "open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+        if not np.isfinite(numeric).all():
+            return None
+        timestamps = df["timestamp"].to_numpy(dtype=float)
+        if ((timestamps <= 0).any()
+                or not np.equal(timestamps, np.floor(timestamps)).all()
+                or not df["timestamp"].is_monotonic_increasing
+                or df["timestamp"].duplicated().any()):
+            return None
+        if ((df["volume"] < 0).any()
+                or (df[["open", "high", "low", "close"]] <= 0).any().any()
+                or (df["high"] < df[["open", "close", "low"]].max(axis=1)).any()
+                or (df["low"] > df[["open", "close", "high"]].min(axis=1)).any()):
+            return None
+        return df.reset_index(drop=True)
+    except Exception:
         return None
 
 def fetch_ticker(symbol):
-    return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol))
+    api_attempts = 1 if (STATE.get("open") or TRADE_STATE.get("in_position")) else None
+    return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol),
+                         _api_max_attempts=api_attempts)
 
 def fetch_orderbook(symbol, limit=20):
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
@@ -2251,13 +2521,44 @@ class PositionSnapshot:
         }
 
 class EventBus:
+    """Lazy, owned worker: construction never starts a background thread."""
+
     def __init__(self):
         self._handlers = {}
         self._queue = queue.Queue(maxsize=2000)
-        self._running = True
+        self._stop = threading.Event()
         self._handlers_lock = threading.RLock()
-        self._worker = threading.Thread(target=self._process, name="ggp-event-bus", daemon=True)
-        self._worker.start()
+        self._lifecycle_lock = threading.RLock()
+        self._worker = None
+        self._worker_started = False
+
+    def start(self):
+        """Start exactly one worker; return False when one is already alive."""
+        with self._lifecycle_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return False
+            self._stop.clear()
+            self._worker = threading.Thread(target=self._process, name="ggp-event-bus", daemon=True)
+            self._worker_started = True
+            self._worker.start()
+            return True
+
+    def stop(self, timeout=5.0):
+        """Signal shutdown and join the owned worker with a bounded wait."""
+        with self._lifecycle_lock:
+            self._stop.set()
+            worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=max(0.1, float(timeout)))
+        with self._lifecycle_lock:
+            self._worker_started = bool(worker is not None and worker.is_alive())
+
+    def status(self):
+        worker = self._worker
+        return {
+            "thread_alive": bool(worker is not None and worker.is_alive()),
+            "started": bool(self._worker_started),
+        }
 
     def subscribe(self, event_type, handler):
         with self._handlers_lock:
@@ -2272,7 +2573,7 @@ class EventBus:
         return True
 
     def _process(self):
-        while self._running:
+        while not self._stop.is_set():
             try:
                 event_type, data = self._queue.get(timeout=0.1)
                 with self._handlers_lock:
@@ -3145,8 +3446,8 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
-        order = ex.create_order(sym, "market", close_side, requested,
-                                params=close_params)
+        order = safe_api_call(ex.create_order, sym, "market", close_side, requested,
+                              params=close_params)
         if not isinstance(order, dict):
             return _close_failure("BingX returned no structured close-order response")
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
@@ -3364,11 +3665,12 @@ def safe_close_partial(symbol, ratio, *, close_reason="TP1", target_remaining_qt
 
 
 def move_native_stop_on_exchange(symbol, new_trigger_price, quantity, *, reason="BREAKEVEN"):
-    """Deprecated hard guard: the exchange-native SL is immutable after entry.
+    """Deprecated compatibility no-op for the old immutable-native-SL policy.
 
-    The function is retained for compatibility with older callers, but it must
-    never cancel, replace, resize, or otherwise modify the original BingX stop.
-    Profit protection belongs to the internal synthetic stop/trailing manager.
+    Active management uses ``_move_native_stop_verified`` and
+    ``TradeExecutionService.replace_native_stop``, which adopt a new native stop
+    only after a fresh exchange read-back proves MOVED. This wrapper is retained
+    only so historical callers cannot mutate the stop without that verification.
     """
     log_execution(
         f"[NATIVE_SL_FIXED] ignored post-entry stop modification for {symbol or STATE.get('current_symbol')}: "
@@ -3491,6 +3793,7 @@ def _move_native_stop_verified(symbol, new_trigger_price, *, action="MOVE_SL", r
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[NATIVE_SL_MOVE] {message}", "INFO"),
+                api_caller=safe_api_call,
             )
             result = service.replace_native_stop(
                 symbol=normalize_symbol(symbol), side=side, quantity=qty,
@@ -4984,7 +5287,8 @@ class ExchangeReconciliationSupervisor:
         self.exchange_sync = exchange_sync
         self.interval_sec = max(5.0, float(interval_sec))
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="ggp-exchange-reconciliation", daemon=True)
+        self._lifecycle_lock = threading.RLock()
+        self._thread = None
         self._started = False
         self.last_result = "NOT_STARTED"
         self.last_success_ts = 0.0
@@ -5002,19 +5306,25 @@ class ExchangeReconciliationSupervisor:
 
     def start(self):
         """Start (or safely restart after a dead thread) exactly one supervisor."""
-        if self._thread is not None and self._thread.is_alive():
-            return False
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="ggp-exchange-reconciliation", daemon=True)
-        self._started = True
-        self.last_result = "STARTED"
-        self._thread.start()
-        return True
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="ggp-exchange-reconciliation", daemon=True)
+            self._started = True
+            self.last_result = "STARTED"
+            self._thread.start()
+            return True
 
     def stop(self, timeout=5.0):
-        self._stop.set()
-        if self._started and self._thread.is_alive():
-            self._thread.join(timeout=max(0.1, float(timeout)))
+        with self._lifecycle_lock:
+            self._stop.set()
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.1, float(timeout)))
+        with self._lifecycle_lock:
+            self._started = bool(thread is not None and thread.is_alive())
 
     def _run(self):
         while not self._stop.wait(self.interval_sec):
@@ -5058,8 +5368,58 @@ _event_bus = EventBus()
 _exchange_sync = ExchangeSyncService(_event_bus)
 _recovery_guard = RecoveryGuard(_event_bus, _exchange_sync)
 _live_manager = LiveTradeManager(_event_bus, _exchange_sync, _recovery_guard)
+# Workers are constructed here but started only by the application lifecycle.
+# Importing this module must never create a background thread.
 _reconciliation_supervisor = ExchangeReconciliationSupervisor(_exchange_sync, interval_sec=15.0)
-_reconciliation_supervisor.start()
+
+# Owned long-lived periodic workers. A named handle is the only authority for
+# starting/restarting a thread, so a timed-out worker that is still alive can
+# never be replaced by a second instance.
+_PERIODIC_WORKER_STOPS = {
+    "institutional_updater": threading.Event(),
+    "keep_alive": threading.Event(),
+}
+_PERIODIC_WORKER_THREADS = {}
+_PERIODIC_WORKER_LOCK = threading.RLock()
+_RUNTIME_WORKERS_STARTED = False
+_RUNTIME_WORKERS_LOCK = threading.RLock()
+_RUNTIME_SHUTTING_DOWN = False
+
+
+def _start_named_worker(name, target):
+    if _RUNTIME_SHUTTING_DOWN:
+        return False
+    with _PERIODIC_WORKER_LOCK:
+        thread = _PERIODIC_WORKER_THREADS.get(name)
+        if thread is not None and thread.is_alive():
+            return False
+        stop_event = _PERIODIC_WORKER_STOPS.setdefault(name, threading.Event())
+        stop_event.clear()
+        thread = threading.Thread(target=target, daemon=True, name=f"ggp_{name}")
+        _PERIODIC_WORKER_THREADS[name] = thread
+        thread.start()
+        return True
+
+
+def _stop_named_worker(name, timeout=5.0):
+    with _PERIODIC_WORKER_LOCK:
+        stop_event = _PERIODIC_WORKER_STOPS.get(name)
+        if stop_event is not None:
+            stop_event.set()
+        thread = _PERIODIC_WORKER_THREADS.get(name)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(0.1, float(timeout)))
+    return not bool(thread is not None and thread.is_alive())
+
+
+def named_worker_status():
+    """Return lifecycle state used by shutdown diagnostics and health checks."""
+    with _PERIODIC_WORKER_LOCK:
+        return {
+            name: {"thread_alive": bool(thread is not None and thread.is_alive())}
+            for name, thread in _PERIODIC_WORKER_THREADS.items()
+        }
+
 
 def sync_position_state(symbol=None):
     if PAPER_MODE:
@@ -6398,12 +6758,102 @@ def update_stats(pnl_pct):
     total = DASHBOARD_STATE["stats"]["trades"]
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
+def _cancel_and_verify_entry_order_terminal(symbol, order_id=None, client_order_id=None, *, cancel_if_open=True):
+    """Cancel an unfilled market-order remainder once, then require terminal read-back."""
+    lookup_id = str(order_id or client_order_id or "").strip()
+    client_id = str(client_order_id or "").strip()
+    if not lookup_id:
+        return False, "ORDER_ID_UNAVAILABLE"
+    fetcher = getattr(ex, "fetch_order", None)
+    if not callable(fetcher):
+        return False, "FETCH_ORDER_UNAVAILABLE"
+    params = {"clientOrderId": client_id} if client_id else {}
+
+    def read_order():
+        if params:
+            return safe_api_call(fetcher, lookup_id, symbol, params, _api_max_attempts=1)
+        return safe_api_call(fetcher, lookup_id, symbol, _api_max_attempts=1)
+
+    def is_terminal(order):
+        if not isinstance(order, dict):
+            return False, "UNKNOWN", None
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        status = str(order.get("status") or info.get("status") or info.get("orderStatus") or "UNKNOWN").upper()
+        filled = safe_float(order.get("filled", info.get("executedQty", 0.0)), 0.0)
+        remaining_raw = order.get("remaining")
+        if remaining_raw in (None, ""):
+            amount_value = safe_float(order.get("amount", info.get("origQty", 0.0)), 0.0)
+            remaining = max(0.0, amount_value - filled) if amount_value > 0 else None
+        else:
+            remaining = max(0.0, safe_float(remaining_raw, 0.0))
+        terminal = status in {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+        if terminal or (remaining is not None and remaining <= 1e-12):
+            return True, status, {"filled": filled, "remaining": remaining}
+        return False, status, {"filled": filled, "remaining": remaining}
+
+    try:
+        observed = read_order()
+    except Exception as exc:
+        return False, f"FETCH_BEFORE_CANCEL_FAILED:{type(exc).__name__}"
+    terminal, status, details = is_terminal(observed)
+    if terminal:
+        return True, status
+    remaining = details.get("remaining") if isinstance(details, dict) else None
+    if remaining is None or remaining <= 1e-12:
+        return False, f"ORDER_REMAINING_UNKNOWN:{status}"
+    if not cancel_if_open:
+        return False, f"ORDER_STILL_OPEN:{status}"
+    canceler = getattr(ex, "cancel_order", None)
+    if not callable(canceler):
+        return False, "CANCEL_ORDER_UNAVAILABLE"
+    try:
+        if params:
+            safe_api_call(canceler, lookup_id, symbol, params, _api_max_attempts=1)
+        else:
+            safe_api_call(canceler, lookup_id, symbol, _api_max_attempts=1)
+    except Exception as exc:
+        # Cancellation is one-shot. Read-back, not a blind retry, decides whether
+        # the remainder is still live.
+        log_execution(
+            f"[ENTRY_RECONCILE] cancel outcome uncertain for {lookup_id}: "
+            f"{type(exc).__name__}: {exc}", "WARN",
+        )
+    try:
+        observed = read_order()
+    except Exception as exc:
+        return False, f"FETCH_AFTER_CANCEL_FAILED:{type(exc).__name__}"
+    terminal, status, details = is_terminal(observed)
+    if terminal:
+        return True, status
+    return False, f"REMAINDER_STILL_UNRESOLVED:{status}:{details}"
+
+
 def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
-    global _ACTIVE_TRADE
+    global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     sym = normalize_symbol(symbol)
     side = str(side or "").upper()
     if side not in ("BUY", "SELL"):
         log_execution(f"[ENTRY] Invalid order side: {side!r}", "ERROR")
+        return None
+    # The execution boundary repeats the account/exposure gate. Strategy callers
+    # are not trusted to be the only route into this non-idempotent operation.
+    blocked_position_state = str(MEMORY.get("position_status") or "").upper()
+    if (
+        STATE.get("open") or TRADE_STATE.get("in_position")
+        or STATE.get("execution_unresolved") or STATE.get("recovery_hold")
+        or STATE.get("close_reconciliation_required")
+        or RECOVERY_BLOCK_ENTRIES
+        or blocked_position_state in {"UNKNOWN", "OPEN", "MULTIPLE_OPEN"}
+    ):
+        log_execution(
+            f"[ENTRY_BLOCKED] {sym}: execution boundary exposure/recovery gate "
+            f"state_open={bool(STATE.get('open'))} "
+            f"trade_state_open={bool(TRADE_STATE.get('in_position'))} "
+            f"position_status={blocked_position_state or 'UNSET'} "
+            f"execution_unresolved={bool(STATE.get('execution_unresolved'))} "
+            f"recovery_hold={bool(STATE.get('recovery_hold'))}",
+            "WARN", debounce_key=f"entry_boundary_hold:{sym}", debounce_sec=10,
+        )
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
@@ -6468,6 +6918,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
+                api_caller=safe_api_call,
             )
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
@@ -6475,12 +6926,94 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                 management_state=management_state,
             )
             if result.state not in {ExecutionState.FILLED}:
-                STATE.update({"execution_unresolved": result.state is ExecutionState.EXECUTION_UNCERTAIN,
-                              "recovery_hold": result.state is not ExecutionState.FILLED,
-                              "entry_execution_state": result.state.value,
-                              "entry_client_order_id": result.client_order_id,
-                              "entry_exchange_order_id": result.exchange_order_id})
-                log_execution(f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} ({result.reason})", "ERROR")
+                filled_qty = safe_float(getattr(result, "filled_qty", 0.0), 0.0)
+                raw_position = getattr(result, "raw_position", None)
+                # PARTIAL_FILL / ENTRY_PRICE_UNKNOWN can represent real exposure,
+                # not a clean rejection. Keep the single-entry lock and force an
+                # account-wide reconciliation before any new order is possible.
+                unresolved = bool(
+                    result.state is ExecutionState.EXECUTION_UNCERTAIN
+                    or result.state in {
+                        ExecutionState.PARTIAL_FILL,
+                        ExecutionState.ENTRY_PRICE_UNKNOWN,
+                        ExecutionState.PROTECTION_HOLD,
+                    }
+                    or filled_qty > 0
+                    or isinstance(raw_position, dict)
+                )
+                entry_order_terminal = result.state is ExecutionState.REJECTED
+                entry_order_status = "REJECTED" if entry_order_terminal else "UNKNOWN"
+                if result.state in {
+                    ExecutionState.EXECUTION_UNCERTAIN,
+                    ExecutionState.PARTIAL_FILL,
+                    ExecutionState.ENTRY_PRICE_UNKNOWN,
+                }:
+                    entry_order_terminal, entry_order_status = _cancel_and_verify_entry_order_terminal(
+                        sym, getattr(result, "exchange_order_id", None),
+                        getattr(result, "client_order_id", None),
+                    )
+                partial_stop_id = None
+                if filled_qty > 0 and isinstance(raw_position, dict):
+                    # A known partial fill is already exchange exposure. Protect
+                    # exactly the confirmed filled quantity before handing the
+                    # unresolved remainder to account-wide recovery.
+                    try:
+                        partial_mode = PositionMode(str(getattr(result, "position_mode", "")).upper())
+                        partial_position_side = str(getattr(result, "position_side", "") or "").upper()
+                        if partial_position_side in {"BOTH", "LONG", "SHORT"}:
+                            partial_stop_id = service.place_and_verify_native_stop(
+                                symbol=sym, side=side, quantity=filled_qty,
+                                trigger_price=float(stop_value), mode=partial_mode,
+                                position_side=partial_position_side,
+                            )
+                    except Exception as protection_exc:
+                        log_execution(
+                            f"[LIVE_SAFETY] Partial fill native-stop placement failed: "
+                            f"{type(protection_exc).__name__}: {protection_exc}",
+                            "CRITICAL",
+                        )
+                STATE.update({
+                    "execution_unresolved": unresolved,
+                    "recovery_hold": unresolved,
+                    "entry_execution_state": result.state.value,
+                    "entry_client_order_id": result.client_order_id,
+                    "entry_exchange_order_id": result.exchange_order_id,
+                    "entry_requested_qty": safe_float(getattr(result, "requested_qty", amount), amount),
+                    "entry_filled_qty": filled_qty,
+                    "entry_remaining_qty": safe_float(getattr(result, "remaining_qty", 0.0), 0.0),
+                    "entry_order_terminal": bool(entry_order_terminal),
+                    "entry_order_status": str(entry_order_status or "UNKNOWN"),
+                    "current_symbol": sym if unresolved else STATE.get("current_symbol"),
+                    "side": side if unresolved else STATE.get("side"),
+                    "trade_id": str(trade_id or getattr(result, "trade_id", "") or STATE.get("trade_id") or ""),
+                    "qty": filled_qty if filled_qty > 0 else STATE.get("qty", 0.0),
+                    "initial_qty": filled_qty if filled_qty > 0 else STATE.get("initial_qty", 0.0),
+                    "remaining_qty": filled_qty if filled_qty > 0 else STATE.get("remaining_qty", 0.0),
+                    "exchange_qty": filled_qty if filled_qty > 0 else STATE.get("exchange_qty", 0.0),
+                    "synthetic_sl": float(stop_value) if filled_qty > 0 else STATE.get("synthetic_sl"),
+                    "sl": float(stop_value) if filled_qty > 0 else STATE.get("sl"),
+                    "native_sl_verified": bool(partial_stop_id),
+                    "native_sl_order_id": partial_stop_id,
+                    "native_sl_status": "VERIFIED" if partial_stop_id else (
+                        "UNVERIFIED_PARTIAL_FILL" if filled_qty > 0 else STATE.get("native_sl_status", "UNKNOWN")
+                    ),
+                    "native_sl_original_price": float(stop_value) if filled_qty > 0 else STATE.get("native_sl_original_price", 0.0),
+                    "native_sl_original_qty": filled_qty if filled_qty > 0 else STATE.get("native_sl_original_qty", 0.0),
+                    "native_sl_last_verified_price": float(stop_value) if partial_stop_id else STATE.get("native_sl_last_verified_price", 0.0),
+                })
+                if unresolved:
+                    RECOVERY_BLOCK_ENTRIES = True
+                    MEMORY["position_status"] = "UNKNOWN"
+                    MEMORY["recovery_status"] = (
+                        "PARTIAL_FILL_PROTECTION_VERIFIED_RECOVERY_REQUIRED"
+                        if partial_stop_id else "ENTRY_EXECUTION_RECONCILIATION_REQUIRED"
+                    )
+                log_execution(
+                    f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} "
+                    f"filled={filled_qty:.10f} remaining={safe_float(getattr(result, 'remaining_qty', 0.0), 0.0):.10f} "
+                    f"({result.reason}); entries held pending exchange reconciliation",
+                    "ERROR",
+                )
                 return None
             native_sl_id = service.place_and_verify_native_stop(
                 symbol=sym, side=side, quantity=result.filled_qty,
@@ -7907,19 +8440,37 @@ def _confirmed_cross_event_id(symbol, timeframe, gate_result):
     return f"{event_symbol}:{timeframe}:{raw_signal_id}"
 
 
-def _advance_cross_event_lifecycles(rows):
-    """Advance active cross events using closed candles only, never a live bar."""
+def _advance_cross_event_lifecycles(rows, progress_callback=None, max_items=None):
+    """Advance a rotating bounded batch of active cross events on closed candles."""
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     evaluator = globals().get("_evaluate_post_cross_rejection_breakout")
     if journal is None or not callable(evaluator):
         return 0
-    advanced = 0
-    for row in list(rows or []):
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        if str(metadata.get("lifecycle_schema") or "") != CROSS_LIFECYCLE_SCHEMA:
-            continue
+    eligible = [
+        row for row in list(rows or [])
+        if isinstance(row, dict)
+        and isinstance(row.get("metadata"), dict)
+        and str(row["metadata"].get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA
+    ]
+    if not eligible:
+        return 0
+    if max_items is not None:
         try:
-            frame = _get_scanner_frame(row.get("exchange_symbol") or row.get("symbol"))
+            batch_limit = max(1, min(len(eligible), int(max_items)))
+        except (TypeError, ValueError, OverflowError):
+            batch_limit = len(eligible)
+        cursor = int(MEMORY.get("_cross_event_lifecycle_cursor", 0) or 0) % len(eligible)
+        selected = [eligible[(cursor + offset) % len(eligible)] for offset in range(batch_limit)]
+        MEMORY["_cross_event_lifecycle_cursor"] = (cursor + batch_limit) % len(eligible)
+    else:
+        selected = eligible
+    advanced = 0
+    for row in selected:
+        symbol = row.get("exchange_symbol") or row.get("symbol")
+        try:
+            if callable(progress_callback):
+                progress_callback("CROSS_EVENT_LIFECYCLE_FETCH", symbol)
+            frame = _get_scanner_frame(symbol)
             lifecycle = evaluator(
                 frame, str(row.get("side") or ""), row,
                 ema_fn=ema, timeframe_seconds=_roro_timeframe_seconds(row.get("timeframe") or INTERVAL),
@@ -7935,6 +8486,9 @@ def _advance_cross_event_lifecycles(rows):
                 f"{type(exc).__name__}: {exc}", "ERROR",
                 debounce_key=f"cross_lifecycle:{row.get('event_id')}", debounce_sec=10,
             )
+        finally:
+            if callable(progress_callback):
+                progress_callback("CROSS_EVENT_LIFECYCLE_COMPLETE", symbol)
     return advanced
 
 
@@ -7943,15 +8497,18 @@ def _project_confirmed_cross_row(row):
     return _project_cross_state(row, now_ts=time.time())
 
 
-def _sync_confirmed_cross_events():
-    """Reload active cross events from the journal into the Watchlist feed."""
+def _sync_confirmed_cross_events(progress_callback=None, lifecycle_max_items=None, memory_target=None):
+    """Reload active cross events; optionally advance a bounded rotating lifecycle batch."""
+    target_memory = memory_target if isinstance(memory_target, dict) else MEMORY
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     rows = []
     if journal is not None:
         try:
             journal.expire_cross_events()
             rows = journal.list_cross_events(statuses=("ACTIVE",))
-            if _advance_cross_event_lifecycles(rows):
+            if _advance_cross_event_lifecycles(
+                rows, progress_callback=progress_callback, max_items=lifecycle_max_items
+            ):
                 rows = journal.list_cross_events(statuses=("ACTIVE",))
         except Exception as exc:
             log_execution(f"[CROSS_EVENT] sync failed: {type(exc).__name__}: {exc}", "ERROR")
@@ -7971,12 +8528,12 @@ def _sync_confirmed_cross_events():
                 "cross_event_breakout_close": metadata.get("breakout_close"),
                 "cross_event_chase_atr": metadata.get("chase_atr"),
             }
-    MEMORY["confirmed_cross_events"] = []
+    target_memory["confirmed_cross_events"] = []
     for row in rows:
         if not (row.get("event_id") and row.get("exchange_symbol")):
             continue
         cross_context = _project_confirmed_cross_row(row)
-        MEMORY["confirmed_cross_events"].append({
+        target_memory["confirmed_cross_events"].append({
             "symbol": str(row.get("symbol") or ""),
             "exchange_symbol": str(row.get("exchange_symbol") or row.get("symbol") or ""),
             "side": str(row.get("side") or "").upper(),
@@ -7997,7 +8554,7 @@ def _sync_confirmed_cross_events():
             "side_hint": str(row.get("side") or "").upper(),
             "sources": ["confirmed_cross_event"],
         })
-    MEMORY["confirmed_cross_events_last_sync"] = time.time()
+    target_memory["confirmed_cross_events_last_sync"] = time.time()
     return rows
 
 
@@ -11130,7 +11687,20 @@ def manual_trade():
     tp1 = price*1.006 if side=="BUY" else price*0.994
     tp2 = price*1.02 if side=="BUY" else price*0.98
     classification = "SNIPER"
-    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
+    entry_lock = globals().get("_ENTRY_DISCOVERY_TASK_LOCK")
+    if entry_lock is not None and not entry_lock.acquire(blocking=False):
+        return jsonify({"error": "Another entry-analysis cycle is active; retry after it completes"}), 409
+    previous_entry_context = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
+    try:
+        # Manual override has its own validated market snapshot; never inherit a
+        # concurrent scanner's symbol/zone/cross context.
+        globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = None
+        ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80,
+                           "Manual override", atr, "HYBRID", "MANUAL", classification)
+    finally:
+        globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = previous_entry_context
+        if entry_lock is not None:
+            entry_lock.release()
     return jsonify({"message": "Done" if ok else "Failed"}),200 if ok else 500
 
 @app.route("/close", methods=["POST"])
@@ -11171,6 +11741,10 @@ def naiso_health_snapshot():
         "resources": MEMORY.get("resource_metrics", {}),
         "maintenance": maintenance.metrics() if maintenance is not None else None,
         "threads": (watchdog.snapshot() if watchdog is not None else None),
+        "watchlist_worker": (
+            _watchlist_worker_health_snapshot()
+            if callable(globals().get("_watchlist_worker_health_snapshot")) else {}
+        ),
         "api": resilience.metrics() if resilience is not None else None,
         "scanner": {
             "tasks": MEMORY.get("scanner_tasks", {}),
@@ -11404,6 +11978,12 @@ def _health_readiness(snapshot):
         blockers.append("EXECUTION_UNRESOLVED")
     if recovery["close_reconciliation_required"]:
         blockers.append("CLOSE_RECONCILIATION_REQUIRED")
+    watchlist_worker = snapshot.get("watchlist_worker") if isinstance(snapshot.get("watchlist_worker"), dict) else {}
+    if watchlist_worker.get("in_progress"):
+        blockers.append("UNIFIED_WATCHLIST_REFRESH_IN_PROGRESS")
+    if watchlist_worker.get("stalled"):
+        blockers.append("UNIFIED_WATCHLIST_WORKER_STALLED")
+        process_failures.append("UNIFIED_WATCHLIST_WORKER_STALLED")
     positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), dict) else {}
     if bool(positions.get("open")):
         # Open-position management is a trading restriction, not a process failure.
@@ -11432,6 +12012,7 @@ def _health_readiness(snapshot):
         "readiness": readiness,
         "process": {"state": HEALTH_PROCESS_LIVE, "pid": os.getpid()},
         "main_loop": main_loop,
+        "watchlist_worker": watchlist_worker,
         "recovery": recovery,
         "blockers": blockers,
         "process_failures": process_failures,
@@ -11447,6 +12028,26 @@ def naiso_health():
     if isinstance(payload, dict):
         payload.update({key: value for key, value in report.items() if key != "http_status"})
     return jsonify(safe_json(payload)), int(report["http_status"])
+
+
+@app.route("/liveness")
+def liveness():
+    """DigitalOcean liveness probe; restart only after the exchange exit gate approved it."""
+    snapshot = naiso_health_snapshot()
+    report = _health_readiness(snapshot)
+    recovery = snapshot.get("recovery") if isinstance(snapshot.get("recovery"), dict) else {}
+    verified_exit_states = {"EXIT_RECONCILED_FLAT", "EXIT_VERIFIED_PROTECTED_OPEN"}
+    restart_authorized = str(recovery.get("status") or "").upper() in verified_exit_states
+    should_restart = bool(report.get("process_failures")) and restart_authorized
+    payload = {
+        "ok": not should_restart,
+        "process": report.get("process"),
+        "main_loop": report.get("main_loop"),
+        "watchlist_worker": report.get("watchlist_worker", {}),
+        "restart_authorized_by_exchange_reconciliation": restart_authorized,
+        "process_failures": report.get("process_failures", []),
+    }
+    return jsonify(safe_json(payload)), 503 if should_restart else 200
 
 
 @app.route("/health")
@@ -11475,6 +12076,7 @@ def health():
         "readiness": report["readiness"],
         "process": report["process"],
         "main_loop": report["main_loop"],
+        "watchlist_worker": report.get("watchlist_worker", {}),
         "recovery_state": report["recovery"],
         "blockers": report["blockers"],
         "process_failures": report["process_failures"],
@@ -11483,11 +12085,13 @@ def health():
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
 def keep_alive():
-    while True:
+    stop_event = _PERIODIC_WORKER_STOPS.setdefault("keep_alive", threading.Event())
+    while not stop_event.is_set():
         watchdog = globals().get("NAISO_WATCHDOG")
         if watchdog is not None:
             watchdog.beat("keep_alive")
-        time.sleep(KEEP_ALIVE_INTERVAL)
+        if stop_event.wait(max(0.1, float(KEEP_ALIVE_INTERVAL))):
+            break
         ports = DASHBOARD_ACTIVE_PORTS or [int(os.getenv("PORT", "8000"))]
         for port in ports:
             try:
@@ -12059,10 +12663,15 @@ def sniper_engine_v2():
             "state": "RUNNING", "last_scan": time.time(), "symbols_scanned": 0,
             "zones_waiting": 0, "zones_ready": 0, "last_error": None,
         })
-        for symbol in symbols:
+        _scanner_progress("sniper_v2", "universe_ready", symbols=len(symbols))
+        for symbol_index, symbol in enumerate(symbols, start=1):
             if STATE.get("open") or TRADE_STATE.get("in_position"):
+                _scanner_progress("sniper_v2", "yielded_to_open_position", symbol=symbol)
                 break
+            _scanner_progress("sniper_v2", "symbol_start", symbol=symbol, index=symbol_index)
             raw_frame = _get_scanner_frame(symbol, 150)
+            _scanner_progress("sniper_v2", "ohlcv_complete", symbol=symbol,
+                              available=bool(raw_frame is not None))
             if raw_frame is None or not validate_dataframe(raw_frame, 80):
                 continue
             closed = roro_validate_closed_frame(
@@ -12112,6 +12721,8 @@ def sniper_engine_v2():
             authority = roro_analyze_symbol_both(
                 symbol, closed, now_ms=int(time.time() * 1000), side_hints=[side]
             )
+            _scanner_progress("sniper_v2", "roro_authority_complete", symbol=symbol,
+                              decision=str(authority.get("decision_state") or "UNKNOWN"))
             if authority.get("decision_state") != "ENTRY_READY" or str(authority.get("side")).upper() != side:
                 log_execution(
                     f"[SNIPER_V2] {key} blocked by RORO authority: "
@@ -12170,6 +12781,7 @@ def sniper_engine_v2():
                 "timeframe_ms": _roro_timeframe_seconds(INTERVAL) * 1000.0,
             }
             try:
+                _scanner_progress("sniper_v2", "entry_authorization", symbol=symbol, side=side)
                 ok = execute_entry(
                     side, symbol, price, structural_stop, float(tp1), float(tp2), 9.0,
                     f"SNIPER_V2 {zone['type']} PIVOT_RETEST confirmation={count} "
@@ -12177,6 +12789,8 @@ def sniper_engine_v2():
                     atr_value, trade_type="SNIPER_V2", entry_type="SNIPER_V2",
                     classification="SNIPER_V2",
                 )
+                _scanner_progress("sniper_v2", "entry_execution_complete",
+                                  symbol=symbol, executed=bool(ok))
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
@@ -12208,15 +12822,17 @@ def sniper_engine_v2():
 
 
 def _run_sniper_scan_if_due():
-    """Run synchronously inside the supervisor; avoid racing the other entry path."""
+    """Dispatch Sniper discovery off MainThread; execution still uses unified entry authority."""
     global _SNIPER_V2_LAST_SCAN
     if not SNIPER_V2_ENABLED:
         return False
     now = time.time()
     if now - _SNIPER_V2_LAST_SCAN < SNIPER_V2_SCAN_INTERVAL:
         return False
-    _SNIPER_V2_LAST_SCAN = now
-    return sniper_engine_v2()
+    dispatched = dispatch_scanner_task("sniper_v2", sniper_engine_v2)
+    if dispatched:
+        _SNIPER_V2_LAST_SCAN = now
+    return dispatched
 
 
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
@@ -12257,14 +12873,16 @@ def update_institutional_flow_scanner():
 
 # ========== LIVE INSTITUTIONAL UPDATER THREAD (PAUSED DURING TRADE) ==========
 def live_institutional_updater():
-    while True:
+    stop_event = _PERIODIC_WORKER_STOPS.setdefault("institutional_updater", threading.Event())
+    while not stop_event.is_set():
         try:
             watchdog = globals().get("NAISO_WATCHDOG")
             if watchdog is not None:
                 watchdog.beat("institutional_updater", paused=bool(STATE.get("open")))
             # Do not run during open trade to avoid duplicate API calls and thread contention
             if STATE.get("open"):
-                time.sleep(5)
+                if stop_event.wait(5):
+                    break
                 continue
             symbol = DEFAULT_SYMBOL
             df = get_ohlcv_safe(symbol, 100)
@@ -12292,7 +12910,8 @@ def live_institutional_updater():
                 update_institutional_flow_scanner()
         except Exception as e:
             log_execution(f"[LIVE_UPDATER] Error: {e}", "ERROR")
-        time.sleep(5)
+        if stop_event.wait(5):
+            break
 
 # ========== MAIN LOOP ==========
 MEMORY = {
@@ -12470,9 +13089,9 @@ def main_loop_sniper():
     else:
         log_execution("[SCANNER_1] Initial discovery dispatch refused; next due unchanged", "WARN")
     try:
-        updater_thread = threading.Thread(target=live_institutional_updater, daemon=True,
-                                          name="live_institutional_updater")
-        updater_thread.start()
+        # Idempotent: the application lifecycle normally owns this worker; this
+        # call only covers a direct main-loop invocation in development/tests.
+        _start_named_worker("institutional_updater", live_institutional_updater)
     except Exception as exc:
         log_execution(f"[THREAD_START] live_institutional_updater failed: {type(exc).__name__}: {exc}",
                       "ERROR")
@@ -12492,9 +13111,12 @@ def main_loop_sniper():
                 continue
 
             if now - last_flow_update > 60:
-                update_institutional_flow_scanner()
+                if not (STATE.get("open") or TRADE_STATE.get("in_position")):
+                    dispatch_scanner_task(
+                        "institutional_flow_context", update_institutional_flow_scanner
+                    )
                 last_flow_update = now
-                _main_loop_progress("institutional_flow_update_complete")
+                _main_loop_progress("institutional_flow_update_dispatched")
 
             if not (TRADE_STATE["in_position"] or STATE["open"]):
                 sync_position_state()
@@ -12518,29 +13140,38 @@ def main_loop_sniper():
                 # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
-                        smart_opportunity_selection()
+                        # Candidate revalidation performs OHLCV reads, institutional
+                        # analysis and final entry checks. Keep that work off the
+                        # foreground supervisor so open-position management remains
+                        # schedulable even when market data or analysis is slow.
+                        dispatched = dispatch_scanner_task(
+                            "institutional_entry_revalidation", smart_opportunity_selection
+                        )
                         last_candidate_scan = now
-                        _main_loop_progress("watchlist_refresh_complete")
+                        _main_loop_progress(
+                            "entry_revalidation_dispatched" if dispatched
+                            else "entry_revalidation_deferred"
+                        )
                     # Sniper is an entry-only candidate engine; it never runs while
                     # a position is open and uses the same bounded scanner cache.
                     if _run_sniper_scan_if_due():
-                        _main_loop_progress("sniper_scan_complete")
+                        _main_loop_progress("sniper_scan_dispatched")
                     time.sleep(1)
                 else:
                     time.sleep(1)
                 continue
             if STATE["open"] and STATE.get("current_symbol"):
+                # LiveTradeManager already owns the authoritative market snapshot,
+                # ATR/thesis updates and exit decisions. Do not issue a second
+                # ticker/OHLCV cycle from MainThread after management; use the
+                # reconciled state for the dashboard projection only.
                 sym = STATE["current_symbol"]
-                price = get_ticker_safe(sym)
-                if price and price > 0:
-                    df = get_ohlcv_safe(sym, 50)
-                    if df is not None:
-                        # Exit authority is exclusively LiveTradeManager; this block only updates auxiliary risk context.
-                        atr = compute_atr(_closed_candle_frame(df, INTERVAL)).iloc[-1]
-                        scaling_logic(sym, df, None)
-                        current_pnl = STATE.get("roe_pct", 0.0)
-                        update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
-                        _main_loop_progress("open_trade_risk_refresh_complete", symbol=str(sym))
+                current_pnl = STATE.get("roe_pct", 0.0)
+                update_position_dashboard(
+                    sym, STATE.get("side"), STATE.get("entry", 0.0),
+                    STATE.get("qty", 0.0), current_pnl,
+                )
+                _main_loop_progress("open_trade_state_projection_complete", symbol=str(sym))
             # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
             # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
             daily_loss_cooldown_active()
@@ -13159,10 +13790,12 @@ def _restart_main_loop_process_after_stall(context=None):
         or os.getenv("RENDER_SERVICE_ID", "").strip()
         or os.getenv("RENDER_INSTANCE_ID", "").strip()
     )
-    # DigitalOcean App Platform exposes APP_ID as a runtime bindable variable.
-    # A Droplet does not provide this signal; it must opt in only when a real
-    # process supervisor (for example systemd) is configured to restart the bot.
-    digitalocean_app_platform_detected = bool(os.getenv("APP_ID", "").strip())
+    # DigitalOcean bindable APP_ID is not automatically injected unless the
+    # app component maps it to a runtime env var. Support both the direct name
+    # and an explicit DIGITALOCEAN_APP_ID mapping from ${APP_ID}.
+    digitalocean_app_platform_detected = bool(
+        os.getenv("APP_ID", "").strip() or os.getenv("DIGITALOCEAN_APP_ID", "").strip()
+    )
     railway_detected = bool(os.getenv("RAILWAY_ENVIRONMENT", "").strip())
     explicit_restart_opt_in = bool(
         os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
@@ -13195,17 +13828,18 @@ def _restart_main_loop_process_after_stall(context=None):
             "CRITICAL", debounce_key="main_loop_process_restart_owner_unknown", debounce_sec=120,
         )
         return True
-    if not _recovery_exit_gate("MAIN_LOOP_WATCHDOG_STALL"):
+    restart_reason = str(context.get("reason") or "MAIN_LOOP_WATCHDOG_STALL")
+    if not _recovery_exit_gate(restart_reason):
         context["engine_resumed"] = False
         context["process_restart_blocked_reason"] = "RECOVERY_EXIT_GATE_REFUSED_UNVERIFIED_EXPOSURE"
         log_execution(
-            "[WATCHDOG] process restart blocked: exchange exposure/native protection could not be verified. "
-            "Recovery Hold remains active; no process exit was attempted.",
+            f"[WATCHDOG] process restart blocked for {restart_reason}: exchange exposure/native protection "
+            "could not be verified. Recovery Hold remains active; no process exit was attempted.",
             "CRITICAL", debounce_key="main_loop_process_restart_safety_hold", debounce_sec=60,
         )
         return True
     log_execution(
-        "[WATCHDOG] MainThread stall confirmed; exchange state and recovery contract verified. "
+        f"[WATCHDOG] {restart_reason} confirmed; exchange state and recovery contract verified. "
         "Exiting process for external supervisor restart.",
         "CRITICAL", debounce_key="main_loop_verified_process_restart", debounce_sec=30,
     )
@@ -13231,18 +13865,13 @@ def _non_trading_engine_verifier():
 
 
 def _resume_institutional_updater_after_verification(_context=None):
-    if _named_thread_alive("live_institutional_updater"):
-        return False
-    threading.Thread(target=live_institutional_updater, daemon=True,
-                     name="live_institutional_updater").start()
-    return True
+    # Owned single-flight restart: a timed-out worker that is still alive is
+    # never replaced. Only a verified dead worker may be restarted.
+    return _start_named_worker("institutional_updater", live_institutional_updater)
 
 
 def _resume_keep_alive_after_verification(_context=None):
-    if _named_thread_alive("keep_alive"):
-        return False
-    threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
-    return True
+    return _start_named_worker("keep_alive", keep_alive)
 
 
 def _verify_main_loop_recovery():
@@ -13252,11 +13881,49 @@ def _verify_main_loop_recovery():
         verification_source="STATE.current_symbol|TRADE_STATE.symbol")
 
 
+_NAISO_SERVICES_STARTED = False
+_NAISO_SERVICES_LOCK = threading.RLock()
+
+
+def start_runtime_workers(*, restart=False):
+    """Idempotently start every owned background worker from the app lifecycle.
+
+    Imports stay side-effect free. A shutdown in progress is never reversed by
+    a late startup call; a fresh explicit lifecycle cycle must pass
+    ``restart=True`` after all owned workers have been joined.
+    """
+    global _RUNTIME_WORKERS_STARTED, _RUNTIME_SHUTTING_DOWN
+    with _RUNTIME_WORKERS_LOCK:
+        if _RUNTIME_WORKERS_STARTED:
+            return False
+        if _RUNTIME_SHUTTING_DOWN and not restart:
+            return False
+        if restart:
+            _RUNTIME_SHUTTING_DOWN = False
+        _RUNTIME_WORKERS_STARTED = True
+    try:
+        _event_bus.start()
+        _reconciliation_supervisor.start()
+        _start_named_worker("institutional_updater", live_institutional_updater)
+        _start_named_worker("keep_alive", keep_alive)
+        TELEGRAM_NOTIFIER.reopen()
+    except Exception:
+        with _RUNTIME_WORKERS_LOCK:
+            _RUNTIME_WORKERS_STARTED = False
+        raise
+    return True
+
+
 def start_naiso_services():
     """Register engines with the watchdog and verified recovery callbacks."""
+    global _NAISO_SERVICES_STARTED
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return False
+    with _NAISO_SERVICES_LOCK:
+        if _NAISO_SERVICES_STARTED:
+            return True
+        _NAISO_SERVICES_STARTED = True
     # The supervisor runs on this foreground thread; bind liveness ownership
     # before any recovery callback can inspect it.
     _main_loop_register_owner()
@@ -13629,23 +14296,79 @@ def _install_shutdown_handlers():
             pass
 
 
+def _close_dashboard_server(server):
+    """Close a Waitress server using its supported API exactly once."""
+    close = getattr(server, "close", None)
+    if callable(close):
+        close()
+        return
+    # Only a genuinely legacy server without close() gets the Werkzeug path.
+    for method_name in ("shutdown", "server_close"):
+        method = getattr(server, method_name, None)
+        if callable(method):
+            method()
+
+
+def _stop_dashboard_server(server, thread):
+    try:
+        _close_dashboard_server(server)
+    except Exception as exc:
+        log_execution(f"[SHUTDOWN] dashboard close failed: {type(exc).__name__}: {exc}", "WARN")
+    try:
+        thread.join(timeout=2.0)
+        is_alive = getattr(thread, "is_alive", None)
+        if callable(is_alive) and is_alive():
+            log_execution("[SHUTDOWN] dashboard thread did not exit within 2.0s", "WARN")
+    except Exception as exc:
+        log_execution(f"[SHUTDOWN] dashboard join failed: {type(exc).__name__}: {exc}", "WARN")
+
+
 def _stop_runtime_services():
+    """Stop and join every owned worker, then close Waitress and the watchdog."""
+    global _RUNTIME_SHUTTING_DOWN, _RUNTIME_WORKERS_STARTED, _NAISO_SERVICES_STARTED
+    with _RUNTIME_WORKERS_LOCK:
+        _RUNTIME_SHUTTING_DOWN = True
+
+    for name in ("institutional_updater", "keep_alive"):
+        _stop_named_worker(name)
+
+    supervisor = globals().get("_reconciliation_supervisor")
+    if supervisor is not None and hasattr(supervisor, "stop"):
+        try:
+            supervisor.stop()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] reconciliation stop failed: {type(exc).__name__}: {exc}", "WARN")
+
+    notifier = globals().get("TELEGRAM_NOTIFIER")
+    if notifier is not None and hasattr(notifier, "close"):
+        try:
+            notifier.close()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] Telegram stop failed: {type(exc).__name__}: {exc}", "WARN")
+
+    event_bus = globals().get("_event_bus")
+    if event_bus is not None and hasattr(event_bus, "stop"):
+        try:
+            event_bus.stop()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] event bus stop failed: {type(exc).__name__}: {exc}", "WARN")
+
+    for server, thread in list(globals().get("DASHBOARD_SERVERS") or []):
+        _stop_dashboard_server(server, thread)
+    with _RUNTIME_WORKERS_LOCK:
+        globals()["DASHBOARD_SERVERS"] = []
+        globals()["DASHBOARD_ACTIVE_PORTS"] = []
+
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is not None and hasattr(watchdog, "stop"):
         try:
             watchdog.stop()
         except Exception as exc:
             log_execution(f"[SHUTDOWN] watchdog stop failed: {type(exc).__name__}: {exc}", "WARN")
-    for server, thread in list(globals().get("DASHBOARD_SERVERS") or []):
-        try:
-            server.shutdown()
-            server.server_close()
-        except Exception as exc:
-            log_execution(f"[SHUTDOWN] dashboard stop failed: {type(exc).__name__}: {exc}", "WARN")
-        try:
-            thread.join(timeout=2.0)
-        except Exception:
-            pass
+
+    with _RUNTIME_WORKERS_LOCK:
+        _RUNTIME_WORKERS_STARTED = False
+        _NAISO_SERVICES_STARTED = False
 
 
 def _release_runtime_lock(handle):
@@ -13875,8 +14598,9 @@ def _integration_fetch_frame(symbol):
 # one asset's trend state leaking into another asset's Watchlist decision.
 _WATCHLIST_TREND_ENGINES = {}
 _WATCHLIST_TRADE_STATE_MACHINES = {}
-def _enrich_with_existing_gpp_engines(frame, side, analysis):
+def _enrich_with_existing_gpp_engines(frame, side, analysis, *, memory_target=None):
     """Closed-candle GGP evidence enrichment; stateful machines advance once per symbol candle."""
+    target_memory = memory_target if isinstance(memory_target, dict) else MEMORY
     result = {}
     try:
         now_ms = int(time.time() * 1000)
@@ -13930,9 +14654,9 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                 symbol_for_proximity = str(analysis.get("symbol") or analysis.get("exchange_symbol") or "")
                 symbol_key = roro_canonical_symbol(symbol_for_proximity)
                 candle_ts = int(closed.timestamp.iloc[-1])
-                last_seen = MEMORY.setdefault("_proximity_last_seen_by_symbol", {})
+                last_seen = target_memory.setdefault("_proximity_last_seen_by_symbol", {})
                 if last_seen.get(symbol_key) != candle_ts:
-                    MEMORY["_proximity_batch_updates"] = int(MEMORY.get("_proximity_batch_updates", 0)) + 1
+                    target_memory["_proximity_batch_updates"] = int(target_memory.get("_proximity_batch_updates", 0)) + 1
                     last_seen[symbol_key] = candle_ts
                     _observed_at = time.time()
                     _proximity_frame_seconds = float(timeframe_seconds)
@@ -13965,11 +14689,11 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     # projected non-durable label so the dashboard cannot show a
                     # bare CROSS_CONFIRMED next to a durable cross event.
                     proximity_item["cross_state_display"] = _ranking_projection["cross_state_display"]
-                    rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
+                    rows = target_memory.setdefault("ema9_vwap_proximity_scanner", [])
                     rows = [x for x in rows if x.get("symbol") != symbol_key]
                     rows.append(proximity_item)
                     rows.sort(key=lambda x: (float(x.get("score", 0) or 0), float(x.get("updated_at", 0) or 0)), reverse=True)
-                    MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
+                    target_memory["ema9_vwap_proximity_scanner"] = rows[:30]
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
                 icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
@@ -13982,7 +14706,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                                                 "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
 
         symbol_key = str(analysis.get("symbol") or roro_canonical_symbol(analysis.get("exchange_symbol")))
-        engine_last = MEMORY.setdefault("_watchlist_engine_last_candle", {})
+        engine_last = target_memory.setdefault("_watchlist_engine_last_candle", {})
         advance_state = engine_last.get(symbol_key) != candle_ts
         if symbol_key not in _WATCHLIST_TREND_ENGINES:
             if len(_WATCHLIST_TREND_ENGINES) >= 200:
@@ -14047,43 +14771,315 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
     return result
 
 _last_unified_watchlist_refresh = 0.0
-def refresh_unified_institutional_watchlist(force=False):
+INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC = _env_float_range(
+    "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0, 30.0, 300.0
+)
+_UNIFIED_WATCHLIST_REFRESH_STATE = {
+    "lock": threading.Lock(), "in_progress": False, "generation": 0, "last_attempt": 0.0,
+    "last_attempt_monotonic": 0.0, "started_monotonic": 0.0,
+    "last_progress_monotonic": 0.0, "last_completed_monotonic": 0.0,
+    "phase": "IDLE", "current_symbol": "", "timed_out": False,
+    "restart_requested": False, "last_error": "", "worker_name": "",
+}
+
+
+def _watchlist_worker_progress(phase, symbol="", generation=None):
+    """Record real worker phase progress; never let a stale worker publish progress."""
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        if (not state.get("in_progress") or state.get("timed_out")
+                or (generation is not None and int(state.get("generation", 0)) != int(generation))):
+            return
+        state["last_progress_monotonic"] = time.monotonic()
+        state["phase"] = str(phase or "UNKNOWN")[:80]
+        state["current_symbol"] = str(symbol or "")[:80]
+
+
+def _watchlist_worker_health_snapshot():
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        row = {key: value for key, value in state.items() if key != "lock"}
+    now = time.monotonic()
+    last_progress = float(row.get("last_progress_monotonic") or row.get("started_monotonic") or 0.0)
+    age = max(0.0, now - last_progress) if row.get("in_progress") else 0.0
+    stalled = bool(row.get("timed_out")) or bool(
+        row.get("in_progress") and age >= INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC
+    )
+    row.update({
+        "progress_age_sec": round(age, 3),
+        "stall_timeout_sec": float(INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC),
+        "stalled": stalled,
+    })
+    return row
+
+
+def _watchlist_worker_generation_active(generation):
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        return bool(state.get("in_progress") and not state.get("timed_out")
+                    and int(state.get("generation", 0)) == int(generation))
+
+
+def _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_refs, generation):
+    """Publish only this worker's changed rows; never overwrite concurrent scanner writes."""
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        if (not state.get("in_progress") or state.get("timed_out")
+                or int(state.get("generation", 0)) != int(generation)):
+            return False
+        live = MEMORY.setdefault("watchlist", {})
+        staged = staged_memory.get("watchlist", {})
+        for key, row in staged.items():
+            if not isinstance(row, dict):
+                continue
+            baseline_row = baseline_watchlist.get(key)
+            if baseline_row is not None:
+                staged_ts = float(row.get("last_update", 0.0) or 0.0)
+                baseline_ts = float(baseline_row.get("last_update", 0.0) or 0.0)
+                if staged_ts <= baseline_ts:
+                    continue
+            current = live.get(key)
+            baseline_ref = baseline_refs.get(key)
+            if key in baseline_watchlist:
+                if current is not baseline_ref:
+                    continue
+                current_ts = float(current.get("last_update", 0.0) or 0.0) if isinstance(current, dict) else 0.0
+                if current_ts > baseline_ts:
+                    continue
+            elif current is not None:
+                continue
+            # The staged row is already detached from the live Watchlist; transfer
+            # ownership rather than deep-copying arbitrary nested pandas objects.
+            live[key] = row
+        for key in ("unified_watchlist_cursor", "unified_watchlist_last_update",
+                    "unified_watchlist_last_batch_count", "unified_watchlist_source_count",
+                    "_proximity_batch_updates", "_proximity_last_seen_by_symbol",
+                    "ema9_vwap_proximity_scanner", "confirmed_cross_events",
+                    "confirmed_cross_events_last_sync", "_watchlist_engine_last_candle"):
+            if key in staged_memory:
+                MEMORY[key] = staged_memory[key]
+        return True
+
+
+def _finalize_cross_watchlist_delivery_after_publish():
+    """Mark durable cross events delivered only after their rows are published."""
+    delivery = MEMORY.get("_cross_watchlist_delivery")
+    if not isinstance(delivery, dict):
+        return False
+    pending_ids = {
+        str(value).strip() for value in (delivery.get("event_ids") or [])
+        if str(value).strip()
+    }
+    if not pending_ids:
+        return False
+    published_ids = {
+        str(row.get("cross_event_id")).strip()
+        for row in (MEMORY.get("watchlist") or {}).values()
+        if isinstance(row, dict) and row.get("cross_event_id")
+    }
+    delivered_ids = sorted(pending_ids.intersection(published_ids))
+    if not delivered_ids:
+        return False
+    delivered_at = time.time()
+    marked = _mark_cross_events_watchlist_delivered(delivered_ids, delivered_at)
+    delivery = dict(delivery)
+    all_delivered = len(delivered_ids) == len(pending_ids)
+    delivery.update({
+        "delivered_at": delivered_at,
+        "delivered_ids": delivered_ids,
+        "lifecycle_marked": list(marked or []),
+        "delivered": all_delivered,
+        "same_cycle": False,
+        "lifecycle_status": ACTIVE_WATCHLIST_LIFECYCLE if all_delivered
+                            else delivery.get("lifecycle_status", CROSS_WATCHLIST_LIFECYCLE),
+        "refresh_seconds": round(delivered_at - float(delivery.get("detected_at", delivered_at)), 3),
+        "reason": "ACTIVE_WATCHLIST_DELIVERED" if all_delivered
+                  else "PARTIAL_WATCHLIST_DELIVERY",
+    })
+    MEMORY["_cross_watchlist_delivery"] = delivery
+    return bool(delivery["delivered"])
+
+
+def _run_unified_institutional_watchlist_refresh(generation=None):
+    """Analyze a private snapshot; publish only if this worker generation is still current."""
     global _last_unified_watchlist_refresh
-    now = time.time()
-    if not force and now - _last_unified_watchlist_refresh < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
-        return MEMORY.setdefault("watchlist", {})
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    if generation is None:
+        with state["lock"]:
+            generation = int(state.get("generation", 0))
+    if not _watchlist_worker_generation_active(generation):
+        # A worker that was already declared stalled/timed out may only mark the
+        # entry gate as failed. It must never publish staged rows or clear the
+        # process-level recovery fence, even if it completes late.
+        with state["lock"]:
+            if (state.get("timed_out")
+                    and int(state.get("generation", 0)) == int(generation)):
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                state["in_progress"] = False
+                state["worker_name"] = ""
+                state["last_completed_monotonic"] = time.monotonic()
+        return
+    success = False
+    baseline_watchlist = copy.deepcopy(MEMORY.get("watchlist", {}))
+    baseline_refs = dict(MEMORY.get("watchlist", {}))
+    staged_memory = dict(MEMORY)
+    staged_memory["watchlist"] = copy.deepcopy(baseline_watchlist)
+    staged_memory["_proximity_last_seen_by_symbol"] = copy.deepcopy(MEMORY.get("_proximity_last_seen_by_symbol", {}))
+    staged_memory["ema9_vwap_proximity_scanner"] = copy.deepcopy(MEMORY.get("ema9_vwap_proximity_scanner", []))
+    staged_memory["_watchlist_engine_last_candle"] = copy.deepcopy(MEMORY.get("_watchlist_engine_last_candle", {}))
+    staged_memory["confirmed_cross_events"] = copy.deepcopy(MEMORY.get("confirmed_cross_events", []))
+    staged_memory["_proximity_batch_updates"] = 0
+    progress = lambda phase, symbol="": _watchlist_worker_progress(phase, symbol, generation)
     try:
-        MEMORY["_proximity_batch_updates"] = 0
-        # Persisted cross events survive scanner cycles and process restarts.
-        _sync_confirmed_cross_events()
+        progress("CROSS_EVENT_SYNC")
+        _sync_confirmed_cross_events(
+            progress_callback=progress,
+            lifecycle_max_items=max(1, INSTITUTIONAL_WATCHLIST_BATCH_SIZE * 2),
+            memory_target=staged_memory,
+        )
+
+        def tracked_fetch_frame(symbol):
+            progress("OHLCV_FETCH", symbol)
+            try:
+                return _integration_fetch_frame(symbol)
+            finally:
+                progress("OHLCV_FETCH_COMPLETE", symbol)
+
+        def tracked_enrich(frame, side, analysis):
+            progress("INSTITUTIONAL_ANALYSIS", analysis.get("symbol", ""))
+            try:
+                return _enrich_with_existing_gpp_engines(frame, side, analysis, memory_target=staged_memory)
+            finally:
+                progress("INSTITUTIONAL_ANALYSIS_COMPLETE", analysis.get("symbol", ""))
+
+        progress("WATCHLIST_BATCH_ANALYSIS")
         result = update_unified_watchlist(
-            MEMORY, _integration_fetch_frame,
+            staged_memory, tracked_fetch_frame,
             max_items=INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS,
             batch_size=INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
-            enrich=_enrich_with_existing_gpp_engines
+            enrich=tracked_enrich
         )
+        if not _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_refs, generation):
+            return
+        _finalize_cross_watchlist_delivery_after_publish()
         proximity_meta = MEMORY.setdefault("ema9_vwap_proximity_scanner_meta", {})
         proximity_meta.update({
-            "observed_this_batch": int(MEMORY.get("_proximity_batch_updates", 0)),
-            "symbols": len(MEMORY.get("ema9_vwap_proximity_scanner", [])),
+            "observed_this_batch": int(staged_memory.get("_proximity_batch_updates", 0)),
+            "symbols": len(staged_memory.get("ema9_vwap_proximity_scanner", [])),
             "updated_at": time.time(), "role": "RANKING_ONLY",
             "batch_size": INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
             "refresh_seconds": INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS,
             "closed_candles_only": True,
         })
-        _last_unified_watchlist_refresh = now
-        MEMORY["_unified_watchlist_refresh_ok"] = True
+        _last_unified_watchlist_refresh = time.time()
+        with state["lock"]:
+            state["last_error"] = ""
+        success = True
         if INSTITUTIONAL_RESOURCE_MANAGER:
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
-        return result
     except Exception as exc:
-        MEMORY["_unified_watchlist_refresh_ok"] = False
+        with state["lock"]:
+            if int(state.get("generation", 0)) == int(generation) and not state.get("timed_out"):
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                state["last_error"] = f"{type(exc).__name__}: {exc}"
         log_execution(
-            f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\\n{traceback.format_exc()}",
+            f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
             "ERROR",
         )
+    finally:
+        with state["lock"]:
+            if int(state.get("generation", 0)) == int(generation):
+                state["in_progress"] = False
+                state["worker_name"] = ""
+                state["last_completed_monotonic"] = time.monotonic()
+                if success and not state.get("timed_out"):
+                    state["phase"] = "IDLE"
+                    state["current_symbol"] = ""
+                    MEMORY["_unified_watchlist_refresh_ok"] = True
+                else:
+                    MEMORY["_unified_watchlist_refresh_ok"] = False
+
+
+def refresh_unified_institutional_watchlist(force=False):
+    """Schedule one background refresh; stale workers trigger verified process recovery.
+
+    The foreground trading loop never waits for Scanner OHLCV or institutional
+    analysis. A worker that stops making progress is permanently fenced for this
+    process and can only be recovered through the external process supervisor.
+    """
+    now = time.time()
+    now_mono = time.monotonic()
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    restart_context = None
+    with state["lock"]:
+        if state.get("timed_out"):
+            MEMORY["_unified_watchlist_refresh_ok"] = False
+            return MEMORY.setdefault("watchlist", {})
+        if state["in_progress"]:
+            last_progress = float(state.get("last_progress_monotonic") or state.get("started_monotonic") or now_mono)
+            stale_for = max(0.0, now_mono - last_progress)
+            if stale_for >= INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC and not state.get("restart_requested"):
+                state["timed_out"] = True
+                state["generation"] = int(state.get("generation", 0)) + 1
+                state["restart_requested"] = True
+                state["last_error"] = f"WORKER_STALLED:{state.get('phase')}:{stale_for:.1f}s"
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                restart_context = {
+                    "reason": "UNIFIED_WATCHLIST_WORKER_STALLED",
+                    "worker_name": state.get("worker_name"),
+                    "worker_phase": state.get("phase"),
+                    "worker_symbol": state.get("current_symbol"),
+                    "worker_stale_for_sec": round(stale_for, 3),
+                }
+            else:
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                return MEMORY.setdefault("watchlist", {})
+        else:
+            last_attempt = float(state.get("last_attempt_monotonic") or 0.0)
+            last_success = float(state.get("last_completed_monotonic") or 0.0)
+            last_completed = max(last_attempt, last_success)
+            if not force and now_mono - last_completed < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
+                return MEMORY.setdefault("watchlist", {})
+            generation = int(state.get("generation", 0)) + 1
+            state.update({
+                "generation": generation,
+                "in_progress": True, "timed_out": False, "restart_requested": False,
+                "last_attempt": now,
+                "last_attempt_monotonic": now_mono,
+                "started_monotonic": now_mono, "last_progress_monotonic": now_mono,
+                "phase": "SCHEDULED", "current_symbol": "",
+                "worker_name": "unified-institutional-watchlist",
+            })
+            MEMORY["_unified_watchlist_refresh_ok"] = False
+
+    if restart_context is not None:
+        log_execution(
+            f"[WATCHDOG] Unified Watchlist worker stopped progressing: {restart_context}; "
+            "entries remain blocked and verified process recovery is requested.",
+            "CRITICAL", debounce_key="unified_watchlist_worker_stalled", debounce_sec=60,
+        )
+        _restart_main_loop_process_after_stall(restart_context)
         return MEMORY.setdefault("watchlist", {})
+
+    try:
+        worker = threading.Thread(
+            target=_run_unified_institutional_watchlist_refresh,
+            args=(generation,),
+            name="unified-institutional-watchlist", daemon=True,
+        )
+        worker.start()
+    except Exception as exc:
+        with state["lock"]:
+            state["in_progress"] = False
+            state["worker_name"] = ""
+            state["phase"] = "START_FAILED"
+            state["last_error"] = f"worker_start_failed:{type(exc).__name__}"
+            state["last_completed_monotonic"] = time.monotonic()
+        MEMORY["_unified_watchlist_refresh_ok"] = False
+        log_execution(f"[INTEGRATION] watchlist worker start failed: {type(exc).__name__}: {exc}", "ERROR")
+    return MEMORY.setdefault("watchlist", {})
 
 def record_watchlist_entry(symbol, side, narrative, score, smart_money=None, momentum=None, source="ggp"):
     key = roro_canonical_symbol(symbol)
@@ -14125,8 +15121,13 @@ RECOVERY_BLOCK_ENTRIES = False
 
 
 def smart_opportunity_selection():
-    """Unified Watchlist -> institutional engines -> one existing GGP execution path."""
+    """Unified Watchlist -> institutional engines -> one existing GGP execution path.
+
+    This function is dispatched as a single-flight scanner task; it must never
+    run on MainThread because candidate revalidation performs market-data reads.
+    """
     global _INSTITUTIONAL_ENTRY_CONTEXT
+    _scanner_progress("institutional_entry_revalidation", "candidate_cycle_start")
     # Hard exposure/recovery gates run before any balance or market-data read so
     # an unresolved exchange state can never trigger an unnecessary API call.
     if STATE.get("open") or TRADE_STATE.get("in_position"):
@@ -14201,11 +15202,23 @@ def smart_opportunity_selection():
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
+            if STATE.get("open") or TRADE_STATE.get("in_position"):
+                _scanner_progress("institutional_entry_revalidation", "yielded_to_open_position",
+                                  symbol=str(canonical))
+                return True
+            if globals().get("RECOVERY_BLOCK_ENTRIES", False) or MEMORY.get("position_status") == "UNKNOWN":
+                _scanner_progress("institutional_entry_revalidation", "blocked_by_recovery",
+                                  symbol=str(canonical))
+                return False
+            _scanner_progress("institutional_entry_revalidation", "candidate_start",
+                              symbol=str(canonical))
             side = str(item.get("side", "")).upper()
             if side not in ("BUY", "SELL"):
                 continue
             exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
             df = _integration_fetch_frame(exchange_sym)
+            _scanner_progress("institutional_entry_revalidation", "candidate_ohlcv_complete",
+                              symbol=str(exchange_sym), available=bool(df is not None))
             if df is None:
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "market_data_unavailable"
@@ -14225,6 +15238,9 @@ def smart_opportunity_selection():
                 side_hints=item.get("side_hints") or [side],
             )
             fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
+            _scanner_progress("institutional_entry_revalidation", "candidate_analysis_complete",
+                              symbol=str(exchange_sym),
+                              decision=str(fresh.get("decision_state") or "UNKNOWN"))
             item.update(fresh)
             item["source"] = item.get("source") or "unified_watchlist"
             if item.get("decision_state") != "ENTRY_READY":
@@ -14420,10 +15436,14 @@ def smart_opportunity_selection():
                 item["capital_allocation_tier"] = "STRONG_30_PERCENT" if is_strong else "STANDARD_20_PERCENT"
                 _INSTITUTIONAL_ENTRY_CONTEXT["capital_allocation_tier"] = item["capital_allocation_tier"]
                 _INSTITUTIONAL_ENTRY_CONTEXT["sizing_eligible_strong"] = bool(is_strong)
+                _scanner_progress("institutional_entry_revalidation", "entry_authorization",
+                                  symbol=str(exchange_sym), side=side)
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
                                    float(item.get("score", 0) or 0), reason, float(atr_value),
                                    trade_type=classification, entry_type="RORO_INSTITUTIONAL",
                                    classification=sizing_class)
+                _scanner_progress("institutional_entry_revalidation", "entry_execution_complete",
+                                  symbol=str(exchange_sym), executed=bool(ok))
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
@@ -14539,10 +15559,12 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
             _finish_scanner_task(name, "FAILED", reason="EXCEPTION", error=error)
             finished = True
         finally:
-            if not finished:
-                _finish_scanner_task(name, "FAILED", reason="UNEXPECTED_EXIT",
-                                     error="worker exited without a result")
-            lock.release()
+            try:
+                if not finished:
+                    _finish_scanner_task(name, "FAILED", reason="UNEXPECTED_EXIT",
+                                         error="worker exited without a result")
+            finally:
+                lock.release()
 
     watchdog = globals().get("NAISO_WATCHDOG")
     watchdog_name = f"scanner:{name}"
@@ -14754,6 +15776,7 @@ def run_global_discovery_scanner():
         "lifecycle_marked": [],
         "lifecycle_status": CROSS_WATCHLIST_LIFECYCLE,
         "reason": "NO_NEW_CROSS_EVENT",
+        "watchlist_refresh_observed": False,
     }
     cross_delivery["event_ids"] = [
         str(row.get("cross_event_id") or "")
@@ -14764,28 +15787,53 @@ def run_global_discovery_scanner():
         if STATE.get("open") or TRADE_STATE.get("in_position"):
             cross_delivery["reason"] = "POSITION_OPEN_DISCOVERY_PAUSED"
         else:
-            # The detector already synced the durable feed. Force the existing
-            # Watchlist refresh now so this scanner cycle hands the event to the
-            # institutional analyzer instead of waiting for the next 15s/20s
-            # main-loop refresh. This is not a second scanner cycle: it reuses
-            # the same bounded refresh and governed frame cache.
+            # The Watchlist refresh is asynchronous. Publish PENDING before
+            # scheduling so the worker can mark delivery only after the event
+            # row is actually committed to the authoritative Watchlist.
+            cross_delivery["reason"] = "WATCHLIST_REFRESH_SCHEDULED"
+            cross_delivery["same_cycle"] = False
+            cross_delivery["delivered"] = False
+            cross_delivery["delivered_at"] = None
+            cross_delivery["watchlist_refresh_observed"] = True
+            MEMORY["_cross_watchlist_delivery"] = dict(cross_delivery)
             refresh_unified_institutional_watchlist(force=True)
-            cross_delivery["delivered_at"] = time.time()
-            cross_delivery["refresh_seconds"] = round(
-                cross_delivery["delivered_at"] - cross_detected_at, 3,
-            )
-            cross_delivery["delivered"] = bool(MEMORY.get("_unified_watchlist_refresh_ok"))
-            cross_delivery["same_cycle"] = cross_delivery["delivered"]
-            cross_delivery["reason"] = (
-                "ACTIVE_WATCHLIST_DELIVERED" if cross_delivery["delivered"]
-                else "WATCHLIST_REFRESH_FAILED"
-            )
-            if cross_delivery["delivered"]:
-                cross_delivery["lifecycle_marked"] = _mark_cross_events_watchlist_delivered(
-                    cross_delivery["event_ids"], cross_delivery["delivered_at"],
-                )
-                cross_delivery["lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+            completed_delivery = MEMORY.get("_cross_watchlist_delivery")
+            if isinstance(completed_delivery, dict):
+                cross_delivery = dict(completed_delivery)
+                if bool(cross_delivery.get("delivered")):
+                    # The worker finished inside this scanner call. A later
+                    # asynchronous completion must never be relabelled as
+                    # same-cycle just because a scanner reads the acknowledgement.
+                    cross_delivery["same_cycle"] = True
+            cross_delivery["refresh_seconds"] = round(time.time() - cross_detected_at, 3)
     cross_delivery["age_seconds"] = round(time.time() - cross_detected_at, 3)
+    # The async Watchlist worker may finish between our read above and this
+    # assignment. Preserve its newer delivery acknowledgement for the same IDs.
+    existing_delivery = MEMORY.get("_cross_watchlist_delivery")
+    if isinstance(existing_delivery, dict):
+        existing_ids = set(existing_delivery.get("event_ids") or [])
+        current_ids = set(cross_delivery.get("event_ids") or [])
+        if (
+            bool(cross_delivery.get("watchlist_refresh_observed"))
+            and existing_ids == current_ids
+            and (
+                bool(existing_delivery.get("delivered"))
+                or len(existing_delivery.get("delivered_ids") or []) >
+                   len(cross_delivery.get("delivered_ids") or [])
+            )
+        ):
+            # Keep the worker's newer delivery acknowledgement, but never let
+            # it rewrite this scanner cycle's detection metadata. A duplicate
+            # cycle must still report zero new events and its own reason.
+            preserved = dict(existing_delivery)
+            for key in ("new_events", "detected_at", "age_seconds", "event_ids"):
+                preserved[key] = cross_delivery.get(key)
+            if not int(cross_delivery.get("new_events") or 0):
+                preserved["reason"] = cross_delivery.get("reason", "NO_NEW_CROSS_EVENT")
+                preserved["same_cycle"] = False
+            elif bool(cross_delivery.get("same_cycle")):
+                preserved["same_cycle"] = True
+            cross_delivery = preserved
     MEMORY["_cross_watchlist_delivery"] = cross_delivery
 
     meta.update({
@@ -16215,17 +17263,94 @@ def sync_all_states():
             MEMORY["current_position"] = None
             RECOVERY_BLOCK_ENTRIES = True
         elif status == "FLAT":
-            MEMORY["position_status"] = "FLAT"
-            MEMORY["current_position"] = None
-            # Confirmed flat resolves an ambiguous order write without fabricating a fill.
-            STATE["execution_unresolved"] = False
-            STATE["recovery_hold"] = False
-            RECOVERY_BLOCK_ENTRIES = False
+            # A flat position snapshot alone does not prove an ambiguous MARKET
+            # order was rejected/canceled: it may still be pending or delayed.
+            # Never release an entry/close uncertainty solely from "no position".
+            entry_outcome_pending = bool(
+                STATE.get("execution_unresolved")
+                and STATE.get("entry_client_order_id")
+                and not STATE.get("entry_order_terminal")
+            )
+            close_outcome_pending = bool(
+                STATE.get("close_reconciliation_required") or STATE.get("pending_close_order_id")
+            )
+            durable_entry_hold = bool(
+                STATE.get("entry_context_persistence_failed")
+                or STATE.get("cross_event_persistence_failed")
+                or STATE.get("entry_event_persistence_failed")
+            )
+            unresolved_order = bool(
+                entry_outcome_pending or close_outcome_pending
+                or (STATE.get("execution_unresolved") and not STATE.get("entry_order_terminal"))
+                or (STATE.get("recovery_hold") and not STATE.get("entry_order_terminal")
+                    and not STATE.get("execution_unresolved"))
+                or durable_entry_hold
+            )
+            if unresolved_order:
+                MEMORY["position_status"] = "UNKNOWN"
+                MEMORY["current_position"] = None
+                MEMORY["recovery_status"] = "ORDER_OUTCOME_REQUIRES_RECONCILIATION"
+                STATE["recovery_hold"] = True
+                STATE["recovery_reason"] = "flat_snapshot_does_not_resolve_pending_order"
+                RECOVERY_BLOCK_ENTRIES = True
+                log_execution(
+                    "[RECOVERY] Exchange reports FLAT but an order outcome remains unresolved; "
+                    "entries stay blocked until order-level reconciliation proves terminal state",
+                    "CRITICAL", debounce_key="flat_with_unresolved_order", debounce_sec=60,
+                )
+            else:
+                MEMORY["position_status"] = "FLAT"
+                MEMORY["current_position"] = None
+                STATE["execution_unresolved"] = False
+                STATE["recovery_hold"] = False
+                if STATE.get("entry_order_terminal"):
+                    STATE["entry_execution_state"] = "RECONCILED_FLAT"
+                    STATE["entry_client_order_id"] = None
+                    STATE["entry_exchange_order_id"] = None
+                    STATE["entry_order_terminal"] = False
+                RECOVERY_BLOCK_ENTRIES = bool(durable_entry_hold)
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]
-                key = roro_canonical_symbol(_position_symbol(position))
-                _attempt_runtime_trade_recovery(_position_symbol(position), position=position, force=False)
+                entry_order_unresolved = bool(
+                    STATE.get("execution_unresolved")
+                    and str(STATE.get("entry_execution_state") or "").upper() in {
+                        "EXECUTION_UNCERTAIN", "PARTIAL_FILL", "ENTRY_PRICE_UNKNOWN", "PROTECTION_HOLD",
+                    }
+                    and not STATE.get("entry_order_terminal")
+                )
+                if entry_order_unresolved:
+                    if STATE.get("entry_client_order_id") or STATE.get("entry_exchange_order_id"):
+                        terminal, order_status = _cancel_and_verify_entry_order_terminal(
+                            str(_position_symbol(position)),
+                            STATE.get("entry_exchange_order_id"),
+                            STATE.get("entry_client_order_id"),
+                            cancel_if_open=False,
+                        )
+                    else:
+                        terminal, order_status = False, "ENTRY_ORDER_ID_UNAVAILABLE"
+                    if terminal:
+                        STATE["entry_order_terminal"] = True
+                        STATE["entry_order_status"] = order_status
+                        _attempt_runtime_trade_recovery(
+                            _position_symbol(position), position=position, force=False,
+                        )
+                    else:
+                        MEMORY["position_status"] = "UNKNOWN"
+                        MEMORY["current_position"] = position
+                        MEMORY["recovery_status"] = "ENTRY_ORDER_REMAINDER_UNRESOLVED"
+                        STATE["recovery_hold"] = True
+                        STATE["recovery_reason"] = str(order_status)
+                        RECOVERY_BLOCK_ENTRIES = True
+                        log_execution(
+                            f"[RECOVERY] Position exists but entry order is not terminal "
+                            f"({order_status}); holding management handoff and new entries",
+                            "CRITICAL", debounce_key="entry_order_remainder_unresolved", debounce_sec=30,
+                        )
+                else:
+                    _attempt_runtime_trade_recovery(
+                        _position_symbol(position), position=position, force=False,
+                    )
             else:
                 MEMORY["position_status"] = "MULTIPLE_OPEN"
                 RECOVERY_BLOCK_ENTRIES = True
@@ -16249,6 +17374,34 @@ def sync_all_states():
         _main_loop_progress("realized_pnl_complete", symbol=str(symbol))
 
 
+# Serialize every entry-producing analysis path because the legacy entry
+# context is process-global. The lock is acquired by the worker itself (not by
+# its dispatcher), so a reentrant execute_entry call from that worker is safe.
+_ENTRY_DISCOVERY_TASK_LOCK = threading.RLock()
+_original_smart_opportunity_selection_for_entry_lock = smart_opportunity_selection
+def smart_opportunity_selection(*args, **kwargs):
+    if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+        log_execution("[ENTRY_SCAN] Institutional revalidation deferred; another entry cycle owns context",
+                      "DEBUG", debounce_key="entry_scan_context_busy", debounce_sec=10)
+        return False
+    try:
+        return _original_smart_opportunity_selection_for_entry_lock(*args, **kwargs)
+    finally:
+        _ENTRY_DISCOVERY_TASK_LOCK.release()
+
+
+_original_sniper_engine_v2_for_entry_lock = sniper_engine_v2
+def sniper_engine_v2(*args, **kwargs):
+    if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+        log_execution("[ENTRY_SCAN] Sniper V2 deferred; another entry cycle owns context",
+                      "DEBUG", debounce_key="entry_scan_context_busy", debounce_sec=10)
+        return False
+    try:
+        return _original_sniper_engine_v2_for_entry_lock(*args, **kwargs)
+    finally:
+        _ENTRY_DISCOVERY_TASK_LOCK.release()
+
+
 # Serialize final entry authorization so one closed-candle trigger cannot
 # submit two orders from concurrent scanner paths. The current signal is checked
 # inside the original entry function after gate calculation and before any order.
@@ -16256,83 +17409,90 @@ _ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
     with _ENTRY_EVENT_EXECUTION_LOCK:
-        globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
-        result = _original_execute_entry_for_journal(*args, **kwargs)
-        gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
-        event_id = str(gate.get("durable_event_id") or "").strip()
-        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
-        if result and STATE.get("open"):
-            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-            _persist_trade_journal_start(ctx.get("setup_type"))
-            trade_id = str(STATE.get("trade_id") or "")
-            entry_context = dict(ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {})
-            sizing_decision = dict(STATE.get("sizing_decision") or ctx.get("sizing_decision") or {})
-            # The handoff is frozen after fill verification: planned values come
-            # from the immutable sizing decision, actual values from the exchange
-            # result (or the verified PAPER fill).
-            entry_context.update({
-                "requested_entry_price": sizing_decision.get("entry_price"),
-                "requested_qty": sizing_decision.get("final_exchange_qty")
-                or sizing_decision.get("final_qty"),
-                "actual_entry_price": STATE.get("entry"),
-                "actual_filled_qty": STATE.get("initial_qty") or STATE.get("qty"),
-                "fill_source": "EXCHANGE_VERIFIED_FILL" if not PAPER_MODE else "PAPER_VERIFIED_FILL",
-            })
-            STATE["entry_context_snapshot"] = dict(entry_context)
-            if journal is not None and entry_context:
-                try:
-                    if not journal.persist_entry_context(trade_id, entry_context):
+        if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+            log_execution("[ENTRY_BLOCKED] Another entry-producing cycle owns the shared context",
+                          "WARN", debounce_key="entry_context_locked", debounce_sec=5)
+            return False
+        try:
+            globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
+            result = _original_execute_entry_for_journal(*args, **kwargs)
+            gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
+            event_id = str(gate.get("durable_event_id") or "").strip()
+            journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+            if result and STATE.get("open"):
+                ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+                _persist_trade_journal_start(ctx.get("setup_type"))
+                trade_id = str(STATE.get("trade_id") or "")
+                entry_context = dict(ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {})
+                sizing_decision = dict(STATE.get("sizing_decision") or ctx.get("sizing_decision") or {})
+                # The handoff is frozen after fill verification: planned values come
+                # from the immutable sizing decision, actual values from the exchange
+                # result (or the verified PAPER fill).
+                entry_context.update({
+                    "requested_entry_price": sizing_decision.get("entry_price"),
+                    "requested_qty": sizing_decision.get("final_exchange_qty")
+                    or sizing_decision.get("final_qty"),
+                    "actual_entry_price": STATE.get("entry"),
+                    "actual_filled_qty": STATE.get("initial_qty") or STATE.get("qty"),
+                    "fill_source": "EXCHANGE_VERIFIED_FILL" if not PAPER_MODE else "PAPER_VERIFIED_FILL",
+                })
+                STATE["entry_context_snapshot"] = dict(entry_context)
+                if journal is not None and entry_context:
+                    try:
+                        if not journal.persist_entry_context(trade_id, entry_context):
+                            STATE["entry_context_persistence_failed"] = True
+                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                            log_execution(
+                                f"[ENTRY_CONTEXT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                                "has no durable entry context; new entries blocked",
+                                "ERROR",
+                            )
+                    except Exception as exc:
                         STATE["entry_context_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[ENTRY_CONTEXT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            "has no durable entry context; new entries blocked",
-                            "ERROR",
+                            f"[ENTRY_CONTEXT] CRITICAL: persistence failed for {trade_id}: "
+                            f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
                         )
-                except Exception as exc:
-                    STATE["entry_context_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[ENTRY_CONTEXT] CRITICAL: persistence failed for {trade_id}: "
-                        f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
-                    )
-            cross_event_id = str(ctx.get("cross_event_id") or "").strip()
-            if cross_event_id and journal is not None:
-                try:
-                    if not journal.consume_cross_event(cross_event_id, trade_id):
+                cross_event_id = str(ctx.get("cross_event_id") or "").strip()
+                if cross_event_id and journal is not None:
+                    try:
+                        if not journal.consume_cross_event(cross_event_id, trade_id):
+                            STATE["cross_event_persistence_failed"] = True
+                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                            log_execution(
+                                f"[CROSS_EVENT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                                f"but could not consume cross event {cross_event_id}; new entries blocked",
+                                "ERROR",
+                            )
+                    except Exception as exc:
                         STATE["cross_event_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[CROSS_EVENT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            f"but could not consume cross event {cross_event_id}; new entries blocked",
-                            "ERROR",
+                            f"[CROSS_EVENT] CRITICAL: consumption failed for {cross_event_id}: "
+                            f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
                         )
-                except Exception as exc:
-                    STATE["cross_event_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[CROSS_EVENT] CRITICAL: consumption failed for {cross_event_id}: "
-                        f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
-                    )
-            if event_id and journal is not None:
-                try:
-                    if not trade_id or not journal.consume_event(event_id, trade_id):
+                if event_id and journal is not None:
+                    try:
+                        if not trade_id or not journal.consume_event(event_id, trade_id):
+                            STATE["entry_event_persistence_failed"] = True
+                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                            log_execution(
+                                f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                                f"but could not durably consume signal {event_id}; new entries blocked",
+                                "ERROR",
+                            )
+                    except Exception as exc:
                         STATE["entry_event_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            f"but could not durably consume signal {event_id}; new entries blocked",
+                            f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
+                            f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
                             "ERROR",
                         )
-                except Exception as exc:
-                    STATE["entry_event_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
-                        f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
-                        "ERROR",
-                    )
-        return result
+            return result
+        finally:
+            _ENTRY_DISCOVERY_TASK_LOCK.release()
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
@@ -16374,8 +17534,13 @@ DASHBOARD_SERVERS = []
 DASHBOARD_ACTIVE_PORTS = []
 
 def start_dashboard_servers():
-    """Start Flask dashboard before trading: local ports 8000+8080, hosted PORT only."""
-    from werkzeug.serving import make_server
+    """Start one-process Waitress servers before the trading supervisor.
+
+    Startup is idempotent per port and transactional: if any port fails after
+    another succeeded, every server started by this call is closed and joined
+    before the error propagates. This prevents leaked WSGI threads or sockets.
+    """
+    from waitress import create_server
     hosted_port = os.getenv("PORT")
     if hosted_port:
         ports = [int(hosted_port)]
@@ -16393,23 +17558,53 @@ def start_dashboard_servers():
         bind_host = os.getenv("DASHBOARD_BIND_HOST", "127.0.0.1")
     if not ports:
         raise RuntimeError("No valid Dashboard port configured")
-    started = []
-    for port in ports:
-        try:
-            server = make_server(bind_host, port, app, threaded=True)
-            thread = threading.Thread(target=server.serve_forever, daemon=True, name=f"ggp_dashboard_{port}")
-            thread.start()
-            DASHBOARD_SERVERS.append((server, thread))
-            DASHBOARD_ACTIVE_PORTS.append(port)
-            started.append(port)
-            log_execution(f"[DASHBOARD] HTTP server started host={bind_host} port={port}", "SUCCESS")
-        except OSError as exc:
-            log_execution(f"[DASHBOARD] Could not bind {bind_host}:{port}: {exc}", "ERROR")
-            if hosted_port:
-                raise
-    if not started:
-        raise RuntimeError("Dashboard could not bind any configured local port")
-    return started
+
+    original_servers = list(DASHBOARD_SERVERS)
+    original_ports = list(DASHBOARD_ACTIVE_PORTS)
+    started = [port for port in ports if port in DASHBOARD_ACTIVE_PORTS]
+    added = []
+    failures = []
+    try:
+        for port in ports:
+            if port in DASHBOARD_ACTIVE_PORTS:
+                continue
+            try:
+                # Waitress is a production WSGI server. Keep a single Python
+                # process: the trading engine, instance lock and recovery
+                # supervisor must never be forked into duplicate order workers.
+                server = create_server(app, host=bind_host, port=port, threads=8)
+                thread = threading.Thread(
+                    target=server.run, daemon=True, name=f"ggp_dashboard_{port}")
+                thread.start()
+                DASHBOARD_SERVERS.append((server, thread))
+                DASHBOARD_ACTIVE_PORTS.append(port)
+                added.append((server, thread, port))
+                started.append(port)
+                log_execution(
+                    f"[DASHBOARD] Waitress WSGI server started host={bind_host} port={port}",
+                    "SUCCESS",
+                )
+            except (OSError, ValueError) as exc:
+                failures.append((port, f"{type(exc).__name__}: {exc}"))
+                log_execution(f"[DASHBOARD] Could not bind {bind_host}:{port}: {exc}", "ERROR")
+                if hosted_port:
+                    raise
+        if failures:
+            # Partial availability is not acceptable: leave no socket or WSGI
+            # thread behind before the caller decides whether to restart.
+            raise RuntimeError(
+                "Dashboard could not bind every configured port: "
+                + ", ".join(f"{port} ({reason})" for port, reason in failures)
+            )
+        if not started:
+            raise RuntimeError("Dashboard could not bind any configured local port")
+        return started
+    except BaseException:
+        for server, thread, _port in added:
+            _stop_dashboard_server(server, thread)
+        DASHBOARD_SERVERS[:] = original_servers
+        DASHBOARD_ACTIVE_PORTS[:] = original_ports
+        raise
 
 
 if __name__ == "__main__":
@@ -16426,14 +17621,13 @@ if __name__ == "__main__":
         # supervisor stays on the foreground thread. This avoids daemon-only
         # process exit.
         start_dashboard_servers()
-        try:
-            threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
-        except Exception as exc:
-            log_execution(f"[THREAD_START] keep_alive failed: {type(exc).__name__}: {exc}", "ERROR")
+        start_runtime_workers()
         start_naiso_services()
         run_trade_supervisor(lock_handle=_GGP_INSTANCE_LOCK, lock_path=_GGP_LOCK_PATH)
     except Exception:
         log_execution(f"[SHUTDOWN] Fatal supervisor error: {traceback.format_exc()}", "ERROR")
         raise
     finally:
+        # Guarantee cleanup on startup failure as well as controlled exit.
+        _stop_runtime_services()
         release_instance_lock(_GGP_INSTANCE_LOCK)

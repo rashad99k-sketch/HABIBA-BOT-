@@ -6,3 +6,4 @@ requests
 psutil
 pytest
 python-dotenv
+waitress==3.0.2

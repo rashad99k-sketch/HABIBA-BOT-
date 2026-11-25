@@ -9,6 +9,14 @@ on:
     branches:
       - main
 
+# Serialize CI per PR/branch without cancelling a running regression suite.
+# GitHub keeps at most one pending run per concurrency group; when newer commits
+# arrive, the newest pending run replaces the older pending run, while the
+# currently executing full regression is allowed to finish.
+concurrency:
+  group: sniper-v2-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -21,6 +29,7 @@ jobs:
       ENABLE_LIVE_TRADING: "false"
       BINGX_API_KEY: ""
       BINGX_API_SECRET: ""
+      PYTHONFAULTHANDLER: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,4 +56,21 @@ jobs:
         run: python -m pytest -q test_native_sl_management_integration.py test_neon_adaptive_entry.py test_ema9_vwap_soft_gate.py
 
       - name: Full regression suite
-        run: python -m pytest -q
+        run: |
+          mkdir -p test-results
+          set +e
+          python -X faulthandler -m pytest -vv -ra --tb=short --junitxml=test-results/junit.xml -o faulthandler_timeout=60
+          pytest_status=$?
+          echo "PYTEST_EXIT_CODE=${pytest_status}"
+          exit "${pytest_status}"
+
+      - name: Upload regression diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-regression-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-results/junit.xml
+            .pytest_cache/v/cache/lastfailed
+          if-no-files-found: warn
+          retention-days: 7

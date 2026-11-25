@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
 import numpy as np
@@ -426,10 +427,52 @@ def _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refr
     monkeypatch.setattr(ggpbot, "_integration_fetch_frame",
                         lambda symbol: fetch_calls.append(symbol) or frame.copy())
 
-    real_refresh = ggpbot.refresh_unified_institutional_watchlist
     def refresh_spy(**kwargs):
+        # Execute the real owned-worker body synchronously so scanner-cycle
+        # delivery is proven end to end, while keeping the test off real clocks
+        # and exchange APIs. Nothing is published until the real worker runs.
         refresh_calls.append(kwargs)
-        return real_refresh(**kwargs)
+        state = {
+            "lock": threading.Lock(), "in_progress": True, "generation": 1,
+            "timed_out": False, "restart_requested": False,
+            "last_attempt": NOW_SEC, "last_attempt_monotonic": 0.0,
+            "started_monotonic": 0.0, "last_progress_monotonic": 0.0,
+            "last_completed_monotonic": 0.0, "phase": "IDLE",
+            "current_symbol": "", "timed_out": False, "restart_requested": False,
+            "last_error": "", "worker_name": "unified-institutional-watchlist",
+        }
+        monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+        monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_BATCH_SIZE", 4)
+        monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 30)
+        monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+        monkeypatch.setitem(
+            ggpbot.MEMORY, "_unified_watchlist_refresh_ok", False)
+
+        def publish_cross_rows(memory_target, _fetch_frame, **_kwargs):
+            for event in memory_target.get("confirmed_cross_events", []):
+                key = ggpbot.roro_canonical_symbol(
+                    event.get("exchange_symbol") or event.get("symbol"))
+                if not key:
+                    continue
+                memory_target.setdefault("watchlist", {})[key] = {
+                    "symbol": event.get("exchange_symbol") or event.get("symbol"),
+                    "side": event.get("side"),
+                    "score": 100.0,
+                    "decision_state": "WAITING_FOR_CONFIRMATION",
+                    "cross_event_id": event.get("cross_event_id"),
+                    "cross_event_status": event.get("cross_event_status", "ACTIVE"),
+                    "cross_event_analysis_required": True,
+                    "cross_event_lifecycle_status": event.get(
+                        "cross_event_lifecycle_status", ggpbot.CROSS_WATCHLIST_LIFECYCLE),
+                    "last_update": NOW_SEC,
+                    "source": "confirmed_cross_event",
+                }
+            return memory_target.setdefault("watchlist", {})
+
+        monkeypatch.setattr(ggpbot, "update_unified_watchlist", publish_cross_rows)
+        monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a, **_k: {})
+        ggpbot._run_unified_institutional_watchlist_refresh()
+        return ggpbot.MEMORY.setdefault("watchlist", {})
     monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", refresh_spy)
 
     for key in ("confirmed_cross_events", "scanner_v2_buy", "scanner_v2_sell",

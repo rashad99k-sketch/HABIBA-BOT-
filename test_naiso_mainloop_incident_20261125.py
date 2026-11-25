@@ -8,6 +8,7 @@ threshold changes are involved.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -21,6 +22,42 @@ import ggpbot
 from naiso_health import HealthWatchdog, RestartPolicy
 
 SYMBOL = "BTC/USDT:USDT"
+
+
+def _healthy_runtime(monkeypatch):
+    """Install an isolated, genuinely progressing runtime for health-route tests."""
+    clock = [100.0]
+    wall_now = 1_700_000_000.0
+    monkeypatch.setattr(ggpbot, "time", SimpleNamespace(
+        time=lambda: wall_now, monotonic=lambda: clock[0], sleep=lambda _s: None))
+    watchdog = HealthWatchdog(
+        restart_policy=RestartPolicy(max_attempts=3, monotonic_fn=lambda: clock[0]),
+        monotonic_fn=lambda: clock[0], sleep_fn=lambda _s: None,
+        alert_fn=lambda *_a, **_k: None)
+    watchdog.register("main_loop", interval_sec=5.0, grace_sec=60.0,
+                      critical=True, restartable=True)
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", watchdog)
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "recovery_hold": False, "execution_unresolved": False,
+        "close_reconciliation_required": False, "current_symbol": None})
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"recovery_status": "READY"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "API_RESILIENCE", None)
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STATE", {"until": 0.0})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_RESTART_STATE", {
+        "in_progress": False, "attempts": 0, "last_reason": "",
+        "supervisor_exhausted": False})
+    thread = threading.current_thread()
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_OWNER", {
+        "thread_id": thread.ident, "thread_name": thread.name, "registered": True})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_PROGRESS_SEQ", 1)
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_LAST_OWNER_PROGRESS", {
+        "seq": 1, "ts": clock[0], "thread_id": thread.ident,
+        "thread_name": thread.name})
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start", progress=True)
+    return watchdog, clock
 
 
 def _watchdog(clock, alerts, *, safety_gate=None, **kwargs):
@@ -615,3 +652,492 @@ def test_restart_attempt_uids_are_unique_when_recovery_is_deferred():
     assert deferred.uid != real.uid, "diagnostic attempt identity must be unique"
     rows = policy.records("main_loop")
     assert [row["uid"] for row in rows] == [deferred.uid, real.uid]
+
+
+# --- Background Watchlist refresh: never run discovery OHLCV on MainThread -- #
+
+def test_unified_watchlist_refresh_schedules_one_background_worker_and_fails_closed(monkeypatch):
+    calls = []
+    workers = []
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon, args=()):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.daemon = daemon
+            workers.append(self)
+
+        def start(self):
+            calls.append(("start", self.name, self.daemon))
+
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
+    monkeypatch.setattr(ggpbot, "_last_unified_watchlist_refresh", 0.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_BATCH_SIZE", 4)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 30)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot.threading, "Thread", FakeThread)
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", {
+        "lock": __import__("threading").Lock(), "in_progress": False,
+        "last_attempt": 0.0, "last_attempt_monotonic": -1000.0,
+        "last_completed_monotonic": -1000.0, "phase": "IDLE",
+        "last_error": "", "worker_name": "",
+    })
+
+    def sync_cross_events(**_kwargs):
+        calls.append(("sync",))
+
+    def update(memory, fetch_frame, **kwargs):
+        calls.append(("update", kwargs["batch_size"], kwargs["max_items"]))
+        return {"BTC": {"decision_state": "WAITING_FOR_CONFIRMATION"}}
+
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", sync_cross_events)
+    monkeypatch.setattr(ggpbot, "update_unified_watchlist", update)
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
+
+    returned = ggpbot.refresh_unified_institutional_watchlist()
+
+    # The foreground call only starts a daemon worker; it never runs data fetches.
+    assert returned == {}
+    assert calls == [("start", "unified-institutional-watchlist", True)]
+    assert len(workers) == 1
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is True
+
+    # Re-entry while the worker is active must not create a second worker.
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(workers) == 1
+
+    # Run the captured worker body deterministically and verify publication.
+    workers[0].target(*workers[0].args)
+    assert calls[1:] == [("sync",), ("update", 4, 30)]
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is True
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is False
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] == ""
+
+
+def test_unified_watchlist_worker_failure_keeps_entry_gate_closed_and_backs_off(monkeypatch):
+    workers = []
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon, args=()):
+            self.target = target
+            self.args = args
+            workers.append(self)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {"BTC": {"decision_state": "ENTRY_READY"}}})
+    monkeypatch.setattr(ggpbot, "_last_unified_watchlist_refresh", 0.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot.threading, "Thread", FakeThread)
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", {
+        "lock": __import__("threading").Lock(), "in_progress": False,
+        "last_attempt": 0.0, "last_attempt_monotonic": -1000.0,
+        "last_completed_monotonic": -1000.0, "phase": "IDLE",
+        "last_error": "", "worker_name": "",
+    })
+    monkeypatch.setattr(
+        ggpbot, "_sync_confirmed_cross_events",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated market-data failure")),
+    )
+
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(workers) == 1
+    workers[0].target(*workers[0].args)
+
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+    assert "simulated market-data failure" in ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["last_error"]
+    assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is False
+
+    # Failed refresh is not retried on every main-loop iteration.
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(workers) == 1
+
+
+# --- Unified Watchlist worker liveness and process-level recovery ------------ #
+
+def test_stalled_watchlist_worker_requests_verified_process_recovery_once(monkeypatch):
+    clock = [200.0]
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": 100.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "ETC/USDT:USDT",
+        "timed_out": False, "restart_requested": False,
+        "last_error": "", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "time", SimpleNamespace(
+        time=lambda: 1000.0, monotonic=lambda: clock[0], sleep=lambda _s: None))
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0)
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {"BTC": {"decision_state": "ENTRY_READY"}}})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    restart_calls = []
+    monkeypatch.setattr(
+        ggpbot, "_restart_main_loop_process_after_stall",
+        lambda context: restart_calls.append(dict(context)) or True,
+    )
+
+    returned = ggpbot.refresh_unified_institutional_watchlist()
+
+    assert returned == ggpbot.MEMORY["watchlist"]
+    assert len(restart_calls) == 1
+    assert restart_calls[0]["reason"] == "UNIFIED_WATCHLIST_WORKER_STALLED"
+    assert restart_calls[0]["worker_phase"] == "OHLCV_FETCH"
+    assert restart_calls[0]["worker_symbol"] == "ETC/USDT:USDT"
+    assert state["timed_out"] is True
+    assert state["restart_requested"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+
+    # A wedged/timed-out worker is never replaced by a concurrent second worker.
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(restart_calls) == 1
+
+
+def test_late_watchlist_worker_completion_cannot_reopen_entry_gate(monkeypatch):
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": 100.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "BTC/USDT:USDT",
+        "timed_out": True, "restart_requested": True,
+        "last_error": "WORKER_STALLED", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda **_kwargs: None)
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
+    monkeypatch.setattr(
+        ggpbot, "update_unified_watchlist",
+        lambda *_a, **_k: {"BTC": {"decision_state": "ENTRY_READY"}},
+    )
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+
+    ggpbot._run_unified_institutional_watchlist_refresh()
+
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+    assert state["timed_out"] is True
+    assert state["in_progress"] is False
+
+
+def test_health_marks_stalled_watchlist_worker_as_process_failure(monkeypatch):
+    watchdog, clock = _healthy_runtime(monkeypatch)
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": clock[0] - 95.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "ETC/USDT:USDT",
+        "timed_out": False, "restart_requested": False,
+        "last_error": "", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0)
+
+    response = ggpbot.app.test_client().get("/health")
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["watchlist_worker"]["stalled"] is True
+    assert "UNIFIED_WATCHLIST_WORKER_STALLED" in payload["process_failures"]
+
+
+def test_normal_watchlist_refresh_is_not_reported_as_process_failure(monkeypatch):
+    watchdog, clock = _healthy_runtime(monkeypatch)
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": clock[0] - 2.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "ETC/USDT:USDT",
+        "timed_out": False, "restart_requested": False,
+        "last_error": "", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0)
+
+    response = ggpbot.app.test_client().get("/health")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["watchlist_worker"]["in_progress"] is True
+    assert payload["watchlist_worker"]["stalled"] is False
+    assert "UNIFIED_WATCHLIST_WORKER_STALLED" not in payload["process_failures"]
+
+
+def test_confirmed_pivots_returns_empty_for_short_or_truncated_frames():
+    import pandas as pd
+    from roro_institutional import _confirmed_pivots
+
+    short = pd.DataFrame({"high": [1.0, 2.0, 3.0], "low": [0.5, 1.0, 2.0]})
+    assert _confirmed_pivots(short, left_right=2) == ([], [])
+    assert _confirmed_pivots(pd.DataFrame({"close": [1.0] * 10}), left_right=2) == ([], [])
+    complete = pd.DataFrame({
+        "high": [5.0, 6.0, 10.0, 9.0, 8.0],
+        "low": [5.0, 4.0, 1.0, 2.0, 3.0],
+    })
+    assert _confirmed_pivots(complete, end=3, left_right=2) == ([], [])
+
+
+def test_confirmed_pivots_skips_non_finite_windows_without_changing_valid_pivots():
+    import math
+    import pandas as pd
+    from roro_institutional import _confirmed_pivots
+
+    frame = pd.DataFrame({
+        "high": [5.0, 6.0, 10.0, 9.0, 8.0, 7.0, 8.0],
+        "low": [5.0, 4.0, 1.0, 2.0, 3.0, 4.0, 3.0],
+    })
+    highs, lows = _confirmed_pivots(frame, left_right=2)
+    assert (2, 10.0) in highs
+    assert (2, 1.0) in lows
+
+    frame.loc[1, "high"] = math.nan
+    highs, lows = _confirmed_pivots(frame, left_right=2)
+    assert (2, 10.0) not in highs
+    assert (2, 1.0) not in lows
+
+
+def test_digitalocean_liveness_restarts_only_after_exchange_exit_gate_authorizes(monkeypatch):
+    _healthy_runtime(monkeypatch)
+    state = {
+        "lock": threading.Lock(), "in_progress": False, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": 100.0, "last_completed_monotonic": 100.0,
+        "phase": "IDLE", "current_symbol": "", "timed_out": True,
+        "restart_requested": True, "last_error": "WORKER_STALLED",
+        "worker_name": "",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "MEMORY", {
+        "recovery_status": "EXIT_REFUSED_UNVERIFIED_EXPOSURE",
+    })
+    ggpbot.STATE["open"] = True
+
+    client = ggpbot.app.test_client()
+    held = client.get("/liveness")
+    assert held.status_code == 200
+    assert held.get_json()["restart_authorized_by_exchange_reconciliation"] is False
+
+    # Once the exchange exit gate records a verified FLAT result, the liveness
+    # probe may ask DigitalOcean to replace this stalled process.
+    ggpbot.STATE["open"] = False
+    ggpbot.MEMORY["recovery_status"] = "EXIT_RECONCILED_FLAT"
+    authorized = client.get("/liveness")
+    assert authorized.status_code == 503
+    assert authorized.get_json()["restart_authorized_by_exchange_reconciliation"] is True
+
+
+def test_confirmed_cross_lifecycle_fetches_are_bounded_and_rotate(monkeypatch):
+    calls = []
+    progress = []
+
+    class Journal:
+        def update_cross_event_lifecycle(self, event_id, lifecycle):
+            return True
+
+    rows = [
+        {
+            "event_id": f"event-{i}", "symbol": f"COIN{i}",
+            "exchange_symbol": f"COIN{i}/USDT:USDT", "side": "BUY",
+            "metadata": {"lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA},
+        }
+        for i in range(5)
+    ]
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", Journal())
+    monkeypatch.setattr(ggpbot, "_evaluate_post_cross_rejection_breakout",
+                        lambda *_a, **_k: {"entry_ready": False, "phase": "WAITING_FOR_PULLBACK"})
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame",
+                        lambda symbol: calls.append(symbol) or {"symbol": symbol})
+    monkeypatch.setattr(ggpbot, "_roro_timeframe_seconds", lambda _tf: 900)
+    monkeypatch.setattr(ggpbot, "ema", lambda *_a, **_k: [])
+    monkeypatch.setattr(ggpbot, "MEMORY", {"_cross_event_lifecycle_cursor": 0})
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+
+    first = ggpbot._advance_cross_event_lifecycles(
+        rows, progress_callback=lambda phase, symbol: progress.append((phase, symbol)),
+        max_items=2,
+    )
+    second = ggpbot._advance_cross_event_lifecycles(
+        rows, progress_callback=lambda phase, symbol: progress.append((phase, symbol)),
+        max_items=2,
+    )
+    third = ggpbot._advance_cross_event_lifecycles(
+        rows, progress_callback=lambda phase, symbol: progress.append((phase, symbol)),
+        max_items=2,
+    )
+
+    assert first == second == third == 2
+    assert calls == [
+        "COIN0/USDT:USDT", "COIN1/USDT:USDT",
+        "COIN2/USDT:USDT", "COIN3/USDT:USDT",
+        "COIN4/USDT:USDT", "COIN0/USDT:USDT",
+    ]
+    assert len(progress) == 12
+    assert ggpbot.MEMORY["_cross_event_lifecycle_cursor"] == 1
+
+
+def test_watchlist_worker_completion_and_entry_readiness_publish_atomically(monkeypatch):
+    class ImmediateThread:
+        def __init__(self, *, target, name, daemon, args=()):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            self.target(*self.args)
+
+    state = {
+        "lock": threading.Lock(), "in_progress": False, "last_attempt": 0.0,
+        "last_attempt_monotonic": -1000.0, "started_monotonic": 0.0,
+        "last_progress_monotonic": 0.0, "last_completed_monotonic": -1000.0,
+        "phase": "IDLE", "current_symbol": "", "timed_out": False,
+        "restart_requested": False, "last_error": "", "worker_name": "",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "_last_unified_watchlist_refresh", 0.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_BATCH_SIZE", 4)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 30)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
+    monkeypatch.setattr(ggpbot, "threading", SimpleNamespace(
+        Lock=threading.Lock, Thread=ImmediateThread, current_thread=threading.current_thread,
+        get_ident=threading.get_ident,
+    ))
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda **_kwargs: None)
+    monkeypatch.setattr(ggpbot, "update_unified_watchlist", lambda *_a, **_k: {})
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+
+    ggpbot.refresh_unified_institutional_watchlist()
+
+    assert state["in_progress"] is False
+    assert state["phase"] == "IDLE"
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is True
+
+
+def test_closed_frame_validator_rejects_bad_rows_instead_of_repairing_snapshot():
+    import numpy as np
+    import pandas as pd
+    from roro_opportunity_pipeline import validate_closed_frame
+
+    count = 60
+    frame = pd.DataFrame({
+        "timestamp": [1_700_000_000_000 + i * 900_000 for i in range(count)],
+        "open": [100.0] * count,
+        "high": [101.0] * count,
+        "low": [99.0] * count,
+        "close": [100.5] * count,
+        "volume": [10.0] * count,
+    })
+    now_ms = int(frame.timestamp.iloc[-1]) + 900_001
+    valid = validate_closed_frame(frame, now_ms=now_ms, timeframe_s=900)
+    assert len(valid) == count
+
+    duplicate = frame.copy()
+    duplicate.loc[10, "timestamp"] = duplicate.loc[9, "timestamp"]
+    unordered = frame.copy()
+    unordered.loc[[10, 11], "timestamp"] = unordered.loc[[11, 10], "timestamp"].to_numpy()
+    infinite = frame.copy()
+    infinite.loc[10, "high"] = np.inf
+    malformed_ohlc = frame.copy()
+    malformed_ohlc.loc[10, "high"] = 99.5
+    negative_volume = frame.copy()
+    negative_volume.loc[10, "volume"] = -1.0
+    missing_value = frame.copy()
+    missing_value.loc[10, "close"] = np.nan
+    fractional_timestamp = frame.copy()
+    # Cast before mutation: newer pandas versions reject fractional assignment
+    # into an int64 column instead of emitting the older FutureWarning.
+    fractional_timestamp["timestamp"] = fractional_timestamp["timestamp"].astype(float)
+    fractional_timestamp.loc[10, "timestamp"] += 0.5
+
+    for invalid in (
+        duplicate, unordered, infinite, malformed_ohlc,
+        negative_volume, missing_value, fractional_timestamp,
+    ):
+        assert validate_closed_frame(invalid, now_ms=now_ms, timeframe_s=900).empty
+
+
+def test_closed_frame_validator_filters_only_the_still_open_candle():
+    import pandas as pd
+    from roro_opportunity_pipeline import validate_closed_frame
+
+    frame = pd.DataFrame({
+        "timestamp": [1_700_000_000_000 + i * 900_000 for i in range(60)],
+        "open": [100.0] * 60, "high": [101.0] * 60,
+        "low": [99.0] * 60, "close": [100.5] * 60, "volume": [10.0] * 60,
+    })
+    now_ms = int(frame.timestamp.iloc[-1]) + 900_000 - 1
+    closed = validate_closed_frame(frame, now_ms=now_ms, timeframe_s=900)
+    assert len(closed) == 59
+    assert int(closed.timestamp.iloc[-1]) == int(frame.timestamp.iloc[-2])
+
+
+def test_dashboard_uses_single_process_waitress_and_closes_cleanly(monkeypatch):
+    created = []
+
+    class FakeServer:
+        def __init__(self, app, host, port, threads):
+            self.app = app
+            self.host = host
+            self.port = port
+            self.threads = threads
+            self.closed = False
+
+        def run(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class FakeThread:
+        def __init__(self, target, daemon, name):
+            self.target = target
+            self.daemon = daemon
+            self.name = name
+            self.started = False
+            self.joined = False
+
+        def start(self):
+            self.started = True
+
+        def join(self, timeout=None):
+            self.joined = True
+
+    def fake_create_server(app, host, port, threads):
+        server = FakeServer(app, host, port, threads)
+        created.append(server)
+        return server
+
+    monkeypatch.setitem(sys.modules, "waitress", SimpleNamespace(create_server=fake_create_server))
+    monkeypatch.setattr(ggpbot, "threading", SimpleNamespace(Thread=FakeThread))
+    monkeypatch.setattr(ggpbot, "DASHBOARD_SERVERS", [])
+    monkeypatch.setattr(ggpbot, "DASHBOARD_ACTIVE_PORTS", [])
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setenv("PORT", "8080")
+
+    assert ggpbot.start_dashboard_servers() == [8080]
+    assert len(created) == 1
+    server, thread = ggpbot.DASHBOARD_SERVERS[0]
+    assert server is created[0]
+    assert server.app is ggpbot.app
+    assert server.host == "0.0.0.0"
+    assert server.port == 8080
+    assert server.threads == 8
+    assert thread.target == server.run
+    assert thread.started is True
+
+    ggpbot._stop_runtime_services()
+    assert server.closed is True
+    assert thread.joined is True

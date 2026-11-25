@@ -193,9 +193,10 @@ def test_dashboard_health_and_data_routes_respond_without_exchange_calls(monkeyp
         assert payload["regime"] == "SYNTHETIC_TEST"
         assert "watchlist" in payload
     finally:
-        for server, thread in ggpbot.DASHBOARD_SERVERS[len(previous_servers):]:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=3)
-        ggpbot.DASHBOARD_SERVERS[:] = previous_servers
-        ggpbot.DASHBOARD_ACTIVE_PORTS[:] = previous_ports
+        try:
+            # Waitress exposes close(); never call Werkzeug-only methods here.
+            for server, thread in ggpbot.DASHBOARD_SERVERS[len(previous_servers):]:
+                ggpbot._stop_dashboard_server(server, thread)
+        finally:
+            ggpbot.DASHBOARD_SERVERS[:] = previous_servers
+            ggpbot.DASHBOARD_ACTIVE_PORTS[:] = previous_ports

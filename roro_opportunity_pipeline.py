@@ -112,18 +112,36 @@ def _finite(value: Any) -> bool:
 
 
 def validate_closed_frame(df: pd.DataFrame, now_ms: Optional[int], timeframe_s: int = 900) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame) or any(c not in df.columns for c in REQUIRED):
-        return pd.DataFrame(columns=REQUIRED)
+    """Validate an authoritative OHLCV snapshot; never sort, deduplicate, or repair it."""
+    empty = pd.DataFrame(columns=REQUIRED)
+    if not isinstance(df, pd.DataFrame) or df.empty or any(c not in df.columns for c in REQUIRED):
+        return empty
     x = df.loc[:, REQUIRED].copy()
     for col in REQUIRED:
         x[col] = pd.to_numeric(x[col], errors="coerce")
-    x = x.dropna().sort_values("timestamp").drop_duplicates("timestamp")
-    if x.empty or (x["volume"] < 0).any() or (x[["open", "high", "low", "close"]] <= 0).any().any():
-        return pd.DataFrame(columns=REQUIRED)
-    if (x["high"] < x[["open", "close", "low"]].max(axis=1)).any() or (x["low"] > x[["open", "close", "high"]].min(axis=1)).any():
-        return pd.DataFrame(columns=REQUIRED)
-    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-    x = x[x.timestamp + timeframe_s * 1000 <= now_ms]
+    if x.isna().any().any():
+        return empty
+    try:
+        values = x.to_numpy(dtype=float, copy=False)
+        timestamps = x["timestamp"].to_numpy(dtype=float, copy=False)
+        frame_seconds = int(timeframe_s)
+        current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return empty
+    if not np.isfinite(values).all() or frame_seconds <= 0 or current_ms <= 0:
+        return empty
+    # Timestamps are Unix milliseconds. Reject fractional, duplicate, or
+    # out-of-order input instead of silently sorting/deduplicating bad snapshots.
+    if (timestamps <= 0).any() or not np.equal(timestamps, np.floor(timestamps)).all():
+        return empty
+    if not x["timestamp"].is_monotonic_increasing or x["timestamp"].duplicated().any():
+        return empty
+    if (x["volume"] < 0).any() or (x[["open", "high", "low", "close"]] <= 0).any().any():
+        return empty
+    if ((x["high"] < x[["open", "close", "low"]].max(axis=1)).any()
+            or (x["low"] > x[["open", "close", "high"]].min(axis=1)).any()):
+        return empty
+    x = x[x.timestamp + frame_seconds * 1000 <= current_ms]
     return x.reset_index(drop=True)
 
 

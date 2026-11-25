@@ -826,6 +826,10 @@ def test_verified_full_close_retains_lock_if_recovery_gate_remains(monkeypatch, 
 
 def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch):
     _fresh_state()
+    # This test isolates the in-process trade lock; the broader recovery gate
+    # is exercised separately and would otherwise return before the lock check.
+    ggpbot.RECOVERY_BLOCK_ENTRIES = False
+    monkeypatch.setitem(ggpbot.MEMORY, "position_status", "FLAT")
     monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", True)
     messages = []
     monkeypatch.setattr(ggpbot, "log_execution", lambda message, *args, **kwargs: messages.append(str(message)))

@@ -48,7 +48,10 @@ def _indicator_frame(frame: pd.DataFrame, period: int = 14) -> Dict[str, Any]:
     x = frame.loc[:, required].copy()
     for column in required:
         x[column] = pd.to_numeric(x[column], errors="coerce")
-    if x.isna().any().any() or not x.timestamp.is_monotonic_increasing or x.timestamp.duplicated().any():
+    if (x.isna().any().any()
+            or not np.isfinite(x.to_numpy(dtype=float, copy=False)).all()
+            or not x.timestamp.is_monotonic_increasing
+            or x.timestamp.duplicated().any()):
         return {"valid": False, "reason": "invalid_or_non_monotonic_closed_candles"}
     if (x.volume < 0).any() or (x[["open", "high", "low", "close"]] <= 0).any().any():
         return {"valid": False, "reason": "invalid_ohlcv_values"}

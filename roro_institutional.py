@@ -118,17 +118,41 @@ class StructuralStopLossEngine:
 
 
 def _confirmed_pivots(df: pd.DataFrame, end: Optional[int] = None, left_right: int = 2):
-    """Return pivot indices/values only when their right-side candles are present."""
+    """Return confirmed pivots only from complete, finite positional windows."""
     highs, lows = [], []
-    stop = len(df) if end is None else min(len(df), int(end))
-    n = max(1, int(left_right))
-    for i in range(n, max(n, stop - n)):
-        if i + n >= stop:
-            break
-        h = float(df.high.iloc[i]); lo = float(df.low.iloc[i])
-        if h > float(df.high.iloc[i-n:i].max()) and h >= float(df.high.iloc[i+1:i+n+1].max()):
+    if not isinstance(df, pd.DataFrame) or not {"high", "low"}.issubset(df.columns):
+        return highs, lows
+    try:
+        n = max(1, int(left_right))
+        row_count = len(df)
+        stop = row_count if end is None else min(row_count, max(0, int(end)))
+    except (TypeError, ValueError, OverflowError):
+        return highs, lows
+    # A pivot requires n candles on both sides plus the pivot candle itself.
+    # Short or truncated frames are a normal data-quality condition, not an
+    # exception and never justify indexing an incomplete window.
+    if row_count < (2 * n + 1) or stop < (2 * n + 1):
+        return highs, lows
+    try:
+        high_values = pd.to_numeric(df["high"], errors="coerce")
+        low_values = pd.to_numeric(df["low"], errors="coerce")
+    except Exception:
+        return highs, lows
+    for i in range(n, stop - n):
+        try:
+            high_window = [float(value) for value in high_values.iloc[i-n:i+n+1]]
+            low_window = [float(value) for value in low_values.iloc[i-n:i+n+1]]
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue
+        if len(high_window) != (2 * n + 1) or len(low_window) != (2 * n + 1):
+            continue
+        if not all(math.isfinite(value) for value in high_window + low_window):
+            continue
+        h = high_window[n]
+        lo = low_window[n]
+        if h > max(high_window[:n]) and h >= max(high_window[n+1:]):
             highs.append((i, h))
-        if lo < float(df.low.iloc[i-n:i].min()) and lo <= float(df.low.iloc[i+1:i+n+1].min()):
+        if lo < min(low_window[:n]) and lo <= min(low_window[n+1:]):
             lows.append((i, lo))
     return highs, lows
 

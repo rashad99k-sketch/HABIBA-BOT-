@@ -52,3 +52,87 @@
 الحالة ما زالت **PAPER / Demo Preparation — NOT LIVE READY**. اجتازت الحزمة 96 اختبارًا محليًا وPreflight، وثُبت CCXT على `4.5.92`. أضيف محول قراءة وضع الحساب ومسار تنفيذ موحد وتحقق Native STOP_MARKET ومهاجرات SQLite.
 
 لم تُنفذ أوامر BingX حقيقية. القبول المتبقي قبل LIVE هو BingX Demo/VST، Hedge وOne-Way، الرافعة وNative SL، partial fill، restart، انقطاع الشبكة، وتشغيل Windows فعلي.
+
+
+## 2026-11-25 — DigitalOcean App Platform liveness and safe restart
+
+The bot exposes two distinct health routes:
+
+- `/health`: readiness/diagnostics. It reports a stalled MainThread or Unified Watchlist worker as HTTP 503. A normal refresh in progress is a trading-readiness blocker, not a process failure.
+- `/liveness`: restart authorization. It returns HTTP 503 only after the internal exchange recovery exit gate has positively recorded `EXIT_RECONCILED_FLAT` or `EXIT_VERIFIED_PROTECTED_OPEN`. If exchange exposure or native protection is UNKNOWN, it returns HTTP 200 so an App Platform probe cannot bypass the bot's fail-closed exit gate.
+
+Recommended App Platform component settings (merge these fields into the **current complete App Spec**; do not replace the existing spec with this fragment):
+
+```yaml
+health_check:
+  initial_delay_seconds: 30
+  period_seconds: 10
+  timeout_seconds: 5
+  success_threshold: 1
+  failure_threshold: 5
+  http_path: /health
+
+liveness_health_check:
+  initial_delay_seconds: 60
+  period_seconds: 15
+  timeout_seconds: 5
+  success_threshold: 1
+  failure_threshold: 3
+  http_path: /liveness
+```
+
+Leave `port` unset to use the component's configured `http_port`. DigitalOcean documents health checks as readiness probes and liveness checks as the mechanism that restarts a component when the liveness probe fails. The current App Spec is not stored in this repository, so these settings must be applied to the existing DigitalOcean App Platform component configuration (or to the downloaded complete App Spec) before relying on liveness-based recovery.
+
+Do not point the liveness probe at `/health`: that route is diagnostic/readiness and may fail while an exchange position is still being reconciled. The dedicated `/liveness` route is deliberately gated by the same verified recovery outcome required before process exit.
+
+## 2026-11-25 — Long-run acceptance gates
+
+- Keep PAPER mode for CI and all synthetic fault-injection tests.
+- Exercise API lock contention, rate-limit responses, read timeouts, worker stalls, late worker completion, and restart recovery.
+- Validate OHLCV with empty, short, duplicated, non-finite, unordered, and malformed rows; invalid data must be rejected, not silently repaired into entry evidence.
+- Verify that a stalled Watchlist worker is single-flight, cannot be replaced while still alive, cannot restore entry readiness after timing out, and triggers process recovery only through the exchange exit gate.
+- Verify that open positions with UNKNOWN native protection prevent process exit; a verified exchange-side protective stop may permit a controlled restart.
+- Run the complete regression suite without increasing its timeout or suppressing hanging tests.
+- Run a staged PAPER soak, then BingX Demo soak, before any LIVE approval. A six-month uptime target is an operational objective, not a guarantee from unit tests.
+
+
+### Required DigitalOcean runtime environment binding
+
+DigitalOcean App Platform bindable variables are not assumed to be injected automatically. Add this runtime environment variable to the existing `habiba-bot` component:
+
+```yaml
+envs:
+  - key: DIGITALOCEAN_APP_ID
+    scope: RUN_TIME
+    value: ${APP_ID}
+```
+
+This is the supervisor identity consumed by the bot's process-restart guard. Without it, the bot deliberately refuses an automatic process exit because it cannot prove that an external supervisor will bring the service back. Preserve all existing environment variables and secrets when applying this change.
+
+
+## BingX Futures endpoint rate policy (source audit 2026-11-25)
+
+Do not derive a request rate from an IP-group identifier. BingX's API reference distinguishes the shared public market-data budget from endpoint-specific annotations; the separate rate-limits guide explicitly warns against treating a group ID as a requests-per-second value.
+
+The current endpoint reference annotates 1 request/second per IP for the following public swap methods: contracts, depth, recent trades, klines, historical funding rate, open interest, 24h ticker, and book ticker. The public market-data shared budget is separately documented as 500 requests per 10 seconds per IP. The bot applies 1.05 seconds only to the individually annotated methods, not to premiumIndex or mark-price klines, whose reference states 500/10s.
+
+For authenticated USDT-M Futures endpoints, BingX publishes:
+- Balance, positions, order queries, and open orders: 5 requests/second per UID.
+- Place order: 10/s ordinary user, 1/s Trader tier.
+- Cancel order: 5/s ordinary user, 1/s Trader tier.
+- Leverage reads: 5/s; leverage changes: 2/s.
+- Margin-mode and position-mode reads/changes: 2/s.
+- Close all positions and cancel all orders: 5/s.
+- Cancel-all-after countdown: the current endpoint-level reference says 1/s per UID; the older rate announcement table says 2/s. The implementation keeps the stricter 1.05-second local interval until BingX confirms which current policy applies.
+
+Because the account's Ordinary-vs-Trader entitlement is not visible from this repository, the code uses a conservative 1.05-second default for individual order writes, matching the published Trader tier, and 0.55 seconds for leverage/margin/position-mode changes. The generic scheduler remains at 0.35 seconds, below the conservative 5/s UID endpoints. These are safety ceilings, not throughput targets. Do not lower them without verifying the account's actual entitlement and current BingX documentation.
+
+Sources:
+- BingX official rate announcement: https://bingx.com/en/support/articles/31103871611289
+- BingX endpoint-level swap reference: https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-market/api-reference.md
+- BingX rate-limit semantics and group-ID warning: https://github.com/BingX-API/api-ai-skills/blob/main/skills/references/rate-limits.md
+
+
+## Production HTTP server
+
+The Dashboard now uses Waitress 3.0.2 as its WSGI server, started inside the existing single bot process with eight request threads. The trade supervisor remains on the foreground thread and the instance lock still guards the one order-submitting process. Do not replace this with a multi-worker Gunicorn configuration: process forking could create duplicate trading engines and order authorities. The Waitress server is closed during the controlled shutdown path.
