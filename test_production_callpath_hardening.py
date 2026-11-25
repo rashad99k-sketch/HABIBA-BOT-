@@ -310,3 +310,28 @@ def test_open_position_market_data_reads_are_one_shot_per_management_cycle(monke
     assert frame is not None and len(frame) == 100
     assert ticker["last"] == 100.5
     assert calls == [("fetch_ohlcv", 1), ("fetch_ticker", 1)]
+
+
+def test_main_loop_dispatches_sniper_and_flow_scans_without_synchronous_execution():
+    source = inspect.getsource(ggpbot._original_main_loop_sniper)
+    assert '"institutional_flow_context", update_institutional_flow_scanner' in source
+    assert '"sniper_scan_complete"' not in source
+    assert '"sniper_scan_dispatched"' in source
+    sniper_dispatch = inspect.getsource(ggpbot._run_sniper_scan_if_due)
+    assert 'dispatch_scanner_task("sniper_v2", sniper_engine_v2)' in sniper_dispatch
+    assert "return sniper_engine_v2()" not in sniper_dispatch
+
+
+def test_sniper_due_check_only_dispatches_a_worker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ggpbot, "SNIPER_V2_ENABLED", True)
+    monkeypatch.setattr(ggpbot, "SNIPER_V2_SCAN_INTERVAL", 5.0)
+    monkeypatch.setattr(ggpbot, "_SNIPER_V2_LAST_SCAN", 0.0)
+    monkeypatch.setattr(ggpbot.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        ggpbot, "dispatch_scanner_task",
+        lambda name, function: calls.append((name, function)) or True,
+    )
+
+    assert ggpbot._run_sniper_scan_if_due() is True
+    assert calls == [("sniper_v2", ggpbot.sniper_engine_v2)]
