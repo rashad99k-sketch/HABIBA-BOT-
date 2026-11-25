@@ -1104,7 +1104,7 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
     waits.clear()
     monkeypatch.setattr(bot, "_last_api_call", clock[0])
     bot.rate_limit(fetch_ticker)
-    assert waits[-1] == pytest.approx(bot.MIN_API_INTERVAL)
+    assert waits[-1] == pytest.approx(bot._API_METHOD_MIN_INTERVALS["fetch_ticker"])
 
 
 def _sr_fixture():
