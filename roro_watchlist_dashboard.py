@@ -69,7 +69,7 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
             "blocking": _first_text(decision.get("blocking_reason"), row.get("rejection_reason"), rejection, default=""),
             "stop_status": _first_text(row.get("structural_stop_status"), decision.get("stop_validation_status"), default="UNKNOWN"),
             "freshness": _first_text(row.get("snapshot_freshness"), row.get("data_freshness"), row.get("data_quality"), default="UNKNOWN"),
-            "updated_at": updated, "cross": _first_text(cross.get("state"), default="NO_CROSS"),
+            "updated_at": updated, "cross": _first_text(cross.get("display_cross_state"), cross.get("cross_state"), row.get("cross_state"), default="NO_CROSS"),
             "durable": bool(cross.get("durable_event", cross.get("durable", row.get("cross_durable", False)))
                             and cross.get("authoritative", True)),
         }
