@@ -14356,7 +14356,7 @@ def _run_unified_institutional_watchlist_refresh():
         with _UNIFIED_WATCHLIST_REFRESH_STATE["lock"]:
             _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
         log_execution(
-            f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\\n{traceback.format_exc()}",
+            f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
             "ERROR",
         )
     finally:
