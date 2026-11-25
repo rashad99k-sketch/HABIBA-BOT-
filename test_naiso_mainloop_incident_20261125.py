@@ -1056,6 +1056,9 @@ def test_closed_frame_validator_rejects_bad_rows_instead_of_repairing_snapshot()
     missing_value = frame.copy()
     missing_value.loc[10, "close"] = np.nan
     fractional_timestamp = frame.copy()
+    # Cast before mutation: newer pandas versions reject fractional assignment
+    # into an int64 column instead of emitting the older FutureWarning.
+    fractional_timestamp["timestamp"] = fractional_timestamp["timestamp"].astype(float)
     fractional_timestamp.loc[10, "timestamp"] += 0.5
 
     for invalid in (
