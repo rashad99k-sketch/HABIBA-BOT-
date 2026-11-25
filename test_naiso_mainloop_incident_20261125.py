@@ -715,3 +715,147 @@ def test_unified_watchlist_worker_failure_keeps_entry_gate_closed_and_backs_off(
     # Failed refresh is not retried on every main-loop iteration.
     ggpbot.refresh_unified_institutional_watchlist()
     assert len(workers) == 1
+
+
+# --- Unified Watchlist worker liveness and process-level recovery ------------ #
+
+def test_stalled_watchlist_worker_requests_verified_process_recovery_once(monkeypatch):
+    clock = [200.0]
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": 100.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "ETC/USDT:USDT",
+        "timed_out": False, "restart_requested": False,
+        "last_error": "", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "time", SimpleNamespace(
+        time=lambda: 1000.0, monotonic=lambda: clock[0], sleep=lambda _s: None))
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0)
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {"BTC": {"decision_state": "ENTRY_READY"}}})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    restart_calls = []
+    monkeypatch.setattr(
+        ggpbot, "_restart_main_loop_process_after_stall",
+        lambda context: restart_calls.append(dict(context)) or True,
+    )
+
+    returned = ggpbot.refresh_unified_institutional_watchlist()
+
+    assert returned == ggpbot.MEMORY["watchlist"]
+    assert len(restart_calls) == 1
+    assert restart_calls[0]["reason"] == "UNIFIED_WATCHLIST_WORKER_STALLED"
+    assert restart_calls[0]["worker_phase"] == "OHLCV_FETCH"
+    assert restart_calls[0]["worker_symbol"] == "ETC/USDT:USDT"
+    assert state["timed_out"] is True
+    assert state["restart_requested"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+
+    # A wedged/timed-out worker is never replaced by a concurrent second worker.
+    ggpbot.refresh_unified_institutional_watchlist()
+    assert len(restart_calls) == 1
+
+
+def test_late_watchlist_worker_completion_cannot_reopen_entry_gate(monkeypatch):
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": 100.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "BTC/USDT:USDT",
+        "timed_out": True, "restart_requested": True,
+        "last_error": "WORKER_STALLED", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda: None)
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
+    monkeypatch.setattr(
+        ggpbot, "update_unified_watchlist",
+        lambda *_a, **_k: {"BTC": {"decision_state": "ENTRY_READY"}},
+    )
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+
+    ggpbot._run_unified_institutional_watchlist_refresh()
+
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
+    assert state["timed_out"] is True
+    assert state["in_progress"] is False
+
+
+def test_health_marks_stalled_watchlist_worker_as_process_failure(monkeypatch):
+    watchdog, clock = _healthy_runtime(monkeypatch)
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": clock[0] - 95.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "ETC/USDT:USDT",
+        "timed_out": False, "restart_requested": False,
+        "last_error": "", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0)
+
+    response = ggpbot.app.test_client().get("/health")
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["watchlist_worker"]["stalled"] is True
+    assert "UNIFIED_WATCHLIST_WORKER_STALLED" in payload["process_failures"]
+
+
+def test_normal_watchlist_refresh_is_not_reported_as_process_failure(monkeypatch):
+    watchdog, clock = _healthy_runtime(monkeypatch)
+    state = {
+        "lock": threading.Lock(), "in_progress": True, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": clock[0] - 2.0, "last_completed_monotonic": 0.0,
+        "phase": "OHLCV_FETCH", "current_symbol": "ETC/USDT:USDT",
+        "timed_out": False, "restart_requested": False,
+        "last_error": "", "worker_name": "unified-institutional-watchlist",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0)
+
+    response = ggpbot.app.test_client().get("/health")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["watchlist_worker"]["in_progress"] is True
+    assert payload["watchlist_worker"]["stalled"] is False
+    assert "UNIFIED_WATCHLIST_WORKER_STALLED" not in payload["process_failures"]
+
+
+def test_confirmed_pivots_returns_empty_for_short_or_truncated_frames():
+    import pandas as pd
+    from roro_institutional import _confirmed_pivots
+
+    short = pd.DataFrame({"high": [1.0, 2.0, 3.0], "low": [0.5, 1.0, 2.0]})
+    assert _confirmed_pivots(short, left_right=2) == ([], [])
+    assert _confirmed_pivots(pd.DataFrame({"close": [1.0] * 10}), left_right=2) == ([], [])
+    complete = pd.DataFrame({
+        "high": [5.0, 6.0, 10.0, 9.0, 8.0],
+        "low": [5.0, 4.0, 1.0, 2.0, 3.0],
+    })
+    assert _confirmed_pivots(complete, end=3, left_right=2) == ([], [])
+
+
+def test_confirmed_pivots_skips_non_finite_windows_without_changing_valid_pivots():
+    import math
+    import pandas as pd
+    from roro_institutional import _confirmed_pivots
+
+    frame = pd.DataFrame({
+        "high": [5.0, 6.0, 10.0, 9.0, 8.0, 7.0, 8.0],
+        "low": [5.0, 4.0, 1.0, 2.0, 3.0, 4.0, 3.0],
+    })
+    highs, lows = _confirmed_pivots(frame, left_right=2)
+    assert (2, 10.0) in highs
+    assert (2, 1.0) in lows
+
+    frame.loc[1, "high"] = math.nan
+    highs, lows = _confirmed_pivots(frame, left_right=2)
+    assert (2, 10.0) not in highs
+    assert (2, 1.0) not in lows
