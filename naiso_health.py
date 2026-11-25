@@ -799,7 +799,10 @@ class HealthWatchdog:
                 # itself has not proved liveness; never refresh its heartbeat.
                 restarted = False
                 result = "RECOVERY_DEFERRED"
-                detail = "engine liveness not confirmed; no duplicate thread started"
+                detail = str(
+                    verification_context.get("process_restart_blocked_reason")
+                    or "engine liveness not confirmed; no duplicate thread started"
+                )[:300]
             # No restart happened on deferral, so the attempt must not be charged.
             consumed = result != "RECOVERY_DEFERRED"
             self.restart_policy.finish(record, result, detail, counts=consumed)
