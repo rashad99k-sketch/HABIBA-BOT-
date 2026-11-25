@@ -7506,7 +7506,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         if gate_frame is None:
             gate_frame = _integration_fetch_frame(symbol)
             gate_frame_source = "SHARED_SCANNER_FRAME_FALLBACK"
-        gate_result = _validate_ema9_vwap_entry_gate(
+        gate_result = _validate_dual_ema_vwap_entry_gate(
             gate_frame, side, ema, timeframe_seconds=_roro_timeframe_seconds(gate_tf),
             now_ms=int(time.time() * 1000), lookback_candles=2,
         )
@@ -14677,6 +14677,9 @@ from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
                              closed_candles as _roro_closed_candles,
                              AUTH_EMA9_VWAP_TRIGGER_VALID as _AUTH_EMA9_VWAP_TRIGGER_VALID,
                              timeframe_seconds as _roro_timeframe_seconds)
+# Preserve the legacy monkeypatch/import seam while the canonical implementation
+# and scanner authorization are EMA9/Session-VWAP only.
+_validate_dual_ema_vwap_entry_gate = _validate_ema9_vwap_entry_gate
 try:
     from roro_resource_manager import ResourceManager
     from roro_trade_journal import TradeJournal
