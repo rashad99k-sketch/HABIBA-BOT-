@@ -23,7 +23,7 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
     """Return at most limit compact rows, prioritizing actionable lifecycle states."""
     if not isinstance(watchlist, Mapping):
         return {}
-    bounded_limit = max(1, min(int(limit), 60))
+    bounded_limit = max(1, min(int(limit), 30))
     rows = []
     for key, raw in watchlist.items():
         row = _mapping(raw)
