@@ -859,3 +859,82 @@ def test_confirmed_pivots_skips_non_finite_windows_without_changing_valid_pivots
     highs, lows = _confirmed_pivots(frame, left_right=2)
     assert (2, 10.0) not in highs
     assert (2, 1.0) not in lows
+
+
+def test_digitalocean_liveness_restarts_only_after_exchange_exit_gate_authorizes(monkeypatch):
+    _healthy_runtime(monkeypatch)
+    state = {
+        "lock": threading.Lock(), "in_progress": False, "last_attempt": 100.0,
+        "last_attempt_monotonic": 100.0, "started_monotonic": 100.0,
+        "last_progress_monotonic": 100.0, "last_completed_monotonic": 100.0,
+        "phase": "IDLE", "current_symbol": "", "timed_out": True,
+        "restart_requested": True, "last_error": "WORKER_STALLED",
+        "worker_name": "",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "MEMORY", {
+        "recovery_status": "EXIT_REFUSED_UNVERIFIED_EXPOSURE",
+    })
+    ggpbot.STATE["open"] = True
+
+    client = ggpbot.app.test_client()
+    held = client.get("/liveness")
+    assert held.status_code == 200
+    assert held.get_json()["restart_authorized_by_exchange_reconciliation"] is False
+
+    # Once the exchange exit gate records a verified FLAT result, the liveness
+    # probe may ask DigitalOcean to replace this stalled process.
+    ggpbot.STATE["open"] = False
+    ggpbot.MEMORY["recovery_status"] = "EXIT_RECONCILED_FLAT"
+    authorized = client.get("/liveness")
+    assert authorized.status_code == 503
+    assert authorized.get_json()["restart_authorized_by_exchange_reconciliation"] is True
+
+
+def test_confirmed_cross_lifecycle_fetches_are_bounded_and_rotate(monkeypatch):
+    calls = []
+    progress = []
+
+    class Journal:
+        def update_cross_event_lifecycle(self, event_id, lifecycle):
+            return True
+
+    rows = [
+        {
+            "event_id": f"event-{i}", "symbol": f"COIN{i}",
+            "exchange_symbol": f"COIN{i}/USDT:USDT", "side": "BUY",
+            "metadata": {"lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA},
+        }
+        for i in range(5)
+    ]
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", Journal())
+    monkeypatch.setattr(ggpbot, "_evaluate_post_cross_rejection_breakout",
+                        lambda *_a, **_k: {"entry_ready": False, "phase": "WAITING_FOR_PULLBACK"})
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame",
+                        lambda symbol: calls.append(symbol) or {"symbol": symbol})
+    monkeypatch.setattr(ggpbot, "_roro_timeframe_seconds", lambda _tf: 900)
+    monkeypatch.setattr(ggpbot, "ema", lambda *_a, **_k: [])
+    monkeypatch.setattr(ggpbot, "MEMORY", {"_cross_event_lifecycle_cursor": 0})
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+
+    first = ggpbot._advance_cross_event_lifecycles(
+        rows, progress_callback=lambda phase, symbol: progress.append((phase, symbol)),
+        max_items=2,
+    )
+    second = ggpbot._advance_cross_event_lifecycles(
+        rows, progress_callback=lambda phase, symbol: progress.append((phase, symbol)),
+        max_items=2,
+    )
+    third = ggpbot._advance_cross_event_lifecycles(
+        rows, progress_callback=lambda phase, symbol: progress.append((phase, symbol)),
+        max_items=2,
+    )
+
+    assert first == second == third == 2
+    assert calls == [
+        "COIN0/USDT:USDT", "COIN1/USDT:USDT",
+        "COIN2/USDT:USDT", "COIN3/USDT:USDT",
+        "COIN4/USDT:USDT", "COIN0/USDT:USDT",
+    ]
+    assert len(progress) == 12
+    assert ggpbot.MEMORY["_cross_event_lifecycle_cursor"] == 1
