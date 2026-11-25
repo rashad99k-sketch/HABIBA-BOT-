@@ -16796,12 +16796,33 @@ def sync_all_states():
             MEMORY["current_position"] = None
             RECOVERY_BLOCK_ENTRIES = True
         elif status == "FLAT":
-            MEMORY["position_status"] = "FLAT"
-            MEMORY["current_position"] = None
-            # Confirmed flat resolves an ambiguous order write without fabricating a fill.
-            STATE["execution_unresolved"] = False
-            STATE["recovery_hold"] = False
-            RECOVERY_BLOCK_ENTRIES = False
+            # A flat position snapshot alone does not prove an ambiguous MARKET
+            # order was rejected/canceled: it may still be pending or delayed.
+            # Never release an entry/close uncertainty solely from "no position".
+            unresolved_order = bool(
+                STATE.get("execution_unresolved")
+                or STATE.get("close_reconciliation_required")
+                or STATE.get("pending_close_order_id")
+                or STATE.get("recovery_hold")
+            )
+            if unresolved_order:
+                MEMORY["position_status"] = "UNKNOWN"
+                MEMORY["current_position"] = None
+                MEMORY["recovery_status"] = "ORDER_OUTCOME_REQUIRES_RECONCILIATION"
+                STATE["recovery_hold"] = True
+                STATE["recovery_reason"] = "flat_snapshot_does_not_resolve_pending_order"
+                RECOVERY_BLOCK_ENTRIES = True
+                log_execution(
+                    "[RECOVERY] Exchange reports FLAT but an order outcome remains unresolved; "
+                    "entries stay blocked until order-level reconciliation proves terminal state",
+                    "CRITICAL", debounce_key="flat_with_unresolved_order", debounce_sec=60,
+                )
+            else:
+                MEMORY["position_status"] = "FLAT"
+                MEMORY["current_position"] = None
+                STATE["execution_unresolved"] = False
+                STATE["recovery_hold"] = False
+                RECOVERY_BLOCK_ENTRIES = False
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]
