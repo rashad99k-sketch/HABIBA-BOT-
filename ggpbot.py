@@ -17026,7 +17026,7 @@ def execute_entry(*args, **kwargs):
                             f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
                             "ERROR",
                         )
-                return result
+            return result
     finally:
         _ENTRY_DISCOVERY_TASK_LOCK.release()
 
