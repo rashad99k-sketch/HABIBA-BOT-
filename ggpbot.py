@@ -849,12 +849,9 @@ def safe_api_call(func, *args, **kwargs):
                         f"[API_CIRCUIT] {method_name} temporarily fenced on retry {attempt + 1}/{attempts}; no request sent",
                         "WARN", debounce_key=f"api_circuit_{method_name}", debounce_sec=30)
                     raise
-            try:
-                rate_limit(func)
-            except ApiRateLockTimeout as exc:
-                if resilience is not None:
-                    resilience.record_failure(method_name, exc)
-                raise
+            # Local scheduler contention is classified once by the outer
+            # exception handler; it is not an exchange request and is never retried.
+            rate_limit(func)
             if resilience is not None:
                 resilience.count_request()
             result = func(*args, **kwargs)
@@ -11235,6 +11232,10 @@ def naiso_health_snapshot():
         "resources": MEMORY.get("resource_metrics", {}),
         "maintenance": maintenance.metrics() if maintenance is not None else None,
         "threads": (watchdog.snapshot() if watchdog is not None else None),
+        "watchlist_worker": (
+            _watchlist_worker_health_snapshot()
+            if callable(globals().get("_watchlist_worker_health_snapshot")) else {}
+        ),
         "api": resilience.metrics() if resilience is not None else None,
         "scanner": {
             "tasks": MEMORY.get("scanner_tasks", {}),
@@ -11468,6 +11469,12 @@ def _health_readiness(snapshot):
         blockers.append("EXECUTION_UNRESOLVED")
     if recovery["close_reconciliation_required"]:
         blockers.append("CLOSE_RECONCILIATION_REQUIRED")
+    watchlist_worker = snapshot.get("watchlist_worker") if isinstance(snapshot.get("watchlist_worker"), dict) else {}
+    if watchlist_worker.get("in_progress"):
+        blockers.append("UNIFIED_WATCHLIST_REFRESH_IN_PROGRESS")
+    if watchlist_worker.get("stalled"):
+        blockers.append("UNIFIED_WATCHLIST_WORKER_STALLED")
+        process_failures.append("UNIFIED_WATCHLIST_WORKER_STALLED")
     positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), dict) else {}
     if bool(positions.get("open")):
         # Open-position management is a trading restriction, not a process failure.
@@ -11539,6 +11546,7 @@ def health():
         "readiness": report["readiness"],
         "process": report["process"],
         "main_loop": report["main_loop"],
+        "watchlist_worker": report.get("watchlist_worker", {}),
         "recovery_state": report["recovery"],
         "blockers": report["blockers"],
         "process_failures": report["process_failures"],
@@ -13259,17 +13267,18 @@ def _restart_main_loop_process_after_stall(context=None):
             "CRITICAL", debounce_key="main_loop_process_restart_owner_unknown", debounce_sec=120,
         )
         return True
-    if not _recovery_exit_gate("MAIN_LOOP_WATCHDOG_STALL"):
+    restart_reason = str(context.get("reason") or "MAIN_LOOP_WATCHDOG_STALL")
+    if not _recovery_exit_gate(restart_reason):
         context["engine_resumed"] = False
         context["process_restart_blocked_reason"] = "RECOVERY_EXIT_GATE_REFUSED_UNVERIFIED_EXPOSURE"
         log_execution(
-            "[WATCHDOG] process restart blocked: exchange exposure/native protection could not be verified. "
-            "Recovery Hold remains active; no process exit was attempted.",
+            f"[WATCHDOG] process restart blocked for {restart_reason}: exchange exposure/native protection "
+            "could not be verified. Recovery Hold remains active; no process exit was attempted.",
             "CRITICAL", debounce_key="main_loop_process_restart_safety_hold", debounce_sec=60,
         )
         return True
     log_execution(
-        "[WATCHDOG] MainThread stall confirmed; exchange state and recovery contract verified. "
+        f"[WATCHDOG] {restart_reason} confirmed; exchange state and recovery contract verified. "
         "Exiting process for external supervisor restart.",
         "CRITICAL", debounce_key="main_loop_verified_process_restart", debounce_sec=30,
     )
@@ -14111,26 +14120,84 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
     return result
 
 _last_unified_watchlist_refresh = 0.0
+INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC = _env_float_range(
+    "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0, 30.0, 300.0
+)
 _UNIFIED_WATCHLIST_REFRESH_STATE = {
     "lock": threading.Lock(), "in_progress": False, "last_attempt": 0.0,
-    "last_error": "", "worker_name": "",
+    "last_attempt_monotonic": 0.0, "started_monotonic": 0.0,
+    "last_progress_monotonic": 0.0, "last_completed_monotonic": 0.0,
+    "phase": "IDLE", "current_symbol": "", "timed_out": False,
+    "restart_requested": False, "last_error": "", "worker_name": "",
 }
 
 
+def _watchlist_worker_progress(phase, symbol=""):
+    """Record real worker phase progress; never let the worker fake main-loop beats."""
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        if not state.get("in_progress") or state.get("timed_out"):
+            return
+        state["last_progress_monotonic"] = time.monotonic()
+        state["phase"] = str(phase or "UNKNOWN")[:80]
+        state["current_symbol"] = str(symbol or "")[:80]
+
+
+def _watchlist_worker_health_snapshot():
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        row = {key: value for key, value in state.items() if key != "lock"}
+    now = time.monotonic()
+    last_progress = float(row.get("last_progress_monotonic") or row.get("started_monotonic") or 0.0)
+    age = max(0.0, now - last_progress) if row.get("in_progress") else 0.0
+    stalled = bool(row.get("timed_out")) or bool(
+        row.get("in_progress") and age >= INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC
+    )
+    row.update({
+        "progress_age_sec": round(age, 3),
+        "stall_timeout_sec": float(INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC),
+        "stalled": stalled,
+    })
+    return row
+
+
 def _run_unified_institutional_watchlist_refresh():
-    """Run market-data discovery off the MainThread; publish entry readiness only on success."""
+    """Run market-data discovery off MainThread with observable bounded progress."""
     global _last_unified_watchlist_refresh
     try:
         MEMORY["_proximity_batch_updates"] = 0
-        # Cross-event lifecycle advancement can itself fetch OHLCV; keep the
-        # entire refresh pipeline on this single bounded background worker.
+        _watchlist_worker_progress("CROSS_EVENT_SYNC")
         _sync_confirmed_cross_events()
+
+        def tracked_fetch_frame(symbol):
+            _watchlist_worker_progress("OHLCV_FETCH", symbol)
+            try:
+                return _integration_fetch_frame(symbol)
+            finally:
+                _watchlist_worker_progress("OHLCV_FETCH_COMPLETE", symbol)
+
+        def tracked_enrich(frame, side, analysis):
+            _watchlist_worker_progress("INSTITUTIONAL_ANALYSIS", analysis.get("symbol", ""))
+            try:
+                return _enrich_with_existing_gpp_engines(frame, side, analysis)
+            finally:
+                _watchlist_worker_progress("INSTITUTIONAL_ANALYSIS_COMPLETE", analysis.get("symbol", ""))
+
+        _watchlist_worker_progress("WATCHLIST_BATCH_ANALYSIS")
         result = update_unified_watchlist(
-            MEMORY, _integration_fetch_frame,
+            MEMORY, tracked_fetch_frame,
             max_items=INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS,
             batch_size=INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
-            enrich=_enrich_with_existing_gpp_engines
+            enrich=tracked_enrich
         )
+        state = _UNIFIED_WATCHLIST_REFRESH_STATE
+        with state["lock"]:
+            timed_out = bool(state.get("timed_out"))
+        if timed_out:
+            # A worker that exceeded its deadline may finish later, but its
+            # snapshot must never reopen entry authorization in this process.
+            MEMORY["_unified_watchlist_refresh_ok"] = False
+            return
         proximity_meta = MEMORY.setdefault("ema9_vwap_proximity_scanner_meta", {})
         proximity_meta.update({
             "observed_this_batch": int(MEMORY.get("_proximity_batch_updates", 0)),
@@ -14142,45 +14209,87 @@ def _run_unified_institutional_watchlist_refresh():
         })
         _last_unified_watchlist_refresh = time.time()
         MEMORY["_unified_watchlist_refresh_ok"] = True
-        _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = ""
+        with state["lock"]:
+            state["last_error"] = ""
         if INSTITUTIONAL_RESOURCE_MANAGER:
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
     except Exception as exc:
         MEMORY["_unified_watchlist_refresh_ok"] = False
-        _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
+        with _UNIFIED_WATCHLIST_REFRESH_STATE["lock"]:
+            _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
         log_execution(
             f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\\n{traceback.format_exc()}",
             "ERROR",
         )
     finally:
-        with _UNIFIED_WATCHLIST_REFRESH_STATE["lock"]:
-            _UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] = False
-            _UNIFIED_WATCHLIST_REFRESH_STATE["worker_name"] = ""
+        state = _UNIFIED_WATCHLIST_REFRESH_STATE
+        with state["lock"]:
+            state["in_progress"] = False
+            state["worker_name"] = ""
+            state["last_completed_monotonic"] = time.monotonic()
+            if not state.get("timed_out"):
+                state["phase"] = "IDLE"
+                state["current_symbol"] = ""
 
 
 def refresh_unified_institutional_watchlist(force=False):
-    """Schedule one background refresh and return immediately to the trading loop.
+    """Schedule one background refresh; stale workers trigger verified process recovery.
 
-    Entry authorization remains fail-closed while the refresh is running or has
-    failed. The main loop never waits for scanner OHLCV, bridge analysis, or
-    cross-event lifecycle fetches.
+    The foreground trading loop never waits for Scanner OHLCV or institutional
+    analysis. A worker that stops making progress is permanently fenced for this
+    process and can only be recovered through the external process supervisor.
     """
     now = time.time()
+    now_mono = time.monotonic()
     state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    restart_context = None
     with state["lock"]:
-        if state["in_progress"]:
+        if state.get("timed_out"):
             MEMORY["_unified_watchlist_refresh_ok"] = False
             return MEMORY.setdefault("watchlist", {})
-        last_attempt = float(state.get("last_attempt") or 0.0)
-        last_success = float(_last_unified_watchlist_refresh or 0.0)
-        last_completed = max(last_attempt, last_success)
-        if not force and now - last_completed < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
-            return MEMORY.setdefault("watchlist", {})
-        state["in_progress"] = True
-        state["last_attempt"] = now
-        state["worker_name"] = "unified-institutional-watchlist"
-        MEMORY["_unified_watchlist_refresh_ok"] = False
+        if state["in_progress"]:
+            last_progress = float(state.get("last_progress_monotonic") or state.get("started_monotonic") or now_mono)
+            stale_for = max(0.0, now_mono - last_progress)
+            if stale_for >= INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC and not state.get("restart_requested"):
+                state["timed_out"] = True
+                state["restart_requested"] = True
+                state["last_error"] = f"WORKER_STALLED:{state.get('phase')}:{stale_for:.1f}s"
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                restart_context = {
+                    "reason": "UNIFIED_WATCHLIST_WORKER_STALLED",
+                    "worker_name": state.get("worker_name"),
+                    "worker_phase": state.get("phase"),
+                    "worker_symbol": state.get("current_symbol"),
+                    "worker_stale_for_sec": round(stale_for, 3),
+                }
+            else:
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                return MEMORY.setdefault("watchlist", {})
+        else:
+            last_attempt = float(state.get("last_attempt_monotonic") or 0.0)
+            last_success = float(state.get("last_completed_monotonic") or 0.0)
+            last_completed = max(last_attempt, last_success)
+            if not force and now_mono - last_completed < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
+                return MEMORY.setdefault("watchlist", {})
+            state.update({
+                "in_progress": True, "last_attempt": now,
+                "last_attempt_monotonic": now_mono,
+                "started_monotonic": now_mono, "last_progress_monotonic": now_mono,
+                "phase": "SCHEDULED", "current_symbol": "",
+                "worker_name": "unified-institutional-watchlist",
+            })
+            MEMORY["_unified_watchlist_refresh_ok"] = False
+
+    if restart_context is not None:
+        log_execution(
+            f"[WATCHDOG] Unified Watchlist worker stopped progressing: {restart_context}; "
+            "entries remain blocked and verified process recovery is requested.",
+            "CRITICAL", debounce_key="unified_watchlist_worker_stalled", debounce_sec=60,
+        )
+        _restart_main_loop_process_after_stall(restart_context)
+        return MEMORY.setdefault("watchlist", {})
 
     try:
         worker = threading.Thread(
@@ -14192,7 +14301,9 @@ def refresh_unified_institutional_watchlist(force=False):
         with state["lock"]:
             state["in_progress"] = False
             state["worker_name"] = ""
+            state["phase"] = "START_FAILED"
             state["last_error"] = f"worker_start_failed:{type(exc).__name__}"
+            state["last_completed_monotonic"] = time.monotonic()
         MEMORY["_unified_watchlist_refresh_ok"] = False
         log_execution(f"[INTEGRATION] watchlist worker start failed: {type(exc).__name__}: {exc}", "ERROR")
     return MEMORY.setdefault("watchlist", {})
