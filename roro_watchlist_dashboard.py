@@ -54,6 +54,57 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
         if not rejection:
             blockers = decision.get("blocking_reasons")
             rejection = blockers[0] if isinstance(blockers, (list, tuple)) and blockers else ""
+        institutional = _mapping(row.get("institutional_report") or unified.get("institutional_report"))
+        readiness = _mapping(decision.get("entry_readiness") or row.get("entry_readiness_context") or unified.get("entry_readiness"))
+        behavior = _mapping(decision.get("entry_behavior_context") or row.get("entry_behavior_context"))
+        classification = _mapping(institutional.get("entry_classification"))
+        location_gate = _mapping(institutional.get("location_gate"))
+        room = _mapping(institutional.get("available_price_room"))
+        report_liquidity = _mapping(institutional.get("liquidity_context"))
+        report_invalidation = _mapping(institutional.get("structural_invalidation"))
+        report_freshness = _mapping(institutional.get("data_freshness"))
+        report_confidence = _mapping(institutional.get("analysis_confidence"))
+        diagnostics = {
+            "decision_state": _first_text(decision.get("decision_state"), state),
+            "cross_state": _first_text(cross.get("display_cross_state"), cross.get("cross_state"), row.get("cross_state"), default="NO_CROSS"),
+            "cross_durable": bool(cross.get("durable_event", cross.get("durable", row.get("cross_durable", False))) and cross.get("authoritative", True)),
+            "cross_role": _first_text(cross.get("role"), default="UNIFIED_ENTRY_AUTHORITY_UNCHANGED"),
+            "zone_quality": zone.get("zone_quality_score", row.get("zone_quality_score")),
+            "zone_valid": supply_demand.get("valid", row.get("zone_valid")),
+            "liquidity_state": _first_text(liquidity.get("state"), report_liquidity.get("event"), default="UNKNOWN"),
+            "liquidity_stage": _first_text(liquidity.get("stage"), default="PENDING"),
+            "confirmation": _first_text(structure.get("confirmation_status"), default="UNKNOWN"),
+            "pullback": _first_text(decision.get("setup_stage"), row.get("decision_stage"), default="UNKNOWN"),
+            "stop_valid": bool(readiness.get("sl_valid") is True),
+            "stop_validation": _first_text(row.get("structural_stop_status"), decision.get("stop_validation_status"), default="UNSPECIFIED"),
+            "gate": _first_text(decision.get("execution_gate_state"), readiness.get("execution_gate_state"), default="NOT_READY"),
+            "blocking": _first_text(decision.get("blocking_reason"), row.get("rejection_reason"), rejection, default="none"),
+            "next_event": _first_text(decision.get("required_next_event"), row.get("required_next_event"), default="SETUP_DIAGNOSTICS_REQUIRED"),
+            "authority": _first_text(readiness.get("authoritative_gate"), classification.get("final_authority"), default="UNIFIED_ENTRY_AUTHORITY_UNCHANGED"),
+            "entry_type": _first_text(behavior.get("entry_type"), row.get("entry_type"), default="NOT_CLASSIFIED"),
+            "entry_reason": _first_text(behavior.get("reason"), default="none"),
+            "entry_confirmation": behavior.get("confirmation"),
+            "entry_invalidation": ", ".join(str(x) for x in (behavior.get("invalidation") or [])[:3]) or "none",
+            "entry_source": _first_text(behavior.get("classification_source"), default="NONE"),
+            "report_cross": _first_text(_mapping(institutional.get("cross_location")).get("state"), default="UNKNOWN"),
+            "report_regime": _first_text(_mapping(institutional.get("market_regime")).get("state"), default="UNKNOWN"),
+            "report_zone": _first_text(_mapping(institutional.get("institutional_zone")).get("state"), default="UNKNOWN"),
+            "report_structure": _first_text(_mapping(institutional.get("structure_bias")).get("state"), default="UNKNOWN"),
+            "report_liquidity": _first_text(report_liquidity.get("event"), default="UNKNOWN"),
+            "report_volume": _first_text(_mapping(institutional.get("volume_confirmation")).get("state"), default="UNKNOWN"),
+            "report_trend": _first_text(_mapping(institutional.get("trend_strength")).get("state"), default="UNKNOWN"),
+            "room_pct": room.get("room_price_pct"), "room_status": _first_text(room.get("status"), default="UNKNOWN"),
+            "invalidation_status": "VALID" if report_invalidation.get("valid") else "INVALID",
+            "report_freshness": _first_text(report_freshness.get("state"), default="UNKNOWN"),
+            "confidence": report_confidence.get("score"),
+            "classification": _first_text(classification.get("entry_type"), default="NOT_CLASSIFIED"),
+            "classification_reasons": ", ".join(str(x) for x in (classification.get("reason_codes") or [])[:4]) or "none",
+            "cross_zone": _first_text(location_gate.get("state"), default="UNKNOWN"),
+            "cross_zone_reasons": ", ".join(str(x) for x in (location_gate.get("reasons") or [])[:3]) or "none",
+            "lifecycle": _first_text(decision.get("lifecycle_status"), default="INSTITUTIONAL_ANALYSIS"),
+            "waiting": _first_text(decision.get("waiting_condition"), default="none"),
+            "analysis_status": _first_text(_mapping(decision.get("lifecycle_context")).get("analysis_status"), default="PENDING"),
+        }
         item = {
             "symbol": _first_text(row.get("symbol"), key, default="UNKNOWN"),
             "side": _first_text(row.get("side"), default="UNKNOWN"),
@@ -72,6 +123,8 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
             "updated_at": updated, "cross": _first_text(cross.get("display_cross_state"), cross.get("cross_state"), row.get("cross_state"), default="NO_CROSS"),
             "durable": bool(cross.get("durable_event", cross.get("durable", row.get("cross_durable", False)))
                             and cross.get("authoritative", True)),
+            "structural_stop": row.get("structural_stop"),
+            "diagnostics": diagnostics,
         }
         rows.append((_STATE_PRIORITY.get(state, 0), score, updated, str(key), item))
     rows.sort(key=lambda value: (value[0], value[1], value[2]), reverse=True)
