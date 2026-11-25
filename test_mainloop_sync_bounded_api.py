@@ -345,3 +345,50 @@ def test_digitalocean_explicit_bindable_app_id_enables_supervisor_detection(monk
     assert context["process_supervisor_detected"] is True
     assert context["process_supervisor_kind"] == "DIGITALOCEAN_APP_PLATFORM"
     assert exits == [ggpbot.EXIT_RECOVERY_EXHAUSTED]
+
+
+def test_fetch_ohlcv_rejects_duplicate_and_out_of_order_timestamps(monkeypatch):
+    rows = _valid_ohlcv_rows()
+    rows[50][0] = rows[49][0]
+    _stub_ohlcv_fetch(monkeypatch, rows)
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    assert ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]["reason"] == "OHLCV_MALFORMED"
+
+    rows = _valid_ohlcv_rows()
+    rows[50], rows[51] = rows[51], rows[50]
+    _stub_ohlcv_fetch(monkeypatch, rows)
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    assert ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]["reason"] == "OHLCV_MALFORMED"
+
+
+def test_fetch_ohlcv_rejects_missing_rows_without_dropping_them(monkeypatch):
+    rows = _valid_ohlcv_rows()
+    rows[50][4] = None
+    _stub_ohlcv_fetch(monkeypatch, rows)
+
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    assert ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]["reason"] == "OHLCV_MALFORMED"
+
+
+def test_fetch_ohlcv_htf_rejects_invalid_rows_without_sorting_or_filling(monkeypatch):
+    rows = _valid_ohlcv_rows(30)
+    rows[10][4] = None
+    _stub_ohlcv_fetch(monkeypatch, rows)
+    assert ggpbot.fetch_ohlcv_htf("BTC/USDT:USDT", timeframe="1h", limit=30) is None
+
+    rows = _valid_ohlcv_rows(30)
+    rows[10][0] = rows[9][0]
+    _stub_ohlcv_fetch(monkeypatch, rows)
+    assert ggpbot.fetch_ohlcv_htf("BTC/USDT:USDT", timeframe="1h", limit=30) is None
+
+
+def test_fetch_ohlcv_htf_preserves_a_valid_ordered_snapshot(monkeypatch):
+    rows = _valid_ohlcv_rows(30)
+    _stub_ohlcv_fetch(monkeypatch, rows)
+
+    frame = ggpbot.fetch_ohlcv_htf("BTC/USDT:USDT", timeframe="1h", limit=30)
+
+    assert frame is not None
+    assert len(frame) == 30
+    assert frame.timestamp.is_monotonic_increasing
+    assert not frame.timestamp.duplicated().any()
