@@ -78,6 +78,7 @@ def test_critical_watchdog_alert_is_saved_to_dashboard_and_telegram(monkeypatch)
     monkeypatch.setattr(ggpbot, "DASHBOARD_STATE", dashboard)
     monkeypatch.setattr(ggpbot, "MEMORY", {"log_debounce": {}})
     monkeypatch.setattr(ggpbot, "_get_runtime_logger", lambda: None)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
     monkeypatch.setattr(ggpbot, "tg_error", lambda message, error_type: telegram.append((message, error_type)))
 
     ggpbot.log_execution(
@@ -160,3 +161,41 @@ def test_dashboard_payload_and_renderer_use_structured_system_errors():
     assert '"system_errors": DASHBOARD_STATE.get("system_errors", [])[-20:]' in source
     assert 'const systemErrors = (d.system_errors || [])' in source
     assert "uniEsc(e.stack_trace)" in source
+
+
+
+def test_system_error_history_survives_process_restart(monkeypatch):
+    persisted = {}
+
+    class FakeJournal:
+        def set_runtime_state(self, key, value):
+            persisted[key] = value
+
+        def get_runtime_state(self, key, default=None):
+            return persisted.get(key, default)
+
+    dashboard = {
+        "logs": [],
+        "errors": [],
+        "system_errors": [{
+            "timestamp": "2026-11-25 08:27:00",
+            "severity": "CRITICAL",
+            "error_type": "WATCHDOG_STALL",
+            "component": "main_loop",
+            "message": "main_loop stalled",
+            "cause": "No progress heartbeat",
+            "stack_trace": "blocking_exchange_call()",
+        }],
+    }
+    monkeypatch.setattr(ggpbot, "DASHBOARD_STATE", dashboard)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", FakeJournal())
+    assert ggpbot._persist_system_errors() is True
+
+    dashboard["system_errors"] = []
+    dashboard["errors"] = []
+    restored = ggpbot._restore_system_errors()
+
+    assert restored == 1
+    assert dashboard["system_errors"][0]["error_type"] == "WATCHDOG_STALL"
+    assert "blocking_exchange_call" in dashboard["system_errors"][0]["stack_trace"]
+    assert dashboard["errors"] == ["[2026-11-25 08:27:00] main_loop stalled"]
