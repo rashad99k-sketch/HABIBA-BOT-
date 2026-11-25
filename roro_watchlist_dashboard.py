@@ -64,6 +64,17 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
         report_invalidation = _mapping(institutional.get("structural_invalidation"))
         report_freshness = _mapping(institutional.get("data_freshness"))
         report_confidence = _mapping(institutional.get("analysis_confidence"))
+        missing_stop = readiness.get("missing")
+        stop_default = (
+            "missing_or_non_positive"
+            if isinstance(missing_stop, (list, tuple)) and "STRUCTURAL_STOP_UNKNOWN" in missing_stop
+            else "invalid_or_unverified" if readiness.get("sl_valid") is False
+            else "UNSPECIFIED"
+        )
+        stop_validation = _first_text(
+            row.get("structural_stop_status"), decision.get("stop_validation_status"),
+            default=stop_default,
+        )
         diagnostics = {
             "decision_state": _first_text(decision.get("decision_state"), state),
             "cross_state": _first_text(cross.get("display_cross_state"), cross.get("cross_state"), row.get("cross_state"), default="NO_CROSS"),
@@ -76,7 +87,7 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
             "confirmation": _first_text(structure.get("confirmation_status"), default="UNKNOWN"),
             "pullback": _first_text(decision.get("setup_stage"), row.get("decision_stage"), default="UNKNOWN"),
             "stop_valid": bool(readiness.get("sl_valid") is True),
-            "stop_validation": _first_text(row.get("structural_stop_status"), decision.get("stop_validation_status"), default="UNSPECIFIED"),
+            "stop_validation": stop_validation,
             "gate": _first_text(decision.get("execution_gate_state"), readiness.get("execution_gate_state"), default="NOT_READY"),
             "blocking": _first_text(decision.get("blocking_reason"), row.get("rejection_reason"), rejection, default="none"),
             "next_event": _first_text(decision.get("required_next_event"), row.get("required_next_event"), default="SETUP_DIAGNOSTICS_REQUIRED"),
@@ -118,7 +129,7 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
             "setup_stage": _first_text(decision.get("setup_stage"), row.get("decision_stage"), default="UNKNOWN"),
             "next_event": _first_text(decision.get("required_next_event"), row.get("required_next_event"), default="WAIT_FOR_UPDATE"),
             "blocking": _first_text(decision.get("blocking_reason"), row.get("rejection_reason"), rejection, default=""),
-            "stop_status": _first_text(row.get("structural_stop_status"), decision.get("stop_validation_status"), default="UNKNOWN"),
+            "stop_status": stop_validation,
             "freshness": _first_text(row.get("snapshot_freshness"), row.get("data_freshness"), row.get("data_quality"), default="UNKNOWN"),
             "updated_at": updated, "cross": _first_text(cross.get("display_cross_state"), cross.get("cross_state"), row.get("cross_state"), default="NO_CROSS"),
             "durable": bool(cross.get("durable_event", cross.get("durable", row.get("cross_durable", False)))
