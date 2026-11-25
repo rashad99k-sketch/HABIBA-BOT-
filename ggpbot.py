@@ -15,6 +15,7 @@ import math
 import gc
 import random
 import uuid
+import copy
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
@@ -3291,8 +3292,8 @@ def _verified_market_reduce_impl(symbol, qty=None, *, ratio=None, target_remaini
             reduce_only_required=(mode_result.mode is PositionMode.ONE_WAY),
         )
         # Do not wrap create_order in safe_api_call: an ambiguous MARKET order must not be retried.
-        order = ex.create_order(sym, "market", close_side, requested,
-                                params=close_params)
+        order = safe_api_call(ex.create_order, sym, "market", close_side, requested,
+                              params=close_params)
         if not isinstance(order, dict):
             return _close_failure("BingX returned no structured close-order response")
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
@@ -8112,8 +8113,9 @@ def _project_confirmed_cross_row(row):
     return _project_cross_state(row, now_ts=time.time())
 
 
-def _sync_confirmed_cross_events(progress_callback=None, lifecycle_max_items=None):
+def _sync_confirmed_cross_events(progress_callback=None, lifecycle_max_items=None, memory_target=None):
     """Reload active cross events; optionally advance a bounded rotating lifecycle batch."""
+    target_memory = memory_target if isinstance(memory_target, dict) else MEMORY
     journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     rows = []
     if journal is not None:
@@ -8142,12 +8144,12 @@ def _sync_confirmed_cross_events(progress_callback=None, lifecycle_max_items=Non
                 "cross_event_breakout_close": metadata.get("breakout_close"),
                 "cross_event_chase_atr": metadata.get("chase_atr"),
             }
-    MEMORY["confirmed_cross_events"] = []
+    target_memory["confirmed_cross_events"] = []
     for row in rows:
         if not (row.get("event_id") and row.get("exchange_symbol")):
             continue
         cross_context = _project_confirmed_cross_row(row)
-        MEMORY["confirmed_cross_events"].append({
+        target_memory["confirmed_cross_events"].append({
             "symbol": str(row.get("symbol") or ""),
             "exchange_symbol": str(row.get("exchange_symbol") or row.get("symbol") or ""),
             "side": str(row.get("side") or "").upper(),
@@ -8168,7 +8170,7 @@ def _sync_confirmed_cross_events(progress_callback=None, lifecycle_max_items=Non
             "side_hint": str(row.get("side") or "").upper(),
             "sources": ["confirmed_cross_event"],
         })
-    MEMORY["confirmed_cross_events_last_sync"] = time.time()
+    target_memory["confirmed_cross_events_last_sync"] = time.time()
     return rows
 
 
@@ -14085,8 +14087,9 @@ def _integration_fetch_frame(symbol):
 # one asset's trend state leaking into another asset's Watchlist decision.
 _WATCHLIST_TREND_ENGINES = {}
 _WATCHLIST_TRADE_STATE_MACHINES = {}
-def _enrich_with_existing_gpp_engines(frame, side, analysis):
+def _enrich_with_existing_gpp_engines(frame, side, analysis, *, memory_target=None):
     """Closed-candle GGP evidence enrichment; stateful machines advance once per symbol candle."""
+    target_memory = memory_target if isinstance(memory_target, dict) else MEMORY
     result = {}
     try:
         now_ms = int(time.time() * 1000)
@@ -14140,9 +14143,9 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                 symbol_for_proximity = str(analysis.get("symbol") or analysis.get("exchange_symbol") or "")
                 symbol_key = roro_canonical_symbol(symbol_for_proximity)
                 candle_ts = int(closed.timestamp.iloc[-1])
-                last_seen = MEMORY.setdefault("_proximity_last_seen_by_symbol", {})
+                last_seen = target_memory.setdefault("_proximity_last_seen_by_symbol", {})
                 if last_seen.get(symbol_key) != candle_ts:
-                    MEMORY["_proximity_batch_updates"] = int(MEMORY.get("_proximity_batch_updates", 0)) + 1
+                    target_memory["_proximity_batch_updates"] = int(target_memory.get("_proximity_batch_updates", 0)) + 1
                     last_seen[symbol_key] = candle_ts
                     _observed_at = time.time()
                     _proximity_frame_seconds = float(timeframe_seconds)
@@ -14175,11 +14178,11 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     # projected non-durable label so the dashboard cannot show a
                     # bare CROSS_CONFIRMED next to a durable cross event.
                     proximity_item["cross_state_display"] = _ranking_projection["cross_state_display"]
-                    rows = MEMORY.setdefault("ema9_vwap_proximity_scanner", [])
+                    rows = target_memory.setdefault("ema9_vwap_proximity_scanner", [])
                     rows = [x for x in rows if x.get("symbol") != symbol_key]
                     rows.append(proximity_item)
                     rows.sort(key=lambda x: (float(x.get("score", 0) or 0), float(x.get("updated_at", 0) or 0)), reverse=True)
-                    MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
+                    target_memory["ema9_vwap_proximity_scanner"] = rows[:30]
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
                 icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
@@ -14192,7 +14195,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                                                 "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
 
         symbol_key = str(analysis.get("symbol") or roro_canonical_symbol(analysis.get("exchange_symbol")))
-        engine_last = MEMORY.setdefault("_watchlist_engine_last_candle", {})
+        engine_last = target_memory.setdefault("_watchlist_engine_last_candle", {})
         advance_state = engine_last.get(symbol_key) != candle_ts
         if symbol_key not in _WATCHLIST_TREND_ENGINES:
             if len(_WATCHLIST_TREND_ENGINES) >= 200:
@@ -14261,7 +14264,7 @@ INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC = _env_float_range(
     "INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC", 90.0, 30.0, 300.0
 )
 _UNIFIED_WATCHLIST_REFRESH_STATE = {
-    "lock": threading.Lock(), "in_progress": False, "last_attempt": 0.0,
+    "lock": threading.Lock(), "in_progress": False, "generation": 0, "last_attempt": 0.0,
     "last_attempt_monotonic": 0.0, "started_monotonic": 0.0,
     "last_progress_monotonic": 0.0, "last_completed_monotonic": 0.0,
     "phase": "IDLE", "current_symbol": "", "timed_out": False,
@@ -14269,11 +14272,12 @@ _UNIFIED_WATCHLIST_REFRESH_STATE = {
 }
 
 
-def _watchlist_worker_progress(phase, symbol=""):
-    """Record real worker phase progress; never let the worker fake main-loop beats."""
+def _watchlist_worker_progress(phase, symbol="", generation=None):
+    """Record real worker phase progress; never let a stale worker publish progress."""
     state = _UNIFIED_WATCHLIST_REFRESH_STATE
     with state["lock"]:
-        if not state.get("in_progress") or state.get("timed_out"):
+        if (not state.get("in_progress") or state.get("timed_out")
+                or (generation is not None and int(state.get("generation", 0)) != int(generation))):
             return
         state["last_progress_monotonic"] = time.monotonic()
         state["phase"] = str(phase or "UNKNOWN")[:80]
@@ -14298,51 +14302,102 @@ def _watchlist_worker_health_snapshot():
     return row
 
 
-def _run_unified_institutional_watchlist_refresh():
-    """Run market-data discovery off MainThread with observable bounded progress."""
+def _watchlist_worker_generation_active(generation):
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        return bool(state.get("in_progress") and not state.get("timed_out")
+                    and int(state.get("generation", 0)) == int(generation))
+
+
+def _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_refs, generation):
+    """Publish only this worker's changed rows; never overwrite concurrent scanner writes."""
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        if (not state.get("in_progress") or state.get("timed_out")
+                or int(state.get("generation", 0)) != int(generation)):
+            return False
+        live = MEMORY.setdefault("watchlist", {})
+        staged = staged_memory.get("watchlist", {})
+        for key, row in staged.items():
+            if not isinstance(row, dict) or row == baseline_watchlist.get(key):
+                continue
+            current = live.get(key)
+            baseline_ref = baseline_refs.get(key)
+            if key in baseline_watchlist:
+                if current is not baseline_ref:
+                    continue
+                baseline_ts = float(baseline_watchlist[key].get("last_update", 0.0) or 0.0)
+                current_ts = float(current.get("last_update", 0.0) or 0.0) if isinstance(current, dict) else 0.0
+                if current_ts > baseline_ts:
+                    continue
+            elif current is not None:
+                continue
+            live[key] = copy.deepcopy(row)
+        for key in ("unified_watchlist_cursor", "unified_watchlist_last_update",
+                    "unified_watchlist_last_batch_count", "unified_watchlist_source_count",
+                    "_proximity_batch_updates", "_proximity_last_seen_by_symbol",
+                    "ema9_vwap_proximity_scanner", "confirmed_cross_events",
+                    "confirmed_cross_events_last_sync", "_watchlist_engine_last_candle"):
+            if key in staged_memory:
+                MEMORY[key] = copy.deepcopy(staged_memory[key])
+        return True
+
+
+def _run_unified_institutional_watchlist_refresh(generation=None):
+    """Analyze a private snapshot; publish only if this worker generation is still current."""
     global _last_unified_watchlist_refresh
+    state = _UNIFIED_WATCHLIST_REFRESH_STATE
+    if generation is None:
+        with state["lock"]:
+            generation = int(state.get("generation", 0))
+    if not _watchlist_worker_generation_active(generation):
+        return
     success = False
+    baseline_watchlist = copy.deepcopy(MEMORY.get("watchlist", {}))
+    baseline_refs = dict(MEMORY.get("watchlist", {}))
+    staged_memory = dict(MEMORY)
+    staged_memory["watchlist"] = copy.deepcopy(baseline_watchlist)
+    staged_memory["_proximity_last_seen_by_symbol"] = copy.deepcopy(MEMORY.get("_proximity_last_seen_by_symbol", {}))
+    staged_memory["ema9_vwap_proximity_scanner"] = copy.deepcopy(MEMORY.get("ema9_vwap_proximity_scanner", []))
+    staged_memory["_watchlist_engine_last_candle"] = copy.deepcopy(MEMORY.get("_watchlist_engine_last_candle", {}))
+    staged_memory["confirmed_cross_events"] = copy.deepcopy(MEMORY.get("confirmed_cross_events", []))
+    staged_memory["_proximity_batch_updates"] = 0
+    progress = lambda phase, symbol="": _watchlist_worker_progress(phase, symbol, generation)
     try:
-        MEMORY["_proximity_batch_updates"] = 0
-        _watchlist_worker_progress("CROSS_EVENT_SYNC")
+        progress("CROSS_EVENT_SYNC")
         _sync_confirmed_cross_events(
-            progress_callback=_watchlist_worker_progress,
+            progress_callback=progress,
             lifecycle_max_items=max(1, INSTITUTIONAL_WATCHLIST_BATCH_SIZE * 2),
+            memory_target=staged_memory,
         )
 
         def tracked_fetch_frame(symbol):
-            _watchlist_worker_progress("OHLCV_FETCH", symbol)
+            progress("OHLCV_FETCH", symbol)
             try:
                 return _integration_fetch_frame(symbol)
             finally:
-                _watchlist_worker_progress("OHLCV_FETCH_COMPLETE", symbol)
+                progress("OHLCV_FETCH_COMPLETE", symbol)
 
         def tracked_enrich(frame, side, analysis):
-            _watchlist_worker_progress("INSTITUTIONAL_ANALYSIS", analysis.get("symbol", ""))
+            progress("INSTITUTIONAL_ANALYSIS", analysis.get("symbol", ""))
             try:
-                return _enrich_with_existing_gpp_engines(frame, side, analysis)
+                return _enrich_with_existing_gpp_engines(frame, side, analysis, memory_target=staged_memory)
             finally:
-                _watchlist_worker_progress("INSTITUTIONAL_ANALYSIS_COMPLETE", analysis.get("symbol", ""))
+                progress("INSTITUTIONAL_ANALYSIS_COMPLETE", analysis.get("symbol", ""))
 
-        _watchlist_worker_progress("WATCHLIST_BATCH_ANALYSIS")
+        progress("WATCHLIST_BATCH_ANALYSIS")
         result = update_unified_watchlist(
-            MEMORY, tracked_fetch_frame,
+            staged_memory, tracked_fetch_frame,
             max_items=INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS,
             batch_size=INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
             enrich=tracked_enrich
         )
-        state = _UNIFIED_WATCHLIST_REFRESH_STATE
-        with state["lock"]:
-            timed_out = bool(state.get("timed_out"))
-        if timed_out:
-            # A worker that exceeded its deadline may finish later, but its
-            # snapshot must never reopen entry authorization in this process.
-            MEMORY["_unified_watchlist_refresh_ok"] = False
+        if not _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_refs, generation):
             return
         proximity_meta = MEMORY.setdefault("ema9_vwap_proximity_scanner_meta", {})
         proximity_meta.update({
-            "observed_this_batch": int(MEMORY.get("_proximity_batch_updates", 0)),
-            "symbols": len(MEMORY.get("ema9_vwap_proximity_scanner", [])),
+            "observed_this_batch": int(staged_memory.get("_proximity_batch_updates", 0)),
+            "symbols": len(staged_memory.get("ema9_vwap_proximity_scanner", [])),
             "updated_at": time.time(), "role": "RANKING_ONLY",
             "batch_size": INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
             "refresh_seconds": INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS,
@@ -14356,28 +14411,26 @@ def _run_unified_institutional_watchlist_refresh():
             INSTITUTIONAL_RESOURCE_MANAGER.record({"event":"watchlist_refresh", "count":len(result), "ts":time.time()})
         log_execution(f"[INTEGRATION] unified watchlist analyzed={len(result)}", "INFO")
     except Exception as exc:
-        MEMORY["_unified_watchlist_refresh_ok"] = False
-        with _UNIFIED_WATCHLIST_REFRESH_STATE["lock"]:
-            _UNIFIED_WATCHLIST_REFRESH_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
+        with state["lock"]:
+            if int(state.get("generation", 0)) == int(generation) and not state.get("timed_out"):
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                state["last_error"] = f"{type(exc).__name__}: {exc}"
         log_execution(
             f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
             "ERROR",
         )
     finally:
-        state = _UNIFIED_WATCHLIST_REFRESH_STATE
         with state["lock"]:
-            timed_out = bool(state.get("timed_out"))
-            state["in_progress"] = False
-            state["worker_name"] = ""
-            state["last_completed_monotonic"] = time.monotonic()
-            if success and not timed_out:
-                # Publish readiness only after the worker is marked complete
-                # under the same lock used by the foreground scheduler.
-                state["phase"] = "IDLE"
-                state["current_symbol"] = ""
-                MEMORY["_unified_watchlist_refresh_ok"] = True
-            else:
-                MEMORY["_unified_watchlist_refresh_ok"] = False
+            if int(state.get("generation", 0)) == int(generation):
+                state["in_progress"] = False
+                state["worker_name"] = ""
+                state["last_completed_monotonic"] = time.monotonic()
+                if success and not state.get("timed_out"):
+                    state["phase"] = "IDLE"
+                    state["current_symbol"] = ""
+                    MEMORY["_unified_watchlist_refresh_ok"] = True
+                else:
+                    MEMORY["_unified_watchlist_refresh_ok"] = False
 
 
 def refresh_unified_institutional_watchlist(force=False):
@@ -14400,6 +14453,7 @@ def refresh_unified_institutional_watchlist(force=False):
             stale_for = max(0.0, now_mono - last_progress)
             if stale_for >= INSTITUTIONAL_WATCHLIST_WORKER_STALL_SEC and not state.get("restart_requested"):
                 state["timed_out"] = True
+                state["generation"] = int(state.get("generation", 0)) + 1
                 state["restart_requested"] = True
                 state["last_error"] = f"WORKER_STALLED:{state.get('phase')}:{stale_for:.1f}s"
                 MEMORY["_unified_watchlist_refresh_ok"] = False
@@ -14420,8 +14474,11 @@ def refresh_unified_institutional_watchlist(force=False):
             last_completed = max(last_attempt, last_success)
             if not force and now_mono - last_completed < INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS:
                 return MEMORY.setdefault("watchlist", {})
+            generation = int(state.get("generation", 0)) + 1
             state.update({
-                "in_progress": True, "last_attempt": now,
+                "generation": generation,
+                "in_progress": True, "timed_out": False, "restart_requested": False,
+                "last_attempt": now,
                 "last_attempt_monotonic": now_mono,
                 "started_monotonic": now_mono, "last_progress_monotonic": now_mono,
                 "phase": "SCHEDULED", "current_symbol": "",
@@ -14441,6 +14498,7 @@ def refresh_unified_institutional_watchlist(force=False):
     try:
         worker = threading.Thread(
             target=_run_unified_institutional_watchlist_refresh,
+            args=(generation,),
             name="unified-institutional-watchlist", daemon=True,
         )
         worker.start()
