@@ -15435,6 +15435,18 @@ def run_global_discovery_scanner():
                 cross_delivery = dict(completed_delivery)
             cross_delivery["refresh_seconds"] = round(time.time() - cross_detected_at, 3)
     cross_delivery["age_seconds"] = round(time.time() - cross_detected_at, 3)
+    # The async Watchlist worker may finish between our read above and this
+    # assignment. Preserve its newer delivery acknowledgement for the same IDs.
+    existing_delivery = MEMORY.get("_cross_watchlist_delivery")
+    if isinstance(existing_delivery, dict):
+        existing_ids = set(existing_delivery.get("event_ids") or [])
+        current_ids = set(cross_delivery.get("event_ids") or [])
+        if existing_ids == current_ids and (
+            bool(existing_delivery.get("delivered"))
+            or len(existing_delivery.get("delivered_ids") or []) >
+               len(cross_delivery.get("delivered_ids") or [])
+        ):
+            cross_delivery = dict(existing_delivery)
     MEMORY["_cross_watchlist_delivery"] = cross_delivery
 
     meta.update({
