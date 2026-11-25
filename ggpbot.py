@@ -1275,9 +1275,30 @@ def fetch_ohlcv(symbol, limit=150):
                 detail=f"only {len(df)} complete OHLCV rows remained after validation",
             )
             return None
+        numeric = df[["timestamp", "open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+        if not np.isfinite(numeric).all():
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(df), detail="non-finite OHLCV value",
+            )
+            return None
         if (df[["close", "high", "low"]] <= 0).any().any():
             _record_ohlcv_fetch_diagnostic(
-                sym, "OHLCV_EMPTY", received=len(df), detail="non-positive OHLC value",
+                sym, "OHLCV_MALFORMED", received=len(df), detail="non-positive OHLC price",
+            )
+            return None
+        body_high = df[["open", "close"]].max(axis=1)
+        body_low = df[["open", "close"]].min(axis=1)
+        malformed = (
+            (df["timestamp"] <= 0)
+            | (df["volume"] < 0)
+            | (df["high"] < body_high)
+            | (df["low"] > body_low)
+            | (df["high"] < df["low"])
+        )
+        if bool(malformed.any()):
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(df),
+                detail=f"{int(malformed.sum())} rows violate timestamp/volume/OHLC bounds",
             )
             return None
         df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
