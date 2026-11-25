@@ -28,6 +28,26 @@ class EntryBehavior(str, Enum):
     WAIT_FOR_STRUCTURE = "WAIT_FOR_STRUCTURE"
 
 
+# Dashboard-facing aliases only. The classifier above remains the single source
+# of entry behavior; these names never feed back into authorization or sizing.
+ENTRY_TYPE_ALIASES = {
+    EntryBehavior.IMMEDIATE.value: "IMMEDIATE_ENTRY",
+    EntryBehavior.PULLBACK.value: "PULLBACK",
+    EntryBehavior.MICRO_PULLBACK.value: "MICRO_PULLBACK",
+    EntryBehavior.RETEST.value: "RETEST",
+}
+
+
+def normalize_entry_type(value: Any) -> Optional[str]:
+    """Project one canonical classifier result into the dashboard entry-type name."""
+    text = str(value or "").strip().upper()
+    if text in ENTRY_TYPE_ALIASES:
+        return ENTRY_TYPE_ALIASES[text]
+    if text in set(ENTRY_TYPE_ALIASES.values()):
+        return text
+    return None
+
+
 class ZoneEvent(str, Enum):
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
     INSIDE_ZONE = "INSIDE_ZONE"

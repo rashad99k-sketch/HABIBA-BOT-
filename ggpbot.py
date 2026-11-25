@@ -90,6 +90,7 @@ from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
 from location_authority import validate_location_zone
 from naiso_unified_decision import (classify_cross_state as _project_cross_state,
+                                    project_dashboard_sections as _project_dashboard_sections,
                                     project_watchlist_row as _project_watchlist_row)
 
 # Observational only: all routine trade-management decisions still come from
@@ -7511,6 +7512,8 @@ def _get_scanner_frame(symbol, limit=150):
 CONFIRMED_CROSS_EVENT_SOURCE = "CLOSED_CANDLE_EMA9_VWAP_CROSS"
 CONFIRMED_CROSS_EVENT_TTL_SEC = 4.0 * 3600.0
 CROSS_LIFECYCLE_SCHEMA = "CROSS_REJECTION_V1"
+CROSS_WATCHLIST_LIFECYCLE = "CROSS_DETECTED"
+ACTIVE_WATCHLIST_LIFECYCLE = "ACTIVE_WATCHLIST"
 try:
     CROSS_REJECTION_MAX_CHASE_ATR = max(0.25, min(3.0, float(os.getenv("CROSS_REJECTION_MAX_CHASE_ATR", "1.5"))))
 except (TypeError, ValueError, OverflowError):
@@ -7588,6 +7591,7 @@ def _sync_confirmed_cross_events():
             lifecycle_projection[str(row.get("event_id") or "")] = {
                 "cross_event_phase": str(metadata.get("phase") or "WAITING_FOR_PULLBACK"),
                 "cross_event_lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "cross_event_lifecycle_status": str(metadata.get("lifecycle_status") or CROSS_WATCHLIST_LIFECYCLE),
                 "cross_event_entry_ready": bool(metadata.get("entry_ready") is True),
                 "cross_event_rejection_high": metadata.get("rejection_high"),
                 "cross_event_rejection_low": metadata.get("rejection_low"),
@@ -7624,6 +7628,47 @@ def _sync_confirmed_cross_events():
         })
     MEMORY["confirmed_cross_events_last_sync"] = time.time()
     return rows
+
+
+def _mark_cross_events_watchlist_delivered(event_ids, delivered_at=None):
+    """Record durable Watchlist handoff without creating another event or store."""
+    delivered_at = float(delivered_at or time.time())
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    changed = []
+    for event_id in list(event_ids or []):
+        event_id = str(event_id or "")
+        if not event_id:
+            continue
+        persisted = False
+        if journal is not None and hasattr(journal, "mark_cross_event_lifecycle_status"):
+            try:
+                persisted = bool(journal.mark_cross_event_lifecycle_status(
+                    event_id, ACTIVE_WATCHLIST_LIFECYCLE, watchlist_delivered_at=delivered_at,
+                ))
+            except Exception as exc:
+                log_execution(
+                    f"[CROSS_EVENT] lifecycle delivery mark failed for {event_id}: "
+                    f"{type(exc).__name__}: {exc}", "ERROR",
+                    debounce_key=f"cross_delivery:{event_id}", debounce_sec=10,
+                )
+        for row in MEMORY.get("confirmed_cross_events", []):
+            if str(row.get("cross_event_id") or "") != event_id:
+                continue
+            row["cross_event_lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+            row["cross_event_watchlist_delivered_at"] = delivered_at
+            metadata = row.get("metadata")
+            if isinstance(metadata, dict):
+                metadata["lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+            cross_context = row.get("cross_context")
+            if isinstance(cross_context, dict):
+                context_metadata = cross_context.get("metadata")
+                if isinstance(context_metadata, dict):
+                    context_metadata["lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+        for row in MEMORY.get("watchlist", {}).values():
+            if isinstance(row, dict) and str(row.get("cross_event_id") or "") == event_id:
+                row["cross_event_lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+        changed.append(event_id)
+    return changed
 
 
 def _invalidate_superseded_cross_events(symbol, direction, journal, keep_event_id=None):
@@ -7682,6 +7727,7 @@ def _detect_confirmed_cross_events(symbols):
                 "detection_method": "validate_dual_ema_vwap_entry_gate",
                 "lookback_candles": 2,
                 "lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
+                "lifecycle_status": CROSS_WATCHLIST_LIFECYCLE,
                 "cross_state": "CONFIRMED_BUY_CROSS" if side == "BUY" else "CONFIRMED_SELL_CROSS",
                 "phase": "WAITING_FOR_PULLBACK",
                 "entry_ready": False,
@@ -7900,6 +7946,14 @@ def _build_persistent_entry_context(ctx, gate_result, side, symbol, trade_id, at
         "entry_regime": str(_first(source.get("market_regime"), market_intel.get("regime"), "UNKNOWN")),
         "trading_mode": str(_first(source.get("trading_mode"), market_intel.get("mode"), "UNCLASSIFIED")),
         "entry_behavior": str(_first(source.get("entry_behavior"), market_intel.get("entry_behavior"), "WAIT_FOR_STRUCTURE")),
+        "entry_type": _first(
+            source.get("entry_type"),
+            (source.get("entry_behavior_context") or {}).get("entry_type")
+            if isinstance(source.get("entry_behavior_context"), dict) else None,
+        ),
+        "entry_behavior_context": (dict(source["entry_behavior_context"])
+                                   if isinstance(source.get("entry_behavior_context"), dict) else {}),
+        "lifecycle_status": _first(source.get("lifecycle_status"), source.get("cross_event_lifecycle_status"), "CROSS_DETECTED"),
         "entry_behavior_confidence": _number(source.get("entry_behavior_confidence"), 0.0),
         "evidence": list(source.get("evidence") or []),
         "unified_decision_context": (source.get("unified_decision_context") or source.get("decision_context")
@@ -10349,6 +10403,9 @@ function updateUI(d) {{
             let cardStructure = cardDecision.structure_context || (w.unified_decision_context || {{}}).structure_context || {{}};
             let cardReadiness = cardDecision.entry_readiness || w.entry_readiness_context || (w.unified_decision_context || {{}}).entry_readiness || {{}};
             let cardTimeframe = cardDecision.timeframe_view || (w.unified_decision_context || {{}}).timeframe_view || {{}};
+            let cardBehavior = cardDecision.entry_behavior_context || w.entry_behavior_context || {{}};
+            let cardLifecycle = cardDecision.lifecycle_context || w.lifecycle_context || {{}};
+            let cardDelivery = d.cross_watchlist_delivery || {{}};
             let cardCrossDurable = cardCross.durable_event === true && cardCross.authoritative === true;
             let cardCrossState = cardCross.display_cross_state || cardCross.cross_state || w.cross_state || "NO_CROSS";
             if (!cardCrossDurable && String(cardCrossState).startsWith("CONFIRMED_")) {{
@@ -10376,7 +10433,10 @@ function updateUI(d) {{
               <br><small>EMA9/EMA50/VWAP: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
               <br><small>Decision projection (read-only): ${{uniEsc(w.symbol || sym)}} / ${{uniEsc(w.side || "UNKNOWN")}} | Cross: ${{uniEsc(cardCrossState)}} | durable=${{uniEsc(cardCrossDurable)}} | role=${{uniEsc(cardCrossRole)}} | Context: ${{uniEsc(cardTimeframe.market_regime || w.market_regime || "UNKNOWN")}} / ${{uniEsc(cardTimeframe.trade_state || w.trade_state || "UNKNOWN")}}</small>
               <br><small>Zone: quality=${{uniEsc(cardZone.zone_quality_score ?? w.zone_quality_score ?? "?")}}/100 | valid=${{uniEsc((cardZone.supply_demand || {{}}).valid ?? "UNKNOWN")}} | Liquidity: ${{uniEsc(cardLiquidity.state || "UNKNOWN")}} / ${{uniEsc(cardLiquidity.stage || "UNKNOWN")}} | Confirmation: ${{uniEsc(cardStructure.confirmation_status || "UNKNOWN")}} | Pullback/Retest: ${{uniEsc(cardDecision.setup_stage || "UNKNOWN")}}</small>
-              <br><small>Structural Stop: ${{uniEsc(cardStopState)}} | Final decision: ${{uniEsc(cardDecisionState)}} (${{uniEsc(cardReadyState)}}) | Blocking: ${{uniEsc(cardBlocking)}} | Next: ${{uniEsc(cardNextEvent)}} | authority=${{uniEsc(cardReadiness.authoritative_gate || "UNCHANGED_EXECUTE_ENTRY")}}</small>
+              <br><small>Structural Stop: ${{uniEsc(cardStopState)}} | Validation: ${{uniEsc(w.structural_stop_status || cardDecision.stop_validation_status || "UNSPECIFIED")}} | Final decision: ${{uniEsc(cardDecisionState)}} (${{uniEsc(cardReadyState)}}) | Gate: ${{uniEsc(cardDecision.execution_gate_state || cardReadyState)}} | Blocking: ${{uniEsc(cardBlocking)}} | Next: ${{uniEsc(cardNextEvent)}} | authority=${{uniEsc(cardReadiness.authoritative_gate || "UNCHANGED_EXECUTE_ENTRY")}}</small>
+              <br><small>Entry type: ${{uniEsc(cardBehavior.entry_type || w.entry_type || "NOT_CLASSIFIED")}} | reason: ${{uniEsc(cardBehavior.reason || "none")}} | confirmation: ${{uniEsc(cardBehavior.confirmation ?? "?")}} | invalidation: ${{uniEsc((cardBehavior.invalidation || []).join(", ") || "none")}} | source: ${{uniEsc(cardBehavior.classification_source || "NONE")}}</small>
+              <br><small>Lifecycle: ${{uniEsc(cardDecision.lifecycle_status || cardLifecycle.lifecycle_status || "INSTITUTIONAL_ANALYSIS")}} | waiting: ${{uniEsc(cardDecision.waiting_condition || cardLifecycle.waiting_condition || "none")}} | analysis: ${{uniEsc(cardLifecycle.analysis_status || "PENDING")}} | durable=${{uniEsc(cardCrossDurable)}} | role=${{uniEsc(cardCrossRole)}}</small>
+              <br><small>Cross delivery: same_cycle=${{uniEsc(cardDelivery.same_cycle ?? false)}} | detected=${{uniEsc(cardDelivery.detected_at ?? 0)}} | delivered=${{uniEsc(cardDelivery.delivered_at ?? 0)}} | refresh_s=${{uniEsc(cardDelivery.refresh_seconds ?? 0)}} | new=${{uniEsc(cardDelivery.new_events ?? 0)}} | status=${{uniEsc(cardDelivery.reason || "NO_NEW_CROSS_EVENT")}}</small>
             </div>`;
         }}
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
@@ -10505,6 +10565,16 @@ def decision_feed():
     except Exception as exc:
         log_execution(f"/decision error: {type(exc).__name__}: {exc}", "ERROR")
         return jsonify({"data": [], "error": "decision_feed_unavailable"}), 200
+
+def _unified_decision_dashboard_sections():
+    """Read-only projection of existing feeds; no scan, exchange call or order."""
+    return _project_dashboard_sections(
+        watchlist=MEMORY.get("watchlist", {}),
+        confirmed_crosses=MEMORY.get("confirmed_cross_events", []),
+        ranking=MEMORY.get("ema9_vwap_proximity_scanner", []),
+        cross_delivery=MEMORY.get("_cross_watchlist_delivery", {}),
+    )
+
 
 @app.route("/data")
 def data():
@@ -10656,6 +10726,8 @@ def data():
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
             "naiso_health": naiso_health_snapshot(),
+            "unified_decision": _unified_decision_dashboard_sections(),
+            "cross_watchlist_delivery": dict(MEMORY.get("_cross_watchlist_delivery", {})),
             **live_data
         }
         safe_payload = safe_json(payload)
@@ -13413,7 +13485,50 @@ def run_global_discovery_scanner():
 
     # Confirmed crosses are derived only from the strict closed-candle gate over
     # the USDT swap universe, never from any of the supplementary scanner rows.
+    cross_detected_at = time.time()
     new_cross_events = _detect_confirmed_cross_events(symbols)
+    cross_delivery = {
+        "new_events": int(new_cross_events or 0),
+        "detected_at": cross_detected_at,
+        "delivered_at": cross_detected_at,
+        "same_cycle": False,
+        "delivered": False,
+        "lifecycle_marked": [],
+        "lifecycle_status": CROSS_WATCHLIST_LIFECYCLE,
+        "reason": "NO_NEW_CROSS_EVENT",
+    }
+    cross_delivery["event_ids"] = [
+        str(row.get("cross_event_id") or "")
+        for row in MEMORY.get("confirmed_cross_events", [])
+        if row.get("cross_event_id")
+    ]
+    if cross_delivery["new_events"] > 0:
+        if STATE.get("open") or TRADE_STATE.get("in_position"):
+            cross_delivery["reason"] = "POSITION_OPEN_DISCOVERY_PAUSED"
+        else:
+            # The detector already synced the durable feed. Force the existing
+            # Watchlist refresh now so this scanner cycle hands the event to the
+            # institutional analyzer instead of waiting for the next 15s/20s
+            # main-loop refresh. This is not a second scanner cycle: it reuses
+            # the same bounded refresh and governed frame cache.
+            refresh_unified_institutional_watchlist(force=True)
+            cross_delivery["delivered_at"] = time.time()
+            cross_delivery["refresh_seconds"] = round(
+                cross_delivery["delivered_at"] - cross_detected_at, 3,
+            )
+            cross_delivery["delivered"] = bool(MEMORY.get("_unified_watchlist_refresh_ok"))
+            cross_delivery["same_cycle"] = cross_delivery["delivered"]
+            cross_delivery["reason"] = (
+                "ACTIVE_WATCHLIST_DELIVERED" if cross_delivery["delivered"]
+                else "WATCHLIST_REFRESH_FAILED"
+            )
+            if cross_delivery["delivered"]:
+                cross_delivery["lifecycle_marked"] = _mark_cross_events_watchlist_delivered(
+                    cross_delivery["event_ids"], cross_delivery["delivered_at"],
+                )
+                cross_delivery["lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+    cross_delivery["age_seconds"] = round(time.time() - cross_detected_at, 3)
+    MEMORY["_cross_watchlist_delivery"] = cross_delivery
 
     meta.update({
         "state": "IDLE", "last_completed": time.time(), "symbols_scanned": len(symbols),
@@ -13424,6 +13539,7 @@ def run_global_discovery_scanner():
         "radar_candidates": len(radar_candidates), "blended_candidates": len(blended),
         "confirmed_cross_events": len(MEMORY.get("confirmed_cross_events", [])),
         "confirmed_cross_events_new": int(new_cross_events),
+        "cross_watchlist_delivery": dict(cross_delivery),
         "duration_seconds": round(time.time() - started, 2),
         "universe_limit": SCANNER_UNIVERSE_MAX,
         "directional_cross_required": False,

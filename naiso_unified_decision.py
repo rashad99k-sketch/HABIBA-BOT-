@@ -18,6 +18,8 @@ import math
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from ggp_market_intelligence import normalize_entry_type
+
 SCHEMA_VERSION = "NAISO_UNIFIED_DECISION_CONTEXT_V1"
 
 CROSS_STATES = (
@@ -31,6 +33,22 @@ CROSS_STATES = (
 )
 CROSS_LIFECYCLE_STATES = ("ACTIVE", "ENTERED", "INVALIDATED", "EXPIRED")
 CROSS_PHASES = ("WAITING_FOR_PULLBACK", "PULLBACK_CONFIRMED", "REJECTION_RECORDED", "BREAKOUT_CONFIRMED")
+
+# Entry type is a dashboard-facing projection of the one canonical classifier in
+# ggp_market_intelligence. These aliases are the only accepted display names.
+ENTRY_TYPES = ("IMMEDIATE_ENTRY", "MICRO_PULLBACK", "PULLBACK", "RETEST")
+WATCHLIST_LIFECYCLE_STATES = (
+    "CROSS_DETECTED", "ACTIVE_WATCHLIST", "INSTITUTIONAL_ANALYSIS",
+    "READY_FOR_IMMEDIATE_ENTRY", "WAITING_FOR_MICRO_PULLBACK",
+    "WAITING_FOR_PULLBACK", "WAITING_FOR_RETEST", "INVALIDATED",
+    "EXPIRED", "ENTERED",
+)
+_ENTRY_TYPE_LIFECYCLE = {
+    "IMMEDIATE_ENTRY": "READY_FOR_IMMEDIATE_ENTRY",
+    "MICRO_PULLBACK": "WAITING_FOR_MICRO_PULLBACK",
+    "PULLBACK": "WAITING_FOR_PULLBACK",
+    "RETEST": "WAITING_FOR_RETEST",
+}
 
 DECISION_STATES = (
     "ENTRY_READY",
@@ -640,6 +658,98 @@ def _map_decision_state(row: Dict[str, Any], cross: Dict[str, Any], zones: Dict[
     return "WAITING_FOR_CROSS"
 
 
+def project_entry_behavior(record: Any, decision: Any = None) -> Dict[str, Any]:
+    """Project the canonical market-intelligence entry behavior for display only."""
+    row = _mapping(record)
+    canonical = _mapping(row.get("market_intelligence"))
+    raw_behavior = _text(canonical.get("entry_behavior"))
+    reason_codes = _items(canonical.get("reason_codes") or row.get("entry_behavior_reasons"))
+    confidence = _number(canonical.get("confidence")
+                         if canonical.get("confidence") is not None
+                         else row.get("entry_behavior_confidence"))
+    entry_type = normalize_entry_type(raw_behavior or row.get("entry_behavior"))
+    decision_map = _mapping(decision)
+    readiness = _mapping(decision_map.get("entry_readiness"))
+    invalidations = _items(row.get("invalidations"))
+    if row.get("invalidation_reason"):
+        invalidations.append(_text(row.get("invalidation_reason")))
+    if row.get("structural_stop_status") not in (None, "", "verified_current_analysis"):
+        invalidations.append(f"structural_stop_{row.get('structural_stop_status')}")
+    lifecycle_hint = _upper(_mapping(row.get("metadata")).get("lifecycle_status")
+                            or row.get("cross_event_lifecycle_status"))
+    authorized = bool(readiness.get("conditions_complete") is True and readiness.get("sl_valid") is True)
+    result = {
+        "schema": SCHEMA_VERSION,
+        "entry_type": entry_type,
+        "classification_status": "CLASSIFIED" if entry_type else "NOT_CLASSIFIED",
+        "classification_source": "GGP_MARKET_INTELLIGENCE" if raw_behavior else "NONE",
+        "raw_behavior": raw_behavior or _text(row.get("entry_behavior")),
+        "reason": reason_codes[0] if reason_codes else ("entry_behavior_not_proven" if not entry_type else "classifier_reason_unavailable"),
+        "reason_codes": reason_codes,
+        "confirmation": confidence,
+        "confirmation_basis": "classifier_confidence",
+        "invalidation": invalidations,
+        "waiting_condition": _ENTRY_TYPE_LIFECYCLE.get(entry_type or "", ""),
+        "stop_valid": readiness.get("sl_valid") is True,
+        "final_authorization": "UNIFIED_ENTRY_AUTHORITY_UNCHANGED" if authorized else "NOT_READY",
+        "authoritative_gate": readiness.get("authoritative_gate") or "UNIFIED_ENTRY_AUTHORITY_UNCHANGED",
+        "lifecycle_hint": lifecycle_hint if lifecycle_hint in WATCHLIST_LIFECYCLE_STATES else "",
+    }
+    result["entry_state"] = (
+        ("READY_FOR_IMMEDIATE_ENTRY" if authorized else "NOT_READY")
+        if entry_type == "IMMEDIATE_ENTRY"
+        else result["waiting_condition"] if entry_type in ENTRY_TYPES else "NOT_READY"
+    )
+    return result
+
+
+def project_watchlist_lifecycle(record: Any, *, cross: Any = None, decision: Any = None,
+                                entry_behavior: Any = None) -> Dict[str, Any]:
+    """Derive one Active Watchlist lifecycle state without writing any new store."""
+    row = _mapping(record)
+    cross_map = _mapping(cross)
+    decision_map = _mapping(decision)
+    behavior = _mapping(entry_behavior or project_entry_behavior(row, decision_map))
+    status = _upper(cross_map.get("cross_event_status") or row.get("cross_event_status")
+                    or row.get("status") or "ACTIVE")
+    if status in {"ENTERED", "CROSS_ALREADY_CONSUMED"}:
+        state, reason = "ENTERED", "cross_event_consumed_once"
+    elif status in {"INVALIDATED", "REJECTED"}:
+        state, reason = "INVALIDATED", _text(row.get("invalidation_reason")) or "cross_event_invalidated"
+    elif status in {"EXPIRED", "INACTIVE", "CROSS_ALREADY_EXPIRED"}:
+        state, reason = "EXPIRED", "cross_event_expired"
+    elif not cross_map.get("durable_event"):
+        state, reason = "ACTIVE_WATCHLIST", "watchlist_observation_no_durable_event"
+    elif not any(row.get(key) for key in (
+            "market_intelligence", "decision_state", "decision_context",
+            "unified_decision_context", "structural_stop", "entry_behavior_context")):
+        hint = _upper(behavior.get("lifecycle_hint"))
+        state = hint if hint in {"CROSS_DETECTED", "ACTIVE_WATCHLIST", "INSTITUTIONAL_ANALYSIS"} else "CROSS_DETECTED"
+        reason = "durable_cross_without_analysis_snapshot"
+    elif decision_map.get("analysis_status") not in (None, "FRESH"):
+        analysis = _upper(decision_map.get("analysis_status"))
+        state, reason = "INSTITUTIONAL_ANALYSIS", (
+            "analysis_in_progress" if analysis == "PENDING" else f"analysis_{analysis.lower()}"
+        )
+    elif not behavior.get("entry_type"):
+        state, reason = "INSTITUTIONAL_ANALYSIS", "entry_behavior_not_proven"
+    else:
+        state = behavior.get("waiting_condition") or "INSTITUTIONAL_ANALYSIS"
+        reason = behavior.get("reason") or "canonical_entry_behavior"
+    hint = _upper(behavior.get("lifecycle_hint"))
+    if state in {"ACTIVE_WATCHLIST", "INSTITUTIONAL_ANALYSIS"} and hint == "CROSS_DETECTED" and not decision_map:
+        state, reason = "CROSS_DETECTED", "durable_cross_not_yet_analyzed"
+    return {
+        "schema": SCHEMA_VERSION,
+        "lifecycle_status": state if state in WATCHLIST_LIFECYCLE_STATES else "INSTITUTIONAL_ANALYSIS",
+        "reason": reason,
+        "entry_type": behavior.get("entry_type"),
+        "waiting_condition": behavior.get("waiting_condition") or "",
+        "analysis_status": decision_map.get("analysis_status") or "PENDING",
+        "durable_event": bool(cross_map.get("durable_event")),
+    }
+
+
 def project_decision_context(record: Any, *, cross: Any = None, now_ts: Optional[float] = None,
                              ranking: bool = False) -> Dict[str, Any]:
     """One explicit projected decision per row with reasons and next required event.
@@ -674,6 +784,18 @@ def project_decision_context(record: Any, *, cross: Any = None, now_ts: Optional
     else:
         state = _map_decision_state(row, cross_map, zones, liquidity, legacy_state, blob)
     readiness = project_execution_readiness(row, decision_state=state)
+    entry_behavior_context = project_entry_behavior(
+        row, {"entry_readiness": readiness, "blocking_reasons": blocking},
+    )
+    lifecycle_context = project_watchlist_lifecycle(
+        row, cross=cross_map, decision={"analysis_status": analysis_status},
+        entry_behavior=entry_behavior_context,
+    )
+    execution_state = "ENTRY_READY" if (
+        readiness.get("conditions_complete") is True and readiness.get("sl_valid") is True
+    ) else "ENTRY_WINDOW_MISSED" if any(
+        token in blob for token in ("entry_window_missed", "no_chase", "outside_institutional_zone")
+    ) else "NOT_READY"
     timestamp = (row.get("origin_timestamp") or row.get("signal_candle_timestamp")
                  or row.get("cross_event_timestamp") or row.get("engine_candle_timestamp")
                  or row.get("closed_candle_timestamp") or row.get("latest_closed_timestamp")
@@ -711,6 +833,14 @@ def project_decision_context(record: Any, *, cross: Any = None, now_ts: Optional
         "timeframe_view": timeframe_view,
         "market_context": market_context,
         "entry_readiness": readiness,
+        "entry_behavior_context": entry_behavior_context,
+        "entry_type": entry_behavior_context["entry_type"],
+        "lifecycle_status": lifecycle_context["lifecycle_status"],
+        "lifecycle_context": lifecycle_context,
+        "waiting_condition": lifecycle_context["waiting_condition"],
+        "execution_gate_state": execution_state,
+        "final_authorization": entry_behavior_context["final_authorization"],
+        "stop_validation_status": row.get("structural_stop_status") or "UNSPECIFIED",
         "zone_quality_score": zones["zone_quality_score"],
         "context_quality_score": zones["context_quality_score"],
     }
@@ -741,12 +871,19 @@ def project_watchlist_row(record: Any, *, now_ts: Optional[float] = None,
         "zone_context": decision["zone_context"],
         "timeframe_view": decision["timeframe_view"],
         "entry_readiness": decision["entry_readiness"],
+        "entry_behavior_context": decision["entry_behavior_context"],
+        "entry_type": decision["entry_type"],
+        "lifecycle_status": decision["lifecycle_status"],
+        "lifecycle_context": decision["lifecycle_context"],
+        "waiting_condition": decision["waiting_condition"],
+        "execution_gate_state": decision["execution_gate_state"],
         "source_snapshot_id": decision["source_snapshot_id"],
     }
 
 
 def project_dashboard_sections(watchlist: Any = None, confirmed_crosses: Any = None,
-                               ranking: Any = None, now_ts: Optional[float] = None) -> Dict[str, Any]:
+                               ranking: Any = None, now_ts: Optional[float] = None,
+                               cross_delivery: Any = None) -> Dict[str, Any]:
     """Build four separated dashboard sections from existing feeds only."""
     watch = _mapping(watchlist)
     crosses = list(confirmed_crosses or [])
@@ -778,6 +915,13 @@ def project_dashboard_sections(watchlist: Any = None, confirmed_crosses: Any = N
             "required_next_event": decision["required_next_event"],
             "source_snapshot_id": decision["source_snapshot_id"],
             "structural_stop_valid": readiness["sl_valid"],
+            "entry_type": decision["entry_type"],
+            "entry_behavior_context": decision["entry_behavior_context"],
+            "lifecycle_status": decision["lifecycle_status"],
+            "waiting_condition": decision["waiting_condition"],
+            "execution_gate_state": decision["execution_gate_state"],
+            "final_authorization": decision["final_authorization"],
+            "stop_validation_status": decision["stop_validation_status"],
         })
         execution_rows.append(readiness)
     execution_rows.sort(key=lambda row: (not row["conditions_complete"], row["symbol"]))
@@ -788,5 +932,6 @@ def project_dashboard_sections(watchlist: Any = None, confirmed_crosses: Any = N
         "watchlist_ranking": ranking_rows,
         "institutional_analysis": institutional_rows,
         "execution_readiness": execution_rows,
+        "cross_delivery": dict(_mapping(cross_delivery)),
         "note": "Projection only. No new authority, order path, indicator or API call.",
     }

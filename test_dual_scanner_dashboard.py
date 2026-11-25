@@ -64,6 +64,27 @@ def test_global_discovery_runs_both_existing_scanners_on_a_shared_universe():
     assert "scan_market_rf" in calls
     assert "get_usdt_perp_symbols" in calls
     assert "radar_score" in calls
+    assert "refresh_unified_institutional_watchlist" in calls
+    source = ast.get_source_segment(SOURCE, fn)
+    assert "force=True" in source
+    assert "new_cross_events" in source
+
+def test_cross_delivery_uses_one_bounded_refresh_without_a_second_scanner():
+    scanner = _function("run_global_discovery_scanner")
+    refresh = _function("refresh_unified_institutional_watchlist")
+    scanner_source = ast.get_source_segment(SOURCE, scanner)
+    refresh_source = ast.get_source_segment(SOURCE, refresh)
+
+    assert 'if cross_delivery["new_events"] > 0:' in scanner_source
+    assert "refresh_unified_institutional_watchlist(force=True)" in scanner_source
+    assert "cross_detected_at = time.time()" in scanner_source
+    assert "refresh_seconds" in scanner_source
+    assert "run_global_discovery_scanner" not in refresh_source
+    assert "INSTITUTIONAL_WATCHLIST_BATCH_SIZE" in refresh_source
+    assert "_integration_fetch_frame" in refresh_source
+    assert "fetch_ohlcv" not in scanner_source
+    assert "safe_api_call" not in scanner_source
+
 
 def test_second_scanner_is_integrated_into_unified_watchlist_enrichment():
     fn = _function("_enrich_with_existing_gpp_engines")

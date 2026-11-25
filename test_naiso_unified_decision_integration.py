@@ -789,3 +789,132 @@ def test_projection_adds_no_exchange_or_snapshot_calls(monkeypatch):
     assert row["decision_context"]["timeframe_view"]["source"] == "EXISTING_FIELDS_NO_EXTRA_FETCH"
     assert "unified" in row or "decision_context" in row
     assert ggpbot.normalize_symbol(SYMBOL) == SYMBOL
+
+
+# --------------------------------------------------------------------------- #
+# 9) One authoritative entry type and one explicit Watchlist lifecycle.
+# --------------------------------------------------------------------------- #
+def test_entry_type_ignores_conflicting_legacy_hints():
+    row = {
+        "market_intelligence": {
+            "entry_behavior": "IMMEDIATE", "confidence": 0.9,
+            "reason_codes": ["strong_fresh_zone", "fresh_order_block"],
+        },
+        "entry_behavior": "ENTER_NOW",
+        "pullback_type": "SNIPER_ZONE_RETEST",
+        "entry_behavior_context": {"entry_type": "PULLBACK"},
+        "structural_stop_status": "missing_or_non_positive",
+        "metadata": {"lifecycle_status": "ACTIVE_WATCHLIST"},
+    }
+    decision = {
+        "entry_readiness": {
+            "conditions_complete": False, "sl_valid": False,
+            "authoritative_gate": "UNIFIED_ENTRY_AUTHORITY_UNCHANGED",
+        },
+        "blocking_reasons": ["STRUCTURAL_STOP_UNKNOWN"],
+    }
+    out = proj.project_entry_behavior(row, decision)
+
+    assert out["entry_type"] == "IMMEDIATE_ENTRY"
+    assert out["classification_status"] == "CLASSIFIED"
+    assert out["classification_source"] == "GGP_MARKET_INTELLIGENCE"
+    assert out["reason"] == "strong_fresh_zone"
+    assert out["confirmation"] == pytest.approx(0.9)
+    assert any("missing_or_non_positive" in item for item in out["invalidation"])
+    assert out["stop_valid"] is False
+    assert out["final_authorization"] == "NOT_READY"
+    assert out["authoritative_gate"] == "UNIFIED_ENTRY_AUTHORITY_UNCHANGED"
+    assert out["lifecycle_hint"] == "ACTIVE_WATCHLIST"
+
+
+@pytest.mark.parametrize("behavior,entry_type,lifecycle", [
+    ("IMMEDIATE", "IMMEDIATE_ENTRY", "READY_FOR_IMMEDIATE_ENTRY"),
+    ("MICRO_PULLBACK", "MICRO_PULLBACK", "WAITING_FOR_MICRO_PULLBACK"),
+    ("PULLBACK", "PULLBACK", "WAITING_FOR_PULLBACK"),
+    ("RETEST", "RETEST", "WAITING_FOR_RETEST"),
+])
+def test_entry_type_and_lifecycle_matrix(behavior, entry_type, lifecycle):
+    row = {
+        **_durable_record(),
+        "symbol": CANONICAL, "exchange_symbol": SYMBOL, "side": "BUY",
+        "decision_state": "WAITING_FOR_CONFIRMATION",
+        "market_intelligence": {"entry_behavior": behavior, "confidence": 0.8,
+                                "reason_codes": ["canonical_classifier"]},
+    }
+    decision = {"entry_readiness": {"conditions_complete": True, "sl_valid": True},
+                "blocking_reasons": [], "analysis_status": "FRESH"}
+    behavior_context = proj.project_entry_behavior(row, decision)
+    lifecycle_context = proj.project_watchlist_lifecycle(
+        row, cross={"durable_event": True}, decision=decision,
+        entry_behavior=behavior_context,
+    )
+    projected = proj.project_watchlist_row(row, now_ts=FIXED_NOW)
+
+    assert behavior_context["entry_type"] == entry_type
+    assert lifecycle_context["lifecycle_status"] == lifecycle
+    assert projected["entry_type"] == entry_type
+    assert projected["lifecycle_status"] == lifecycle
+    assert projected["decision_context"]["entry_behavior_context"]["entry_type"] == entry_type
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("ENTERED", "ENTERED"), ("INVALIDATED", "INVALIDATED"), ("EXPIRED", "EXPIRED"),
+])
+def test_terminal_cross_status_drives_watchlist_lifecycle(status, expected):
+    row = {"symbol": CANONICAL, "side": "BUY", "decision_state": "ENTRY_READY",
+           "cross_event_status": status}
+    cross = proj.classify_cross_state(row, now_ts=FIXED_NOW)
+    out = proj.project_watchlist_lifecycle(row, cross=cross)
+    assert out["lifecycle_status"] == expected
+    assert cross["authoritative"] is False
+
+
+def test_execution_gate_distinguishes_not_ready_from_window_missed():
+    invalid_stop = proj.project_decision_context({
+        "symbol": CANONICAL, "side": "BUY", "decision_state": "ENTRY_READY",
+        "decision_reason": "structural_stop_missing", "structural_stop_status": "missing_or_non_positive",
+    })
+    missed = proj.project_decision_context({
+        "symbol": CANONICAL, "side": "BUY", "decision_state": "NO_CHASE",
+        "decision_reason": "entry_window_missed_price_outside_zone",
+    })
+    assert invalid_stop["execution_gate_state"] == "NOT_READY"
+    assert invalid_stop["stop_validation_status"] == "missing_or_non_positive"
+    assert invalid_stop["final_authorization"] == "NOT_READY"
+    assert missed["execution_gate_state"] == "ENTRY_WINDOW_MISSED"
+
+
+def test_dashboard_exposes_entry_lifecycle_stop_and_same_cycle_timing(monkeypatch):
+    row = _watchlist_card_row()
+    row["market_intelligence"] = {
+        "entry_behavior": "RETEST", "confidence": 0.82,
+        "reason_codes": ["sweep_then_mss", "causal_zone_retest_required"],
+    }
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {"BTC": row})
+    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [_durable_record()])
+    monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [])
+    monkeypatch.setitem(ggpbot.MEMORY, "_cross_watchlist_delivery", {
+        "new_events": 1, "same_cycle": True, "delivered": True,
+        "detected_at": FIXED_NOW, "delivered_at": FIXED_NOW + 0.25,
+        "refresh_seconds": 0.25, "reason": "ACTIVE_WATCHLIST_DELIVERED",
+    })
+    _patch_dashboard_runtime(monkeypatch)
+
+    client = ggpbot.app.test_client()
+    html = client.get("/").get_data(as_text=True)
+    payload = client.get("/data").get_json()
+
+    sections = payload["unified_decision"]
+    assert set(("confirmed_crosses", "watchlist_ranking", "institutional_analysis",
+                "execution_readiness", "cross_delivery")).issubset(sections)
+    execution = sections["execution_readiness"][0]
+    assert execution["entry_type"] == "RETEST"
+    assert execution["lifecycle_status"] == "WAITING_FOR_RETEST"
+    assert execution["execution_gate_state"] in {"NOT_READY", "ENTRY_READY"}
+    assert execution["final_authorization"] in {"NOT_READY", "UNIFIED_ENTRY_AUTHORITY_UNCHANGED"}
+    assert payload["cross_watchlist_delivery"]["same_cycle"] is True
+    assert payload["cross_watchlist_delivery"]["refresh_seconds"] == pytest.approx(0.25)
+
+    for token in ("Entry type:", "Lifecycle:", "waiting:", "Cross delivery:",
+                  "same_cycle=", "refresh_s=", "Validation:", "Gate:"):
+        assert token in html

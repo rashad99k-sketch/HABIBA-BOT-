@@ -63,3 +63,21 @@ def test_entry_checks_current_event_before_order_and_persists_after_verified_fil
         and node.func.attr == "consume_event"
     )
     assert original_call_line < consume_call_line
+
+
+def test_cross_delivery_and_lifecycle_projection_never_bypass_entry_authority():
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    scanner = next(node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "run_global_discovery_scanner")
+    scanner_source = ast.get_source_segment(source, scanner)
+    scanner_calls = [node.func.attr if isinstance(node.func, ast.Attribute)
+                     else node.func.id if isinstance(node.func, ast.Name) else ""
+                     for node in ast.walk(scanner) if isinstance(node, ast.Call)]
+
+    assert "execute_entry" not in scanner_calls
+    assert "calculate_position_size" not in scanner_calls
+    assert "open_position" not in scanner_calls
+    assert "refresh_unified_institutional_watchlist" in scanner_calls
+    projection_source = Path(__file__).with_name("naiso_unified_decision.py").read_text(encoding="utf-8")
+    assert "UNIFIED_ENTRY_AUTHORITY_UNCHANGED" in projection_source

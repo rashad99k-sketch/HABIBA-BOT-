@@ -370,6 +370,50 @@ class TradeJournal:
             db.execute("COMMIT")
             return changed
 
+    _WATCHLIST_LIFECYCLE_RANK = {
+        "CROSS_DETECTED": 0, "ACTIVE_WATCHLIST": 1, "INSTITUTIONAL_ANALYSIS": 2,
+        "READY_FOR_IMMEDIATE_ENTRY": 3, "WAITING_FOR_MICRO_PULLBACK": 3,
+        "WAITING_FOR_PULLBACK": 3, "WAITING_FOR_RETEST": 3,
+        "INVALIDATED": 4, "EXPIRED": 4, "ENTERED": 4,
+    }
+
+    def mark_cross_event_lifecycle_status(self, event_id: str, lifecycle_status: str,
+                                          **extra: Any) -> bool:
+        """Advance only the metadata lifecycle; DB status remains authoritative."""
+        status = str(lifecycle_status or "").strip().upper()
+        if not event_id or status not in self._WATCHLIST_LIFECYCLE_RANK:
+            return False
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status, metadata_json FROM confirmed_cross_events WHERE event_id=?",
+                (str(event_id),),
+            ).fetchone()
+            if not row or str(row[0]).upper() != "ACTIVE":
+                db.execute("ROLLBACK")
+                return False
+            try:
+                metadata = json.loads(row[1] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            previous = str(metadata.get("lifecycle_status") or "CROSS_DETECTED").upper()
+            if self._WATCHLIST_LIFECYCLE_RANK.get(status, -1) < self._WATCHLIST_LIFECYCLE_RANK.get(previous, -1):
+                db.execute("ROLLBACK")
+                return False
+            candidate = dict(metadata)
+            candidate.update(extra)
+            candidate["lifecycle_status"] = status
+            candidate["lifecycle_updated_ts"] = time.time()
+            db.execute(
+                "UPDATE confirmed_cross_events SET metadata_json=?, updated_ts=? "
+                "WHERE event_id=? AND status='ACTIVE'",
+                (json.dumps(candidate, sort_keys=True, default=str, separators=(",", ":")),
+                 time.time(), str(event_id)),
+            )
+            changed = db.execute("SELECT changes()").fetchone()[0] == 1
+            db.execute("COMMIT")
+            return changed
+
     def expire_cross_events(self, now: Optional[float] = None) -> int:
         cutoff = float(now if now is not None else time.time())
         with self._db() as db:
