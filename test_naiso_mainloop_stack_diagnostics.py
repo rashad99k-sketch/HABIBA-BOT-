@@ -17,6 +17,8 @@ class MainLoopStackDiagnosticsTests(unittest.TestCase):
 
         snapshot = watchdog._stack_snapshot(component)
         self.assertTrue(snapshot["possible_stacks"])
+        self.assertIn("test_main_thread_stack_is_captured_for_main_loop",
+                      snapshot["main_thread_stack"])
         current_stack = snapshot["possible_stacks"].get(str(threading.get_ident()), "")
         self.assertIn("test_main_thread_stack_is_captured_for_main_loop", current_stack)
 
