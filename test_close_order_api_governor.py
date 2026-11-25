@@ -42,6 +42,9 @@ def test_order_write_safe_api_call_is_paced_and_never_retried(monkeypatch):
     pacing = []
     monkeypatch.setattr(ggpbot, "API_RESILIENCE", probe)
     monkeypatch.setattr(ggpbot, "rate_limit", lambda func: pacing.append(func.__name__))
+    monkeypatch.setitem(ggpbot.STATE, "execution_unresolved", False)
+    monkeypatch.setitem(ggpbot.MEMORY, "recovery_status", "READY")
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
 
     def create_order(*args, **kwargs):
         calls.append((args, kwargs))
