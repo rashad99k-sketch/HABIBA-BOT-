@@ -634,6 +634,13 @@ def rate_limit(func=None):
             )
 
         wait_seconds = 0.0
+        owner_now = time.monotonic()
+        _API_RATE_LOCK_OWNER.update({
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+            "since_monotonic": owner_now,
+            "method": method_name,
+        })
         try:
             now = time.monotonic()
             elapsed = now - _last_api_call
@@ -641,12 +648,6 @@ def rate_limit(func=None):
                 _last_api_call = now
                 return
             wait_seconds = min_interval - elapsed
-            _API_RATE_LOCK_OWNER.update({
-                "thread_id": threading.get_ident(),
-                "thread_name": threading.current_thread().name,
-                "since_monotonic": now,
-                "method": method_name,
-            })
         finally:
             _API_RATE_LOCK_OWNER.update({
                 "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
@@ -790,7 +791,6 @@ def safe_api_call(func, *args, **kwargs):
     if is_order_write and resilience is not None:
         try:
             resilience.before_call(method_name)
-            resilience.count_request()
         except CircuitOpenError:
             if "MEMORY" in globals():
                 MEMORY["api_circuit_state"] = "OPEN"
@@ -798,7 +798,14 @@ def safe_api_call(func, *args, **kwargs):
                           debounce_key=f"api_circuit_{method_name}", debounce_sec=30)
             raise
     if is_order_write:
-        rate_limit(func)
+        try:
+            rate_limit(func)
+        except ApiRateLockTimeout as exc:
+            if resilience is not None:
+                resilience.record_failure(method_name, exc)
+            raise
+        if resilience is not None:
+            resilience.count_request()
         try:
             result = func(*args, **kwargs)
         except Exception as exc:
@@ -842,8 +849,14 @@ def safe_api_call(func, *args, **kwargs):
                         f"[API_CIRCUIT] {method_name} temporarily fenced on retry {attempt + 1}/{attempts}; no request sent",
                         "WARN", debounce_key=f"api_circuit_{method_name}", debounce_sec=30)
                     raise
+            try:
+                rate_limit(func)
+            except ApiRateLockTimeout as exc:
+                if resilience is not None:
+                    resilience.record_failure(method_name, exc)
+                raise
+            if resilience is not None:
                 resilience.count_request()
-            rate_limit(func)
             result = func(*args, **kwargs)
             if resilience is not None:
                 resilience.record_success(method_name)
