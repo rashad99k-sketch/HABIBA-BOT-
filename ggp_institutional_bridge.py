@@ -1030,7 +1030,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         best["first_seen"] = previous.get("first_seen", time.time())
         best["discovery_sources"] = list(candidate.get("sources", []))
         best["discovery_score"] = float(candidate.get("score", 0) or 0)
-        for cross_field in ("cross_event_id", "cross_event_source", "cross_event_direction",
+        for cross_field in ("cross_event_id", "cross_event_side", "cross_event_conflict", "cross_event_source", "cross_event_direction",
                             "cross_event_timestamp", "cross_event_status", "cross_event_timeframe",
                             "cross_event_lifecycle_status", "cross_event_phase", "cross_event_lifecycle_schema",
                             "cross_event_entry_ready", "cross_event_rejection_high",
