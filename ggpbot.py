@@ -13844,8 +13844,12 @@ def _stop_runtime_services():
             log_execution(f"[SHUTDOWN] watchdog stop failed: {type(exc).__name__}: {exc}", "WARN")
     for server, thread in list(globals().get("DASHBOARD_SERVERS") or []):
         try:
-            server.shutdown()
-            server.server_close()
+            # Waitress exposes close(); Werkzeug's legacy server exposes
+            # shutdown()/server_close(). Support both during controlled rollout.
+            for method_name in ("shutdown", "close", "server_close"):
+                method = getattr(server, method_name, None)
+                if callable(method):
+                    method()
         except Exception as exc:
             log_execution(f"[SHUTDOWN] dashboard stop failed: {type(exc).__name__}: {exc}", "WARN")
         try:
@@ -16740,8 +16744,8 @@ DASHBOARD_SERVERS = []
 DASHBOARD_ACTIVE_PORTS = []
 
 def start_dashboard_servers():
-    """Start Flask dashboard before trading: local ports 8000+8080, hosted PORT only."""
-    from werkzeug.serving import make_server
+    """Start one-process production WSGI servers before the trading supervisor."""
+    from waitress import create_server
     hosted_port = os.getenv("PORT")
     if hosted_port:
         ports = [int(hosted_port)]
@@ -16762,14 +16766,17 @@ def start_dashboard_servers():
     started = []
     for port in ports:
         try:
-            server = make_server(bind_host, port, app, threaded=True)
-            thread = threading.Thread(target=server.serve_forever, daemon=True, name=f"ggp_dashboard_{port}")
+            # Waitress is a production WSGI server. Keep a single Python
+            # process: the trading engine, instance lock and recovery supervisor
+            # must never be forked into duplicate order-submitting workers.
+            server = create_server(app, host=bind_host, port=port, threads=8)
+            thread = threading.Thread(target=server.run, daemon=True, name=f"ggp_dashboard_{port}")
             thread.start()
             DASHBOARD_SERVERS.append((server, thread))
             DASHBOARD_ACTIVE_PORTS.append(port)
             started.append(port)
-            log_execution(f"[DASHBOARD] HTTP server started host={bind_host} port={port}", "SUCCESS")
-        except OSError as exc:
+            log_execution(f"[DASHBOARD] Waitress WSGI server started host={bind_host} port={port}", "SUCCESS")
+        except (OSError, ValueError) as exc:
             log_execution(f"[DASHBOARD] Could not bind {bind_host}:{port}: {exc}", "ERROR")
             if hosted_port:
                 raise
