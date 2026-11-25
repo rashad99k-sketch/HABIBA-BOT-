@@ -257,3 +257,57 @@ def test_bingx_public_market_reads_share_documented_one_second_ip_pacing():
         ggpbot._API_METHOD_MIN_INTERVALS[name] >= 1.0
         for name in expected
     )
+
+
+def _valid_ohlcv_rows(count=100):
+    return [
+        [1_700_000_000_000 + index * 900_000, 100.0, 101.0, 99.0, 100.5, 12.0]
+        for index in range(count)
+    ]
+
+
+def _stub_ohlcv_fetch(monkeypatch, rows):
+    class Exchange:
+        def fetch_ohlcv(self, *_args, **_kwargs):
+            return rows
+
+    monkeypatch.setattr(ggpbot, "ex", Exchange())
+    monkeypatch.setattr(ggpbot, "normalize_symbol", lambda symbol: symbol)
+    monkeypatch.setattr(ggpbot, "_ohlcv_rate_limit_cooldown_remaining", lambda _symbol: 0.0)
+    monkeypatch.setattr(ggpbot, "safe_api_call", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(ggpbot, "OHLCV_FETCH_DIAGNOSTICS", {})
+    monkeypatch.setattr(ggpbot, "INTERVAL", "15m")
+
+
+def test_fetch_ohlcv_rejects_malformed_candle_bounds(monkeypatch):
+    rows = _valid_ohlcv_rows()
+    rows[50] = [rows[50][0], 100.0, 99.0, 98.0, 100.5, 12.0]
+    _stub_ohlcv_fetch(monkeypatch, rows)
+
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    assert ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]["reason"] == "OHLCV_MALFORMED"
+
+
+def test_fetch_ohlcv_rejects_nonfinite_values_and_negative_volume(monkeypatch):
+    rows = _valid_ohlcv_rows()
+    rows[25][2] = float("inf")
+    _stub_ohlcv_fetch(monkeypatch, rows)
+
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    assert ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]["reason"] == "OHLCV_MALFORMED"
+
+    rows = _valid_ohlcv_rows()
+    rows[25][5] = -1.0
+    _stub_ohlcv_fetch(monkeypatch, rows)
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    assert ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]["reason"] == "OHLCV_MALFORMED"
+
+
+def test_fetch_ohlcv_keeps_valid_closed_candle_frame(monkeypatch):
+    rows = _valid_ohlcv_rows()
+    _stub_ohlcv_fetch(monkeypatch, rows)
+
+    frame = ggpbot.fetch_ohlcv("BTC/USDT:USDT")
+    assert frame is not None
+    assert len(frame) == 100
+    assert list(frame.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
