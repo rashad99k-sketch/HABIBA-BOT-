@@ -6717,9 +6717,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         gate_result["durable_event_id"] = ""
     cross_event_id = str(institutional_entry_ctx.get("cross_event_id") or "").strip()
     if not cross_event_id and not PAPER_MODE and MODE_LIVE:
+        # Expected fail-closed decision, not a runtime failure. Keep it out of
+        # SYSTEM ERRORS and Telegram ERROR alerts; entry authority is unchanged.
         log_execution(
             f"[CROSS_EVENT] BLOCKED LIVE {symbol} {side}: entry requires a durable confirmed cross event",
-            "ERROR",
+            "WARN",
         )
         return False
     if cross_event_id:
