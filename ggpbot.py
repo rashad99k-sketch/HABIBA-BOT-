@@ -6195,6 +6195,7 @@ DASHBOARD_STATE = {
     "position": None,
     "logs": [],
     "errors": [],
+    "system_errors": [],
     "live_trade_mode": False,
     "lifecycle_state": "IDLE",
     "live_supervisor": {},
@@ -6230,7 +6231,103 @@ def _get_runtime_logger():
             _RUNTIME_LOGGER = False
     return _RUNTIME_LOGGER
 
+def _system_error_record(message, severity, timestamp):
+    """Build a bounded, dashboard-safe incident record from the canonical log event."""
+    raw = str(message or "")[:8000]
+    upper = raw.upper()
+    if "[WATCHDOG]" in upper and "STALLED FOR" in upper:
+        error_type = "WATCHDOG_STALL"
+        component = "main_loop" if "MAIN_LOOP" in upper else "WATCHDOG_COMPONENT"
+        cause = "No real progress heartbeat was recorded before the watchdog grace window expired."
+    elif "[WATCHDOG]" in upper and "RESTART FAILED" in upper:
+        error_type = "WATCHDOG_RESTART_FAILED"
+        component = "main_loop" if "MAIN_LOOP" in upper else "WATCHDOG_COMPONENT"
+        cause = "In-process recovery did not restore component liveness; inspect restart_guard and the captured stack."
+    elif "[WATCHDOG]" in upper and (
+        "PROCESS RESTART BLOCKED" in upper
+        or "PROCESS RESTART DEFERRED" in upper
+        or "NO EXTERNAL PROCESS SUPERVISOR" in upper
+    ):
+        error_type = "WATCHDOG_RECOVERY_BLOCKED"
+        component = "main_loop"
+        cause = raw[:1600]
+    elif "CRITICAL EXCEPTION" in upper:
+        error_type = "MAIN_LOOP_EXCEPTION"
+        component = "main_loop"
+        cause = "The foreground main loop raised an uncaught exception; traceback is included in the incident message."
+    else:
+        error_type = "SYSTEM_ERROR"
+        component = "runtime"
+        cause = raw.split("|", 1)[1].strip()[:1600] if "|" in raw else raw[:1600]
+    if "restart_guard=" in raw:
+        tail = raw.split("restart_guard=", 1)[1]
+        cause = ("restart_guard=" + tail.split()[0])[:1600]
+    stack = ""
+    marker = "[MAIN_THREAD_STACK]"
+    if marker in raw:
+        stack = raw.split(marker, 1)[1].strip()[-6000:]
+    return {
+        "timestamp": str(timestamp),
+        "severity": str(severity).upper(),
+        "error_type": error_type,
+        "component": component,
+        "message": raw[:2400],
+        "cause": str(cause)[:1600],
+        "stack_trace": stack,
+    }
+
+
+_SYSTEM_ERROR_STATE_KEY = "dashboard_system_errors_v1"
+_SYSTEM_ERROR_LOCK = threading.RLock()
+
+
+def _persist_system_errors():
+    """Persist the bounded dashboard incident ring in the existing trade journal."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    setter = getattr(journal, "set_runtime_state", None)
+    if not callable(setter):
+        return False
+    with _SYSTEM_ERROR_LOCK:
+        records = list(DASHBOARD_STATE.get("system_errors", []))[-50:]
+        payload = {"version": 1, "records": records}
+    try:
+        setter(_SYSTEM_ERROR_STATE_KEY, payload)
+        return True
+    except Exception:
+        # Incident persistence must never interrupt trade management or recovery.
+        return False
+
+
+def _restore_system_errors():
+    """Restore recent incidents after a process restart so Dashboard retains history."""
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    getter = getattr(journal, "get_runtime_state", None)
+    if not callable(getter):
+        return 0
+    try:
+        payload = getter(_SYSTEM_ERROR_STATE_KEY, default={})
+    except TypeError:
+        try:
+            payload = getter(_SYSTEM_ERROR_STATE_KEY)
+        except Exception:
+            return 0
+    except Exception:
+        return 0
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return 0
+    valid = [row for row in records[-50:] if isinstance(row, dict)]
+    with _SYSTEM_ERROR_LOCK:
+        DASHBOARD_STATE["system_errors"] = valid
+        DASHBOARD_STATE["errors"] = [
+            f"[{row.get('timestamp', '-')}] {row.get('message', '')}"
+            for row in valid
+        ][-50:]
+    return len(valid)
+
+
 def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
+    level_name = str(level or "INFO").upper()
     if debounce_key:
         now = time.time()
         last = MEMORY.get("log_debounce", {}).get(debounce_key, 0)
@@ -6238,13 +6335,13 @@ def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
             return
         MEMORY.setdefault("log_debounce", {})[debounce_key] = now
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if level == "INFO":
+    if level_name == "INFO":
         colored = color_text(msg, CYAN)
-    elif level == "SUCCESS":
+    elif level_name == "SUCCESS":
         colored = color_text(msg, GREEN)
-    elif level == "ERROR":
+    elif level_name in {"ERROR", "CRITICAL"}:
         colored = color_text(msg, RED)
-    elif level == "WARN":
+    elif level_name == "WARN":
         colored = color_text(msg, YELLOW)
     else:
         colored = msg
@@ -6260,14 +6357,22 @@ def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
     runtime_logger = _get_runtime_logger()
     if runtime_logger:
         try:
-            runtime_logger.log(getattr(logging, str(level).upper(), logging.INFO), str(msg))
+            runtime_logger.log(getattr(logging, level_name, logging.INFO), str(msg))
         except Exception:
             pass
-    if level == "ERROR":
+    if level_name in {"ERROR", "CRITICAL"}:
         DASHBOARD_STATE["errors"].append(entry)
         if len(DASHBOARD_STATE["errors"]) > 50:
             DASHBOARD_STATE["errors"].pop(0)
-        tg_error(msg, level)
+        DASHBOARD_STATE.setdefault("system_errors", []).append(
+            _system_error_record(msg, level_name, ts)
+        )
+        if len(DASHBOARD_STATE["system_errors"]) > 50:
+            DASHBOARD_STATE["system_errors"].pop(0)
+        _persist_system_errors()
+        # Watchdog alerts have one canonical path to both Dashboard and Telegram.
+        error_type = "NAISO_HEALTH" if "[WATCHDOG]" in str(msg).upper() else level_name
+        tg_error(msg, error_type)
 
 def update_stats(pnl_pct):
     DASHBOARD_STATE["stats"]["trades"] += 1
@@ -10490,7 +10595,19 @@ function updateUI(d) {{
     document.getElementById("cont_pressure").innerHTML = d.continuation_pressure || 50;
     document.getElementById("thesis_failure").innerHTML = d.thesis_failure_score || 0;
     document.getElementById("logs").innerHTML = (d.logs || []).slice(-15).join("<br>");
-    document.getElementById("errors").innerHTML = (d.errors || []).slice(-5).join("<br>");
+    const systemErrors = (d.system_errors || []).slice(-8).reverse();
+    const systemErrorHtml = systemErrors.map(function(e) {{
+        const stack = e.stack_trace
+            ? '<details><summary>MainThread stack trace</summary><pre>' + uniEsc(e.stack_trace) + '</pre></details>'
+            : '';
+        return '<div class="system-error"><div><b>' + uniEsc(e.error_type || "SYSTEM_ERROR") +
+            '</b> · ' + uniEsc(e.severity || "ERROR") + ' · ' + uniEsc(e.component || "runtime") +
+            ' · ' + uniEsc(e.timestamp || "-") + '</div><div>' + uniEsc(e.message || "-") +
+            '</div><div><b>Cause:</b> ' + uniEsc(e.cause || "Not classified; inspect diagnostic details.") +
+            '</div>' + stack + '</div><hr>';
+    }}).join("");
+    document.getElementById("errors").innerHTML = systemErrorHtml ||
+        (d.errors || []).slice(-5).map(uniEsc).join("<br>");
     let top5Html = "";
     (d.top5 || []).forEach(o => {{
         top5Html += `<div><b>${{o.symbol}}</b> | Score: ${{o.score.toFixed(2)}} | ADX: ${{o.adx || 0}} | RSI: ${{o.rsi || 0}}</div><hr>`;
@@ -10884,6 +11001,7 @@ def data():
             "position": pos,
             "logs": DASHBOARD_STATE["logs"][-30:],
             "errors": DASHBOARD_STATE["errors"][-10:],
+            "system_errors": DASHBOARD_STATE.get("system_errors", [])[-20:],
             "top5": top5,
             "candidates": MEMORY.get("top_candidates", []),
             "scanned_count": len(MEMORY.get("top_candidates", [])),
@@ -12967,6 +13085,67 @@ def _resume_main_loop_after_verification(context=None):
                 context.get("restart_guard_reason") or guard_reason)
 
 
+def _restart_main_loop_process_after_stall(context=None):
+    """Request an OS-process restart only after the final exposure safety gate passes.
+
+    Python cannot terminate or replace a blocked MainThread. The watchdog runs on
+    its own worker, verifies the exchange state, persists the recovery contract,
+    then exits the process so the hosting supervisor can create a clean process.
+    If no external supervisor is detected, or exposure/protection is UNKNOWN,
+    remain alive in fail-closed recovery hold and keep diagnostics available.
+    """
+    context = context if isinstance(context, dict) else {}
+    owner = _main_loop_owner()
+    owner_alive = bool(_main_loop_owner_alive())
+    context["process_restart_required"] = True
+    context["process_restart_owner"] = str(owner.get("thread_name") or "UNKNOWN")
+    supervisor_available = bool(
+        os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
+        or os.getenv("RAILWAY_ENVIRONMENT", "").strip()
+        or os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
+           in {"1", "true", "yes", "on"}
+    )
+    if not supervisor_available:
+        context["engine_resumed"] = False
+        context["process_restart_blocked_reason"] = "EXTERNAL_PROCESS_SUPERVISOR_NOT_DETECTED"
+        log_execution(
+            "[WATCHDOG] main_loop is stalled on a live foreground thread; in-process thread restart is impossible. "
+            "No external process supervisor detected; preserving fail-closed state and diagnostics.",
+            "CRITICAL", debounce_key="main_loop_process_restart_no_supervisor", debounce_sec=120,
+        )
+        return True
+    if not owner_alive or owner.get("thread_name") != "MainThread":
+        context["engine_resumed"] = False
+        context["process_restart_blocked_reason"] = "FOREGROUND_OWNER_IDENTITY_NOT_CONFIRMED"
+        log_execution(
+            f"[WATCHDOG] process restart deferred: foreground owner identity is not verified ({owner}).",
+            "CRITICAL", debounce_key="main_loop_process_restart_owner_unknown", debounce_sec=120,
+        )
+        return True
+    if not _recovery_exit_gate("MAIN_LOOP_WATCHDOG_STALL"):
+        context["engine_resumed"] = False
+        context["process_restart_blocked_reason"] = "RECOVERY_EXIT_GATE_REFUSED_UNVERIFIED_EXPOSURE"
+        log_execution(
+            "[WATCHDOG] process restart blocked: exchange exposure/native protection could not be verified. "
+            "Recovery Hold remains active; no process exit was attempted.",
+            "CRITICAL", debounce_key="main_loop_process_restart_safety_hold", debounce_sec=60,
+        )
+        return True
+    log_execution(
+        "[WATCHDOG] MainThread stall confirmed; exchange state and recovery contract verified. "
+        "Exiting process for external supervisor restart.",
+        "CRITICAL", debounce_key="main_loop_verified_process_restart", debounce_sec=30,
+    )
+    context["engine_resumed"] = True
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(EXIT_RECOVERY_EXHAUSTED)
+    return True
+
+
 def _resume_exchange_reconciliation_after_verification(_context=None):
     """Restart only the reconciliation monitor, never Scanner or trade startup."""
     supervisor = globals().get("_reconciliation_supervisor")
@@ -13011,7 +13190,7 @@ def start_naiso_services():
     watchdog.register("main_loop", interval_sec=max(5.0, safe_float(BASE_SLEEP, 5.0)),
                       grace_sec=60.0, critical=True, restartable=True,
                       recovery_verifier=_verify_main_loop_recovery,
-                      restart_fn=_resume_main_loop_after_verification,
+                      restart_fn=_restart_main_loop_process_after_stall,
                       lifecycle="BLOCKED", resume_requires_liveness=True)
     # Startup exchange recovery runs before the first loop iteration. Classify it
     # as a bounded startup phase instead of letting the watchdog call it a stall.
@@ -13165,6 +13344,7 @@ try:
     from roro_trade_journal import TradeJournal
     INSTITUTIONAL_RESOURCE_MANAGER = ResourceManager(max_cache_items=5000, max_history=2000)
     INSTITUTIONAL_TRADE_JOURNAL = TradeJournal(os.getenv("TRADE_JOURNAL_PATH", "data/ggp_trade_journal.sqlite3"))
+    _restore_system_errors()
 except Exception as _integration_init_error:
     INSTITUTIONAL_RESOURCE_MANAGER = None
     INSTITUTIONAL_TRADE_JOURNAL = None
@@ -13438,12 +13618,9 @@ try:
     from naiso_maintenance import MaintenanceManager
 
     def _naiso_alert(message, level="ERROR"):
+        # log_execution is the single incident fan-out: Dashboard + runtime log + Telegram.
+        # Do not send a second Telegram-only copy from the watchdog callback.
         log_execution(str(message), str(level))
-        if str(level).upper() in {"ERROR", "CRITICAL"}:
-            try:
-                tg_error(str(message)[:400], "NAISO_HEALTH")
-            except Exception:
-                pass
 
     def _naiso_safety_gate():
         if STATE.get("open") or TRADE_STATE.get("in_position"):
