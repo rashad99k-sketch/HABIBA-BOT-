@@ -413,6 +413,6 @@ def test_entry_producing_scanner_tasks_share_one_single_flight_lock(monkeypatch)
 
 def test_manual_entry_does_not_reuse_a_scanner_global_context():
     source = inspect.getsource(ggpbot.manual_trade)
-    assert '_ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)' in source
+    assert 'entry_lock.acquire(blocking=False)' in source
     assert 'globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = None' in source
     assert 'previous_entry_context' in source
