@@ -938,3 +938,44 @@ def test_confirmed_cross_lifecycle_fetches_are_bounded_and_rotate(monkeypatch):
     ]
     assert len(progress) == 12
     assert ggpbot.MEMORY["_cross_event_lifecycle_cursor"] == 1
+
+
+def test_watchlist_worker_completion_and_entry_readiness_publish_atomically(monkeypatch):
+    class ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            self.target()
+
+    state = {
+        "lock": threading.Lock(), "in_progress": False, "last_attempt": 0.0,
+        "last_attempt_monotonic": 0.0, "started_monotonic": 0.0,
+        "last_progress_monotonic": 0.0, "last_completed_monotonic": 0.0,
+        "phase": "IDLE", "current_symbol": "", "timed_out": False,
+        "restart_requested": False, "last_error": "", "worker_name": "",
+    }
+    monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
+    monkeypatch.setattr(ggpbot, "_last_unified_watchlist_refresh", 0.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_REFRESH_SECONDS", 20.0)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_BATCH_SIZE", 4)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_WATCHLIST_MAX_SYMBOLS", 30)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_RESOURCE_MANAGER", None)
+    monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
+    monkeypatch.setattr(ggpbot, "threading", SimpleNamespace(
+        Lock=threading.Lock, Thread=ImmediateThread, current_thread=threading.current_thread,
+        get_ident=threading.get_ident,
+    ))
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda **_kwargs: None)
+    monkeypatch.setattr(ggpbot, "update_unified_watchlist", lambda *_a, **_k: {})
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
+    monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+
+    ggpbot.refresh_unified_institutional_watchlist()
+
+    assert state["in_progress"] is False
+    assert state["phase"] == "IDLE"
+    assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is True
