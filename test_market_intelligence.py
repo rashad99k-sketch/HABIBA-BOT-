@@ -1074,8 +1074,17 @@ def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
 
 
 def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
+    import time as real_time
+    from types import SimpleNamespace
+
     import ggpbot as bot
 
+    # ggpbot.time normally references Python's process-global time module.
+    # Replacing its attributes here would also alter clocks/sleeps used by
+    # background workers started by earlier tests. Inject a module-local clock
+    # facade instead, so this deterministic pacing test cannot affect threads.
+    real_monotonic = real_time.monotonic
+    real_sleep = real_time.sleep
     clock = [100.0]
     waits = []
 
@@ -1092,8 +1101,13 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
     def fetch_ticker():
         return None
 
-    monkeypatch.setattr(bot.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(bot.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        bot,
+        "time",
+        SimpleNamespace(monotonic=fake_monotonic, sleep=fake_sleep),
+    )
+    assert real_time.monotonic is real_monotonic
+    assert real_time.sleep is real_sleep
     monkeypatch.setattr(bot, "_last_api_call", 100.0)
     monkeypatch.setattr(bot, "BINGX_KLINE_MIN_INTERVAL", 1.05)
     monkeypatch.setitem(bot._API_METHOD_MIN_INTERVALS, "fetch_ohlcv", 1.05)
