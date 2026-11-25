@@ -12770,9 +12770,12 @@ def main_loop_sniper():
                 continue
 
             if now - last_flow_update > 60:
-                update_institutional_flow_scanner()
+                if not (STATE.get("open") or TRADE_STATE.get("in_position")):
+                    dispatch_scanner_task(
+                        "institutional_flow_context", update_institutional_flow_scanner
+                    )
                 last_flow_update = now
-                _main_loop_progress("institutional_flow_update_complete")
+                _main_loop_progress("institutional_flow_update_dispatched")
 
             if not (TRADE_STATE["in_position"] or STATE["open"]):
                 sync_position_state()
