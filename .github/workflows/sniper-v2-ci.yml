@@ -9,11 +9,13 @@ on:
     branches:
       - main
 
-# Keep one authoritative CI run per PR/branch. Rapid repair commits must not
-# launch many competing full-regression suites and starve the newest revision.
+# Serialize CI per PR/branch without cancelling a running regression suite.
+# GitHub keeps at most one pending run per concurrency group; when newer commits
+# arrive, the newest pending run replaces the older pending run, while the
+# currently executing full regression is allowed to finish.
 concurrency:
   group: sniper-v2-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
