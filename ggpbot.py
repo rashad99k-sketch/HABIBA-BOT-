@@ -634,7 +634,8 @@ _API_METHOD_MIN_INTERVALS = {
     "set_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "add_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
     "reduce_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
-    # BingX cancelAllAfter is documented at 1/s per UID; retain local 1/s cap.\n    "cancel_all_orders_after": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    # BingX cancelAllAfter is documented at 1/s per UID; retain local 1/s cap.
+    "cancel_all_orders_after": BINGX_TRADE_WRITE_MIN_INTERVAL,
 }
 _API_RATE_LOCK = threading.Lock()
 # Never let API scheduler contention pin MainThread indefinitely. A timeout is
