@@ -28,6 +28,7 @@ from html import escape as html_escape
 import ccxt
 import pandas as pd
 import numpy as np
+from roro_watchlist_snapshot_cache import WATCHLIST_SNAPSHOT_CACHE
 from flask import Flask, jsonify, request
 import requests
 
@@ -13897,13 +13898,37 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
     try:
         now_ms = int(time.time() * 1000)
         timeframe_seconds = _roro_timeframe_seconds(INTERVAL)
-        closed = roro_validate_closed_frame(frame, now_ms=now_ms, timeframe_s=timeframe_seconds)
-        if len(closed) < 55:
+        symbol_for_snapshot = str(analysis.get("symbol") or analysis.get("exchange_symbol") or "")
+        raw_last_ts = int(frame.timestamp.iloc[-1]) if frame is not None and len(frame) and "timestamp" in frame else 0
+        # The in-progress candle may change, but the closed-candle snapshot remains
+        # stable until the next interval. Cache key also includes the raw frame shape.
+        snapshot_key = (roro_canonical_symbol(symbol_for_snapshot), str(INTERVAL),
+                        raw_last_ts, len(frame) if frame is not None else 0)
+        def _build_closed_snapshot():
+            return roro_validate_closed_frame(frame, now_ms=now_ms, timeframe_s=timeframe_seconds)
+        closed = WATCHLIST_SNAPSHOT_CACHE.get_or_compute(
+            snapshot_key, _build_closed_snapshot, ttl_seconds=max(5.0, timeframe_seconds * 2.0)
+        )
+        if closed is None or len(closed) < 55:
             return {"gpp_engine_diagnostics": {"status": "PARTIAL", "reason": "insufficient_closed_candles"}}
-        smart = SmartMoneyEngine.analyze_smart_money(closed)
-        momentum = MomentumFlowEngine.analyze_momentum_flow(closed)  # GGP engine uses direction-neutral signature
-        adx_state = ADXDIIntelligence.get_adx_state(closed)
-        di_state = ADXDIIntelligence.get_di_state(closed)
+        candle_ts = int(closed.timestamp.iloc[-1])
+        evidence_key = (snapshot_key, candle_ts)
+        def _build_direction_neutral_evidence():
+            return {
+                "smart_money": SmartMoneyEngine.analyze_smart_money(closed),
+                "momentum": MomentumFlowEngine.analyze_momentum_flow(closed),
+                "adx_state": ADXDIIntelligence.get_adx_state(closed),
+                "di_state": ADXDIIntelligence.get_di_state(closed),
+                "atr_value": float(compute_atr(closed).iloc[-1]),
+            }
+        evidence = WATCHLIST_SNAPSHOT_CACHE.get_or_compute(
+            ("evidence", evidence_key), _build_direction_neutral_evidence,
+            ttl_seconds=max(5.0, timeframe_seconds * 2.0)
+        )
+        smart = evidence["smart_money"]
+        momentum = evidence["momentum"]
+        adx_state = evidence["adx_state"]
+        di_state = evidence["di_state"]
         result.update({
             "smart_money": smart,
             "momentum": momentum,
@@ -13974,7 +13999,6 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                                                 "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
 
         symbol_key = str(analysis.get("symbol") or roro_canonical_symbol(analysis.get("exchange_symbol")))
-        candle_ts = int(closed.timestamp.iloc[-1])
         engine_last = MEMORY.setdefault("_watchlist_engine_last_candle", {})
         advance_state = engine_last.get(symbol_key) != candle_ts
         if symbol_key not in _WATCHLIST_TREND_ENGINES:
@@ -13984,8 +14008,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
         trend = _WATCHLIST_TREND_ENGINES[symbol_key]
         if advance_state:
             trend.update_trend_state(closed, analysis.get("order_block"))
-        atr_series = compute_atr(closed)
-        atr_value = float(atr_series.iloc[-1]) if len(atr_series) else float("nan")
+        atr_value = float(evidence.get("atr_value", float("nan")))
         price_value = float(closed.close.iloc[-1])
         trend_ok, trend_reason = trend.should_enter(side, closed, analysis.get("order_block"), atr_value, price_value)
         result["institutional_trend"] = {
