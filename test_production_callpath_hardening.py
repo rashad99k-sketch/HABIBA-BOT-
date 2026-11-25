@@ -185,3 +185,93 @@ def test_entry_revalidation_reports_real_candidate_progress():
     assert 'candidate_ohlcv_complete' in source
     assert 'candidate_analysis_complete' in source
     assert 'entry_execution_complete' in source
+
+
+def test_partial_entry_fill_keeps_execution_lock_and_requires_reconciliation(monkeypatch):
+    from types import SimpleNamespace
+    from bingx_execution import ExecutionState
+
+    class Exchange:
+        def market(self, _symbol):
+            return {"contractSize": 1.0}
+        def amount_to_precision(self, _symbol, amount):
+            return str(amount)
+        def fetch_balance(self):
+            return {"free": {"USDT": 1000.0}}
+        def fetch_ticker(self, _symbol):
+            return {"last": 100.0}
+
+    class PartialFillService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def submit_market_entry(self, **_kwargs):
+            return SimpleNamespace(
+                state=ExecutionState.PARTIAL_FILL,
+                trade_id="partial-trade",
+                client_order_id="partial-client",
+                exchange_order_id="partial-order",
+                requested_qty=1.0,
+                filled_qty=0.4,
+                remaining_qty=0.6,
+                average_fill_price=100.0,
+                raw_position={"contracts": 0.4},
+                reason="partially filled",
+            )
+
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "ex", Exchange())
+    monkeypatch.setattr(ggpbot, "TradeExecutionService", PartialFillService)
+    monkeypatch.setattr(ggpbot, "safe_api_call", lambda func, *a, **k: func(*a, **k))
+    monkeypatch.setattr(ggpbot, "normalize_symbol", lambda value: value)
+    monkeypatch.setattr(ggpbot, "dynamic_spread_tolerance", lambda _symbol: 10.0)
+    monkeypatch.setattr(ggpbot, "get_spread_bps", lambda _symbol: 1.0)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "execution_unresolved": False, "recovery_hold": False,
+        "close_reconciliation_required": False,
+    })
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"position_status": "FLAT"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", False)
+
+    result = ggpbot.open_position(
+        "BUY", 1.0, "BTC/USDT:USDT", stop_loss=90.0,
+        trade_id="partial-trade", management_state={"sl": 90.0},
+    )
+
+    assert result is None
+    assert ggpbot.STATE["execution_unresolved"] is True
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.STATE["entry_filled_qty"] == pytest.approx(0.4)
+    assert ggpbot.STATE["entry_remaining_qty"] == pytest.approx(0.6)
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.MEMORY["position_status"] == "UNKNOWN"
+    assert ggpbot.MEMORY["recovery_status"] == "ENTRY_EXECUTION_RECONCILIATION_REQUIRED"
+    assert ggpbot._ACTIVE_TRADE is True
+
+
+def test_open_position_boundary_refuses_unknown_account_before_api_calls(monkeypatch):
+    calls = []
+
+    class Exchange:
+        def market(self, _symbol):
+            calls.append("market")
+            return {"contractSize": 1.0}
+
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "ex", Exchange())
+    monkeypatch.setattr(ggpbot, "normalize_symbol", lambda value: value)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "execution_unresolved": False, "recovery_hold": False,
+        "close_reconciliation_required": False,
+    })
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"position_status": "UNKNOWN"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", False)
+
+    assert ggpbot.open_position("BUY", 1.0, "BTC/USDT:USDT", stop_loss=90.0) is None
+    assert calls == []
+    assert ggpbot._ACTIVE_TRADE is False
