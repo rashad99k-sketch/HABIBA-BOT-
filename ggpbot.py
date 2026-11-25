@@ -78,6 +78,13 @@ from ggp_position_sizing import (
 from bingx_execution import (TradeExecutionService, BingXPositionModeAdapter,
                               ExecutionState, PositionMode, build_position_order_params,
                               leverage_params)
+try:
+    from naiso_api_resilience import ORDER_WRITE_METHODS as _ORDER_WRITE_METHODS
+except Exception:  # pragma: no cover - fallback keeps the governor self-contained
+    _ORDER_WRITE_METHODS = frozenset({
+        "create_order", "create_market_order", "create_limit_order",
+        "cancel_order", "cancel_all_orders", "swapV1PrivatePostTradeCancelReplace",
+    })
 from ggp_recovery import resolve_position_identity, build_restored_management_state
 from ggp_market_data import (
     REQUIRED_CLOSED_CANDLES,
@@ -649,32 +656,90 @@ _API_RATE_LOCK_OWNER = {
 }
 _LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
+# Overall pacing budget. The old loop only bounded each lock acquisition, so a
+# tiny remaining wait or a wedged clock could spin forever. Both a logical
+# (possibly injected) deadline and a captured real-time deadline are enforced.
+API_RATE_WAIT_TIMEOUT_SEC = _env_float_range("API_RATE_WAIT_TIMEOUT_SEC", 5.0, 0.05, 30.0)
+API_RATE_MIN_SLEEP_SEC = _env_float_range("API_RATE_MIN_SLEEP_SEC", 0.001, 0.000001, 0.05)
+API_RATE_MAX_WAIT_ITERATIONS = _env_int_range("API_RATE_MAX_WAIT_ITERATIONS", 4096, 8, 100000)
+_HARD_MONOTONIC = time.monotonic
+
 
 class ApiRateLockTimeout(RuntimeError):
-    """Raised when the shared API scheduler lock cannot be acquired promptly."""
+    """Raised when the shared API scheduler cannot reserve a request start."""
 
 
 def rate_limit(func=None):
-    """Pace API starts without sleeping while holding the shared scheduler lock.
+    """Reserve the next request start with bounded, progress-checked pacing.
 
-    Every lock acquisition is bounded. Waiting for the endpoint interval occurs
-    outside the lock; contenders re-check the actual last-start timestamp before
-    reserving the next request start. If the lock itself is wedged, fail closed
-    rather than allowing the foreground loop to hang.
+    The lock is held only while reading/reserving ``_last_api_call``; pacing
+    sleeps always happen after release. Every acquisition and the complete wait
+    are bounded by both the logical clock and a real monotonic clock captured
+    before any test can replace ``ggpbot.time``. A clock that makes no progress
+    fails closed instead of spinning in a zero-progress sleep loop.
     """
     global _last_api_call
     method_name = getattr(func, "__name__", "") if func is not None else ""
-    min_interval = max(MIN_API_INTERVAL, _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL))
 
-    while True:
-        acquired = _API_RATE_LOCK.acquire(timeout=API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC)
+    def _finite(value):
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    configured_interval = _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL)
+    if not (_finite(MIN_API_INTERVAL) and _finite(configured_interval)):
+        raise ApiRateLockTimeout(
+            f"API_RATE rejected non-finite interval for {method_name or 'unknown'}; "
+            f"base={MIN_API_INTERVAL!r} endpoint={configured_interval!r}"
+        )
+    min_interval = max(MIN_API_INTERVAL, configured_interval)
+
+    # Non-finite clock values are never a reason to sleep or reserve a request
+    # start. Fail closed before acquiring the shared lock so no exchange call
+    # can be dispatched from an undefined pacing state.
+    real_now = _HARD_MONOTONIC()
+    logical_now = time.monotonic()
+    if not (_finite(real_now) and _finite(logical_now)
+            and _finite(min_interval) and _finite(_last_api_call)):
+        raise ApiRateLockTimeout(
+            f"API_RATE rejected non-finite pacing state for {method_name or 'unknown'}; "
+            f"real={real_now!r} logical={logical_now!r} interval={min_interval!r} "
+            f"last_call={_last_api_call!r}"
+        )
+
+    # Two independent budgets: the logical clock may be replaced by tests, but
+    # real elapsed time is captured from the original monotonic function so a
+    # frozen/injected clock can never remove the hard termination guarantee.
+    real_deadline = real_now + API_RATE_WAIT_TIMEOUT_SEC
+    logical_deadline = logical_now + API_RATE_WAIT_TIMEOUT_SEC
+    # A reservation within one float ULP of its due time is already on time;
+    # this prevents sub-ULP residue from producing an endless one-nanosecond
+    # sleep loop.
+    interval_tolerance = max(1e-12, min_interval * 1e-9)
+
+    for _iteration in range(API_RATE_MAX_WAIT_ITERATIONS):
+        remaining_real = real_deadline - _HARD_MONOTONIC()
+        remaining_logical = logical_deadline - time.monotonic()
+        if remaining_real <= 0.0 or remaining_logical <= 0.0:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing deadline exceeded for {method_name or 'unknown'}; "
+                f"remaining_logical={remaining_logical:.6f}s "
+                f"remaining_real={remaining_real:.6f}s"
+            )
+
+        acquire_timeout = max(
+            0.0,
+            min(API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC, remaining_real, remaining_logical),
+        )
+        acquired = _API_RATE_LOCK.acquire(timeout=acquire_timeout)
         if not acquired:
             owner = dict(_API_RATE_LOCK_OWNER)
             owner_since = float(owner.get("since_monotonic") or 0.0)
             held_for = max(0.0, time.monotonic() - owner_since) if owner_since > 0 else 0.0
             raise ApiRateLockTimeout(
                 f"API_RATE_LOCK acquisition timed out after "
-                f"{API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC:.2f}s for {method_name or 'unknown'}; "
+                f"{acquire_timeout:.2f}s for {method_name or 'unknown'}; "
                 f"owner_thread={owner.get('thread_name') or 'unknown'} "
                 f"owner_id={owner.get('thread_id')} held_for={held_for:.2f}s "
                 f"owner_method={owner.get('method') or 'unknown'}"
@@ -690,21 +755,50 @@ def rate_limit(func=None):
         })
         try:
             now = time.monotonic()
-            elapsed = now - _last_api_call
-            if elapsed >= min_interval:
-                _last_api_call = now
+            if not _finite(now):
+                raise ApiRateLockTimeout(
+                    f"API_RATE rejected non-finite logical clock for {method_name or 'unknown'}"
+                )
+            due = float(_last_api_call) + min_interval
+            if not _finite(due):
+                raise ApiRateLockTimeout(
+                    f"API_RATE rejected non-finite reservation deadline for {method_name or 'unknown'}"
+                )
+            if now + interval_tolerance >= due:
+                # Reserve at the exact due time so repeated small sleeps cannot
+                # accumulate drift across a high-iteration stress run.
+                _last_api_call = max(now, due)
                 return
-            wait_seconds = min_interval - elapsed
+            remaining_real = real_deadline - _HARD_MONOTONIC()
+            remaining_logical = logical_deadline - now
+            wait_seconds = min(due - now, remaining_real, remaining_logical)
         finally:
             _API_RATE_LOCK_OWNER.update({
                 "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
             })
             _API_RATE_LOCK.release()
 
-        # Do not hold the global lock during pacing sleeps. Re-check under the
-        # lock afterwards because another worker may have started a request.
-        if wait_seconds > 0:
-            time.sleep(min(wait_seconds, 0.25))
+        if wait_seconds <= 0.0:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing budget exhausted before reservation for "
+                f"{method_name or 'unknown'}"
+            )
+
+        # Every sleep is strictly positive and at least one quantum. A coarse
+        # clock may not tick for a tiny sleep; that is safe because both the
+        # deadline and the iteration budget still bound the loop.
+        sleep_for = max(float(wait_seconds), API_RATE_MIN_SLEEP_SEC)
+        if sleep_for > remaining_real or sleep_for > remaining_logical:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing deadline would be exceeded by sleep for "
+                f"{method_name or 'unknown'}"
+            )
+        time.sleep(sleep_for)
+
+    raise ApiRateLockTimeout(
+        f"API_RATE pacing iteration budget ({API_RATE_MAX_WAIT_ITERATIONS}) "
+        f"exhausted for {method_name or 'unknown'}"
+    )
 
 CACHE_LOCK = threading.RLock()
 CACHE_MAX_ITEMS = _env_int_range("CACHE_MAX_ITEMS", 2500, 100, 10000)
@@ -826,14 +920,18 @@ def safe_api_call(func, *args, **kwargs):
     requested_attempts = kwargs.pop("_api_max_attempts", None)
     # Order creation is non-idempotent. Never automatically retry a timed-out
     # create_order call: BingX may have accepted the first request already.
-    method_name = getattr(func, "__name__", "exchange_call")
+    # functools.wraps wrappers must not hide an order write behind a lambda name.
+    unwrapped = func
+    for _ in range(8):
+        candidate = getattr(unwrapped, "__wrapped__", None)
+        if candidate is None:
+            break
+        unwrapped = candidate
+    method_name = getattr(unwrapped, "__name__", getattr(func, "__name__", "exchange_call"))
     # Cancellations and cancel-replace are order mutations too. A timeout may
     # have been applied by BingX, so retrying can duplicate or escalate an
     # uncertain order-state change; reconciliation must decide, not the retry loop.
-    is_order_write = method_name in {
-        "create_order", "create_market_order", "create_limit_order",
-        "cancel_order", "cancel_all_orders", "swapV1PrivatePostTradeCancelReplace",
-    }
+    is_order_write = method_name in _ORDER_WRITE_METHODS
     resilience = globals().get("API_RESILIENCE")
     if is_order_write and resilience is not None:
         try:
@@ -907,10 +1005,26 @@ def safe_api_call(func, *args, **kwargs):
             return result
         except CircuitOpenError:
             raise
+        except ApiRateLockTimeout as exc:
+            # Local scheduling is never an exchange failure. Even when the
+            # optional resilience module is disabled, fail closed without
+            # retrying, backing off, or sending a request.
+            if resilience is not None:
+                resilience.record_failure(method_name, exc)
+            raise
         except Exception as e:
             failure_kind = None
             if resilience is not None:
                 failure_kind = resilience.record_failure(method_name, e)
+            else:
+                # Absence of the optional circuit breaker must not turn a
+                # business/configuration failure into a retryable read.
+                fallback_classifier = globals().get("classify_api_error")
+                if callable(fallback_classifier):
+                    try:
+                        failure_kind = fallback_classifier(e, method=method_name)
+                    except Exception:
+                        failure_kind = None
             is_rate_limited = (("rate limit" in str(e).lower() or "100410" in str(e))
                                if failure_kind is None else failure_kind.kind == "RATE_LIMITED")
             if is_rate_limited:
@@ -2407,13 +2521,44 @@ class PositionSnapshot:
         }
 
 class EventBus:
+    """Lazy, owned worker: construction never starts a background thread."""
+
     def __init__(self):
         self._handlers = {}
         self._queue = queue.Queue(maxsize=2000)
-        self._running = True
+        self._stop = threading.Event()
         self._handlers_lock = threading.RLock()
-        self._worker = threading.Thread(target=self._process, name="ggp-event-bus", daemon=True)
-        self._worker.start()
+        self._lifecycle_lock = threading.RLock()
+        self._worker = None
+        self._worker_started = False
+
+    def start(self):
+        """Start exactly one worker; return False when one is already alive."""
+        with self._lifecycle_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return False
+            self._stop.clear()
+            self._worker = threading.Thread(target=self._process, name="ggp-event-bus", daemon=True)
+            self._worker_started = True
+            self._worker.start()
+            return True
+
+    def stop(self, timeout=5.0):
+        """Signal shutdown and join the owned worker with a bounded wait."""
+        with self._lifecycle_lock:
+            self._stop.set()
+            worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=max(0.1, float(timeout)))
+        with self._lifecycle_lock:
+            self._worker_started = bool(worker is not None and worker.is_alive())
+
+    def status(self):
+        worker = self._worker
+        return {
+            "thread_alive": bool(worker is not None and worker.is_alive()),
+            "started": bool(self._worker_started),
+        }
 
     def subscribe(self, event_type, handler):
         with self._handlers_lock:
@@ -2428,7 +2573,7 @@ class EventBus:
         return True
 
     def _process(self):
-        while self._running:
+        while not self._stop.is_set():
             try:
                 event_type, data = self._queue.get(timeout=0.1)
                 with self._handlers_lock:
@@ -5141,7 +5286,8 @@ class ExchangeReconciliationSupervisor:
         self.exchange_sync = exchange_sync
         self.interval_sec = max(5.0, float(interval_sec))
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="ggp-exchange-reconciliation", daemon=True)
+        self._lifecycle_lock = threading.RLock()
+        self._thread = None
         self._started = False
         self.last_result = "NOT_STARTED"
         self.last_success_ts = 0.0
@@ -5159,19 +5305,25 @@ class ExchangeReconciliationSupervisor:
 
     def start(self):
         """Start (or safely restart after a dead thread) exactly one supervisor."""
-        if self._thread is not None and self._thread.is_alive():
-            return False
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="ggp-exchange-reconciliation", daemon=True)
-        self._started = True
-        self.last_result = "STARTED"
-        self._thread.start()
-        return True
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="ggp-exchange-reconciliation", daemon=True)
+            self._started = True
+            self.last_result = "STARTED"
+            self._thread.start()
+            return True
 
     def stop(self, timeout=5.0):
-        self._stop.set()
-        if self._started and self._thread.is_alive():
-            self._thread.join(timeout=max(0.1, float(timeout)))
+        with self._lifecycle_lock:
+            self._stop.set()
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.1, float(timeout)))
+        with self._lifecycle_lock:
+            self._started = bool(thread is not None and thread.is_alive())
 
     def _run(self):
         while not self._stop.wait(self.interval_sec):
@@ -5215,8 +5367,58 @@ _event_bus = EventBus()
 _exchange_sync = ExchangeSyncService(_event_bus)
 _recovery_guard = RecoveryGuard(_event_bus, _exchange_sync)
 _live_manager = LiveTradeManager(_event_bus, _exchange_sync, _recovery_guard)
+# Workers are constructed here but started only by the application lifecycle.
+# Importing this module must never create a background thread.
 _reconciliation_supervisor = ExchangeReconciliationSupervisor(_exchange_sync, interval_sec=15.0)
-_reconciliation_supervisor.start()
+
+# Owned long-lived periodic workers. A named handle is the only authority for
+# starting/restarting a thread, so a timed-out worker that is still alive can
+# never be replaced by a second instance.
+_PERIODIC_WORKER_STOPS = {
+    "institutional_updater": threading.Event(),
+    "keep_alive": threading.Event(),
+}
+_PERIODIC_WORKER_THREADS = {}
+_PERIODIC_WORKER_LOCK = threading.RLock()
+_RUNTIME_WORKERS_STARTED = False
+_RUNTIME_WORKERS_LOCK = threading.RLock()
+_RUNTIME_SHUTTING_DOWN = False
+
+
+def _start_named_worker(name, target):
+    if _RUNTIME_SHUTTING_DOWN:
+        return False
+    with _PERIODIC_WORKER_LOCK:
+        thread = _PERIODIC_WORKER_THREADS.get(name)
+        if thread is not None and thread.is_alive():
+            return False
+        stop_event = _PERIODIC_WORKER_STOPS.setdefault(name, threading.Event())
+        stop_event.clear()
+        thread = threading.Thread(target=target, daemon=True, name=f"ggp_{name}")
+        _PERIODIC_WORKER_THREADS[name] = thread
+        thread.start()
+        return True
+
+
+def _stop_named_worker(name, timeout=5.0):
+    with _PERIODIC_WORKER_LOCK:
+        stop_event = _PERIODIC_WORKER_STOPS.get(name)
+        if stop_event is not None:
+            stop_event.set()
+        thread = _PERIODIC_WORKER_THREADS.get(name)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(0.1, float(timeout)))
+    return not bool(thread is not None and thread.is_alive())
+
+
+def named_worker_status():
+    """Return lifecycle state used by shutdown diagnostics and health checks."""
+    with _PERIODIC_WORKER_LOCK:
+        return {
+            name: {"thread_alive": bool(thread is not None and thread.is_alive())}
+            for name, thread in _PERIODIC_WORKER_THREADS.items()
+        }
+
 
 def sync_position_state(symbol=None):
     if PAPER_MODE:
@@ -11882,11 +12084,13 @@ def health():
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
 def keep_alive():
-    while True:
+    stop_event = _PERIODIC_WORKER_STOPS.setdefault("keep_alive", threading.Event())
+    while not stop_event.is_set():
         watchdog = globals().get("NAISO_WATCHDOG")
         if watchdog is not None:
             watchdog.beat("keep_alive")
-        time.sleep(KEEP_ALIVE_INTERVAL)
+        if stop_event.wait(max(0.1, float(KEEP_ALIVE_INTERVAL))):
+            break
         ports = DASHBOARD_ACTIVE_PORTS or [int(os.getenv("PORT", "8000"))]
         for port in ports:
             try:
@@ -12668,14 +12872,16 @@ def update_institutional_flow_scanner():
 
 # ========== LIVE INSTITUTIONAL UPDATER THREAD (PAUSED DURING TRADE) ==========
 def live_institutional_updater():
-    while True:
+    stop_event = _PERIODIC_WORKER_STOPS.setdefault("institutional_updater", threading.Event())
+    while not stop_event.is_set():
         try:
             watchdog = globals().get("NAISO_WATCHDOG")
             if watchdog is not None:
                 watchdog.beat("institutional_updater", paused=bool(STATE.get("open")))
             # Do not run during open trade to avoid duplicate API calls and thread contention
             if STATE.get("open"):
-                time.sleep(5)
+                if stop_event.wait(5):
+                    break
                 continue
             symbol = DEFAULT_SYMBOL
             df = get_ohlcv_safe(symbol, 100)
@@ -12703,7 +12909,8 @@ def live_institutional_updater():
                 update_institutional_flow_scanner()
         except Exception as e:
             log_execution(f"[LIVE_UPDATER] Error: {e}", "ERROR")
-        time.sleep(5)
+        if stop_event.wait(5):
+            break
 
 # ========== MAIN LOOP ==========
 MEMORY = {
@@ -12881,9 +13088,9 @@ def main_loop_sniper():
     else:
         log_execution("[SCANNER_1] Initial discovery dispatch refused; next due unchanged", "WARN")
     try:
-        updater_thread = threading.Thread(target=live_institutional_updater, daemon=True,
-                                          name="live_institutional_updater")
-        updater_thread.start()
+        # Idempotent: the application lifecycle normally owns this worker; this
+        # call only covers a direct main-loop invocation in development/tests.
+        _start_named_worker("institutional_updater", live_institutional_updater)
     except Exception as exc:
         log_execution(f"[THREAD_START] live_institutional_updater failed: {type(exc).__name__}: {exc}",
                       "ERROR")
@@ -13657,18 +13864,13 @@ def _non_trading_engine_verifier():
 
 
 def _resume_institutional_updater_after_verification(_context=None):
-    if _named_thread_alive("live_institutional_updater"):
-        return False
-    threading.Thread(target=live_institutional_updater, daemon=True,
-                     name="live_institutional_updater").start()
-    return True
+    # Owned single-flight restart: a timed-out worker that is still alive is
+    # never replaced. Only a verified dead worker may be restarted.
+    return _start_named_worker("institutional_updater", live_institutional_updater)
 
 
 def _resume_keep_alive_after_verification(_context=None):
-    if _named_thread_alive("keep_alive"):
-        return False
-    threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
-    return True
+    return _start_named_worker("keep_alive", keep_alive)
 
 
 def _verify_main_loop_recovery():
@@ -13678,11 +13880,49 @@ def _verify_main_loop_recovery():
         verification_source="STATE.current_symbol|TRADE_STATE.symbol")
 
 
+_NAISO_SERVICES_STARTED = False
+_NAISO_SERVICES_LOCK = threading.RLock()
+
+
+def start_runtime_workers(*, restart=False):
+    """Idempotently start every owned background worker from the app lifecycle.
+
+    Imports stay side-effect free. A shutdown in progress is never reversed by
+    a late startup call; a fresh explicit lifecycle cycle must pass
+    ``restart=True`` after all owned workers have been joined.
+    """
+    global _RUNTIME_WORKERS_STARTED, _RUNTIME_SHUTTING_DOWN
+    with _RUNTIME_WORKERS_LOCK:
+        if _RUNTIME_WORKERS_STARTED:
+            return False
+        if _RUNTIME_SHUTTING_DOWN and not restart:
+            return False
+        if restart:
+            _RUNTIME_SHUTTING_DOWN = False
+        _RUNTIME_WORKERS_STARTED = True
+    try:
+        _event_bus.start()
+        _reconciliation_supervisor.start()
+        _start_named_worker("institutional_updater", live_institutional_updater)
+        _start_named_worker("keep_alive", keep_alive)
+        TELEGRAM_NOTIFIER.reopen()
+    except Exception:
+        with _RUNTIME_WORKERS_LOCK:
+            _RUNTIME_WORKERS_STARTED = False
+        raise
+    return True
+
+
 def start_naiso_services():
     """Register engines with the watchdog and verified recovery callbacks."""
+    global _NAISO_SERVICES_STARTED
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return False
+    with _NAISO_SERVICES_LOCK:
+        if _NAISO_SERVICES_STARTED:
+            return True
+        _NAISO_SERVICES_STARTED = True
     # The supervisor runs on this foreground thread; bind liveness ownership
     # before any recovery callback can inspect it.
     _main_loop_register_owner()
@@ -14055,27 +14295,79 @@ def _install_shutdown_handlers():
             pass
 
 
+def _close_dashboard_server(server):
+    """Close a Waitress server using its supported API exactly once."""
+    close = getattr(server, "close", None)
+    if callable(close):
+        close()
+        return
+    # Only a genuinely legacy server without close() gets the Werkzeug path.
+    for method_name in ("shutdown", "server_close"):
+        method = getattr(server, method_name, None)
+        if callable(method):
+            method()
+
+
+def _stop_dashboard_server(server, thread):
+    try:
+        _close_dashboard_server(server)
+    except Exception as exc:
+        log_execution(f"[SHUTDOWN] dashboard close failed: {type(exc).__name__}: {exc}", "WARN")
+    try:
+        thread.join(timeout=2.0)
+        is_alive = getattr(thread, "is_alive", None)
+        if callable(is_alive) and is_alive():
+            log_execution("[SHUTDOWN] dashboard thread did not exit within 2.0s", "WARN")
+    except Exception as exc:
+        log_execution(f"[SHUTDOWN] dashboard join failed: {type(exc).__name__}: {exc}", "WARN")
+
+
 def _stop_runtime_services():
+    """Stop and join every owned worker, then close Waitress and the watchdog."""
+    global _RUNTIME_SHUTTING_DOWN, _RUNTIME_WORKERS_STARTED, _NAISO_SERVICES_STARTED
+    with _RUNTIME_WORKERS_LOCK:
+        _RUNTIME_SHUTTING_DOWN = True
+
+    for name in ("institutional_updater", "keep_alive"):
+        _stop_named_worker(name)
+
+    supervisor = globals().get("_reconciliation_supervisor")
+    if supervisor is not None and hasattr(supervisor, "stop"):
+        try:
+            supervisor.stop()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] reconciliation stop failed: {type(exc).__name__}: {exc}", "WARN")
+
+    notifier = globals().get("TELEGRAM_NOTIFIER")
+    if notifier is not None and hasattr(notifier, "close"):
+        try:
+            notifier.close()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] Telegram stop failed: {type(exc).__name__}: {exc}", "WARN")
+
+    event_bus = globals().get("_event_bus")
+    if event_bus is not None and hasattr(event_bus, "stop"):
+        try:
+            event_bus.stop()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] event bus stop failed: {type(exc).__name__}: {exc}", "WARN")
+
+    for server, thread in list(globals().get("DASHBOARD_SERVERS") or []):
+        _stop_dashboard_server(server, thread)
+    with _RUNTIME_WORKERS_LOCK:
+        globals()["DASHBOARD_SERVERS"] = []
+        globals()["DASHBOARD_ACTIVE_PORTS"] = []
+
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is not None and hasattr(watchdog, "stop"):
         try:
             watchdog.stop()
         except Exception as exc:
             log_execution(f"[SHUTDOWN] watchdog stop failed: {type(exc).__name__}: {exc}", "WARN")
-    for server, thread in list(globals().get("DASHBOARD_SERVERS") or []):
-        try:
-            # Waitress exposes close(); Werkzeug's legacy server exposes
-            # shutdown()/server_close(). Support both during controlled rollout.
-            for method_name in ("shutdown", "close", "server_close"):
-                method = getattr(server, method_name, None)
-                if callable(method):
-                    method()
-        except Exception as exc:
-            log_execution(f"[SHUTDOWN] dashboard stop failed: {type(exc).__name__}: {exc}", "WARN")
-        try:
-            thread.join(timeout=2.0)
-        except Exception:
-            pass
+
+    with _RUNTIME_WORKERS_LOCK:
+        _RUNTIME_WORKERS_STARTED = False
+        _NAISO_SERVICES_STARTED = False
 
 
 def _release_runtime_lock(handle):
@@ -14615,6 +14907,16 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
         with state["lock"]:
             generation = int(state.get("generation", 0))
     if not _watchlist_worker_generation_active(generation):
+        # A worker that was already declared stalled/timed out may only mark the
+        # entry gate as failed. It must never publish staged rows or clear the
+        # process-level recovery fence, even if it completes late.
+        with state["lock"]:
+            if (state.get("timed_out")
+                    and int(state.get("generation", 0)) == int(generation)):
+                MEMORY["_unified_watchlist_refresh_ok"] = False
+                state["in_progress"] = False
+                state["worker_name"] = ""
+                state["last_completed_monotonic"] = time.monotonic()
         return
     success = False
     baseline_watchlist = copy.deepcopy(MEMORY.get("watchlist", {}))
@@ -15473,6 +15775,7 @@ def run_global_discovery_scanner():
         "lifecycle_marked": [],
         "lifecycle_status": CROSS_WATCHLIST_LIFECYCLE,
         "reason": "NO_NEW_CROSS_EVENT",
+        "watchlist_refresh_observed": False,
     }
     cross_delivery["event_ids"] = [
         str(row.get("cross_event_id") or "")
@@ -15490,11 +15793,17 @@ def run_global_discovery_scanner():
             cross_delivery["same_cycle"] = False
             cross_delivery["delivered"] = False
             cross_delivery["delivered_at"] = None
+            cross_delivery["watchlist_refresh_observed"] = True
             MEMORY["_cross_watchlist_delivery"] = dict(cross_delivery)
             refresh_unified_institutional_watchlist(force=True)
             completed_delivery = MEMORY.get("_cross_watchlist_delivery")
             if isinstance(completed_delivery, dict):
                 cross_delivery = dict(completed_delivery)
+                if bool(cross_delivery.get("delivered")):
+                    # The worker finished inside this scanner call. A later
+                    # asynchronous completion must never be relabelled as
+                    # same-cycle just because a scanner reads the acknowledgement.
+                    cross_delivery["same_cycle"] = True
             cross_delivery["refresh_seconds"] = round(time.time() - cross_detected_at, 3)
     cross_delivery["age_seconds"] = round(time.time() - cross_detected_at, 3)
     # The async Watchlist worker may finish between our read above and this
@@ -15503,12 +15812,27 @@ def run_global_discovery_scanner():
     if isinstance(existing_delivery, dict):
         existing_ids = set(existing_delivery.get("event_ids") or [])
         current_ids = set(cross_delivery.get("event_ids") or [])
-        if existing_ids == current_ids and (
-            bool(existing_delivery.get("delivered"))
-            or len(existing_delivery.get("delivered_ids") or []) >
-               len(cross_delivery.get("delivered_ids") or [])
+        if (
+            bool(cross_delivery.get("watchlist_refresh_observed"))
+            and existing_ids == current_ids
+            and (
+                bool(existing_delivery.get("delivered"))
+                or len(existing_delivery.get("delivered_ids") or []) >
+                   len(cross_delivery.get("delivered_ids") or [])
+            )
         ):
-            cross_delivery = dict(existing_delivery)
+            # Keep the worker's newer delivery acknowledgement, but never let
+            # it rewrite this scanner cycle's detection metadata. A duplicate
+            # cycle must still report zero new events and its own reason.
+            preserved = dict(existing_delivery)
+            for key in ("new_events", "detected_at", "age_seconds", "event_ids"):
+                preserved[key] = cross_delivery.get(key)
+            if not int(cross_delivery.get("new_events") or 0):
+                preserved["reason"] = cross_delivery.get("reason", "NO_NEW_CROSS_EVENT")
+                preserved["same_cycle"] = False
+            elif bool(cross_delivery.get("same_cycle")):
+                preserved["same_cycle"] = True
+            cross_delivery = preserved
     MEMORY["_cross_watchlist_delivery"] = cross_delivery
 
     meta.update({
@@ -17083,12 +17407,12 @@ def sniper_engine_v2(*args, **kwargs):
 _ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
-    if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
-        log_execution("[ENTRY_BLOCKED] Another entry-producing cycle owns the shared context",
-                      "WARN", debounce_key="entry_context_locked", debounce_sec=5)
-        return False
-    try:
-        with _ENTRY_EVENT_EXECUTION_LOCK:
+    with _ENTRY_EVENT_EXECUTION_LOCK:
+        if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+            log_execution("[ENTRY_BLOCKED] Another entry-producing cycle owns the shared context",
+                          "WARN", debounce_key="entry_context_locked", debounce_sec=5)
+            return False
+        try:
             globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
             result = _original_execute_entry_for_journal(*args, **kwargs)
             gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
@@ -17166,8 +17490,8 @@ def execute_entry(*args, **kwargs):
                             "ERROR",
                         )
             return result
-    finally:
-        _ENTRY_DISCOVERY_TASK_LOCK.release()
+        finally:
+            _ENTRY_DISCOVERY_TASK_LOCK.release()
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
@@ -17209,7 +17533,12 @@ DASHBOARD_SERVERS = []
 DASHBOARD_ACTIVE_PORTS = []
 
 def start_dashboard_servers():
-    """Start one-process production WSGI servers before the trading supervisor."""
+    """Start one-process Waitress servers before the trading supervisor.
+
+    Startup is idempotent per port and transactional: if any port fails after
+    another succeeded, every server started by this call is closed and joined
+    before the error propagates. This prevents leaked WSGI threads or sockets.
+    """
     from waitress import create_server
     hosted_port = os.getenv("PORT")
     if hosted_port:
@@ -17228,26 +17557,53 @@ def start_dashboard_servers():
         bind_host = os.getenv("DASHBOARD_BIND_HOST", "127.0.0.1")
     if not ports:
         raise RuntimeError("No valid Dashboard port configured")
-    started = []
-    for port in ports:
-        try:
-            # Waitress is a production WSGI server. Keep a single Python
-            # process: the trading engine, instance lock and recovery supervisor
-            # must never be forked into duplicate order-submitting workers.
-            server = create_server(app, host=bind_host, port=port, threads=8)
-            thread = threading.Thread(target=server.run, daemon=True, name=f"ggp_dashboard_{port}")
-            thread.start()
-            DASHBOARD_SERVERS.append((server, thread))
-            DASHBOARD_ACTIVE_PORTS.append(port)
-            started.append(port)
-            log_execution(f"[DASHBOARD] Waitress WSGI server started host={bind_host} port={port}", "SUCCESS")
-        except (OSError, ValueError) as exc:
-            log_execution(f"[DASHBOARD] Could not bind {bind_host}:{port}: {exc}", "ERROR")
-            if hosted_port:
-                raise
-    if not started:
-        raise RuntimeError("Dashboard could not bind any configured local port")
-    return started
+
+    original_servers = list(DASHBOARD_SERVERS)
+    original_ports = list(DASHBOARD_ACTIVE_PORTS)
+    started = [port for port in ports if port in DASHBOARD_ACTIVE_PORTS]
+    added = []
+    failures = []
+    try:
+        for port in ports:
+            if port in DASHBOARD_ACTIVE_PORTS:
+                continue
+            try:
+                # Waitress is a production WSGI server. Keep a single Python
+                # process: the trading engine, instance lock and recovery
+                # supervisor must never be forked into duplicate order workers.
+                server = create_server(app, host=bind_host, port=port, threads=8)
+                thread = threading.Thread(
+                    target=server.run, daemon=True, name=f"ggp_dashboard_{port}")
+                thread.start()
+                DASHBOARD_SERVERS.append((server, thread))
+                DASHBOARD_ACTIVE_PORTS.append(port)
+                added.append((server, thread, port))
+                started.append(port)
+                log_execution(
+                    f"[DASHBOARD] Waitress WSGI server started host={bind_host} port={port}",
+                    "SUCCESS",
+                )
+            except (OSError, ValueError) as exc:
+                failures.append((port, f"{type(exc).__name__}: {exc}"))
+                log_execution(f"[DASHBOARD] Could not bind {bind_host}:{port}: {exc}", "ERROR")
+                if hosted_port:
+                    raise
+        if failures:
+            # Partial availability is not acceptable: leave no socket or WSGI
+            # thread behind before the caller decides whether to restart.
+            raise RuntimeError(
+                "Dashboard could not bind every configured port: "
+                + ", ".join(f"{port} ({reason})" for port, reason in failures)
+            )
+        if not started:
+            raise RuntimeError("Dashboard could not bind any configured local port")
+        return started
+    except BaseException:
+        for server, thread, _port in added:
+            _stop_dashboard_server(server, thread)
+        DASHBOARD_SERVERS[:] = original_servers
+        DASHBOARD_ACTIVE_PORTS[:] = original_ports
+        raise
 
 
 if __name__ == "__main__":
@@ -17264,14 +17620,13 @@ if __name__ == "__main__":
         # supervisor stays on the foreground thread. This avoids daemon-only
         # process exit.
         start_dashboard_servers()
-        try:
-            threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
-        except Exception as exc:
-            log_execution(f"[THREAD_START] keep_alive failed: {type(exc).__name__}: {exc}", "ERROR")
+        start_runtime_workers()
         start_naiso_services()
         run_trade_supervisor(lock_handle=_GGP_INSTANCE_LOCK, lock_path=_GGP_LOCK_PATH)
     except Exception:
         log_execution(f"[SHUTDOWN] Fatal supervisor error: {traceback.format_exc()}", "ERROR")
         raise
     finally:
+        # Guarantee cleanup on startup failure as well as controlled exit.
+        _stop_runtime_services()
         release_instance_lock(_GGP_INSTANCE_LOCK)

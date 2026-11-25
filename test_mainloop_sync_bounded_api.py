@@ -176,23 +176,31 @@ def test_digitalocean_app_platform_identity_is_accepted_as_supervisor(monkeypatc
 
 
 def test_api_rate_limit_releases_global_lock_before_pacing_sleep(monkeypatch):
+    import time as real_time
+    from types import SimpleNamespace
+
     clock = [100.0]
     sleeps = []
+    real_monotonic = real_time.monotonic
+    real_sleep = real_time.sleep
     monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 1.0)
     monkeypatch.setattr(ggpbot, "_API_METHOD_MIN_INTERVALS", {})
     monkeypatch.setattr(ggpbot, "_last_api_call", 99.5)
-    monkeypatch.setattr(ggpbot.time, "monotonic", lambda: clock[0])
-
     def fake_sleep(seconds):
         assert not ggpbot._API_RATE_LOCK.locked()
         sleeps.append(seconds)
         clock[0] += seconds
 
-    monkeypatch.setattr(ggpbot.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        ggpbot,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=fake_sleep),
+    )
+    assert real_time.monotonic is real_monotonic
+    assert real_time.sleep is real_sleep
     ggpbot.rate_limit(lambda: None)
 
-    assert sleeps
-    assert all(0 < delay <= 0.25 for delay in sleeps)
+    assert sleeps == pytest.approx([0.5])
     assert ggpbot._last_api_call >= 100.5
 
 

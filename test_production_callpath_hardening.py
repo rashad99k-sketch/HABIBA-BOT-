@@ -5,6 +5,7 @@ non-idempotent BingX close-order path. They do not alter strategy decisions.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import threading
 
@@ -174,13 +175,36 @@ def test_ambiguous_close_order_is_not_retried_by_safe_api_call(monkeypatch):
 
 def test_main_loop_dispatches_entry_revalidation_off_foreground_thread():
     source = inspect.getsource(ggpbot._original_main_loop_sniper)
-    assert 'dispatch_scanner_task(' in source
-    assert '"institutional_entry_revalidation", smart_opportunity_selection' in source
-    assert 'smart_opportunity_selection()' not in source
+    tree = ast.parse(source)
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    dispatch_calls = [
+        node for node in calls if node.func.id == "dispatch_scanner_task"
+    ]
+    assert dispatch_calls
+    assert any(
+        len(node.args) >= 2
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "institutional_entry_revalidation"
+        and isinstance(node.args[1], ast.Name)
+        and node.args[1].id == "smart_opportunity_selection"
+        for node in dispatch_calls
+    )
+    # No direct invocation of the candidate scanner on the foreground path.
+    assert not any(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "smart_opportunity_selection"
+        for node in calls
+    )
 
 
 def test_entry_revalidation_reports_real_candidate_progress():
-    source = inspect.getsource(ggpbot.smart_opportunity_selection)
+    # The final exported symbol is a serialization wrapper; phase beats belong
+    # to the original candidate cycle that the wrapper delegates to.
+    source = inspect.getsource(
+        ggpbot._original_smart_opportunity_selection_for_entry_lock)
     assert 'candidate_cycle_start' in source
     assert 'candidate_ohlcv_complete' in source
     assert 'candidate_analysis_complete' in source

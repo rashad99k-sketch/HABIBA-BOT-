@@ -421,10 +421,13 @@ def test_main_loop_has_progress_after_long_candidate_work():
     import inspect
 
     source = inspect.getsource(ggpbot._original_main_loop_sniper)
-    assert "smart_opportunity_selection()" in source
-    assert "watchlist_refresh_complete" in source
+    # Long candidate work is dispatched to owned workers; the foreground loop
+    # records progress at the dispatch boundary instead of blocking inline.
+    assert "dispatch_scanner_task(" in source
+    assert '"institutional_entry_revalidation"' in source
+    assert "entry_revalidation_dispatched" in source
     assert "_run_sniper_scan_if_due()" in source
-    assert "sniper_scan_complete" in source
+    assert "sniper_scan_dispatched" in source
     assert "position_sync_complete" in inspect.getsource(ggpbot.sync_all_states)
 
 

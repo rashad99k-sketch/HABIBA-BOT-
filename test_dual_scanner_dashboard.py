@@ -80,8 +80,12 @@ def test_cross_delivery_uses_one_bounded_refresh_without_a_second_scanner():
     assert "cross_detected_at = time.time()" in scanner_source
     assert "refresh_seconds" in scanner_source
     assert "run_global_discovery_scanner" not in refresh_source
-    assert "INSTITUTIONAL_WATCHLIST_BATCH_SIZE" in refresh_source
-    assert "_integration_fetch_frame" in refresh_source
+    assert "_UNIFIED_WATCHLIST_REFRESH_STATE" in refresh_source
+    assert 'name="unified-institutional-watchlist"' in refresh_source
+    # Market-data reads belong to the single owned worker, never to the
+    # foreground refresh scheduler that the main loop calls.
+    assert "_run_unified_institutional_watchlist_refresh" in refresh_source
+    assert "_integration_fetch_frame" not in refresh_source
     assert "fetch_ohlcv" not in scanner_source
     assert "safe_api_call" not in scanner_source
 
@@ -99,7 +103,8 @@ def test_dashboard_server_supports_two_local_ports_and_host_port():
     assert "8000,8080" in source
     assert 'os.getenv("PORT")' in source
     assert "0.0.0.0" in source
-    assert "make_server" in source
+    assert "from waitress import create_server" in source
+    assert "create_server(app, host=bind_host, port=port, threads=8)" in source
 
 def test_dashboard_server_is_started_before_trade_supervisor():
     module_main = next(

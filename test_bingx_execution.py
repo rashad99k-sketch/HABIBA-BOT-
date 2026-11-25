@@ -163,10 +163,35 @@ def test_rejected_order_is_not_a_position():
 
 
 def test_timeout_does_not_resubmit_market_order():
-    exchange = FakeExchange(timeout=True)
+    class ResponseLostExchange(FakeExchange):
+        def fetch_order(self, order_id, symbol, params=None):
+            raise RuntimeError("late order lookup unavailable")
+
+    exchange = ResponseLostExchange(timeout=True)
     result = TradeExecutionService(exchange).submit_market_entry(
         symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-timeout")
-    assert result.state in {ExecutionState.FILLED, ExecutionState.EXECUTION_UNCERTAIN}
+    assert result.state is ExecutionState.EXECUTION_UNCERTAIN
+    assert len([c for c in exchange.create_calls if c[1] == "market"]) == 1
+
+
+def test_lost_order_response_is_reconciled_only_by_client_order_id_proof():
+    late_order = {"id": "ex-late", "status": "closed", "filled": 2.0,
+                  "remaining": 0.0, "average": 101.5}
+
+    class LateProofExchange(FakeExchange):
+        def fetch_order(self, order_id, symbol, params=None):
+            client_order_id = str(order_id or "")
+            if client_order_id != "GGP-CLIENT-LATE":
+                raise RuntimeError(f"unexpected order lookup: {client_order_id!r}")
+            return late_order
+
+    exchange = LateProofExchange(timeout=True)
+    result = TradeExecutionService(exchange).submit_market_entry(
+        symbol="BTC/USDT:USDT", side="BUY", quantity=2, trade_id="t-late-proof",
+        client_order_id="GGP-CLIENT-LATE")
+    assert result.state is ExecutionState.FILLED
+    assert result.client_order_id == "GGP-CLIENT-LATE"
+    assert result.exchange_order_id == "ex-late"
     assert len([c for c in exchange.create_calls if c[1] == "market"]) == 1
 
 

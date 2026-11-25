@@ -64,13 +64,29 @@ class TelegramNotifier:
         self._ensure_worker()
         return True
 
-    def _ensure_worker(self) -> None:
+    def start(self) -> bool:
+        """Explicitly start the single owned delivery worker (no-op when disabled)."""
         with self._worker_lock:
-            if self._worker_started or self._closed:
-                return
+            if self._worker_started or self._closed or not self.configured:
+                return False
             self._worker = threading.Thread(target=self._run, daemon=True, name="ggp_telegram_worker")
             self._worker.start()
             self._worker_started = True
+            return True
+
+    def reopen(self) -> bool:
+        """Explicitly reopen a notifier closed by a previous lifecycle cycle."""
+        with self._worker_lock:
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                return False
+            self._closed = False
+            self._worker_started = False
+            self._worker = None
+        return self.start()
+
+    def _ensure_worker(self) -> None:
+        self.start()
 
     def _report_error(self, message: str) -> None:
         self._last_error = str(message)[:180]

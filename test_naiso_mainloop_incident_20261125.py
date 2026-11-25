@@ -661,8 +661,9 @@ def test_unified_watchlist_refresh_schedules_one_background_worker_and_fails_clo
     workers = []
 
     class FakeThread:
-        def __init__(self, *, target, name, daemon):
+        def __init__(self, *, target, name, daemon, args=()):
             self.target = target
+            self.args = args
             self.name = name
             self.daemon = daemon
             workers.append(self)
@@ -680,7 +681,9 @@ def test_unified_watchlist_refresh_schedules_one_background_worker_and_fails_clo
     monkeypatch.setattr(ggpbot.threading, "Thread", FakeThread)
     monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", {
         "lock": __import__("threading").Lock(), "in_progress": False,
-        "last_attempt": 0.0, "last_error": "", "worker_name": "",
+        "last_attempt": 0.0, "last_attempt_monotonic": -1000.0,
+        "last_completed_monotonic": -1000.0, "phase": "IDLE",
+        "last_error": "", "worker_name": "",
     })
 
     def sync_cross_events(**_kwargs):
@@ -709,7 +712,7 @@ def test_unified_watchlist_refresh_schedules_one_background_worker_and_fails_clo
     assert len(workers) == 1
 
     # Run the captured worker body deterministically and verify publication.
-    workers[0].target()
+    workers[0].target(*workers[0].args)
     assert calls[1:] == [("sync",), ("update", 4, 30)]
     assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is True
     assert ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["in_progress"] is False
@@ -720,8 +723,9 @@ def test_unified_watchlist_worker_failure_keeps_entry_gate_closed_and_backs_off(
     workers = []
 
     class FakeThread:
-        def __init__(self, *, target, name, daemon):
+        def __init__(self, *, target, name, daemon, args=()):
             self.target = target
+            self.args = args
             workers.append(self)
 
         def start(self):
@@ -734,16 +738,18 @@ def test_unified_watchlist_worker_failure_keeps_entry_gate_closed_and_backs_off(
     monkeypatch.setattr(ggpbot.threading, "Thread", FakeThread)
     monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", {
         "lock": __import__("threading").Lock(), "in_progress": False,
-        "last_attempt": 0.0, "last_error": "", "worker_name": "",
+        "last_attempt": 0.0, "last_attempt_monotonic": -1000.0,
+        "last_completed_monotonic": -1000.0, "phase": "IDLE",
+        "last_error": "", "worker_name": "",
     })
     monkeypatch.setattr(
         ggpbot, "_sync_confirmed_cross_events",
-        lambda: (_ for _ in ()).throw(RuntimeError("simulated market-data failure")),
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated market-data failure")),
     )
 
     ggpbot.refresh_unified_institutional_watchlist()
     assert len(workers) == 1
-    workers[0].target()
+    workers[0].target(*workers[0].args)
 
     assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is False
     assert "simulated market-data failure" in ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE["last_error"]
@@ -979,18 +985,19 @@ def test_confirmed_cross_lifecycle_fetches_are_bounded_and_rotate(monkeypatch):
 
 def test_watchlist_worker_completion_and_entry_readiness_publish_atomically(monkeypatch):
     class ImmediateThread:
-        def __init__(self, *, target, name, daemon):
+        def __init__(self, *, target, name, daemon, args=()):
             self.target = target
+            self.args = args
             self.name = name
             self.daemon = daemon
 
         def start(self):
-            self.target()
+            self.target(*self.args)
 
     state = {
         "lock": threading.Lock(), "in_progress": False, "last_attempt": 0.0,
-        "last_attempt_monotonic": 0.0, "started_monotonic": 0.0,
-        "last_progress_monotonic": 0.0, "last_completed_monotonic": 0.0,
+        "last_attempt_monotonic": -1000.0, "started_monotonic": 0.0,
+        "last_progress_monotonic": 0.0, "last_completed_monotonic": -1000.0,
         "phase": "IDLE", "current_symbol": "", "timed_out": False,
         "restart_requested": False, "last_error": "", "worker_name": "",
     }
