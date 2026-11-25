@@ -69,6 +69,8 @@ def classify_api_error(exc: BaseException, *, method: str = "") -> ApiFailureCla
     detail = f"{name}: {text[:160]}"
     if method in ORDER_WRITE_METHODS:
         return ApiFailureClass("ORDER_EXECUTION_UNKNOWN", False, detail)
+    if name == "ApiRateLockTimeout":
+        return ApiFailureClass("LOCAL_SCHEDULER_CONTENTION", False, detail)
     if any(pattern in lowered for pattern in NON_RETRYABLE_PATTERNS):
         return ApiFailureClass("NON_RETRYABLE_BUSINESS", False, detail)
     if any(pattern in lowered for pattern in TRANSIENT_PATTERNS[:4]):
@@ -134,6 +136,7 @@ class ApiResilience:
             "circuit_rejections": 0,
             "half_open_successes": 0,
             "business_rejections": 0,
+            "scheduler_contention": 0,
         }
         self._enabled = True
 
@@ -188,6 +191,8 @@ class ApiResilience:
                 self._counters["rate_limited"] += 1
             elif kind.kind == "TIMEOUT":
                 self._counters["timeouts"] += 1
+            elif kind.kind == "LOCAL_SCHEDULER_CONTENTION":
+                self._counters["scheduler_contention"] += 1
             elif not counts_toward_circuit:
                 self._counters["business_rejections"] += 1
             state.last_failure_kind = kind.kind
