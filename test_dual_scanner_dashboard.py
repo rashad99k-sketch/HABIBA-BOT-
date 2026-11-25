@@ -64,6 +64,27 @@ def test_global_discovery_runs_both_existing_scanners_on_a_shared_universe():
     assert "scan_market_rf" in calls
     assert "get_usdt_perp_symbols" in calls
     assert "radar_score" in calls
+    assert "refresh_unified_institutional_watchlist" in calls
+    source = ast.get_source_segment(SOURCE, fn)
+    assert "force=True" in source
+    assert "new_cross_events" in source
+
+def test_cross_delivery_uses_one_bounded_refresh_without_a_second_scanner():
+    scanner = _function("run_global_discovery_scanner")
+    refresh = _function("refresh_unified_institutional_watchlist")
+    scanner_source = ast.get_source_segment(SOURCE, scanner)
+    refresh_source = ast.get_source_segment(SOURCE, refresh)
+
+    assert 'if cross_delivery["new_events"] > 0:' in scanner_source
+    assert "refresh_unified_institutional_watchlist(force=True)" in scanner_source
+    assert "cross_detected_at = time.time()" in scanner_source
+    assert "refresh_seconds" in scanner_source
+    assert "run_global_discovery_scanner" not in refresh_source
+    assert "INSTITUTIONAL_WATCHLIST_BATCH_SIZE" in refresh_source
+    assert "_integration_fetch_frame" in refresh_source
+    assert "fetch_ohlcv" not in scanner_source
+    assert "safe_api_call" not in scanner_source
+
 
 def test_second_scanner_is_integrated_into_unified_watchlist_enrichment():
     fn = _function("_enrich_with_existing_gpp_engines")
@@ -87,7 +108,10 @@ def test_dashboard_server_is_started_before_trade_supervisor():
         and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__"
     )
     calls = [node.func.id for node in ast.walk(module_main) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
-    assert calls.index("start_dashboard_servers") < calls.index("safe_main_loop")
+    # The controlled-exit contract wraps safe_main_loop in the foreground
+    # supervisor; the dashboard must still start before that supervisor.
+    supervisor_call = "run_trade_supervisor" if "run_trade_supervisor" in calls else "safe_main_loop"
+    assert calls.index("start_dashboard_servers") < calls.index(supervisor_call)
 
 def test_api_request_start_rate_limit_uses_a_thread_lock():
     fn = _function("rate_limit")

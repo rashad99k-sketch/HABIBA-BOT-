@@ -20,8 +20,9 @@ from roro_institutional import (
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
-                                     build_support_resistance_zones, validate_order_block_zone)
-from naiso_unified_decision import project_decision_context
+                                     build_support_resistance_zones, validate_order_block_zone,
+                                     normalize_entry_type)
+from naiso_unified_decision import project_decision_context, project_entry_behavior
 
 
 REVERSAL = ReversalEngine()
@@ -354,6 +355,69 @@ def _decision_result(decision) -> Dict[str, Any]:
     return data
 
 
+def _finite_number(value: Any) -> Optional[float]:
+    """Return a finite float only; booleans are never numeric stops or timestamps."""
+    if isinstance(value, (bool, np.bool_)) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _current_structural_stop(row: Dict[str, Any], key: str,
+                             candidate: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Validate a stop as belonging to the analysis row being written now.
+
+    This never reads prior Watchlist state. The caller must set the key to None
+    when validation fails so the broad Watchlist merge cannot resurrect an old
+    stop from a previous decision.
+    """
+    stop = _finite_number(row.get("structural_stop"))
+    if stop is None or stop <= 0:
+        return None, "missing_or_non_positive"
+
+    side = str(row.get("side") or "").strip().upper()
+    if side not in {"BUY", "SELL"}:
+        return None, "missing_or_invalid_side"
+    if str(row.get("signal_direction") or side).strip().upper() != side:
+        return None, "direction_conflict"
+    if canonical_symbol(row.get("symbol")) != key:
+        return None, "symbol_mismatch"
+    expected_exchange = exchange_symbol(candidate.get("exchange_symbol") or key)
+    if str(row.get("exchange_symbol") or "").strip().upper() != expected_exchange.strip().upper():
+        return None, "exchange_symbol_mismatch"
+
+    price = _finite_number(row.get("price"))
+    if price is None or price <= 0:
+        return None, "missing_or_invalid_price"
+    if side == "BUY" and stop >= price:
+        return None, "stop_wrong_side"
+    if side == "SELL" and stop <= price:
+        return None, "stop_wrong_side"
+
+    if str(row.get("decision_state") or "").strip().upper() != DecisionState.ENTRY_READY.value:
+        return None, "decision_not_entry_ready"
+    if str(row.get("decision_reason") or "").strip() == "":
+        return None, "missing_analysis_identity"
+    if not str(row.get("event_id") or "").strip():
+        return None, "missing_event_identity"
+    if _finite_number(row.get("origin_timestamp")) is None:
+        return None, "missing_origin_timestamp"
+    updated = _finite_number(row.get("last_update", row.get("last_updated")))
+    if updated is None or updated <= 0:
+        return None, "missing_analysis_timestamp"
+    if str(row.get("data_quality") or "").strip().upper() != "VALID_CLOSED_CANDLES":
+        return None, "invalid_data_quality"
+    freshness = str(row.get("data_freshness")
+                    or (row.get("indicator_snapshot") or {}).get("quality")
+                    or "").strip().upper()
+    if freshness != "FRESH":
+        return None, "stale_market_snapshot"
+    return stop, "verified_current_analysis"
+
+
 def _with_projected_decision(result: Dict[str, Any]) -> Dict[str, Any]:
     """Attach one read-only decision projection; legacy engine fields stay unchanged."""
     projection = project_decision_context(result)
@@ -664,7 +728,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _intelligence["price_pattern"] = classify_price_pattern(
         closed.to_dict("records"), atr=_atr(closed)
     )
-    return _with_projected_decision({
+    row = _with_projected_decision({
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
         "regime_direction": reg.direction, "market_structure": context["structure"],
@@ -693,6 +757,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
         "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
+        "entry_type": normalize_entry_type(_intelligence.get("entry_behavior")),
         "entry_behavior_confidence": float(_intelligence.get("confidence", 0.0) or 0.0),
         "entry_behavior_reasons": list(_intelligence.get("reason_codes") or []),
         "entry_zone_low": _intelligence.get("reference_low"),
@@ -714,6 +779,12 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             "status": "✅" if decision.state == DecisionState.ENTRY_READY.value else "🟡" if decision.state.startswith("WAITING") or decision.state == "NO_CHASE" else "⚪",
         },
     })
+    # One display projection over the canonical classifier output. It cannot
+    # change decision_state, structural_stop, authorization, sizing or execution.
+    behavior_context = project_entry_behavior(row, row.get("decision_context"))
+    row["entry_type"] = behavior_context["entry_type"]
+    row["entry_behavior_context"] = behavior_context
+    return row
 
 
 def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] = None,
@@ -897,7 +968,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         best["discovery_score"] = float(candidate.get("score", 0) or 0)
         for cross_field in ("cross_event_id", "cross_event_source", "cross_event_direction",
                             "cross_event_timestamp", "cross_event_status", "cross_event_timeframe",
-                            "cross_event_phase", "cross_event_lifecycle_schema",
+                            "cross_event_lifecycle_status", "cross_event_phase", "cross_event_lifecycle_schema",
                             "cross_event_entry_ready", "cross_event_rejection_high",
                             "cross_event_rejection_low", "cross_event_rejection_timestamp",
                             "cross_event_breakout_timestamp", "cross_event_breakout_close",
@@ -906,6 +977,12 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 best[cross_field] = candidate[cross_field]
         if best.get("cross_event_id"):
             best["cross_event_analysis_required"] = True
+        # A stop is decision-scoped. Clear it explicitly before projection and
+        # before {**previous, **best}: an omitted/invalid stop in this analysis
+        # must never inherit the old row's value.
+        current_stop, stop_status = _current_structural_stop(best, key, candidate)
+        best["structural_stop"] = current_stop
+        best["structural_stop_status"] = stop_status
         best = _with_projected_decision(best)
         best["analysis_priority_score"] = round(_decision_priority(best)[0] * 10
             + float(best.get("score", 0) or 0) * 0.25

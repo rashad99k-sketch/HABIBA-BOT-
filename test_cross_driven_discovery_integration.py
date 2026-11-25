@@ -18,6 +18,7 @@ import pytest
 
 import ggpbot
 import ggp_institutional_bridge as bridge
+import naiso_unified_decision as proj
 from ggp_profit_brain import (
     RANGE_MODE, STANDARD_MODE, TREND_MODE, classify_profit_mode,
 )
@@ -408,6 +409,117 @@ def test_supplementary_scanner_rows_cannot_create_cross_events(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------- #
+# 2b) A discovered cross reaches the existing Active Watchlist in the same cycle.
+# --------------------------------------------------------------------------- #
+def _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls):
+    monkeypatch.setattr(ggpbot.time, "time", lambda: NOW_SEC)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "_scanner_recovery_blocked", lambda: "")
+    monkeypatch.setattr(ggpbot, "get_usdt_perp_symbols",
+                        lambda: calls.append("universe") or [SYMBOL])
+    monkeypatch.setattr(ggpbot, "run_scanner_v2", lambda **kwargs: calls.append("v2"))
+    monkeypatch.setattr(ggpbot, "_professional_lightweight_scan",
+                        lambda **kwargs: ([], {"total": 0, "valid_data": 0}))
+    monkeypatch.setattr(ggpbot, "scan_market_rf", lambda **kwargs: calls.append("rf") or [])
+    monkeypatch.setattr(ggpbot, "radar_score", lambda _frame: 0)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame.copy())
+    monkeypatch.setattr(ggpbot, "_integration_fetch_frame",
+                        lambda symbol: fetch_calls.append(symbol) or frame.copy())
+
+    real_refresh = ggpbot.refresh_unified_institutional_watchlist
+    def refresh_spy(**kwargs):
+        refresh_calls.append(kwargs)
+        return real_refresh(**kwargs)
+    monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", refresh_spy)
+
+    for key in ("confirmed_cross_events", "scanner_v2_buy", "scanner_v2_sell",
+                "rf_watchlist", "radar_watchlist", "top_candidates"):
+        monkeypatch.setitem(ggpbot.MEMORY, key, [])
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
+    monkeypatch.setitem(ggpbot.MEMORY, "_last_unified_watchlist_refresh", NOW_SEC)
+    monkeypatch.setitem(ggpbot.STATE, "open", None)
+    monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
+
+
+def test_confirmed_cross_is_delivered_to_active_watchlist_in_same_scanner_cycle(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "same-cycle.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+
+    ggpbot.run_global_discovery_scanner()
+
+    events = journal.list_cross_events(("ACTIVE",))
+    assert len(events) == 1
+    event_id = events[0]["event_id"]
+    feed = ggpbot.MEMORY["confirmed_cross_events"]
+    watch = ggpbot.MEMORY["watchlist"]
+
+    assert len(feed) == 1 and feed[0]["cross_event_id"] == event_id
+    assert watch[CANONICAL]["cross_event_id"] == event_id
+    assert watch[CANONICAL]["cross_event_status"] == "ACTIVE"
+    assert watch[CANONICAL]["cross_event_analysis_required"] is True
+    assert refresh_calls == [{"force": True}]
+    assert calls.count("universe") == 1
+    assert calls.count("v2") == 1
+    assert calls.count("rf") == 1
+    assert len(fetch_calls) <= ggpbot.INSTITUTIONAL_WATCHLIST_BATCH_SIZE
+
+    delivery = ggpbot.MEMORY["_cross_watchlist_delivery"]
+    assert delivery["new_events"] == 1
+    assert delivery["same_cycle"] is True
+    assert delivery["delivered"] is True
+    assert delivery["reason"] == "ACTIVE_WATCHLIST_DELIVERED"
+    assert delivery["detected_at"] == pytest.approx(NOW_SEC)
+    assert delivery["delivered_at"] >= delivery["detected_at"]
+    assert ggpbot.MEMORY["discovery_scanner"]["cross_watchlist_delivery"] == delivery
+
+
+def test_duplicate_scanner_cycle_keeps_event_without_second_delivery(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "duplicate-cycle.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+
+    ggpbot.run_global_discovery_scanner()
+    first_event = journal.list_cross_events(("ACTIVE",))[0]["event_id"]
+    refresh_calls.clear()
+
+    ggpbot.run_global_discovery_scanner()
+
+    assert [row["event_id"] for row in journal.list_cross_events(("ACTIVE",))] == [first_event]
+    assert ggpbot.MEMORY["watchlist"][CANONICAL]["cross_event_id"] == first_event
+    assert refresh_calls == []
+    assert ggpbot.MEMORY["_cross_watchlist_delivery"]["new_events"] == 0
+    assert ggpbot.MEMORY["_cross_watchlist_delivery"]["reason"] == "NO_NEW_CROSS_EVENT"
+
+
+def test_new_cross_respects_open_position_discovery_pause(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "cross-position-pause.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+
+    real_detect = ggpbot._detect_confirmed_cross_events
+    def detect_then_open(symbols):
+        created = real_detect(symbols)
+        monkeypatch.setitem(ggpbot.STATE, "open", True)
+        return created
+    monkeypatch.setattr(ggpbot, "_detect_confirmed_cross_events", detect_then_open)
+
+    ggpbot.run_global_discovery_scanner()
+
+    assert len(journal.list_cross_events(("ACTIVE",))) == 1
+    assert ggpbot.MEMORY["confirmed_cross_events"]
+    assert refresh_calls == []
+    delivery = ggpbot.MEMORY["_cross_watchlist_delivery"]
+    assert delivery["new_events"] == 1
+    assert delivery["delivered"] is False
+    assert delivery["same_cycle"] is False
+    assert delivery["reason"] == "POSITION_OPEN_DISCOVERY_PAUSED"
+
+
+# --------------------------------------------------------------------------- #
 # 3) Active cross events are forced into bounded Watchlist analysis every cycle.
 # --------------------------------------------------------------------------- #
 def test_active_cross_event_is_forced_into_each_watchlist_batch(monkeypatch):
@@ -777,3 +889,106 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     assert decision.action == TradeDecisionType.PARTIAL_CLOSE
     assert decision.params["ratio"] == pytest.approx(0.5)
     assert board._decision_history[-1]["entry_cross_event_id"] == event["event_id"]
+
+
+# --------------------------------------------------------------------------- #
+# 8) The same-cycle handoff is bounded, idempotent and lifecycle-aware.
+# --------------------------------------------------------------------------- #
+def test_no_new_cross_does_not_force_watchlist_refresh(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "no-new-cross.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+    monkeypatch.setattr(ggpbot, "_detect_confirmed_cross_events", lambda symbols: 0)
+
+    ggpbot.run_global_discovery_scanner()
+
+    assert refresh_calls == []
+    assert ggpbot.MEMORY["_cross_watchlist_delivery"]["new_events"] == 0
+    assert ggpbot.MEMORY["_cross_watchlist_delivery"]["lifecycle_status"] == "CROSS_DETECTED"
+
+
+def test_no_journal_never_attempts_watchlist_delivery(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "no-journal.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+
+    ggpbot.run_global_discovery_scanner()
+
+    assert refresh_calls == []
+    assert ggpbot.MEMORY["confirmed_cross_events"] == []
+    assert ggpbot.MEMORY["_cross_watchlist_delivery"]["reason"] == "NO_NEW_CROSS_EVENT"
+
+
+def test_same_cycle_delivery_marks_durable_active_watchlist_lifecycle(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "lifecycle-delivery.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+
+    ggpbot.run_global_discovery_scanner()
+
+    event_id = journal.list_cross_events(("ACTIVE",))[0]["event_id"]
+    durable = journal.get_cross_event(event_id)
+    assert durable["metadata"]["lifecycle_status"] == "ACTIVE_WATCHLIST"
+    assert durable["metadata"]["watchlist_delivered_at"] == pytest.approx(NOW_SEC)
+    assert ggpbot.MEMORY["confirmed_cross_events"][0]["cross_event_lifecycle_status"] == "ACTIVE_WATCHLIST"
+    assert ggpbot.MEMORY["watchlist"][CANONICAL]["cross_event_lifecycle_status"] == "ACTIVE_WATCHLIST"
+    delivery = ggpbot.MEMORY["_cross_watchlist_delivery"]
+    assert delivery["lifecycle_marked"] == [event_id]
+    assert delivery["lifecycle_status"] == "ACTIVE_WATCHLIST"
+    assert delivery["event_ids"] == [event_id]
+
+
+def test_cross_lifecycle_survives_watchlist_snapshot_disappearance(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "snapshot-gone.sqlite3"))
+    event = _lifecycle_event("BUY")
+    event["metadata"]["lifecycle_status"] = "ACTIVE_WATCHLIST"
+    assert journal.record_cross_event(**event) is True
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: None)
+    monkeypatch.setitem(ggpbot.MEMORY, "confirmed_cross_events", [])
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
+
+    ggpbot._sync_confirmed_cross_events()
+
+    feed = ggpbot.MEMORY["confirmed_cross_events"]
+    assert len(feed) == 1
+    assert feed[0]["cross_event_lifecycle_status"] == "ACTIVE_WATCHLIST"
+    projected = proj.project_watchlist_row(feed[0])
+    assert projected["lifecycle_status"] == "ACTIVE_WATCHLIST"
+    assert projected["decision_context"]["lifecycle_status"] == "ACTIVE_WATCHLIST"
+    assert projected["cross_context"]["durable_event"] is True
+    assert projected["cross_context"]["authoritative"] is True
+
+
+def test_two_cross_symbols_keep_distinct_events_sides_and_stops(tmp_path, monkeypatch):
+    journal = TradeJournal(str(tmp_path / "two-cross.sqlite3"))
+    frame = _cross_frame("BUY")
+    calls, fetch_calls, refresh_calls = [], [], []
+    _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refresh_calls)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda symbol: _cross_frame("BUY"))
+
+    symbols = [SYMBOL, "ETH/USDT:USDT"]
+    assert ggpbot._detect_confirmed_cross_events(symbols) == 2
+
+    rows = journal.list_cross_events(("ACTIVE",))
+    assert len(rows) == 2
+    assert len({row["event_id"] for row in rows}) == 2
+    assert {row["symbol"] for row in rows} == {CANONICAL, "ETH"}
+    assert {row["exchange_symbol"] for row in rows} == set(symbols)
+
+    bridge.update_unified_watchlist(
+        ggpbot.MEMORY, lambda symbol: _cross_frame("BUY"),
+        max_items=10, batch_size=10,
+    )
+    watch = ggpbot.MEMORY["watchlist"]
+    assert set(watch) == {CANONICAL, "ETH"}
+    assert watch[CANONICAL]["cross_event_id"] != watch["ETH"]["cross_event_id"]
+    assert watch[CANONICAL]["source_snapshot_id"] != watch["ETH"]["source_snapshot_id"]
+    for symbol, row in watch.items():
+        assert row["cross_event_status"] == "ACTIVE"
+        assert row["decision_context"]["authority"] == "UNIFIED_ENTRY_AUTHORITY_UNCHANGED"
+        assert row["entry_behavior_context"]["classification_source"] in {"GGP_MARKET_INTELLIGENCE", "NONE"}
