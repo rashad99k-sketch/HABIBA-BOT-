@@ -1297,14 +1297,18 @@ def fetch_ohlcv(symbol, limit=150):
                 detail=f"fetcher minimum is 100 rows; received {len(data)}",
             )
             return None
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        try:
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        except (TypeError, ValueError):
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(data), detail="invalid OHLCV row shape",
+            )
+            return None
         for col in ["timestamp", "open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
-        if len(df) < 100:
+        if df.isna().any().any():
             _record_ohlcv_fetch_diagnostic(
-                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
-                detail=f"only {len(df)} complete OHLCV rows remained after validation",
+                sym, "OHLCV_MALFORMED", received=len(df), detail="missing or non-numeric OHLCV value",
             )
             return None
         numeric = df[["timestamp", "open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
@@ -1313,33 +1317,32 @@ def fetch_ohlcv(symbol, limit=150):
                 sym, "OHLCV_MALFORMED", received=len(df), detail="non-finite OHLCV value",
             )
             return None
-        if (df[["close", "high", "low"]] <= 0).any().any():
+        timestamps = df["timestamp"].to_numpy(dtype=float)
+        if ((timestamps <= 0).any()
+                or not np.equal(timestamps, np.floor(timestamps)).all()
+                or not df["timestamp"].is_monotonic_increasing
+                or df["timestamp"].duplicated().any()):
             _record_ohlcv_fetch_diagnostic(
-                sym, "OHLCV_MALFORMED", received=len(df), detail="non-positive OHLC price",
+                sym, "OHLCV_MALFORMED", received=len(df),
+                detail="timestamps must be positive integer milliseconds, strictly increasing and unique",
             )
             return None
-        body_high = df[["open", "close"]].max(axis=1)
-        body_low = df[["open", "close"]].min(axis=1)
+        if (df["volume"] < 0).any() or (df[["open", "high", "low", "close"]] <= 0).any().any():
+            _record_ohlcv_fetch_diagnostic(
+                sym, "OHLCV_MALFORMED", received=len(df), detail="non-positive price or negative volume",
+            )
+            return None
         malformed = (
-            (df["timestamp"] <= 0)
-            | (df["volume"] < 0)
-            | (df["high"] < body_high)
-            | (df["low"] > body_low)
-            | (df["high"] < df["low"])
+            (df["high"] < df[["open", "close", "low"]].max(axis=1))
+            | (df["low"] > df[["open", "close", "high"]].min(axis=1))
         )
         if bool(malformed.any()):
             _record_ohlcv_fetch_diagnostic(
                 sym, "OHLCV_MALFORMED", received=len(df),
-                detail=f"{int(malformed.sum())} rows violate timestamp/volume/OHLC bounds",
+                detail=f"{int(malformed.sum())} rows violate OHLC bounds",
             )
             return None
-        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-        if len(df) < 100:
-            _record_ohlcv_fetch_diagnostic(
-                sym, "INSUFFICIENT_CLOSED_BARS", received=len(df),
-                detail=f"only {len(df)} unique OHLCV rows remained",
-            )
-            return None
+        df = df.reset_index(drop=True)
         _record_ohlcv_fetch_diagnostic(sym, "OK", received=len(df))
         return df
     except Exception as e:
@@ -1359,15 +1362,30 @@ def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
         data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit)
         if not data or len(data) < 30:
             return None
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
-        df = df.dropna()
-        if len(df) < 30:
+        try:
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        except (TypeError, ValueError):
             return None
-        df = df.sort_index().drop_duplicates().ffill().bfill()
-        return df
-    except Exception as e:
+        for col in ["timestamp", "open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df.isna().any().any():
+            return None
+        numeric = df[["timestamp", "open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+        if not np.isfinite(numeric).all():
+            return None
+        timestamps = df["timestamp"].to_numpy(dtype=float)
+        if ((timestamps <= 0).any()
+                or not np.equal(timestamps, np.floor(timestamps)).all()
+                or not df["timestamp"].is_monotonic_increasing
+                or df["timestamp"].duplicated().any()):
+            return None
+        if ((df["volume"] < 0).any()
+                or (df[["open", "high", "low", "close"]] <= 0).any().any()
+                or (df["high"] < df[["open", "close", "low"]].max(axis=1)).any()
+                or (df["low"] > df[["open", "close", "high"]].min(axis=1)).any()):
+            return None
+        return df.reset_index(drop=True)
+    except Exception:
         return None
 
 def fetch_ticker(symbol):
