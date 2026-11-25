@@ -14562,8 +14562,16 @@ RECOVERY_BLOCK_ENTRIES = False
 
 
 def smart_opportunity_selection():
-    """Unified Watchlist -> institutional engines -> one existing GGP execution path."""
+    """Unified Watchlist -> institutional engines -> one existing GGP execution path.
+
+    This function is dispatched as a single-flight scanner task; it must never
+    run on MainThread because candidate revalidation performs market-data reads.
+    """
     global _INSTITUTIONAL_ENTRY_CONTEXT
+    if threading.current_thread() is threading.main_thread():
+        log_execution("[ENTRY_REVALIDATION] Refusing synchronous MainThread execution", "ERROR")
+        return False
+    _scanner_progress("institutional_entry_revalidation", "candidate_cycle_start")
     # Hard exposure/recovery gates run before any balance or market-data read so
     # an unresolved exchange state can never trigger an unnecessary API call.
     if STATE.get("open") or TRADE_STATE.get("in_position"):
@@ -14638,11 +14646,23 @@ def smart_opportunity_selection():
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
+            if STATE.get("open") or TRADE_STATE.get("in_position"):
+                _scanner_progress("institutional_entry_revalidation", "yielded_to_open_position",
+                                  symbol=str(canonical))
+                return True
+            if globals().get("RECOVERY_BLOCK_ENTRIES", False) or MEMORY.get("position_status") == "UNKNOWN":
+                _scanner_progress("institutional_entry_revalidation", "blocked_by_recovery",
+                                  symbol=str(canonical))
+                return False
+            _scanner_progress("institutional_entry_revalidation", "candidate_start",
+                              symbol=str(canonical))
             side = str(item.get("side", "")).upper()
             if side not in ("BUY", "SELL"):
                 continue
             exchange_sym = item.get("exchange_symbol") or roro_exchange_symbol(canonical)
             df = _integration_fetch_frame(exchange_sym)
+            _scanner_progress("institutional_entry_revalidation", "candidate_ohlcv_complete",
+                              symbol=str(exchange_sym), available=bool(df is not None))
             if df is None:
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "market_data_unavailable"
@@ -14662,6 +14682,9 @@ def smart_opportunity_selection():
                 side_hints=item.get("side_hints") or [side],
             )
             fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
+            _scanner_progress("institutional_entry_revalidation", "candidate_analysis_complete",
+                              symbol=str(exchange_sym),
+                              decision=str(fresh.get("decision_state") or "UNKNOWN"))
             item.update(fresh)
             item["source"] = item.get("source") or "unified_watchlist"
             if item.get("decision_state") != "ENTRY_READY":
@@ -14857,10 +14880,14 @@ def smart_opportunity_selection():
                 item["capital_allocation_tier"] = "STRONG_30_PERCENT" if is_strong else "STANDARD_20_PERCENT"
                 _INSTITUTIONAL_ENTRY_CONTEXT["capital_allocation_tier"] = item["capital_allocation_tier"]
                 _INSTITUTIONAL_ENTRY_CONTEXT["sizing_eligible_strong"] = bool(is_strong)
+                _scanner_progress("institutional_entry_revalidation", "entry_authorization",
+                                  symbol=str(exchange_sym), side=side)
                 ok = execute_entry(side, exchange_sym, price, float(sl), float(tp1), float(tp2),
                                    float(item.get("score", 0) or 0), reason, float(atr_value),
                                    trade_type=classification, entry_type="RORO_INSTITUTIONAL",
                                    classification=sizing_class)
+                _scanner_progress("institutional_entry_revalidation", "entry_execution_complete",
+                                  symbol=str(exchange_sym), executed=bool(ok))
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
