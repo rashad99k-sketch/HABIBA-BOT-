@@ -1015,3 +1015,58 @@ def test_watchlist_worker_completion_and_entry_readiness_publish_atomically(monk
     assert state["in_progress"] is False
     assert state["phase"] == "IDLE"
     assert ggpbot.MEMORY["_unified_watchlist_refresh_ok"] is True
+
+
+def test_closed_frame_validator_rejects_bad_rows_instead_of_repairing_snapshot():
+    import numpy as np
+    import pandas as pd
+    from roro_opportunity_pipeline import validate_closed_frame
+
+    count = 60
+    frame = pd.DataFrame({
+        "timestamp": [1_700_000_000_000 + i * 900_000 for i in range(count)],
+        "open": [100.0] * count,
+        "high": [101.0] * count,
+        "low": [99.0] * count,
+        "close": [100.5] * count,
+        "volume": [10.0] * count,
+    })
+    now_ms = int(frame.timestamp.iloc[-1]) + 900_001
+    valid = validate_closed_frame(frame, now_ms=now_ms, timeframe_s=900)
+    assert len(valid) == count
+
+    duplicate = frame.copy()
+    duplicate.loc[10, "timestamp"] = duplicate.loc[9, "timestamp"]
+    unordered = frame.copy()
+    unordered.loc[[10, 11], "timestamp"] = unordered.loc[[11, 10], "timestamp"].to_numpy()
+    infinite = frame.copy()
+    infinite.loc[10, "high"] = np.inf
+    malformed_ohlc = frame.copy()
+    malformed_ohlc.loc[10, "high"] = 99.5
+    negative_volume = frame.copy()
+    negative_volume.loc[10, "volume"] = -1.0
+    missing_value = frame.copy()
+    missing_value.loc[10, "close"] = np.nan
+    fractional_timestamp = frame.copy()
+    fractional_timestamp.loc[10, "timestamp"] += 0.5
+
+    for invalid in (
+        duplicate, unordered, infinite, malformed_ohlc,
+        negative_volume, missing_value, fractional_timestamp,
+    ):
+        assert validate_closed_frame(invalid, now_ms=now_ms, timeframe_s=900).empty
+
+
+def test_closed_frame_validator_filters_only_the_still_open_candle():
+    import pandas as pd
+    from roro_opportunity_pipeline import validate_closed_frame
+
+    frame = pd.DataFrame({
+        "timestamp": [1_700_000_000_000 + i * 900_000 for i in range(60)],
+        "open": [100.0] * 60, "high": [101.0] * 60,
+        "low": [99.0] * 60, "close": [100.5] * 60, "volume": [10.0] * 60,
+    })
+    now_ms = int(frame.timestamp.iloc[-1]) + 900_000 - 1
+    closed = validate_closed_frame(frame, now_ms=now_ms, timeframe_s=900)
+    assert len(closed) == 59
+    assert int(closed.timestamp.iloc[-1]) == int(frame.timestamp.iloc[-2])
