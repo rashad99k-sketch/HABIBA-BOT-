@@ -10,6 +10,8 @@ from __future__ import annotations
 import inspect
 import time
 
+import numpy as np
+import pandas as pd
 import pytest
 
 import ggpbot
@@ -349,8 +351,140 @@ def test_board_metadata_and_mode_change_event_are_reporting_only(monkeypatch):
 
 def test_single_executor_and_single_management_authority_are_unchanged():
     entry_source = inspect.getsource(ggpbot._original_execute_entry_for_journal)
-    assert "validate_institutional_location" in entry_source
-    assert entry_source.index("validate_institutional_location") < entry_source.index("open_position(")
+    assert "_entry_location_permission" in entry_source
+    assert entry_source.index("_entry_location_permission") < entry_source.index("open_position(")
+    permission_source = inspect.getsource(ggpbot._entry_location_permission)
+    assert "validate_institutional_location" in permission_source
     board_source = inspect.getsource(ggpbot.TradeManagementBoard.evaluate)
     assert "build_management_mode_report" in board_source
     assert board_source.index("build_management_mode_report") < board_source.index("def decision(")
+
+
+def _run_real_execute_entry(monkeypatch, *, with_report=True):
+    """Drive the actual single executor in PAPER mode, isolating only I/O."""
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STATE", {
+        "until": 0.0, "triggered_at": 0.0, "trigger_balance": None,
+        "utc_day": None, "peak_balance": None, "trigger_count": 0,
+    })
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STORE_READY", True)
+    monkeypatch.setitem(ggpbot.MEMORY, "position_status", "FLAT")
+    monkeypatch.setitem(ggpbot.STATE, "open", False)
+    monkeypatch.setitem(ggpbot.STATE, "execution_unresolved", False)
+    monkeypatch.setitem(ggpbot.STATE, "close_reconciliation_required", False)
+    monkeypatch.setitem(ggpbot.STATE, "recovery_hold", False)
+    monkeypatch.setitem(ggpbot.STATE, "range_target_price", 0.0)
+    monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", False)
+    ggpbot.paper["balance"] = 100.0
+    ggpbot.paper["position"] = None
+
+    n = 120
+    ts = [1_700_000_000_000 + i * 900_000 for i in range(n)]
+    base = np.linspace(99.0, 100.0, n)
+    frame = pd.DataFrame({
+        "timestamp": ts, "open": base * 0.999, "high": base * 1.004,
+        "low": base * 0.996, "close": base, "volume": np.full(n, 1000.0),
+    })
+    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: frame)
+    monkeypatch.setattr(
+        ggpbot, "_validate_dual_ema_vwap_entry_gate",
+        lambda *a, **k: {
+            "ready": True, "reason": "test_valid_dual_cross",
+            "ema9_cross": "BULLISH", "ema50_cross": "BULLISH",
+            "ema9_cross_timestamp": ts[-2], "ema50_cross_timestamp": ts[-2],
+            "ema9": 100.1, "ema50": 100.0, "vwap": 99.9,
+            "latest_closed_timestamp": ts[-1],
+        },
+    )
+    monkeypatch.setattr(ggpbot, "get_ticker_safe", lambda *a, **k: 100.0)
+    monkeypatch.setattr(ggpbot, "update_position_dashboard", lambda *a, **k: None)
+    monkeypatch.setattr(ggpbot, "tg_entry", lambda *a, **k: None)
+    monkeypatch.setattr(ggpbot, "_live_manager",
+                        type("M", (), {"start_trade": lambda *a, **k: None})())
+
+    now = time.time()
+    row = _base_row(now=now, entry_behavior="PULLBACK",
+                    entry_behavior_reasons=["test_closed_candle_reason"],
+                    resistances=[_zone("RESISTANCE", 101.0, 101.4)])
+    context = {
+        "setup_type": "TEST_UNIFIED_ENTRY", "event_id": "test-event", "evidence": ["test"],
+        "structural_stop": 99.5, "entry_behavior": "PULLBACK",
+        "entry_behavior_confidence": 0.7, "entry_behavior_reasons": ["test_closed_candle_reason"],
+        "support_resistance": row["support_resistance"], "market_regime": row["market_regime"],
+        "liquidity": row["liquidity"], "cross_event_id": "", "candle_timeframe": "15m",
+        "closed_candle_frame": frame, "closed_candle_source": "TEST_CLOSED_FRAME",
+        "closed_candle_timestamp": ts[-1],
+    }
+    if with_report:
+        context["institutional_report"] = build_institutional_report(row, now_ts=now)
+        context["data_freshness"] = "FRESH"
+        context["data_quality"] = "VALID_CLOSED_CANDLES"
+        context["last_updated"] = now
+        context["timeframe_ms"] = 900_000
+    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", context, raising=False)
+    ok = ggpbot.execute_entry(
+        "BUY", "BTC/USDT:USDT", 100.0, 99.5, 100.25, 101.0, 80,
+        "institutional_strategy_test", 0.5, "TREND", "TEST", "TREND",
+    )
+    return ok, context
+
+
+def test_executor_fallback_never_invents_fresh_validated_location_data(monkeypatch):
+    captured = {}
+    original = ggpbot.build_institutional_report
+
+    def capture(row, **kwargs):
+        captured.update(row)
+        return original(row, **kwargs)
+
+    monkeypatch.setattr(ggpbot, "build_institutional_report", capture)
+    ok, _ = _run_real_execute_entry(monkeypatch, with_report=False)
+    assert ok is True
+    assert captured["data_freshness"] == "UNKNOWN"
+    assert captured["data_quality"] == "UNKNOWN"
+    assert captured["closed_candle_source"] == "TEST_CLOSED_FRAME"
+
+
+def test_live_location_permission_is_fail_closed_on_stale_and_missing_evidence():
+    now = time.time()
+    fresh_row = _base_row(now=now, resistances=[_zone("RESISTANCE", 101.0, 101.4)])
+    fresh = build_institutional_report(fresh_row, now_ts=now)
+    stale_row = _base_row(now=now, resistances=[_zone("RESISTANCE", 101.0, 101.4)])
+    stale_row["last_updated"] = now - 10_000.0
+    stale = build_institutional_report(stale_row, now_ts=now)
+    missing = build_institutional_report({}, side="BUY", now_ts=0.0)
+
+    assert ggpbot._entry_location_permission(fresh, strict_freshness=True)[0] is True
+    allowed, gate, reason = ggpbot._entry_location_permission(stale, strict_freshness=True)
+    assert allowed is False
+    assert gate["state"] == "INSUFFICIENT_DATA"
+    assert "location_report_requires_fresh_validated_closed_data" in reason
+    allowed, gate, _ = ggpbot._entry_location_permission(missing, strict_freshness=True)
+    assert allowed is False
+    assert gate["state"] == "INSUFFICIENT_DATA"
+
+
+def test_real_execute_entry_preserves_trace_into_dashboard_and_decision(monkeypatch):
+    ok, _ = _run_real_execute_entry(monkeypatch, with_report=True)
+    assert ok is True
+
+    state = ggpbot.STATE
+    assert state["entry_risk_plan"]["leverage"] == 20
+    assert state["entry_risk_plan"]["basis"] == "PRE_TRADE_ESTIMATE_NOT_REALIZED_PNL"
+    assert state["management_mode_report"]["management_mode"] == "STANDARD"
+    assert len(state["management_mode_history"]) == 1
+    assert state["institutional_report"]["entry_classification"]["entry_type"] == "PULLBACK"
+
+    _patch_dashboard_runtime(monkeypatch)
+    client = ggpbot.app.test_client()
+    data_pos = client.get("/data").get_json()["position"]
+    assert data_pos["entry_risk_plan"]["leverage"] == 20
+    assert data_pos["selected_target_gross_roe_pct"] == pytest.approx(5.0)
+    assert len(data_pos["management_mode_history"]) == 1
+
+    decision = client.get("/decision").get_json()["active_trade"]
+    assert decision["management_mode"] == "STANDARD"
+    assert decision["selected_target_gross_roe_pct"] == pytest.approx(5.0)
+    assert decision["entry_risk_plan"]["leverage"] == 20

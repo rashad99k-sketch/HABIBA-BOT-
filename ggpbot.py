@@ -6738,6 +6738,22 @@ def record_entry_data_rejection(symbol, side, diagnostic, *, stage="INSTITUTIONA
     )
 
 
+def _entry_location_permission(report, *, strict_freshness):
+    """Read-only location decision used by every path that reaches execute_entry.
+
+    Strict mode is the LIVE production path: an ALLOWED gate is mandatory, so a
+    missing, stale or non-validated report can never be presented as a fresh
+    allowance. Non-strict paper/legacy paths retain the neutral-missing contract
+    and only block on an observed insufficient-room decision.
+    """
+    gate = validate_institutional_location(report)
+    allowed = bool(gate["allowed"]) if strict_freshness else gate["state"] != "BLOCKED"
+    reason = gate["blocking_reason"] or "|".join(gate["reasons"])
+    if not allowed and not reason:
+        reason = "location_evidence_insufficient_or_stale"
+    return allowed, gate, reason
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] drawdown cooldown active; {symbol} {side} rejected", "WARN",
@@ -6821,7 +6837,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
     # Final location enforcement lives in the single executor so no Watchlist,
     # Sniper or legacy caller can bypass a strong opposing supply/demand zone.
-    # Missing evidence is neutral here; only observed insufficient room blocks.
+    # A synthesized fallback never claims fresh validated closed data it cannot
+    # prove; LIVE additionally requires an explicit ALLOWED gate.
     report = institutional_entry_ctx.get("institutional_report")
     if not isinstance(report, dict) or not report:
         report = build_institutional_report({
@@ -6835,15 +6852,20 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "vwap": gate_result.get("vwap"),
             "cross_state": str(gate_result.get("ema9_cross") or "").upper(),
             "cross_event_id": cross_event_id,
-            "data_freshness": institutional_entry_ctx.get("data_freshness", "FRESH"),
-            "data_quality": "VALID_CLOSED_CANDLES",
+            "data_freshness": institutional_entry_ctx.get("data_freshness", "UNKNOWN"),
+            "data_quality": institutional_entry_ctx.get("data_quality", "UNKNOWN"),
+            "closed_candle_source": institutional_entry_ctx.get("closed_candle_source", "UNKNOWN"),
+            "last_updated": institutional_entry_ctx.get("last_updated", 0.0),
+            "timeframe_ms": _roro_timeframe_seconds(gate_tf) * 1000.0,
         }, side=side, now_ts=time.time())
-    location_gate = validate_institutional_location(report)
+    allowed, location_gate, blocking_reason = _entry_location_permission(
+        report, strict_freshness=not PAPER_MODE and MODE_LIVE,
+    )
     institutional_entry_ctx["institutional_report"] = report
     institutional_entry_ctx["institutional_location_gate"] = location_gate
-    if location_gate["state"] == "BLOCKED":
+    if not allowed:
         log_execution(
-            f"[INSTITUTIONAL_LOCATION] BLOCKED {symbol} {side}: {location_gate['blocking_reason']}",
+            f"[INSTITUTIONAL_LOCATION] BLOCKED {symbol} {side}: {blocking_reason}",
             "WARN", debounce_key=f"institutional_location_executor:{symbol}:{side}", debounce_sec=10,
         )
         return False
@@ -7212,6 +7234,15 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
+    # Freeze the pre-trade audit record once. Both successful fill paths must
+    # carry these fields into the open-trade state instead of resetting them.
+    frozen_entry_trace = {
+        "entry_risk_plan": dict(STATE.get("entry_risk_plan") or {}),
+        "management_mode": str(STATE.get("management_mode") or "STANDARD"),
+        "management_mode_report": dict(STATE.get("management_mode_report") or {}),
+        "management_mode_history": list(STATE.get("management_mode_history") or []),
+        "institutional_report": dict(institutional_entry_ctx.get("institutional_report") or {}),
+    }
     institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
     if not PAPER_MODE and MODE_LIVE and institutional_ctx:
         df, candle_diagnostic = resolve_entry_closed_candles(symbol, institutional_ctx)
@@ -7403,8 +7434,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "trade_id": trade_id,
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
-            "management_mode": "STANDARD", "management_mode_report": {}, "management_mode_history": [],
-            "management_mode_last_change_ts": 0.0, "entry_risk_plan": {}, "institutional_report": {},
+            **frozen_entry_trace,
+            "management_mode_last_change_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
@@ -7545,8 +7576,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "execution_unresolved": bool(order.get("protection_unverified", False)),
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
-            "management_mode": "STANDARD", "management_mode_report": {}, "management_mode_history": [],
-            "management_mode_last_change_ts": 0.0, "entry_risk_plan": {}, "institutional_report": {},
+            **frozen_entry_trace,
+            "management_mode_last_change_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "opposing_liquidity_status": "UNKNOWN", "opposing_liquidity_level": 0.0,
             "opposing_liquidity_distance_pct": 0.0, "opposing_liquidity_timestamp": 0.0,
@@ -11962,6 +11993,10 @@ def sniper_engine_v2():
                 "closed_candle_frame": closed.copy(),
                 "closed_candle_source": "SNIPER_V2_CONFIRMED_FRAME",
                 "closed_candle_timestamp": int(closed["timestamp"].iloc[-1]),
+                "data_freshness": "FRESH",
+                "data_quality": "VALID_CLOSED_CANDLES",
+                "last_updated": float(int(closed["timestamp"].iloc[-1]) / 1000.0),
+                "timeframe_ms": _roro_timeframe_seconds(INTERVAL) * 1000.0,
             }
             try:
                 ok = execute_entry(
@@ -13929,12 +13964,20 @@ def smart_opportunity_selection():
                 continue
             institutional_report = item.get("institutional_report")
             if not isinstance(institutional_report, dict) or not institutional_report:
-                institutional_report = build_institutional_report(item, side=side, now_ts=time.time())
-            location_gate = validate_institutional_location(institutional_report)
+                report_row = dict(item)
+                report_row.setdefault("data_freshness", "FRESH")
+                report_row.setdefault("data_quality", "VALID_CLOSED_CANDLES")
+                report_row.setdefault("closed_candle_source", "UNIFIED_WATCHLIST_AUTHORIZED_FRAME")
+                report_row.setdefault("last_updated", float(int(closed_df["timestamp"].iloc[-1]) / 1000.0))
+                report_row.setdefault("timeframe_ms", _roro_timeframe_seconds(INTERVAL) * 1000.0)
+                institutional_report = build_institutional_report(report_row, side=side, now_ts=time.time())
+            allowed, location_gate, blocking_reason = _entry_location_permission(
+                institutional_report, strict_freshness=not PAPER_MODE and MODE_LIVE,
+            )
             item["institutional_report"] = institutional_report
             item["institutional_location_gate"] = location_gate
-            if location_gate["state"] == "BLOCKED":
-                reason = location_gate["blocking_reason"] or "strong_opposing_zone_requires_wait"
+            if not allowed:
+                reason = blocking_reason or "strong_opposing_zone_requires_wait"
                 item["decision_state"] = "NO_CHASE"
                 item["rejection_reason"] = reason
                 MEMORY.setdefault("no_entry_feed", []).append({
@@ -14090,6 +14133,10 @@ def smart_opportunity_selection():
                 "closed_candle_frame": closed_df.copy(),
                 "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
                 "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
+                "data_freshness": "FRESH",
+                "data_quality": "VALID_CLOSED_CANDLES",
+                "last_updated": float(int(closed_df["timestamp"].iloc[-1]) / 1000.0),
+                "timeframe_ms": timeframe_ms,
             }
             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
             try:
