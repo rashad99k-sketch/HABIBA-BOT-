@@ -502,3 +502,116 @@ def test_restart_failed_diagnostics_include_attempt_thread_and_guard_context():
                      "recovery_guard=RECOVERY_GUARD_REJECTED",
                      "exception=RuntimeError: restart exploded"):
         assert fragment in alert
+
+
+# --- Verifier single-flight, generation and unique attempt IDs -------------- #
+
+def test_blocked_verifier_is_single_flight_and_generation_tagged():
+    clock = [0.0]
+    alerts = []
+    release = threading.Event()
+    calls = []
+    restarted_with = []
+
+    def verifier():
+        calls.append(clock[0])
+        token = "late" if len(calls) == 1 else "current"
+        release.wait(timeout=5.0)
+        return True, "VERIFIED", {"token": token}
+
+    def restart_fn(context):
+        restarted_with.append(context.get("token"))
+        return True
+
+    watchdog = _watchdog(clock, alerts, safety_gate=lambda: (True, "READY"),
+                         verification_retry_sec=1.0)
+    watchdog.register("main_loop", interval_sec=1.0, grace_sec=2.0, critical=True,
+                      restartable=True, recovery_verifier=verifier, restart_fn=restart_fn)
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start",
+                  thread_name="MainThread")
+
+    clock[0] = 3.0
+    first = watchdog.check()["main_loop"]
+    component = watchdog._components["main_loop"]
+    assert first["restart"] == "VERIFICATION_HOLD"
+    assert first["verifier_timeout"] is True
+    assert first["verification_generation"] == 1
+    assert first["verification_id"] == "main_loop:v1"
+    assert calls == [3.0]
+    assert component.verifier_thread is not None and component.verifier_thread.is_alive()
+
+    # The verification backoff expires while the first verifier is still blocked.
+    clock[0] = 5.0
+    second = watchdog.check()["main_loop"]
+    assert calls == [3.0], "a blocked verifier must not be duplicated"
+    assert second["reason"] == "VERIFIER_ALREADY_RUNNING"
+    assert second["verifier_already_running"] is True
+    assert second["verification_generation"] == 1
+    assert component.verification_generation == 1
+
+    blocked = component.verifier_thread
+    release.set()
+    blocked.join(timeout=2.0)
+    assert not blocked.is_alive()
+
+    clock[0] = 7.0
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start",
+                  thread_name="MainThread")
+    clock[0] = 10.0
+    third = watchdog.check()["main_loop"]
+    assert calls == [3.0, 10.0]
+    assert component.verification_generation == 2
+    assert restarted_with == ["current"], "a late verifier result must not win"
+
+
+def test_idle_verifier_timeout_cannot_accumulate_threads(monkeypatch):
+    clock = [0.0]
+    alerts = []
+    release = threading.Event()
+    calls = []
+
+    def verifier():
+        calls.append(clock[0])
+        release.wait(timeout=5.0)
+        return True, "VERIFIED", {}
+
+    watchdog = _watchdog(clock, alerts, verification_retry_sec=1.0)
+    watchdog.register("scanner:global_discovery", interval_sec=10.0, grace_sec=2.0,
+                      critical=False, restartable=False, lifecycle="IDLE",
+                      recovery_verifier=verifier)
+    watchdog.beat("scanner:global_discovery", state="IDLE", idle_until=1.0,
+                  progress=False)
+    component = watchdog._components["scanner:global_discovery"]
+
+    clock[0] = 2.0
+    first = watchdog.check()["scanner:global_discovery"]
+    assert first["verifier_timeout"] is True
+    assert first["verification_id"] == "scanner:global_discovery:v1"
+
+    # Repeated IDLE due dates must not start a second verifier while the first
+    # one is still blocked.
+    for due in (5.0, 8.0, 11.0):
+        clock[0] = due
+        report = watchdog.check()["scanner:global_discovery"]
+        assert report["restart"] == "VERIFICATION_HOLD"
+    assert calls == [2.0]
+    assert component.verification_generation == 1
+
+    blocked = component.verifier_thread
+    release.set()
+    blocked.join(timeout=2.0)
+    assert not blocked.is_alive()
+    monkeypatch.setattr(watchdog, "alert_fn", lambda message, level: None)
+
+
+def test_restart_attempt_uids_are_unique_when_recovery_is_deferred():
+    policy = RestartPolicy(max_attempts=3, monotonic_fn=lambda: 0.0)
+    deferred = policy.begin("main_loop", "deferred", 0.05)
+    policy.finish(deferred, "RECOVERY_DEFERRED", counts=False)
+    real = policy.begin("main_loop", "real", 0.05)
+    policy.finish(real, "RESTARTED")
+
+    assert deferred.attempt == real.attempt == 1, "budget attempt must not be consumed"
+    assert deferred.uid != real.uid, "diagnostic attempt identity must be unique"
+    rows = policy.records("main_loop")
+    assert [row["uid"] for row in rows] == [deferred.uid, real.uid]

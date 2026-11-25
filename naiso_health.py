@@ -28,6 +28,9 @@ class RestartRecord:
     detail: str = ""
     # A deferred recovery performed no restart, so it must not consume budget.
     counts: bool = True
+    # Stable diagnostic identity. Unlike ``attempt``, it never repeats after
+    # deferred callbacks or diagnostic-history trimming.
+    uid: int = 0
 
 
 class RestartPolicy:
@@ -56,6 +59,7 @@ class RestartPolicy:
         self._monotonic = monotonic_fn or time.monotonic
         self._sleep = sleep_fn or time.sleep
         self._records: Dict[str, List[RestartRecord]] = {}
+        self._attempt_seq: Dict[str, int] = {}
         self._lock = threading.RLock()
 
     def next_delay(self, name: str) -> Optional[float]:
@@ -79,6 +83,8 @@ class RestartPolicy:
             # Attempt IDs only advance on consumed attempts; deferred callbacks
             # did not restart anything and must not inflate the next ID.
             record.attempt = 1 + sum(1 for r in records if r.counts)
+            self._attempt_seq[str(name)] = int(self._attempt_seq.get(str(name), 0)) + 1
+            record.uid = int(self._attempt_seq[str(name)])
             records.append(record)
             # Restart history is diagnostic, not an audit ledger. Cap it so a
             # long-running process cannot grow memory without bound; the active
@@ -102,6 +108,7 @@ class RestartPolicy:
         rows.sort(key=lambda r: r.ts, reverse=True)
         return [{
             "name": r.name, "reason": r.reason, "ts": r.ts, "attempt": r.attempt,
+            "uid": int(r.uid),
             "delay": round(r.delay, 3), "result": r.result, "detail": r.detail,
             "counts": bool(r.counts),
         } for r in rows[:max(1, int(limit))]]
@@ -132,6 +139,11 @@ class ComponentHealth:
     thread_name: str = ""
     cycle_id: int = 0
     resume_requires_liveness: bool = False
+    # One verifier per component at a time. A timed-out verifier is abandoned,
+    # not duplicated; a permanently blocked verifier fails closed until it exits
+    # or the process is restarted.
+    verifier_thread: Optional[threading.Thread] = None
+    verification_generation: int = 0
 
 
 class HealthWatchdog:
@@ -257,7 +269,8 @@ class HealthWatchdog:
                         self._alarms.pop(alarm_key, None)
                     for key in ("verification_next_attempt", "verification_attempts",
                                 "verification_last_reason", "verification_progress_at",
-                                "verification_first_attempt_ts", "verification_exhausted"):
+                                "verification_first_attempt_ts", "verification_exhausted",
+                                "verification_id", "verification_generation"):
                         component.diagnostics.pop(key, None)
             state = diagnostics.pop("state", None)
             if state is not None and str(state).upper() in {"RUNNING", "IDLE", "BLOCKED", "FAILED"}:
@@ -368,49 +381,85 @@ class HealthWatchdog:
         return round(min(5.0, max(0.01, grace / 2.0), grace) if grace > 0 else 0.01, 4)
 
     def _run_recovery_verifier(self, component: ComponentHealth):
-        """Run a verifier on a daemon worker; never block the watchdog thread.
+        """Run at most one verifier per component on a bounded daemon worker.
 
         Returns ``(verified, reason, context, timed_out)``. A verifier that hangs
         is abandoned after the bounded join and reported as ``VERIFIER_TIMEOUT``
-        with no restart attempt consumed. Such workers are daemon threads by
-        design: a third-party verifier may block forever, so the watchdog cannot
-        join indefinitely or read its result after the bound; it does not keep the
-        process alive and is capped by the bounded verification retry policy.
+        with no restart attempt consumed. The timed-out daemon thread is tracked
+        until it exits: no second verifier can start for the same component while
+        it is alive, so repeated incidents cannot accumulate blocked verifiers.
+        A permanently blocked verifier therefore fails closed until process
+        restart rather than being replaced with a newer overlapping worker.
         """
-        outcome: Dict[str, Any] = {}
+        with self._lock:
+            active = component.verifier_thread
+            if active is not None and active.is_alive():
+                generation = int(component.verification_generation)
+                return False, "VERIFIER_ALREADY_RUNNING", {
+                    "verifier_already_running": True,
+                    "verification_generation": generation,
+                    "verification_id": f"{component.name}:v{generation}",
+                    "verifier_thread_name": str(active.name),
+                    "component": component.name,
+                }, False
+            component.verification_generation = int(component.verification_generation) + 1
+            generation = int(component.verification_generation)
+            base_context = {
+                "component": component.name,
+                "verification_generation": generation,
+                "verification_id": f"{component.name}:v{generation}",
+            }
 
-        def worker():
-            try:
-                outcome["value"] = component.recovery_verifier()
-            except BaseException as exc:
-                outcome["exception"] = f"{type(exc).__name__}: {exc}"
-                outcome["traceback"] = traceback.format_exc()[-1200:]
+            def verification_context(**extra):
+                payload = dict(base_context)
+                payload.update(extra)
+                return payload
+
+            outcome: Dict[str, Any] = {}
+
+            def worker():
+                try:
+                    outcome["value"] = component.recovery_verifier()
+                except BaseException as exc:
+                    outcome["exception"] = f"{type(exc).__name__}: {exc}"
+                    outcome["traceback"] = traceback.format_exc()[-1200:]
+                finally:
+                    with self._lock:
+                        if component.verification_generation == generation:
+                            component.verifier_thread = None
+
+            thread = threading.Thread(
+                target=worker, daemon=True,
+                name=f"naiso-verifier-{component.name}-g{generation}"[-80:])
+            component.verifier_thread = thread
 
         bound = self._verifier_bound_sec(component)
-        thread = threading.Thread(target=worker, daemon=True,
-                                  name=f"naiso-verifier-{component.name}"[-80:])
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                if component.verification_generation == generation:
+                    component.verifier_thread = None
+            raise
         thread.join(bound)
         if thread.is_alive():
-            return False, "VERIFIER_TIMEOUT", {
-                "verifier_blocked": True, "verifier_timeout": True,
-                "verifier_timeout_sec": bound, "verifier_thread_name": thread.name,
-                "component": component.name,
-            }, True
+            return False, "VERIFIER_TIMEOUT", verification_context(
+                verifier_blocked=True, verifier_timeout=True,
+                verifier_timeout_sec=bound, verifier_thread_name=thread.name), True
         if "exception" in outcome:
             detail = str(outcome["exception"])
             kind = detail.split(":", 1)[0]
-            return False, f"VERIFIER_EXCEPTION:{kind}", {
-                "verifier_exception_detail": detail,
-                "verifier_exception_traceback": outcome.get("traceback", ""),
-                "component": component.name,
-            }, False
+            return False, f"VERIFIER_EXCEPTION:{kind}", verification_context(
+                verifier_exception_detail=detail,
+                verifier_exception_traceback=outcome.get("traceback", "")), False
         value = outcome.get("value")
         try:
-            verified, reason, context = value
+            verified, reason, result_context = value
         except (TypeError, ValueError):
-            return False, "VERIFIER_INVALID_RESULT", {"component": component.name}, False
-        return bool(verified), str(reason), dict(context or {}), False
+            return False, "VERIFIER_INVALID_RESULT", verification_context(), False
+        merged = dict(result_context or {})
+        merged.update(base_context)  # generation and component are watchdog-owned
+        return bool(verified), str(reason), merged, False
 
     def check(self) -> Dict[str, Any]:
         now = float(self._monotonic())
@@ -486,7 +535,11 @@ class HealthWatchdog:
                                 f"[WATCHDOG] scheduled restart of {component.name} deferred: {verify_reason}")
                     report[component.name] = {"status": component.status, "lifecycle": "IDLE",
                                               "age_sec": round(now - scheduled_due, 3),
-                                              "restart": "VERIFICATION_HOLD", "reason": str(verify_reason)}
+                                              "restart": "VERIFICATION_HOLD", "reason": str(verify_reason),
+                                              "verification_id": verification_context.get("verification_id", ""),
+                                              "verification_generation": int(
+                                                  verification_context.get("verification_generation", 0) or 0),
+                                              "verifier_timeout": bool(_timed_out)}
                     continue
                 if callable(self.safety_gate):
                     allowed, reason = self.safety_gate()
@@ -572,7 +625,8 @@ class HealthWatchdog:
                     # verification; a blocked verifier is never retried forever.
                     for key in ("verification_next_attempt", "verification_attempts",
                                 "verification_last_reason", "verification_progress_at",
-                                "verification_first_attempt_ts", "verification_exhausted"):
+                                "verification_first_attempt_ts", "verification_exhausted",
+                                "verification_id", "verification_generation"):
                         diag.pop(key, None)
                 if diag.get("verification_exhausted"):
                     component.status = "STALLED_SAFE_HOLD"
@@ -583,6 +637,8 @@ class HealthWatchdog:
                         "reason": str(diag.get("verification_last_reason") or ""),
                         "verification_attempts": int(diag.get("verification_attempts", 0) or 0),
                         "verification_hold_sec": round(max(0.0, now - first), 3),
+                        "verification_id": str(diag.get("verification_id", "")),
+                        "verification_generation": int(diag.get("verification_generation", 0) or 0),
                         "caller": diag.get("verification_caller", ""),
                         "component": diag.get("verification_component", component.name),
                         "symbol_status": diag.get("verification_symbol_status", ""),
@@ -598,12 +654,18 @@ class HealthWatchdog:
                         "reason": str(diag.get("verification_last_reason") or ""),
                         "next_verification_sec": remaining,
                         "verification_attempts": int(diag.get("verification_attempts", 0) or 0),
+                        "verification_id": str(diag.get("verification_id", "")),
+                        "verification_generation": int(diag.get("verification_generation", 0) or 0),
                         "caller": diag.get("verification_caller", ""),
                         "component": diag.get("verification_component", component.name),
                     }
                     continue
                 verified, verify_reason, context, verifier_timed_out = self._run_recovery_verifier(component)
                 verification_context = dict(context or {})
+                if verification_context.get("verification_id"):
+                    diag["verification_id"] = str(verification_context["verification_id"])[:80]
+                    diag["verification_generation"] = int(
+                        verification_context.get("verification_generation", 0) or 0)
                 if verifier_timed_out:
                     # Fail closed before any restart budget is touched.
                     verification_context["verifier_timeout"] = True
@@ -634,6 +696,11 @@ class HealthWatchdog:
                         "next_verification_sec": round(self.verification_retry_sec, 3),
                         "verification_attempts": attempts,
                         "verification_hold_sec": round(hold_sec, 3),
+                        "verification_id": verification_context.get("verification_id", ""),
+                        "verification_generation": int(
+                            verification_context.get("verification_generation", 0) or 0),
+                        "verifier_already_running": bool(
+                            verification_context.get("verifier_already_running")),
                         "verifier_timeout": bool(verifier_timed_out),
                         "verifier_timeout_sec": (self._verifier_bound_sec(component)
                                                  if verifier_timed_out else None),
@@ -725,7 +792,7 @@ class HealthWatchdog:
                     verification_context.get("recovery_guard_reason") or
                     component.diagnostics.get("recovery_guard_reason") or "NOT_REPORTED")
                 diagnostic = (
-                    f"attempt={component.name}:{record.attempt} status={component.status} "
+                    f"attempt={component.name}:{record.uid} status={component.status} "
                     f"previous_status={previous_status} lifecycle={lifecycle} "
                     f"thread={thread_name} thread_alive={thread_alive} "
                     f"restart_guard={guard_reason} safety_gate={safety_gate_reason} "
@@ -739,7 +806,8 @@ class HealthWatchdog:
                     "status": component.status, "previous_status": previous_status,
                     "lifecycle": lifecycle, "age_sec": round(age, 3),
                     "restart": result, "attempt": record.attempt,
-                    "attempt_id": f"{component.name}:{record.attempt}",
+                    "attempt_id": f"{component.name}:{record.uid}",
+                    "attempt_uid": int(record.uid),
                     "thread_name": thread_name, "thread_alive": bool(thread_alive),
                     "restart_guard": guard_reason, "safety_gate_reason": safety_gate_reason,
                     "recovery_guard_reason": recovery_guard_reason,
@@ -750,7 +818,8 @@ class HealthWatchdog:
                 continue
             report[component.name] = {"status": component.status, "age_sec": round(age, 3),
                                       "restart": result, "attempt": record.attempt,
-                                      "counts": bool(consumed)}
+                                      "attempt_id": f"{component.name}:{record.uid}",
+                                      "attempt_uid": int(record.uid), "counts": bool(consumed)}
         return report
 
     def snapshot(self) -> Dict[str, Any]:
