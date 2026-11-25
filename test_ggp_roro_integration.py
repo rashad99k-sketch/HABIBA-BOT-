@@ -30,6 +30,8 @@ def test_analysis_returns_evidence_and_fails_closed_shape():
     assert result["decision_state"] in {"ENTRY_READY", "WAITING_FOR_CONFIRMATION", "WAITING_FOR_RETEST", "REJECTED"}
     assert "evidence" in result or "rejection_reason" in result
     assert "market_regime" in result
+    assert result["entry_behavior_authority"] == "ADVISORY_ONLY"
+    assert result["entry_behavior_can_authorize_entry"] is False
 
 
 def test_watchlist_does_not_require_rf_only():
