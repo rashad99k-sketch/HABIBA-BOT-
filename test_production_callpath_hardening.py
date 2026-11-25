@@ -170,3 +170,18 @@ def test_ambiguous_close_order_is_not_retried_by_safe_api_call(monkeypatch):
     assert calls == [1]
     assert ggpbot.STATE["execution_unresolved"] is True
     assert ggpbot.MEMORY["recovery_status"] == "ORDER_SUBMISSION_UNCERTAIN"
+
+
+def test_main_loop_dispatches_entry_revalidation_off_foreground_thread():
+    source = inspect.getsource(ggpbot._original_main_loop_sniper)
+    assert 'dispatch_scanner_task(' in source
+    assert '"institutional_entry_revalidation", smart_opportunity_selection' in source
+    assert 'smart_opportunity_selection()' not in source
+
+
+def test_entry_revalidation_reports_real_candidate_progress():
+    source = inspect.getsource(ggpbot.smart_opportunity_selection)
+    assert 'candidate_cycle_start' in source
+    assert 'candidate_ohlcv_complete' in source
+    assert 'candidate_analysis_complete' in source
+    assert 'entry_execution_complete' in source
