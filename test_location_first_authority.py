@@ -205,3 +205,104 @@ def test_central_authority_rejects_non_mapping_zone_without_raising():
     result = validate_location_zone(None, "BUY", 100.0, 1.0, 1_700_000_000_000, 900_000)
     assert result["valid"] is False
     assert result["reason"] == "malformed_location_zone"
+
+
+def test_buy_selection_retains_demand_identity_and_confirmed_geometry():
+    from roro_institutional import _zone_metadata_for_retest
+
+    context = _context()
+    selected = _zone_metadata_for_retest(
+        context, "BUY", "ORDER_BLOCK", 1_699_999_100_000, 99.0, 100.5
+    )
+    assert selected["zone_direction"] == "DEMAND"
+    assert selected["kind"] == "ORDER_BLOCK"
+    assert selected["low"] == 99.0
+    assert selected["high"] == 100.5
+    assert selected["available_timestamp"] == 1_699_999_100_000
+
+
+def test_sell_selection_retains_supply_identity_and_confirmed_geometry():
+    from roro_institutional import _zone_metadata_for_retest
+
+    context = _context(order_block={
+        "low": 100.5, "high": 102.0, "timestamp": 1_699_999_000_000,
+        "impulse_timestamp": 1_699_999_100_000, "strength": 8.0,
+        "distance_atr": 0.5, "zone_definition": "BEARISH_OPEN_TO_HIGH",
+    })
+    selected = _zone_metadata_for_retest(
+        context, "SELL", "ORDER_BLOCK", 1_699_999_100_000, 100.5, 102.0
+    )
+    assert selected["zone_direction"] == "SUPPLY"
+    assert selected["kind"] == "ORDER_BLOCK"
+    assert selected["low"] == 100.5
+    assert selected["high"] == 102.0
+
+
+def test_zone_identity_is_not_fabricated_when_selected_zone_is_missing():
+    from roro_institutional import _zone_metadata_for_retest
+
+    selected = _zone_metadata_for_retest(
+        _context(order_block=None), "BUY", "ORDER_BLOCK",
+        1_699_999_100_000, 99.0, 100.5,
+    )
+    assert selected == {}
+
+
+def test_buy_candidate_cannot_use_supply_resistance_from_wrong_collection():
+    context = _context(
+        order_block=None,
+        support_resistance={
+            "supports": [],
+            "resistances": [{
+                "type": "RESISTANCE", "low": 99.0, "high": 100.5,
+                "status": "CONFIRMED", "strength": 8.0,
+                "distance_atr": 0.0, "confirmed_at_timestamp": 1_699_999_100_000,
+            }],
+        },
+    )
+    assert _zone_retest_candidates(context, 101.0, 1.0, "BUY") == []
+
+
+def test_sell_candidate_cannot_use_demand_support_from_wrong_collection():
+    context = _context(
+        order_block=None,
+        support_resistance={
+            "supports": [{
+                "type": "SUPPORT", "low": 100.5, "high": 102.0,
+                "status": "CONFIRMED", "strength": 8.0,
+                "distance_atr": 0.0, "confirmed_at_timestamp": 1_699_999_100_000,
+            }],
+            "resistances": [],
+        },
+    )
+    assert _zone_retest_candidates(context, 99.0, 1.0, "SELL") == []
+
+
+def test_entry_zone_is_an_explicit_decision_field_and_defaults_to_none():
+    from roro_institutional import DecisionState, InstitutionalDecision
+
+    waiting = InstitutionalDecision(
+        DecisionState.WAITING_FOR_RETEST.value, "TREND_CONTINUATION_RETEST",
+        "BUY", "waiting",
+    )
+    assert waiting.to_dict()["entry_zone"] is None
+
+    selected_zone = {
+        "zone_direction": "DEMAND", "kind": "ORDER_BLOCK",
+        "low": 99.0, "high": 100.5, "available_timestamp": 1_699_999_100_000,
+    }
+    ready = InstitutionalDecision(
+        DecisionState.ENTRY_READY.value, "TREND_CONTINUATION_RETEST",
+        "BUY", "ready", entry_zone=selected_zone,
+    )
+    assert ready.to_dict()["entry_zone"] == selected_zone
+
+
+def test_zone_definition_conflict_cannot_be_overridden_by_direction_hint():
+    context = _context(order_block={
+        "low": 99.0, "high": 100.5, "timestamp": 1_699_999_000_000,
+        "impulse_timestamp": 1_699_999_100_000, "strength": 8.0,
+        "distance_atr": 0.0, "zone_definition": "BEARISH_OPEN_TO_HIGH",
+        "direction": "BULLISH",
+    })
+    assert _zone_retest_candidates(context, 101.0, 1.0, "BUY") == []
