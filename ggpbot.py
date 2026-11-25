@@ -14389,27 +14389,34 @@ def _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_
         live = MEMORY.setdefault("watchlist", {})
         staged = staged_memory.get("watchlist", {})
         for key, row in staged.items():
-            if not isinstance(row, dict) or row == baseline_watchlist.get(key):
+            if not isinstance(row, dict):
                 continue
+            baseline_row = baseline_watchlist.get(key)
+            if baseline_row is not None:
+                staged_ts = float(row.get("last_update", 0.0) or 0.0)
+                baseline_ts = float(baseline_row.get("last_update", 0.0) or 0.0)
+                if staged_ts <= baseline_ts:
+                    continue
             current = live.get(key)
             baseline_ref = baseline_refs.get(key)
             if key in baseline_watchlist:
                 if current is not baseline_ref:
                     continue
-                baseline_ts = float(baseline_watchlist[key].get("last_update", 0.0) or 0.0)
                 current_ts = float(current.get("last_update", 0.0) or 0.0) if isinstance(current, dict) else 0.0
                 if current_ts > baseline_ts:
                     continue
             elif current is not None:
                 continue
-            live[key] = copy.deepcopy(row)
+            # The staged row is already detached from the live Watchlist; transfer
+            # ownership rather than deep-copying arbitrary nested pandas objects.
+            live[key] = row
         for key in ("unified_watchlist_cursor", "unified_watchlist_last_update",
                     "unified_watchlist_last_batch_count", "unified_watchlist_source_count",
                     "_proximity_batch_updates", "_proximity_last_seen_by_symbol",
                     "ema9_vwap_proximity_scanner", "confirmed_cross_events",
                     "confirmed_cross_events_last_sync", "_watchlist_engine_last_candle"):
             if key in staged_memory:
-                MEMORY[key] = copy.deepcopy(staged_memory[key])
+                MEMORY[key] = staged_memory[key]
         return True
 
 
