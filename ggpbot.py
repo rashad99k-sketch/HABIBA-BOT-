@@ -12870,17 +12870,17 @@ def main_loop_sniper():
                     time.sleep(1)
                 continue
             if STATE["open"] and STATE.get("current_symbol"):
+                # LiveTradeManager already owns the authoritative market snapshot,
+                # ATR/thesis updates and exit decisions. Do not issue a second
+                # ticker/OHLCV cycle from MainThread after management; use the
+                # reconciled state for the dashboard projection only.
                 sym = STATE["current_symbol"]
-                price = get_ticker_safe(sym)
-                if price and price > 0:
-                    df = get_ohlcv_safe(sym, 50)
-                    if df is not None:
-                        # Exit authority is exclusively LiveTradeManager; this block only updates auxiliary risk context.
-                        atr = compute_atr(_closed_candle_frame(df, INTERVAL)).iloc[-1]
-                        scaling_logic(sym, df, None)
-                        current_pnl = STATE.get("roe_pct", 0.0)
-                        update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
-                        _main_loop_progress("open_trade_risk_refresh_complete", symbol=str(sym))
+                current_pnl = STATE.get("roe_pct", 0.0)
+                update_position_dashboard(
+                    sym, STATE.get("side"), STATE.get("entry", 0.0),
+                    STATE.get("qty", 0.0), current_pnl,
+                )
+                _main_loop_progress("open_trade_state_projection_complete", symbol=str(sym))
             # Drawdown cooldown never force-closes exposure; LiveTradeManager owns exits.
             # Cooldown does not own cleanup; the existing bounded lifecycle cleanup does.
             daily_loss_cooldown_active()
