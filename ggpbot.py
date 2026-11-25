@@ -637,7 +637,8 @@ def rate_limit(func=None):
         acquired = _API_RATE_LOCK.acquire(timeout=API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC)
         if not acquired:
             owner = dict(_API_RATE_LOCK_OWNER)
-            held_for = max(0.0, time.monotonic() - float(owner.get("since_monotonic") or 0.0))
+            owner_since = float(owner.get("since_monotonic") or 0.0)
+            held_for = max(0.0, time.monotonic() - owner_since) if owner_since > 0 else 0.0
             raise ApiRateLockTimeout(
                 f"API_RATE_LOCK acquisition timed out after "
                 f"{API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC:.2f}s for {method_name or 'unknown'}; "
