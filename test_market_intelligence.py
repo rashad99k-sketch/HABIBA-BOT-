@@ -1074,15 +1074,14 @@ def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
 
 
 def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
+    import threading
     import time as real_time
     from types import SimpleNamespace
 
     import ggpbot as bot
 
-    # ggpbot.time normally references Python's process-global time module.
-    # Replacing its attributes here would also alter clocks/sleeps used by
-    # background workers started by earlier tests. Inject a module-local clock
-    # facade instead, so this deterministic pacing test cannot affect threads.
+    # Isolate every mutable scheduler primitive. Background threads created by
+    # earlier integration tests must not contend with or advance this test.
     real_monotonic = real_time.monotonic
     real_sleep = real_time.sleep
     clock = [100.0]
@@ -1106,19 +1105,48 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
         "time",
         SimpleNamespace(monotonic=fake_monotonic, sleep=fake_sleep),
     )
-    assert real_time.monotonic is real_monotonic
-    assert real_time.sleep is real_sleep
+    monkeypatch.setattr(bot, "_API_RATE_LOCK", threading.Lock())
+    monkeypatch.setattr(
+        bot, "_API_RATE_LOCK_OWNER",
+        {"thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""},
+    )
     monkeypatch.setattr(bot, "_last_api_call", 100.0)
-    monkeypatch.setattr(bot, "BINGX_KLINE_MIN_INTERVAL", 1.05)
+    monkeypatch.setattr(bot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.05)
     monkeypatch.setitem(bot._API_METHOD_MIN_INTERVALS, "fetch_ohlcv", 1.05)
 
+    assert real_time.monotonic is real_monotonic
+    assert real_time.sleep is real_sleep
+
     bot.rate_limit(fetch_ohlcv)
-    assert waits[-1] == pytest.approx(1.05)
+    assert sum(waits) == pytest.approx(1.05)
+    assert not bot._API_RATE_LOCK.locked()
 
     waits.clear()
     monkeypatch.setattr(bot, "_last_api_call", clock[0])
     bot.rate_limit(fetch_ticker)
-    assert waits[-1] == pytest.approx(bot._API_METHOD_MIN_INTERVALS["fetch_ticker"])
+    assert sum(waits) == pytest.approx(bot._API_METHOD_MIN_INTERVALS["fetch_ticker"])
+    assert not bot._API_RATE_LOCK.locked()
+
+
+def test_bingx_rate_limit_fails_closed_when_scheduler_lock_is_contended(monkeypatch):
+    import threading
+
+    import ggpbot as bot
+
+    lock = threading.Lock()
+    lock.acquire()
+    monkeypatch.setattr(bot, "_API_RATE_LOCK", lock)
+    monkeypatch.setattr(bot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.05)
+
+    def fetch_ticker():
+        return None
+
+    with pytest.raises(bot.ApiRateLockTimeout, match="API_RATE_LOCK acquisition timed out"):
+        bot.rate_limit(fetch_ticker)
+
+    # The caller must not release a lock owned by another thread.
+    assert lock.locked()
+    lock.release()
 
 
 def _sr_fixture():
