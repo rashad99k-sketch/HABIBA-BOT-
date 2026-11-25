@@ -6668,6 +6668,26 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                     or filled_qty > 0
                     or isinstance(raw_position, dict)
                 )
+                partial_stop_id = None
+                if filled_qty > 0 and isinstance(raw_position, dict):
+                    # A known partial fill is already exchange exposure. Protect
+                    # exactly the confirmed filled quantity before handing the
+                    # unresolved remainder to account-wide recovery.
+                    try:
+                        partial_mode = PositionMode(str(getattr(result, "position_mode", "")).upper())
+                        partial_position_side = str(getattr(result, "position_side", "") or "").upper()
+                        if partial_position_side in {"BOTH", "LONG", "SHORT"}:
+                            partial_stop_id = service.place_and_verify_native_stop(
+                                symbol=sym, side=side, quantity=filled_qty,
+                                trigger_price=float(stop_value), mode=partial_mode,
+                                position_side=partial_position_side,
+                            )
+                    except Exception as protection_exc:
+                        log_execution(
+                            f"[LIVE_SAFETY] Partial fill native-stop placement failed: "
+                            f"{type(protection_exc).__name__}: {protection_exc}",
+                            "CRITICAL",
+                        )
                 STATE.update({
                     "execution_unresolved": unresolved,
                     "recovery_hold": unresolved,
@@ -6680,11 +6700,28 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                     "current_symbol": sym if unresolved else STATE.get("current_symbol"),
                     "side": side if unresolved else STATE.get("side"),
                     "trade_id": str(trade_id or getattr(result, "trade_id", "") or STATE.get("trade_id") or ""),
+                    "qty": filled_qty if filled_qty > 0 else STATE.get("qty", 0.0),
+                    "initial_qty": filled_qty if filled_qty > 0 else STATE.get("initial_qty", 0.0),
+                    "remaining_qty": filled_qty if filled_qty > 0 else STATE.get("remaining_qty", 0.0),
+                    "exchange_qty": filled_qty if filled_qty > 0 else STATE.get("exchange_qty", 0.0),
+                    "synthetic_sl": float(stop_value) if filled_qty > 0 else STATE.get("synthetic_sl"),
+                    "sl": float(stop_value) if filled_qty > 0 else STATE.get("sl"),
+                    "native_sl_verified": bool(partial_stop_id),
+                    "native_sl_order_id": partial_stop_id,
+                    "native_sl_status": "VERIFIED" if partial_stop_id else (
+                        "UNVERIFIED_PARTIAL_FILL" if filled_qty > 0 else STATE.get("native_sl_status", "UNKNOWN")
+                    ),
+                    "native_sl_original_price": float(stop_value) if filled_qty > 0 else STATE.get("native_sl_original_price", 0.0),
+                    "native_sl_original_qty": filled_qty if filled_qty > 0 else STATE.get("native_sl_original_qty", 0.0),
+                    "native_sl_last_verified_price": float(stop_value) if partial_stop_id else STATE.get("native_sl_last_verified_price", 0.0),
                 })
                 if unresolved:
                     RECOVERY_BLOCK_ENTRIES = True
                     MEMORY["position_status"] = "UNKNOWN"
-                    MEMORY["recovery_status"] = "ENTRY_EXECUTION_RECONCILIATION_REQUIRED"
+                    MEMORY["recovery_status"] = (
+                        "PARTIAL_FILL_PROTECTION_VERIFIED_RECOVERY_REQUIRED"
+                        if partial_stop_id else "ENTRY_EXECUTION_RECONCILIATION_REQUIRED"
+                    )
                 log_execution(
                     f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} "
                     f"filled={filled_qty:.10f} remaining={safe_float(getattr(result, 'remaining_qty', 0.0), 0.0):.10f} "
