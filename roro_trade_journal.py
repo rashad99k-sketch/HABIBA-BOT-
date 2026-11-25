@@ -82,6 +82,20 @@ class TradeJournal:
             );
             CREATE INDEX IF NOT EXISTS ix_confirmed_cross_events_status
                 ON confirmed_cross_events(status, expires_ts);
+            CREATE TABLE IF NOT EXISTS rf_reentry_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                rf_signal_timestamp INTEGER NOT NULL,
+                close_ts REAL NOT NULL,
+                created_ts REAL NOT NULL,
+                released_ts REAL,
+                metadata_json TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_rf_reentry_block_identity
+                ON rf_reentry_blocks(symbol, direction, rf_signal_timestamp);
+            CREATE INDEX IF NOT EXISTS ix_rf_reentry_blocks_active
+                ON rf_reentry_blocks(symbol, direction, released_ts, rf_signal_timestamp);
             """)
             # Upgrade databases created by earlier releases without discarding rows.
             existing = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
@@ -426,6 +440,138 @@ class TradeJournal:
             count = int(cur.rowcount)
             db.execute("COMMIT")
             return count
+
+    # --- Durable Range Filter opposite-signal re-entry blocks ----------------
+    # A row exists only after a verified RF-driven close. It is released only by
+    # a strictly later closed-candle entry signal that was actually traded.
+    _RF_REENTRY_BLOCK_COLUMNS = (
+        "id", "symbol", "direction", "rf_signal_timestamp", "close_ts",
+        "created_ts", "released_ts", "metadata_json",
+    )
+
+    @staticmethod
+    def _rf_reentry_block_row(row: Any) -> Dict[str, Any]:
+        item = dict(zip(TradeJournal._RF_REENTRY_BLOCK_COLUMNS, row))
+        try:
+            item["rf_signal_timestamp"] = int(item["rf_signal_timestamp"])
+            item["close_ts"] = float(item["close_ts"])
+            item["created_ts"] = float(item["created_ts"])
+            item["released_ts"] = (float(item["released_ts"])
+                                   if item.get("released_ts") is not None else None)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"malformed RF re-entry block: {exc}") from exc
+        if item["rf_signal_timestamp"] <= 0 or not item["close_ts"] > 0:
+            raise ValueError("malformed RF re-entry block timestamps")
+        try:
+            item["metadata"] = json.loads(item.pop("metadata_json", None) or "{}")
+        except (TypeError, ValueError):
+            item["metadata"] = {}
+        if not isinstance(item["metadata"], dict):
+            item["metadata"] = {}
+        return item
+
+    @staticmethod
+    def _rf_reentry_direction(direction: str) -> str:
+        normalized = str(direction or "").strip().upper()
+        if normalized not in {"BUY", "SELL"}:
+            raise ValueError(f"invalid RF re-entry direction: {direction!r}")
+        return normalized
+
+    def record_rf_reentry_block(self, *, symbol: str, direction: str,
+                                rf_signal_timestamp: int, close_ts: float,
+                                metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Persist one RF-opposite-close block. Duplicate identities are ignored."""
+        side = self._rf_reentry_direction(direction)
+        try:
+            signal_ts = int(rf_signal_timestamp)
+            close_at = float(close_ts)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid RF re-entry timestamps: {exc}") from exc
+        if signal_ts <= 0 or not close_at > 0:
+            raise ValueError("RF re-entry timestamps must be positive")
+        payload = json.dumps(metadata or {}, sort_keys=True, default=str, separators=(",", ":"))
+        now = time.time()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """INSERT OR IGNORE INTO rf_reentry_blocks(
+                       symbol, direction, rf_signal_timestamp, close_ts,
+                       created_ts, released_ts, metadata_json)
+                   VALUES(?,?,?,?,?,NULL,?)""",
+                (str(symbol), side, signal_ts, close_at, now, payload),
+            )
+            db.execute("COMMIT")
+            return cur.rowcount == 1
+
+    def get_active_rf_reentry_block(self, symbol: str,
+                                    direction: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Read the newest active block; malformed durable rows fail closed."""
+        params: List[Any] = [str(symbol)]
+        query = ("SELECT id,symbol,direction,rf_signal_timestamp,close_ts,created_ts,"
+                 "released_ts,metadata_json FROM rf_reentry_blocks "
+                 "WHERE symbol=? AND released_ts IS NULL")
+        if direction is not None:
+            query += " AND direction=?"
+            params.append(self._rf_reentry_direction(direction))
+        query += " ORDER BY rf_signal_timestamp DESC, id DESC LIMIT 1"
+        with self._db() as db:
+            row = db.execute(query, params).fetchone()
+        return self._rf_reentry_block_row(row) if row else None
+
+    def list_rf_reentry_blocks(self, symbol: Optional[str] = None,
+                               direction: Optional[str] = None,
+                               *, include_released: bool = True) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        query = ("SELECT id,symbol,direction,rf_signal_timestamp,close_ts,created_ts,"
+                 "released_ts,metadata_json FROM rf_reentry_blocks WHERE 1=1")
+        if symbol is not None:
+            query += " AND symbol=?"
+            params.append(str(symbol))
+        if direction is not None:
+            query += " AND direction=?"
+            params.append(self._rf_reentry_direction(direction))
+        if not include_released:
+            query += " AND released_ts IS NULL"
+        query += " ORDER BY rf_signal_timestamp DESC, id DESC"
+        with self._db() as db:
+            rows = db.execute(query, params).fetchall()
+        return [self._rf_reentry_block_row(row) for row in rows]
+
+    def release_rf_reentry_blocks(self, symbol: str, direction: str,
+                                  signal_timestamp: int) -> int:
+        """Release blocks only when a strictly later signal candle traded."""
+        side = self._rf_reentry_direction(direction)
+        try:
+            signal_ts = int(signal_timestamp)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid RF re-entry release signal: {exc}") from exc
+        if signal_ts <= 0:
+            raise ValueError("RF re-entry release signal must be positive")
+        now = time.time()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """SELECT id,metadata_json FROM rf_reentry_blocks
+                   WHERE symbol=? AND direction=? AND released_ts IS NULL
+                     AND rf_signal_timestamp<?""",
+                (str(symbol), side, signal_ts),
+            ).fetchall()
+            for row_id, metadata_json in rows:
+                try:
+                    metadata = json.loads(metadata_json or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["released_by_signal_timestamp"] = signal_ts
+                db.execute(
+                    """UPDATE rf_reentry_blocks
+                       SET released_ts=?, metadata_json=? WHERE id=? AND released_ts IS NULL""",
+                    (now, json.dumps(metadata, sort_keys=True, default=str,
+                                     separators=(",", ":")), row_id),
+                )
+            db.execute("COMMIT")
+            return len(rows)
 
     def persist_entry_context(self, trade_id: str, context: Dict[str, Any]) -> bool:
         """Store the immutable entry-time evidence as an audit event.

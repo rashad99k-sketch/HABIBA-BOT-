@@ -122,6 +122,49 @@ def _exit_runtime(monkeypatch, *, paper=False, journal_record=None):
     return journal
 
 
+def _registry_runtime(monkeypatch, items, *, finalize_on_exit=False):
+    """Minimal registry surface for exit-gate tests (no exchange I/O)."""
+    active = list(items)
+    positions = {
+        item["trade_id"]: SimpleNamespace(symbol=item["symbol"], state=item["state"])
+        for item in items
+    }
+
+    class _Focus:
+        def __init__(self, trade_id):
+            self.trade_id = trade_id
+
+        def __enter__(self):
+            ggpbot.STATE["current_symbol"] = positions[self.trade_id].symbol
+            return self
+
+        def __exit__(self, *_exc):
+            if finalize_on_exit:
+                active[:] = [item for item in active if item["trade_id"] != self.trade_id]
+                positions.pop(self.trade_id, None)
+            return False
+
+    runtime = SimpleNamespace(
+        status=lambda: {"active": list(active)},
+        focus=lambda trade_id: _Focus(str(trade_id)),
+        _positions=positions,
+    )
+    monkeypatch.setattr(ggpbot, "PORTFOLIO_RUNTIME", runtime, raising=False)
+    monkeypatch.setattr(ggpbot, "PORTFOLIO_ALLOCATOR", SimpleNamespace(
+        counts=lambda: {"TOTAL": 0},
+    ), raising=False)
+    return runtime
+
+
+def _protected_paper_state(symbol, side="BUY"):
+    return {
+        "open": True, "current_symbol": symbol, "side": side,
+        "remaining_qty": 1.0, "synthetic_sl": 100.0,
+        "native_sl_status": "PAPER_SIMULATED", "execution_unresolved": False,
+        "close_reconciliation_required": False,
+    }
+
+
 # --- Health/readiness state transitions ------------------------------------ #
 
 def test_health_reports_running_readiness_and_genuine_progress(monkeypatch):
@@ -282,6 +325,62 @@ def test_exit_gate_verified_flat_persists_safe_exit(monkeypatch):
     assert journal.record["exposure_status"] == "FLAT"
     assert journal.record["safe_to_exit"] is True
     assert journal.record["details"]["exchange_flat_confirmed"] is True
+
+
+def test_exit_gate_refuses_when_any_registered_position_is_unprotected(monkeypatch):
+    journal = _exit_runtime(monkeypatch, paper=True)
+    good = _protected_paper_state("BTC/USDT:USDT")
+    bad = dict(good, symbol="ETH/USDT:USDT", current_symbol="ETH/USDT:USDT", synthetic_sl=0.0)
+    _registry_runtime(monkeypatch, [
+        {"trade_id": "t-btc", "symbol": "BTC/USDT:USDT", "state": good},
+        {"trade_id": "t-eth", "symbol": "ETH/USDT:USDT", "state": bad},
+    ])
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda *_a, **_k: ("OPEN", []))
+
+    assert ggpbot._recovery_exit_gate("SUPERVISOR_RESTART_LIMIT_EXHAUSTED") is False
+    assert ggpbot.MEMORY["recovery_status"] == "EXIT_REFUSED_UNVERIFIED_EXPOSURE"
+    assert journal.record["safe_to_exit"] is False
+
+
+def test_exit_gate_verifies_every_registered_open_position(monkeypatch):
+    journal = _exit_runtime(monkeypatch, paper=True)
+    _registry_runtime(monkeypatch, [
+        {"trade_id": "t-btc", "symbol": "BTC/USDT:USDT",
+         "state": _protected_paper_state("BTC/USDT:USDT")},
+        {"trade_id": "t-eth", "symbol": "ETH/USDT:USDT",
+         "state": _protected_paper_state("ETH/USDT:USDT", side="SELL")},
+    ])
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda *_a, **_k: ("OPEN", []))
+
+    assert ggpbot._recovery_exit_gate("SUPERVISOR_RESTART_LIMIT_EXHAUSTED") is True
+    assert ggpbot.MEMORY["recovery_status"] == "EXIT_VERIFIED_PROTECTED_OPEN"
+    assert journal.record["safe_to_exit"] is True
+    assert journal.record["exposure_status"] == "OPEN"
+
+
+def test_exit_gate_finalizes_every_registered_position_before_flat(monkeypatch):
+    journal = _exit_runtime(monkeypatch, paper=True)
+    _registry_runtime(monkeypatch, [
+        {"trade_id": "t-btc", "symbol": "BTC/USDT:USDT",
+         "state": _protected_paper_state("BTC/USDT:USDT")},
+        {"trade_id": "t-eth", "symbol": "ETH/USDT:USDT",
+         "state": _protected_paper_state("ETH/USDT:USDT", side="SELL")},
+    ], finalize_on_exit=True)
+    cleared = []
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda *_a, **_k: ("FLAT", []))
+    monkeypatch.setattr(ggpbot, "_clear_confirmed_flat",
+                        lambda symbol, reason: cleared.append((symbol, reason)) or True)
+
+    assert ggpbot._recovery_exit_gate("SUPERVISOR_RESTART_LIMIT_EXHAUSTED") is True
+    assert cleared == [
+        ("BTC/USDT:USDT", "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"),
+        ("ETH/USDT:USDT", "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"),
+    ]
+    assert ggpbot.MEMORY["recovery_status"] == "EXIT_RECONCILED_FLAT"
+    assert journal.record["safe_to_exit"] is True
 
 
 def test_exit_gate_refuses_when_persistence_unavailable(monkeypatch):
