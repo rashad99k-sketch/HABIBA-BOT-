@@ -470,6 +470,33 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 side = str(item.get("side_hint") or implied_side or "").upper()
             if side in {"BUY", "SELL"}:
                 entry["sides"].add(side)
+            # A durable EMA9/VWAP event carries its own immutable direction.
+            # Keep that direction separate from soft scanner hints so the
+            # institutional analyzer cannot select the opposite hypothesis
+            # and accidentally inherit this event identity.
+            if source == "confirmed_cross_events" and item.get("cross_event_id"):
+                event_side = str(item.get("side") or "").upper()
+                if event_side in {"BUY", "SELL"}:
+                    existing_event_id = str(entry.get("cross_event_id") or "")
+                    incoming_event_id = str(item.get("cross_event_id") or "")
+                    if not existing_event_id or existing_event_id == incoming_event_id:
+                        entry["cross_event_id"] = incoming_event_id
+                        entry["cross_event_side"] = event_side
+                        for field in (
+                            "cross_event_source", "cross_event_direction",
+                            "cross_event_timestamp", "cross_event_status",
+                            "cross_event_timeframe", "cross_event_lifecycle_status",
+                            "cross_event_phase", "cross_event_lifecycle_schema",
+                            "cross_event_entry_ready", "cross_event_rejection_high",
+                            "cross_event_rejection_low", "cross_event_rejection_timestamp",
+                            "cross_event_breakout_timestamp", "cross_event_breakout_close",
+                            "cross_event_chase_atr",
+                        ):
+                            if item.get(field) not in (None, "", "UNKNOWN"):
+                                entry[field] = item[field]
+                    else:
+                        entry["cross_event_conflict"] = True
+                        entry.setdefault("cross_event_ids", [existing_event_id]).append(incoming_event_id)
             try:
                 entry["score"] = max(float(entry["score"]), float(item.get("score", 0) or 0))
             except (TypeError, ValueError):
@@ -927,7 +954,27 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 "data_quality": "DATA_UNAVAILABLE", "last_update": time.time(), "icons": {"status": "⚪"},
             })
         else:
-            results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in ("BUY", "SELL")]
+            cross_side = str(candidate.get("cross_event_side") or "").upper()
+            cross_event_active = bool(
+                candidate.get("cross_event_id")
+                and str(candidate.get("cross_event_status", "ACTIVE")).upper() == "ACTIVE"
+            )
+            if cross_event_active and (
+                candidate.get("cross_event_conflict") or cross_side not in {"BUY", "SELL"}
+            ):
+                best = _with_projected_decision({
+                    "symbol": key, "exchange_symbol": candidate["exchange_symbol"],
+                    "side": "UNKNOWN", "decision_state": DecisionState.REJECTED.value,
+                    "entry_status": DecisionState.REJECTED.value,
+                    "decision_reason": "conflicting_or_missing_durable_cross_direction",
+                    "rejection_reasons": ["conflicting_or_missing_durable_cross_direction"],
+                    "data_quality": "VALID_CLOSED_CANDLES", "last_update": time.time(),
+                    "icons": {"status": "⛔"},
+                })
+                results = []
+            else:
+                analysis_sides = [cross_side] if cross_event_active else ["BUY", "SELL"]
+                results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in analysis_sides]
             for result in results:
                 if enrich is not None:
                     try:
@@ -939,20 +986,26 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 result["sources"] = list(candidate.get("sources", []))
                 result["discovery_score"] = candidate.get("score", 0)
                 result["side_hints"] = list(candidate.get("sides", []))
-            ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
-            if len(ready) > 1:
-                best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
-                best.update({"decision_state": DecisionState.REJECTED.value, "entry_status": DecisionState.REJECTED.value,
-                             "decision_reason": "conflicting_opposing_setups_require_resolution",
-                             "rejection_reasons": ["both_buy_and_sell_hypotheses_entry_ready"],
-                             "conflicting_directions": [row.get("side") for row in ready],
-                             "structural_stop": None, "event_id": None,
-                             "icons": {**(best.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
+            if not results:
+                pass
             else:
-                hints = set(candidate.get("sides", []))
-                best = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
-                best["side_hint_used_as_gate"] = False
-                best["side_selection_reason"] = "both_directions_analyzed; discovery_side_is_soft_hint"
+                ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
+                if len(ready) > 1:
+                    best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
+                    best.update({"decision_state": DecisionState.REJECTED.value, "entry_status": DecisionState.REJECTED.value,
+                                 "decision_reason": "conflicting_opposing_setups_require_resolution",
+                                 "rejection_reasons": ["both_buy_and_sell_hypotheses_entry_ready"],
+                                 "conflicting_directions": [row.get("side") for row in ready],
+                                 "structural_stop": None, "event_id": None,
+                                 "icons": {**(best.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
+                else:
+                    hints = set(candidate.get("sides", []))
+                    best = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
+                    best["side_hint_used_as_gate"] = bool(cross_event_active)
+                    best["side_selection_reason"] = (
+                        "durable_cross_direction_is_authoritative" if cross_event_active
+                        else "both_directions_analyzed; discovery_side_is_soft_hint"
+                    )
             best["side_analyses"] = {
                 row.get("side"): {"state": row.get("decision_state"), "setup": row.get("decision_setup_type"),
                                   "score": row.get("score"), "reason": row.get("decision_reason"),
