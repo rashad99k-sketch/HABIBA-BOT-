@@ -1282,7 +1282,12 @@ def fetch_ohlcv(symbol, limit=150):
                 detail=f"endpoint cooldown active for {cooldown:.2f}s; no request sent",
             )
             return None
-        data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
+        # Position management is a latency-critical foreground responsibility.
+        # One physical read per cycle is safer than exhausting the watchdog budget
+        # with retries; the next management cycle performs the next reconciliation.
+        api_attempts = 1 if (STATE.get("open") or TRADE_STATE.get("in_position")) else None
+        data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit,
+                             _api_max_attempts=api_attempts)
         if not data:
             rate = _LAST_API_RATE_LIMIT
             rate_limited = (
@@ -1361,7 +1366,9 @@ def fetch_ohlcv(symbol, limit=150):
 def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
     try:
         sym = normalize_symbol(symbol)
-        data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit)
+        api_attempts = 1 if (STATE.get("open") or TRADE_STATE.get("in_position")) else None
+        data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit,
+                             _api_max_attempts=api_attempts)
         if not data or len(data) < 30:
             return None
         try:
@@ -1391,7 +1398,9 @@ def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
         return None
 
 def fetch_ticker(symbol):
-    return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol))
+    api_attempts = 1 if (STATE.get("open") or TRADE_STATE.get("in_position")) else None
+    return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol),
+                         _api_max_attempts=api_attempts)
 
 def fetch_orderbook(symbol, limit=20):
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
