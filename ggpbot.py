@@ -3613,6 +3613,7 @@ def _move_native_stop_verified(symbol, new_trigger_price, *, action="MOVE_SL", r
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[NATIVE_SL_MOVE] {message}", "INFO"),
+                api_caller=safe_api_call,
             )
             result = service.replace_native_stop(
                 symbol=normalize_symbol(symbol), side=side, quantity=qty,
@@ -6590,6 +6591,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
+                api_caller=safe_api_call,
             )
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
