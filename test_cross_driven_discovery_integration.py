@@ -426,10 +426,11 @@ def _prepare_scanner_cycle(monkeypatch, journal, frame, calls, fetch_calls, refr
     monkeypatch.setattr(ggpbot, "_integration_fetch_frame",
                         lambda symbol: fetch_calls.append(symbol) or frame.copy())
 
-    real_refresh = ggpbot.refresh_unified_institutional_watchlist
     def refresh_spy(**kwargs):
+        # This test owns scanner-cycle delivery, not the asynchronous worker.
+        # Worker execution and completion are covered by dedicated incident tests.
         refresh_calls.append(kwargs)
-        return real_refresh(**kwargs)
+        return ggpbot.MEMORY.setdefault("watchlist", {})
     monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", refresh_spy)
 
     for key in ("confirmed_cross_events", "scanner_v2_buy", "scanner_v2_sell",
