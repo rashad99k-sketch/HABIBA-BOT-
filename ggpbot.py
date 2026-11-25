@@ -11503,6 +11503,7 @@ def _health_readiness(snapshot):
         "readiness": readiness,
         "process": {"state": HEALTH_PROCESS_LIVE, "pid": os.getpid()},
         "main_loop": main_loop,
+        "watchlist_worker": watchlist_worker,
         "recovery": recovery,
         "blockers": blockers,
         "process_failures": process_failures,
