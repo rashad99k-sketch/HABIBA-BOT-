@@ -462,3 +462,10 @@ def test_async_watchlist_delivery_completes_when_all_durable_events_are_publishe
     assert delivery["reason"] == "ACTIVE_WATCHLIST_DELIVERED"
     assert delivery["lifecycle_status"] == ggpbot.ACTIVE_WATCHLIST_LIFECYCLE
     assert delivery["same_cycle"] is False
+
+
+def test_global_discovery_does_not_overwrite_newer_async_cross_delivery_ack():
+    source = inspect.getsource(ggpbot.run_global_discovery_scanner)
+    assert 'existing_delivery = MEMORY.get("_cross_watchlist_delivery")' in source
+    assert 'existing_delivery.get("delivered")' in source
+    assert 'WATCHLIST_REFRESH_SCHEDULED' in source
