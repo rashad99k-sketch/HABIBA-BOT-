@@ -51,6 +51,9 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
         if not rejection:
             reasons = row.get("rejection_reasons")
             rejection = reasons[0] if isinstance(reasons, (list, tuple)) and reasons else ""
+        if not rejection:
+            blockers = decision.get("blocking_reasons")
+            rejection = blockers[0] if isinstance(blockers, (list, tuple)) and blockers else ""
         item = {
             "symbol": _first_text(row.get("symbol"), key, default="UNKNOWN"),
             "side": _first_text(row.get("side"), default="UNKNOWN"),
@@ -67,7 +70,8 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
             "stop_status": _first_text(row.get("structural_stop_status"), decision.get("stop_validation_status"), default="UNKNOWN"),
             "freshness": _first_text(row.get("snapshot_freshness"), row.get("data_freshness"), row.get("data_quality"), default="UNKNOWN"),
             "updated_at": updated, "cross": _first_text(cross.get("state"), default="NO_CROSS"),
-            "durable": bool(cross.get("durable", row.get("cross_durable", False))),
+            "durable": bool(cross.get("durable_event", cross.get("durable", row.get("cross_durable", False)))
+                            and cross.get("authoritative", True)),
         }
         rows.append((_STATE_PRIORITY.get(state, 0), score, updated, str(key), item))
     rows.sort(key=lambda value: (value[0], value[1], value[2]), reverse=True)
