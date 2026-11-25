@@ -721,6 +721,10 @@ def cache_set(key, value):
                 CACHE.pop(old_key, None)
 
 def safe_api_call(func, *args, **kwargs):
+    # Internal callers may lower the retry budget for latency-sensitive reads
+    # that run on the foreground trade-control loop. This never increases the
+    # configured global retry budget and is not forwarded to CCXT.
+    requested_attempts = kwargs.pop("_api_max_attempts", None)
     # Order creation is non-idempotent. Never automatically retry a timed-out
     # create_order call: BingX may have accepted the first request already.
     method_name = getattr(func, "__name__", "exchange_call")
@@ -764,7 +768,14 @@ def safe_api_call(func, *args, **kwargs):
         if resilience is not None:
             resilience.record_success(method_name)
         return result
-    attempts = int(getattr(resilience, "max_attempts", 3) or 3) if resilience is not None else 3
+    configured_attempts = int(getattr(resilience, "max_attempts", 3) or 3) if resilience is not None else 3
+    attempts = configured_attempts
+    if requested_attempts is not None:
+        try:
+            # A call-site override may only tighten the shared retry policy.
+            attempts = min(configured_attempts, max(1, int(requested_attempts)))
+        except (TypeError, ValueError):
+            attempts = configured_attempts
     for attempt in range(attempts):
         try:
             # The circuit gate must be enforced for every physical attempt. A
@@ -1032,7 +1043,9 @@ ex = ccxt.bingx({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "timeout": _env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 60000),
+    # Keep one-shot foreground reconciliation reads bounded below the
+    # watchdog grace window; slow reads become UNKNOWN and retry next cycle.
+    "timeout": _env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 15000),
     "options": {"defaultType": "swap"}
 })
 
@@ -1236,10 +1249,10 @@ def fetch_ticker(symbol):
 def fetch_orderbook(symbol, limit=20):
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
 
-def get_balance():
+def get_balance(_api_max_attempts=None):
     if PAPER_MODE:
         return paper["balance"]
-    bal = safe_api_call(ex.fetch_balance)
+    bal = safe_api_call(ex.fetch_balance, _api_max_attempts=_api_max_attempts)
     if bal:
         return bal.get("total", {}).get("USDT", 0.0)
     return 0.0
@@ -1329,11 +1342,11 @@ def get_ticker_safe(symbol):
             return price
     return None
 
-def get_balance_safe():
+def get_balance_safe(*, api_max_attempts=None):
     cached = cache_get("balance", 5)  # 5 seconds
     if cached is not None:
         return cached
-    bal = get_balance()
+    bal = get_balance(_api_max_attempts=api_max_attempts)
     cache_set("balance", bal)
     return bal
 
@@ -12351,7 +12364,9 @@ def get_realized_pnl(symbol, limit=100):
         sym, reason, _diagnostics = resolve_position_symbol(symbol)
         if not sym:
             return 0.0, 0.0
-        trades = safe_api_call(ex.fetch_my_trades, sym, limit=limit)
+        # Main-loop accounting is best-effort: a transient read failure is
+        # retried on the next cycle, not three times while holding MainThread.
+        trades = safe_api_call(ex.fetch_my_trades, sym, limit=limit, _api_max_attempts=1)
         if not trades:
             return 0.0, 0.0
         buy_value = 0.0
@@ -12366,7 +12381,7 @@ def get_realized_pnl(symbol, limit=100):
             elif side == 'sell':
                 sell_value += cost
         pnl = sell_value - buy_value
-        balance = get_balance_safe()
+        balance = get_balance_safe(api_max_attempts=1)
         pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
         return pnl, pnl_pct
     except Exception as e:
@@ -13139,12 +13154,30 @@ def _restart_main_loop_process_after_stall(context=None):
     owner_alive = bool(_main_loop_owner_alive())
     context["process_restart_required"] = True
     context["process_restart_owner"] = str(owner.get("thread_name") or "UNKNOWN")
-    supervisor_available = bool(
+    render_detected = bool(
         os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
-        or os.getenv("RAILWAY_ENVIRONMENT", "").strip()
-        or os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
-           in {"1", "true", "yes", "on"}
+        or os.getenv("RENDER_SERVICE_ID", "").strip()
+        or os.getenv("RENDER_INSTANCE_ID", "").strip()
     )
+    # DigitalOcean App Platform exposes APP_ID as a runtime bindable variable.
+    # A Droplet does not provide this signal; it must opt in only when a real
+    # process supervisor (for example systemd) is configured to restart the bot.
+    digitalocean_app_platform_detected = bool(os.getenv("APP_ID", "").strip())
+    railway_detected = bool(os.getenv("RAILWAY_ENVIRONMENT", "").strip())
+    explicit_restart_opt_in = bool(
+        os.getenv("NAISO_PROCESS_RESTART_ON_MAIN_LOOP_STALL", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    supervisor_kind = (
+        "DIGITALOCEAN_APP_PLATFORM" if digitalocean_app_platform_detected else
+        "RENDER" if render_detected else
+        "RAILWAY" if railway_detected else
+        "EXPLICIT_OPT_IN" if explicit_restart_opt_in else
+        "NONE"
+    )
+    supervisor_available = supervisor_kind != "NONE"
+    context["process_supervisor_detected"] = supervisor_available
+    context["process_supervisor_kind"] = supervisor_kind
     if not supervisor_available:
         context["engine_resumed"] = False
         context["process_restart_blocked_reason"] = "EXTERNAL_PROCESS_SUPERVISOR_NOT_DETECTED"
@@ -14832,9 +14865,12 @@ def fetch_position_tri_state(symbol=None, *, strict_account_snapshot=False):
                     f"final={diagnostics.get('normalized_symbol')!r}",
                     "ERROR", debounce_key=f"tri_state_symbol_{reason}", debounce_sec=30)
                 return "UNKNOWN", None
-            result = safe_api_call(ex.fetch_positions, [resolved])
+            result = safe_api_call(ex.fetch_positions, [resolved], _api_max_attempts=1)
         else:
-            result = safe_api_call(ex.fetch_positions)
+            # Position state is safety-critical, but repeated synchronous retries
+            # can pin MainThread beyond the watchdog grace window. Treat a failed
+            # snapshot as UNKNOWN and let the next governed cycle retry once.
+            result = safe_api_call(ex.fetch_positions, _api_max_attempts=1)
         if result is None or not isinstance(result, (list, tuple)):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
