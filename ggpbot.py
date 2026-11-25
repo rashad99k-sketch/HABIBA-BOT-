@@ -11401,7 +11401,20 @@ def manual_trade():
     tp1 = price*1.006 if side=="BUY" else price*0.994
     tp2 = price*1.02 if side=="BUY" else price*0.98
     classification = "SNIPER"
-    ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80, "Manual override", atr, "HYBRID", "MANUAL", classification)
+    entry_lock = globals().get("_ENTRY_DISCOVERY_TASK_LOCK")
+    if entry_lock is not None and not entry_lock.acquire(blocking=False):
+        return jsonify({"error": "Another entry-analysis cycle is active; retry after it completes"}), 409
+    previous_entry_context = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
+    try:
+        # Manual override has its own validated market snapshot; never inherit a
+        # concurrent scanner's symbol/zone/cross context.
+        globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = None
+        ok = execute_entry(side, DEFAULT_SYMBOL, price, sl, tp1, tp2, 80,
+                           "Manual override", atr, "HYBRID", "MANUAL", classification)
+    finally:
+        globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = previous_entry_context
+        if entry_lock is not None:
+            entry_lock.release()
     return jsonify({"message": "Done" if ok else "Failed"}),200 if ok else 500
 
 @app.route("/close", methods=["POST"])
@@ -15087,11 +15100,25 @@ def _finish_scanner_task(name, state, *, reason="", error=None):
     watchdog.beat(f"scanner:{name}", state=final_state, **details)
 
 
+# Candidate workers share one mutable institutional entry context. Keep all
+# entry-producing analysis single-flight across task names, not merely per-task.
+_ENTRY_DISCOVERY_TASK_NAMES = frozenset({
+    "institutional_entry_revalidation", "sniper_v2",
+})
+_ENTRY_DISCOVERY_TASK_LOCK = threading.Lock()
+
+
 def dispatch_scanner_task(name, function, *args, **kwargs):
+    entry_task_lock_acquired = False
     with _SCANNER_TASKS_LOCK:
         lock = _SCANNER_TASK_LOCKS.setdefault(name, threading.Lock())
         if not lock.acquire(blocking=False):
             return False
+        if name in _ENTRY_DISCOVERY_TASK_NAMES:
+            entry_task_lock_acquired = _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)
+            if not entry_task_lock_acquired:
+                lock.release()
+                return False
         previous = _SCANNER_TASK_STATUS.get(name) or {}
         cycle_id = int(previous.get("cycle_id", 0)) + 1
         _SCANNER_TASK_CYCLES[name] = cycle_id
@@ -15124,6 +15151,8 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
                 _finish_scanner_task(name, "FAILED", reason="UNEXPECTED_EXIT",
                                      error="worker exited without a result")
             lock.release()
+            if entry_task_lock_acquired:
+                _ENTRY_DISCOVERY_TASK_LOCK.release()
 
     watchdog = globals().get("NAISO_WATCHDOG")
     watchdog_name = f"scanner:{name}"
@@ -15150,6 +15179,11 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
                 lock.release()
             except RuntimeError:
                 pass
+            if entry_task_lock_acquired:
+                try:
+                    _ENTRY_DISCOVERY_TASK_LOCK.release()
+                except RuntimeError:
+                    pass
         log_execution(f"[SCANNER_TASK] {name} could not start: {error}", "ERROR")
         return False
 
