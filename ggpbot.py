@@ -10739,18 +10739,32 @@ function updateUI(d) {{
         document.getElementById("proximity-scanner-panel").innerHTML = "Waiting for scanner data";
     }}
     if(d.watchlist) {{
+        const delivery = d.cross_watchlist_delivery || {{}};
         const entries = Object.entries(d.watchlist);
         const wHtml = entries.map(([sym, w]) => {{
+            const q = w.diagnostics || {{}};
             const sideIcon = w.side === "BUY" ? "🟢" : (w.side === "SELL" ? "🔴" : "⚪");
             const state = w.state || "UNKNOWN";
             const stateColor = state === "ENTRY_READY" ? "#2ecc71" :
-                (String(state).startsWith("WAITING") || state === "NO_CHASE" ? "#f1c40f" : "#95a5a6");
+                (String(state).startsWith("WAITING") || state === "NO_CHASE" ? "#f1c40f" :
+                (state === "INVALIDATED" || state === "REJECTED" ? "#e74c3c" : "#95a5a6"));
             const price = Number.isFinite(Number(w.price)) ? Number(w.price).toPrecision(8) : "-";
+            const stopText = Number.isFinite(Number(w.structural_stop)) && Number(w.structural_stop) > 0 ? Number(w.structural_stop).toPrecision(8) : "UNKNOWN";
             const updated = w.updated_at ? new Date(w.updated_at * 1000).toLocaleTimeString() : "-";
             return `<div style="margin-bottom:7px;border:1px solid #26364a;border-radius:7px;padding:7px;background:#101a29;">
               <div><b>${{sideIcon}} ${{uniEsc(w.symbol || sym)}}</b> · ${{uniEsc(w.regime)}} · <span style="color:${{stateColor}}">${{uniEsc(state)}}</span> · Score ${{uniEsc(w.score)}}</div>
               <small>Price ${{uniEsc(price)}} · Structure ${{uniEsc(w.structure)}} · Liquidity ${{uniEsc(w.liquidity)}}/${{uniEsc(w.liquidity_stage)}} · Zone ${{uniEsc(w.zone_quality ?? "-")}}/100 · Valid ${{uniEsc(w.zone_valid ?? "UNKNOWN")}}</small>
               <br><small>Next: ${{uniEsc(w.next_event)}} · Block: ${{uniEsc(w.blocking || "none")}} · Stop: ${{uniEsc(w.stop_status)}} · Data: ${{uniEsc(w.freshness)}} · Cross: ${{uniEsc(w.cross)}} · Updated: ${{uniEsc(updated)}}</small>
+              <details style="margin-top:5px;"><summary style="cursor:pointer;color:#8fa8c7;">Advanced diagnostics (collapsed)</summary>
+                <small>Decision projection (read-only): ${{uniEsc(w.symbol || sym)}} / ${{uniEsc(w.side || "UNKNOWN")}} | Cross: ${{uniEsc(q.cross_state)}} | durable=${{uniEsc(q.cross_durable)}} | role=${{uniEsc(q.cross_role)}}</small>
+                <br><small>Zone: quality=${{uniEsc(q.zone_quality ?? w.zone_quality ?? "-")}}/100 | valid=${{uniEsc(q.zone_valid ?? "UNKNOWN")}} | Liquidity: ${{uniEsc(q.liquidity_state)}} / ${{uniEsc(q.liquidity_stage)}} | Confirmation: ${{uniEsc(q.confirmation)}} | Pullback/Retest: ${{uniEsc(q.pullback)}}</small>
+                <br><small>Structural Stop: ${{uniEsc(q.stop_valid ? "VALID" : "STOP_INVALID_NOT_READY")}} | Validation: ${{uniEsc(q.stop_validation)}} | Final decision: ${{uniEsc(q.decision_state)}} | Gate: ${{uniEsc(q.gate)}} | Blocking: ${{uniEsc(q.blocking)}} | Next: ${{uniEsc(q.next_event)}} | authority=${{uniEsc(q.authority || "UNCHANGED_EXECUTE_ENTRY")}}</small>
+                <br><small>Entry type: ${{uniEsc(q.entry_type)}} | reason: ${{uniEsc(q.entry_reason)}} | confirmation: ${{uniEsc(q.entry_confirmation ?? "?")}} | invalidation: ${{uniEsc(q.entry_invalidation)}} | source: ${{uniEsc(q.entry_source)}}</small>
+                <br><small>Institutional report: cross=${{uniEsc(q.report_cross)}} | regime=${{uniEsc(q.report_regime)}} | zone=${{uniEsc(q.report_zone)}} | structure=${{uniEsc(q.report_structure)}} | liquidity=${{uniEsc(q.report_liquidity)}} | volume=${{uniEsc(q.report_volume)}} | trend=${{uniEsc(q.report_trend)}} | room=${{uniEsc(q.room_pct ?? "?")}}% (${{uniEsc(q.room_status)}}) | invalidation=${{uniEsc(q.invalidation_status)}} | freshness=${{uniEsc(q.report_freshness)}} | confidence=${{uniEsc(q.confidence ?? "?")}}</small>
+                <br><small>Entry classification: ${{uniEsc(q.classification)}} | reason: ${{uniEsc(q.classification_reasons)}} | cross-zone: ${{uniEsc(q.cross_zone)}} (${{uniEsc(q.cross_zone_reasons)}}) | authority: ${{uniEsc(q.authority)}}</small>
+                <br><small>Lifecycle: ${{uniEsc(q.lifecycle)}} | waiting: ${{uniEsc(q.waiting)}} | analysis: ${{uniEsc(q.analysis_status)}} | durable=${{uniEsc(q.cross_durable)}} | role=${{uniEsc(q.cross_role)}}</small>
+                <br><small>Cross delivery: same_cycle=${{uniEsc(delivery.same_cycle ?? false)}} | detected=${{uniEsc(delivery.detected_at ?? 0)}} | delivered=${{uniEsc(delivery.delivered_at ?? 0)}} | refresh_s=${{uniEsc(delivery.refresh_seconds ?? 0)}} | new=${{uniEsc(delivery.new_events ?? 0)}} | status=${{uniEsc(delivery.reason || "NO_NEW_CROSS_EVENT")}}</small>
+              </details>
             </div>`;
         }}).join("");
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
