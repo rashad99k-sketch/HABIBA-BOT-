@@ -646,7 +646,7 @@ def test_unified_watchlist_refresh_schedules_one_background_worker_and_fails_clo
         "last_attempt": 0.0, "last_error": "", "worker_name": "",
     })
 
-    def sync_cross_events():
+    def sync_cross_events(**_kwargs):
         calls.append(("sync",))
 
     def update(memory, fetch_frame, **kwargs):
@@ -770,7 +770,7 @@ def test_late_watchlist_worker_completion_cannot_reopen_entry_gate(monkeypatch):
     }
     monkeypatch.setattr(ggpbot, "_UNIFIED_WATCHLIST_REFRESH_STATE", state)
     monkeypatch.setattr(ggpbot, "MEMORY", {"watchlist": {}})
-    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda: None)
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda **_kwargs: None)
     monkeypatch.setattr(ggpbot, "_integration_fetch_frame", lambda _symbol: None)
     monkeypatch.setattr(ggpbot, "_enrich_with_existing_gpp_engines", lambda *_a: {})
     monkeypatch.setattr(
