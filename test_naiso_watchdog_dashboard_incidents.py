@@ -61,7 +61,7 @@ def test_restart_failure_payload_preserves_main_thread_stack():
     )
     watchdog.register(
         "main_loop", interval_sec=5.0, grace_sec=10.0, restartable=True,
-        restart_fn=lambda _context: False,
+        restart_fn=lambda context: False,
     )
     watchdog.beat("main_loop", state="RUNNING", thread_name="MainThread")
     clock[0] = 11.0
