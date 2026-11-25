@@ -596,7 +596,17 @@ BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.
 BINGX_PUBLIC_MARKET_MIN_INTERVAL = _env_float_range(
     "BINGX_PUBLIC_MARKET_MIN_INTERVAL", BINGX_KLINE_MIN_INTERVAL, 1.0, 2.0
 )
+# BingX Futures publishes a 1/s Trader tier for individual order writes and
+# 2/s for leverage/margin/position-mode changes. Use the conservative tier
+# unless the account's current entitlement is explicitly verified.
+BINGX_TRADE_WRITE_MIN_INTERVAL = _env_float_range(
+    "BINGX_TRADE_WRITE_MIN_INTERVAL", 1.05, 1.0, 2.0
+)
+BINGX_CONFIG_WRITE_MIN_INTERVAL = _env_float_range(
+    "BINGX_CONFIG_WRITE_MIN_INTERVAL", 0.55, 0.5, 2.0
+)
 _API_METHOD_MIN_INTERVALS = {
+    # Public swap endpoints individually annotated at 1/s per IP.
     "fetch_ohlcv": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
     "fetch_order_book": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
     "fetch_trades": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
@@ -606,6 +616,20 @@ _API_METHOD_MIN_INTERVALS = {
     "fetch_funding_rate_history": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
     "fetch_markets": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
     "fetch_open_interest": BINGX_PUBLIC_MARKET_MIN_INTERVAL,
+    # Order writes: 1/s is the most restrictive published Trader tier.
+    "create_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "create_market_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "create_limit_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "create_orders": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "cancel_order": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "cancel_orders": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    # Leverage, margin and position-mode configuration: 2/s.
+    "set_leverage": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "set_margin_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "set_position_mode": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "add_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "reduce_margin": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+    "cancel_all_orders_after": BINGX_CONFIG_WRITE_MIN_INTERVAL,
 }
 _API_RATE_LOCK = threading.Lock()
 # Never let API scheduler contention pin MainThread indefinitely. A timeout is
