@@ -593,19 +593,70 @@ MIN_API_INTERVAL = _env_float_range("MIN_API_INTERVAL", 0.35, 0.20, 2.0)
 BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.0, 2.0)
 _API_METHOD_MIN_INTERVALS = {"fetch_ohlcv": BINGX_KLINE_MIN_INTERVAL}
 _API_RATE_LOCK = threading.Lock()
+# Never let API scheduler contention pin MainThread indefinitely. A timeout is
+# fail-closed: the exchange call is not sent and the next loop can try again.
+API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC = _env_float_range(
+    "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.75, 0.05, 2.0
+)
+_API_RATE_LOCK_OWNER = {
+    "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
+}
 _LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
+
+class ApiRateLockTimeout(RuntimeError):
+    """Raised when the shared API scheduler lock cannot be acquired promptly."""
+
+
 def rate_limit(func=None):
-    """Serialize API request starts, applying endpoint-specific minimum spacing."""
+    """Pace API starts without sleeping while holding the shared scheduler lock.
+
+    Every lock acquisition is bounded. Waiting for the endpoint interval occurs
+    outside the lock; contenders re-check the actual last-start timestamp before
+    reserving the next request start. If the lock itself is wedged, fail closed
+    rather than allowing the foreground loop to hang.
+    """
     global _last_api_call
     method_name = getattr(func, "__name__", "") if func is not None else ""
     min_interval = max(MIN_API_INTERVAL, _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL))
-    with _API_RATE_LOCK:
-        now = time.monotonic()
-        elapsed = now - _last_api_call
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        _last_api_call = time.monotonic()
+
+    while True:
+        acquired = _API_RATE_LOCK.acquire(timeout=API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC)
+        if not acquired:
+            owner = dict(_API_RATE_LOCK_OWNER)
+            held_for = max(0.0, time.monotonic() - float(owner.get("since_monotonic") or 0.0))
+            raise ApiRateLockTimeout(
+                f"API_RATE_LOCK acquisition timed out after "
+                f"{API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC:.2f}s for {method_name or 'unknown'}; "
+                f"owner_thread={owner.get('thread_name') or 'unknown'} "
+                f"owner_id={owner.get('thread_id')} held_for={held_for:.2f}s "
+                f"owner_method={owner.get('method') or 'unknown'}"
+            )
+
+        wait_seconds = 0.0
+        try:
+            now = time.monotonic()
+            elapsed = now - _last_api_call
+            if elapsed >= min_interval:
+                _last_api_call = now
+                return
+            wait_seconds = min_interval - elapsed
+            _API_RATE_LOCK_OWNER.update({
+                "thread_id": threading.get_ident(),
+                "thread_name": threading.current_thread().name,
+                "since_monotonic": now,
+                "method": method_name,
+            })
+        finally:
+            _API_RATE_LOCK_OWNER.update({
+                "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
+            })
+            _API_RATE_LOCK.release()
+
+        # Do not hold the global lock during pacing sleeps. Re-check under the
+        # lock afterwards because another worker may have started a request.
+        if wait_seconds > 0:
+            time.sleep(min(wait_seconds, 0.25))
 
 CACHE_LOCK = threading.RLock()
 CACHE_MAX_ITEMS = _env_int_range("CACHE_MAX_ITEMS", 2500, 100, 10000)
