@@ -28,6 +28,7 @@ from test_cross_driven_discovery_integration import (
 
 
 FIXED_NOW = 1_800_000_000.0
+EXPECTED_RANKING_CARD_LABEL = "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
 
 
 def _durable_record(side="BUY", *, phase="WAITING_FOR_PULLBACK", entry_ready=False,
@@ -631,6 +632,15 @@ def _patch_dashboard_runtime(monkeypatch):
     monkeypatch.setattr(ggpbot, "naiso_health_snapshot", lambda: {"status": "TEST"})
 
 
+def _card_cross_label(cross):
+    """Mirror the Watchlist-card guard in ggpbot.py:10352-10355 for tests."""
+    state = cross.get("display_cross_state") or cross.get("cross_state") or "NO_CROSS"
+    durable = cross.get("durable_event") is True and cross.get("authoritative") is True
+    if not durable and str(state).startswith("CONFIRMED_"):
+        state = "RANKING_ONLY_" + state + "_OBSERVATION"
+    return state
+
+
 def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
     monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {
         "BTC": _watchlist_card_row(),
@@ -643,6 +653,7 @@ def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
     ranking_row["cross_state"] = ranking_projection["cross_context"]["cross_state"]
     ranking_row["cross_context"] = ranking_projection["cross_context"]
     ranking_row["cross_state_display"] = ranking_projection["cross_state_display"]
+    assert ranking_row["cross_state_display"] == ranking_row["cross_context"]["display_cross_state"]
     monkeypatch.setitem(ggpbot.MEMORY, "ema9_vwap_proximity_scanner", [ranking_row])
     _patch_dashboard_runtime(monkeypatch)
 
@@ -661,6 +672,8 @@ def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
         assert token in html
     assert "cardDecision = w.decision_context" in html
     assert 'if (!cardCrossDurable && String(cardCrossState).startsWith("CONFIRMED_"))' in html
+    assert 'cardCrossState = cardCross.display_cross_state || cardCross.cross_state || w.cross_state || "NO_CROSS"' in html
+    assert '"RANKING_ONLY_" + cardCrossState + "_OBSERVATION"' in html
     assert "SL: UNKNOWN" not in html
     assert 'const slText = x.sl_valid ? "VALID" : "UNKNOWN";' not in html
     assert 'item.cross_state_display || item.state || "UNKNOWN"' in html
@@ -675,12 +688,16 @@ def test_dashboard_renders_one_watchlist_with_card_diagnostics(monkeypatch):
         assert key not in payload
     proximity = payload["ema9_vwap_proximity_scanner"][0]
     assert proximity["state"] == "CROSS_CONFIRMED"
+    assert proximity["cross_state"] == "CONFIRMED_BUY_CROSS"
     assert proximity["cross_state_display"] == "RANKING_ONLY_CONFIRMED_BUY_CROSS_OBSERVATION"
+    assert proximity["cross_context"]["display_cross_state"] == proximity["cross_state_display"]
     assert proximity["cross_context"]["durable_event"] is False
     assert proximity["cross_context"]["authoritative"] is False
+    assert _card_cross_label(proximity["cross_context"]) == EXPECTED_RANKING_CARD_LABEL
     decision = payload["watchlist"]["BTC"]["decision_context"]
     assert decision["cross_context"]["durable_event"] is True
     assert decision["cross_context"]["authoritative"] is True
+    assert _card_cross_label(decision["cross_context"]) == "CONFIRMED_BUY_CROSS"
     assert decision["blocking_reasons"] == ["closed_retest_not_confirmed"]
     assert decision["required_next_event"] == "CLOSED_INSTITUTIONAL_ZONE_RETEST"
     assert decision["entry_readiness"]["sl_valid"] is True
