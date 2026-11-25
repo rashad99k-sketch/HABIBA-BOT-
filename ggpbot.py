@@ -14485,6 +14485,41 @@ def _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_
         return True
 
 
+def _finalize_cross_watchlist_delivery_after_publish():
+    """Mark durable cross events delivered only after their rows are published."""
+    delivery = MEMORY.get("_cross_watchlist_delivery")
+    if not isinstance(delivery, dict):
+        return False
+    pending_ids = {
+        str(value).strip() for value in (delivery.get("event_ids") or [])
+        if str(value).strip()
+    }
+    if not pending_ids:
+        return False
+    published_ids = {
+        str(row.get("cross_event_id")).strip()
+        for row in (MEMORY.get("watchlist") or {}).values()
+        if isinstance(row, dict) and row.get("cross_event_id")
+    }
+    delivered_ids = sorted(pending_ids.intersection(published_ids))
+    if not delivered_ids:
+        return False
+    delivered_at = time.time()
+    marked = _mark_cross_events_watchlist_delivered(delivered_ids, delivered_at)
+    delivery = dict(delivery)
+    delivery.update({
+        "delivered_at": delivered_at,
+        "delivered_ids": delivered_ids,
+        "lifecycle_marked": list(marked or []),
+        "delivered": len(delivered_ids) == len(pending_ids),
+        "same_cycle": False,
+        "reason": "ACTIVE_WATCHLIST_DELIVERED" if len(delivered_ids) == len(pending_ids)
+                  else "PARTIAL_WATCHLIST_DELIVERY",
+    })
+    MEMORY["_cross_watchlist_delivery"] = delivery
+    return bool(delivery["delivered"])
+
+
 def _run_unified_institutional_watchlist_refresh(generation=None):
     """Analyze a private snapshot; publish only if this worker generation is still current."""
     global _last_unified_watchlist_refresh
@@ -14536,6 +14571,7 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
         )
         if not _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_refs, generation):
             return
+        _finalize_cross_watchlist_delivery_after_publish()
         proximity_meta = MEMORY.setdefault("ema9_vwap_proximity_scanner_meta", {})
         proximity_meta.update({
             "observed_this_batch": int(staged_memory.get("_proximity_batch_updates", 0)),
@@ -15381,27 +15417,19 @@ def run_global_discovery_scanner():
         if STATE.get("open") or TRADE_STATE.get("in_position"):
             cross_delivery["reason"] = "POSITION_OPEN_DISCOVERY_PAUSED"
         else:
-            # The detector already synced the durable feed. Force the existing
-            # Watchlist refresh now so this scanner cycle hands the event to the
-            # institutional analyzer instead of waiting for the next 15s/20s
-            # main-loop refresh. This is not a second scanner cycle: it reuses
-            # the same bounded refresh and governed frame cache.
+            # The Watchlist refresh is asynchronous. Publish PENDING before
+            # scheduling so the worker can mark delivery only after the event
+            # row is actually committed to the authoritative Watchlist.
+            cross_delivery["reason"] = "WATCHLIST_REFRESH_SCHEDULED"
+            cross_delivery["same_cycle"] = False
+            cross_delivery["delivered"] = False
+            cross_delivery["delivered_at"] = None
+            MEMORY["_cross_watchlist_delivery"] = dict(cross_delivery)
             refresh_unified_institutional_watchlist(force=True)
-            cross_delivery["delivered_at"] = time.time()
-            cross_delivery["refresh_seconds"] = round(
-                cross_delivery["delivered_at"] - cross_detected_at, 3,
-            )
-            cross_delivery["delivered"] = bool(MEMORY.get("_unified_watchlist_refresh_ok"))
-            cross_delivery["same_cycle"] = cross_delivery["delivered"]
-            cross_delivery["reason"] = (
-                "ACTIVE_WATCHLIST_DELIVERED" if cross_delivery["delivered"]
-                else "WATCHLIST_REFRESH_FAILED"
-            )
-            if cross_delivery["delivered"]:
-                cross_delivery["lifecycle_marked"] = _mark_cross_events_watchlist_delivered(
-                    cross_delivery["event_ids"], cross_delivery["delivered_at"],
-                )
-                cross_delivery["lifecycle_status"] = ACTIVE_WATCHLIST_LIFECYCLE
+            completed_delivery = MEMORY.get("_cross_watchlist_delivery")
+            if isinstance(completed_delivery, dict):
+                cross_delivery = dict(completed_delivery)
+            cross_delivery["refresh_seconds"] = round(time.time() - cross_detected_at, 3)
     cross_delivery["age_seconds"] = round(time.time() - cross_detected_at, 3)
     MEMORY["_cross_watchlist_delivery"] = cross_delivery
 
