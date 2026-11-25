@@ -6859,6 +6859,70 @@ def _entry_location_permission(report, *, strict_freshness):
     return allowed, gate, reason
 
 
+def _validate_selected_entry_zone(zone, side, *, price, atr, latest_timestamp, timeframe_ms):
+    """Final fail-closed proof that a live institutional entry retested its own side's zone."""
+    expected_direction = "DEMAND" if str(side or "").upper() == "BUY" else "SUPPLY" if str(side or "").upper() == "SELL" else ""
+    if not expected_direction or not isinstance(zone, dict):
+        return False, "missing_selected_entry_zone"
+    if str(zone.get("side") or "").upper() != str(side).upper():
+        return False, "entry_zone_side_mismatch"
+    if str(zone.get("zone_direction") or "").upper() != expected_direction:
+        return False, "entry_zone_direction_mismatch"
+    kind = str(zone.get("kind") or "").upper()
+    if kind not in {"ORDER_BLOCK", "FVG", "SUPPORT", "RESISTANCE"}:
+        return False, "entry_zone_kind_invalid"
+    try:
+        low = float(zone.get("low"))
+        high = float(zone.get("high"))
+        formed = int(zone.get("available_timestamp"))
+        latest = int(latest_timestamp)
+        duration = int(timeframe_ms)
+        px = float(price)
+        volatility = float(atr)
+    except (TypeError, ValueError, OverflowError):
+        return False, "entry_zone_geometry_or_timestamp_missing"
+    if not all(math.isfinite(v) for v in (low, high, px, volatility)) or not (0 < low < high and px > 0 and volatility > 0):
+        return False, "entry_zone_geometry_invalid"
+    if formed <= 0 or latest <= 0 or duration <= 0 or formed > latest:
+        return False, "entry_zone_timestamp_invalid"
+    age_bars = (latest - formed) / duration
+    if not math.isfinite(age_bars) or age_bars > 48:
+        return False, "entry_zone_stale"
+    if max(low - px, 0.0, px - high) / volatility > 1.5:
+        return False, "entry_zone_outside_no_chase_distance"
+    if kind == "ORDER_BLOCK":
+        expected_definition = "BULLISH_LOW_TO_OPEN" if side == "BUY" else "BEARISH_OPEN_TO_HIGH"
+        if str(zone.get("zone_definition") or "").upper() != expected_definition:
+            return False, "entry_zone_order_block_definition_mismatch"
+        try:
+            if float(zone.get("strength", 0) or 0) < 5.0:
+                return False, "entry_zone_order_block_quality_below_threshold"
+        except (TypeError, ValueError, OverflowError):
+            return False, "entry_zone_order_block_quality_invalid"
+    elif kind == "FVG":
+        expected = "BULLISH" if side == "BUY" else "BEARISH"
+        if str(zone.get("direction") or "").upper() != expected:
+            return False, "entry_zone_fvg_direction_mismatch"
+        if str(zone.get("status") or "").upper() not in {"UNFILLED", "PARTIALLY_FILLED"}:
+            return False, "entry_zone_fvg_not_actionable"
+        try:
+            size = float(zone.get("size_atr"))
+            if not math.isfinite(size) or size < 0.08:
+                return False, "entry_zone_fvg_too_small"
+        except (TypeError, ValueError, OverflowError):
+            return False, "entry_zone_fvg_size_invalid"
+    else:
+        expected = "SUPPORT" if side == "BUY" else "RESISTANCE"
+        if kind != expected or str(zone.get("status") or "").upper() != "CONFIRMED":
+            return False, "entry_zone_support_resistance_wrong_side_or_unconfirmed"
+        try:
+            if float(zone.get("strength", 0) or 0) < 5.0:
+                return False, "entry_zone_support_resistance_quality_below_threshold"
+        except (TypeError, ValueError, OverflowError):
+            return False, "entry_zone_support_resistance_quality_invalid"
+    return True, "selected_entry_zone_validated"
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] drawdown cooldown active; {symbol} {side} rejected", "WARN",
@@ -6944,6 +7008,31 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     # Sniper or legacy caller can bypass a strong opposing supply/demand zone.
     # A synthesized fallback never claims fresh validated closed data it cannot
     # prove; LIVE additionally requires an explicit ALLOWED gate.
+    # Institutional Watchlist entries must carry the exact retested zone chosen
+    # by the structural engine. Sniper/legacy and PAPER contracts are unchanged.
+    if not PAPER_MODE and MODE_LIVE and institutional_entry_ctx.get("setup_type") in {
+        "REVERSAL_ENGINE", "FAILED_AUCTION_REVERSAL", "TREND_CONTINUATION_ENGINE",
+        "TREND_CONTINUATION_RETEST",
+    }:
+        selected_zone = institutional_entry_ctx.get("entry_zone")
+        zone_ok, zone_reason = _validate_selected_entry_zone(
+            selected_zone, side, price=price, atr=atr_val,
+            latest_timestamp=institutional_entry_ctx.get("closed_candle_timestamp"),
+            timeframe_ms=institutional_entry_ctx.get("timeframe_ms"),
+        )
+        if not zone_ok:
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: {zone_reason}",
+                "WARN", debounce_key=f"entry_zone_gate:{symbol}:{side}:{zone_reason}", debounce_sec=10,
+            )
+            return False
+        institutional_entry_ctx["entry_zone_gate"] = {
+            "allowed": True, "reason": zone_reason,
+            "kind": selected_zone.get("kind"),
+            "zone_direction": selected_zone.get("zone_direction"),
+            "low": selected_zone.get("low"), "high": selected_zone.get("high"),
+            "available_timestamp": selected_zone.get("available_timestamp"),
+        }
     report = institutional_entry_ctx.get("institutional_report")
     if not isinstance(report, dict) or not report:
         report = build_institutional_report({
@@ -14260,6 +14349,9 @@ def smart_opportunity_selection():
 
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
+                "entry_zone": dict(item.get("entry_zone")) if isinstance(item.get("entry_zone"), dict) else None,
+                "entry_zone_status": str(item.get("entry_zone_status") or "NOT_SELECTED"),
+                "entry_zone_direction": str(item.get("entry_zone_direction") or "UNKNOWN"),
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),

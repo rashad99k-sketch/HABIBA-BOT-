@@ -50,6 +50,9 @@ class InstitutionalDecision:
     invalidation_level: Optional[float] = None
     structural_stop: Optional[float] = None
     score: float = 0.0
+    # Exact validated zone that produced the post-structure retest. None means
+    # no execution-ready location was selected.
+    entry_zone: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -147,7 +150,10 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
                 zone_definition = str(ob.get("zone_definition") or "").upper()
                 ob_direction = str(ob.get("direction") or "").upper()
                 expected_direction = "BULLISH" if direction == "BUY" else "BEARISH"
-                if zone_definition != expected_definition and ob_direction != expected_direction:
+                if zone_definition:
+                    if zone_definition != expected_definition:
+                        raise ValueError("order_block_direction_unconfirmed")
+                elif ob_direction != expected_direction:
                     raise ValueError("order_block_direction_unconfirmed")
             levels.append((float(ob["low"]), float(ob["high"]), "ORDER_BLOCK",
                            int(available_ts) if available_ts is not None else None))
@@ -231,6 +237,48 @@ def _zone_retest_candidates(context: Dict[str, Any], fallback_level: float, atr:
         return actionable
     return levels
 
+
+
+def _zone_metadata_for_retest(context: Dict[str, Any], side: str,
+                              zone_name: str, zone_timestamp: Any,
+                              zone_low: float, zone_high: float) -> Dict[str, Any]:
+    """Return validated identity/geometry for the exact zone used by a retest."""
+    direction = str(side or "").upper()
+    sr = context.get("support_resistance") if isinstance(context.get("support_resistance"), dict) else {}
+    if zone_name == "ORDER_BLOCK":
+        raw = context.get("order_block")
+    elif zone_name == "FVG":
+        raw = context.get("fvg")
+    elif zone_name in {"SUPPORT", "RESISTANCE"}:
+        rows = sr.get("supports" if zone_name == "SUPPORT" else "resistances", [])
+        raw = next((z for z in rows if isinstance(z, dict)
+                    and _near_equal(z.get("low"), zone_low)
+                    and _near_equal(z.get("high"), zone_high)), None)
+    else:
+        raw = None
+    if not isinstance(raw, dict):
+        return {}
+    result = dict(raw)
+    result.update({
+        "kind": zone_name,
+        "side": direction,
+        "low": float(zone_low),
+        "high": float(zone_high),
+        "available_timestamp": int(zone_timestamp) if zone_timestamp is not None else None,
+        "zone_direction": (
+            "DEMAND" if direction == "BUY" else "SUPPLY"
+            if direction == "SELL" else "UNKNOWN"
+        ),
+    })
+    return result
+
+
+def _near_equal(left: Any, right: Any) -> bool:
+    try:
+        a, b = float(left), float(right)
+        return math.isfinite(a) and math.isfinite(b) and abs(a - b) <= max(1e-10, abs(b) * 1e-9)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 def _find_failed_auction(x: pd.DataFrame, side: str, atr: float, lookback: int = 12):
     """Find a recent failed acceptance outside a previously confirmed swing level.
@@ -375,6 +423,7 @@ class ReversalEngine:
                 int(x.timestamp.iloc[sweep_idx]), level, None, 60.0,
             )
         retest_idx = None; retest_zone = ""; retest_zone_ts = None
+        selected_zone = {}
         for r in range(bos_idx + 1, len(x) - 1):
             candle = x.iloc[r]
             candle_ts = int(candle.timestamp)
@@ -386,6 +435,9 @@ class ReversalEngine:
                 if touched and held:
                     retest_idx, retest_zone = r, zname
                     retest_zone_ts = available_ts
+                    selected_zone = _zone_metadata_for_retest(
+                        context, side, zname, available_ts, zlow, zhigh
+                    )
                     break
             if retest_idx is not None:
                 break
@@ -425,9 +477,15 @@ class ReversalEngine:
             if context.get("location_first_required") and retest_zone_ts is not None
             else _event_id(symbol, side, setup_name, ts)
         )
+        zone_trace = (
+            f"entry_zone:{selected_zone.get('zone_direction', 'UNKNOWN')}:"
+            f"{retest_zone}:{selected_zone.get('low')}:{selected_zone.get('high')}:"
+            f"{selected_zone.get('available_timestamp')}"
+        )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, setup_name, side,
-                                     "reversal_sequence_confirmed", evidence, (),
-                                     location_event_id, ts, level, stop, min(100.0, score))
+                                     "reversal_sequence_confirmed", evidence + (zone_trace,), (),
+                                     location_event_id, ts, level, stop, min(100.0, score),
+                                     entry_zone=selected_zone or None)
 
 
 class ContinuationEngine:
@@ -624,9 +682,15 @@ class ContinuationEngine:
             if context.get("location_first_required") and retest_zone_ts is not None
             else _event_id(symbol, side, "TREND_CONTINUATION_RETEST", ts)
         )
+        zone_trace = (
+            f"entry_zone:{selected_zone.get('zone_direction', 'UNKNOWN')}:"
+            f"{retest_zone}:{selected_zone.get('low')}:{selected_zone.get('high')}:"
+            f"{selected_zone.get('available_timestamp')}"
+        )
         return InstitutionalDecision(DecisionState.ENTRY_READY.value, "TREND_CONTINUATION_RETEST", side,
-                                     "continuation_sequence_confirmed", evidence, (),
-                                     location_event_id, ts, broken_level, stop, min(100.0, score))
+                                     "continuation_sequence_confirmed", evidence + (zone_trace,), (),
+                                     location_event_id, ts, broken_level, stop, min(100.0, score),
+                                     entry_zone=selected_zone or None)
 
 
 class UnifiedEntryAuthority:
