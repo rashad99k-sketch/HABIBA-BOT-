@@ -12723,9 +12723,18 @@ def main_loop_sniper():
                 # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
-                        smart_opportunity_selection()
+                        # Candidate revalidation performs OHLCV reads, institutional
+                        # analysis and final entry checks. Keep that work off the
+                        # foreground supervisor so open-position management remains
+                        # schedulable even when market data or analysis is slow.
+                        dispatched = dispatch_scanner_task(
+                            "institutional_entry_revalidation", smart_opportunity_selection
+                        )
                         last_candidate_scan = now
-                        _main_loop_progress("watchlist_refresh_complete")
+                        _main_loop_progress(
+                            "entry_revalidation_dispatched" if dispatched
+                            else "entry_revalidation_deferred"
+                        )
                     # Sniper is an entry-only candidate engine; it never runs while
                     # a position is open and uses the same bounded scanner cache.
                     if _run_sniper_scan_if_due():
