@@ -8,6 +8,7 @@ unsafe maintenance during open positions and untested daily-loss pausing.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -583,9 +584,38 @@ def test_elapsed_loss_pause_stays_blocked_while_position_open(tmp_path, monkeypa
     assert ggpbot.daily_loss_cooldown_active() is False
 
 
-def test_naiso_health_endpoint_exposes_recovery_and_loss_state():
+def _install_healthy_main_loop(monkeypatch):
+    """Install a real supervised, genuinely progressing main_loop observation."""
+    import ggpbot
+    from naiso_health import HealthWatchdog
+
+    watchdog = HealthWatchdog(monotonic_fn=time.monotonic)
+    watchdog.register("main_loop", interval_sec=5.0, grace_sec=60.0,
+                      critical=True, restartable=True)
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", watchdog)
+    thread = threading.current_thread()
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_OWNER", {
+        "thread_id": thread.ident, "thread_name": thread.name, "registered": True})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_PROGRESS_SEQ", 1)
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_LAST_OWNER_PROGRESS", {
+        "seq": 1, "ts": watchdog.monotonic(), "thread_id": thread.ident,
+        "thread_name": thread.name})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STATE", {"until": 0.0})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_RESTART_STATE", {
+        "in_progress": False, "attempts": 0, "last_reason": "",
+        "supervisor_exhausted": False})
+    for key in ("open", "recovery_hold", "execution_unresolved", "close_reconciliation_required"):
+        monkeypatch.setitem(ggpbot.STATE, key, False)
+    monkeypatch.setitem(ggpbot.MEMORY, "recovery_status", "READY")
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start", progress=True)
+    return watchdog
+
+
+def test_naiso_health_endpoint_exposes_recovery_and_loss_state(monkeypatch):
     import ggpbot
 
+    _install_healthy_main_loop(monkeypatch)
     response = ggpbot.app.test_client().get("/naiso/health")
     assert response.status_code == 200
     payload = response.get_json()

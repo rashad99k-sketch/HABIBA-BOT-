@@ -3,6 +3,9 @@
 All market data is deterministic and synthetic. No exchange credentials, live orders,
 network calls, or real account state are used.
 """
+import threading
+import time
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -134,12 +137,36 @@ def test_dashboard_health_and_data_routes_respond_without_exchange_calls(monkeyp
     monkeypatch.setattr(ggpbot, "cleanup_watchlist", lambda: None)
     monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
     monkeypatch.setattr(ggpbot, "MODE_LIVE", False)
+    monkeypatch.setattr(ggpbot, "API_RESILIENCE", None)
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
     monkeypatch.setitem(ggpbot.STATE, "open", False)
+    monkeypatch.setitem(ggpbot.STATE, "recovery_hold", False)
+    monkeypatch.setitem(ggpbot.STATE, "execution_unresolved", False)
+    monkeypatch.setitem(ggpbot.STATE, "close_reconciliation_required", False)
     monkeypatch.setitem(ggpbot.DASHBOARD_STATE, "position", None)
     monkeypatch.setitem(ggpbot.MEMORY, "last_scan", 0)
     monkeypatch.setitem(ggpbot.MEMORY, "regime", "SYNTHETIC_TEST")
     monkeypatch.setitem(ggpbot.MEMORY, "health", {"api": "TEST", "status": "HEALTHY"})
     monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
+    monkeypatch.setitem(ggpbot.MEMORY, "recovery_status", "READY")
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "_LOSS_COOLDOWN_STATE", {"until": 0.0})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_RESTART_STATE", {
+        "in_progress": False, "attempts": 0, "last_reason": "",
+        "supervisor_exhausted": False})
+    from naiso_health import HealthWatchdog
+    watchdog = HealthWatchdog(monotonic_fn=time.monotonic)
+    watchdog.register("main_loop", interval_sec=5.0, grace_sec=60.0,
+                      critical=True, restartable=True)
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", watchdog)
+    thread = threading.current_thread()
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_OWNER", {
+        "thread_id": thread.ident, "thread_name": thread.name, "registered": True})
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_PROGRESS_SEQ", 1)
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_LAST_OWNER_PROGRESS", {
+        "seq": 1, "ts": watchdog.monotonic(), "thread_id": thread.ident,
+        "thread_name": thread.name})
+    watchdog.beat("main_loop", state="RUNNING", phase="iteration_start", progress=True)
 
     import socket
     import requests

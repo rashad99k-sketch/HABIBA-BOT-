@@ -833,7 +833,10 @@ class HealthWatchdog:
                     "lifecycle": component.lifecycle,
                     "critical": component.critical,
                     "restartable": component.restartable,
+                    "grace_sec": round(float(component.grace_sec), 3),
                     "age_sec": round(max(0.0, now - progress_at), 3),
+                    "last_progress_monotonic": (round(float(component.last_progress), 3)
+                                                if component.last_progress else None),
                     "reason": component.reason,
                     "thread_name": component.thread_name,
                     "cycle_id": component.cycle_id,
@@ -848,4 +851,25 @@ class HealthWatchdog:
                 "components": rows,
                 "restart_history": self.restart_policy.records(limit=30),
                 "alerts": dict(self._alarms),
+            }
+
+    def progress_snapshot(self, name: str) -> Optional[Dict[str, Any]]:
+        """Read-only genuine-progress view; never writes a beat or runs check()."""
+        with self._lock:
+            component = self._components.get(str(name))
+            if component is None:
+                return None
+            now = float(self._monotonic())
+            progress_at = max(component.last_beat, component.last_progress or 0.0)
+            return {
+                "status": component.status,
+                "lifecycle": component.lifecycle,
+                "critical": component.critical,
+                "grace_sec": round(float(component.grace_sec), 3),
+                "age_sec": round(max(0.0, now - progress_at), 3),
+                "last_progress_monotonic": (round(float(component.last_progress), 3)
+                                            if component.last_progress else None),
+                "reason": component.reason,
+                "thread_name": component.thread_name,
+                "diagnostics": dict(component.diagnostics),
             }

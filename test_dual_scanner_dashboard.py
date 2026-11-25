@@ -108,7 +108,10 @@ def test_dashboard_server_is_started_before_trade_supervisor():
         and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__"
     )
     calls = [node.func.id for node in ast.walk(module_main) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
-    assert calls.index("start_dashboard_servers") < calls.index("safe_main_loop")
+    # The controlled-exit contract wraps safe_main_loop in the foreground
+    # supervisor; the dashboard must still start before that supervisor.
+    supervisor_call = "run_trade_supervisor" if "run_trade_supervisor" in calls else "safe_main_loop"
+    assert calls.index("start_dashboard_servers") < calls.index(supervisor_call)
 
 def test_api_request_start_rate_limit_uses_a_thread_lock():
     fn = _function("rate_limit")

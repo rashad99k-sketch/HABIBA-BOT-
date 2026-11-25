@@ -8,6 +8,7 @@
 import os
 import time
 import json
+import signal
 import threading
 import traceback
 import math
@@ -10681,6 +10682,7 @@ def data():
                 "smart_money_dominant": STATE["smart_money"].get("smart_money_dominant", False)
             }
 
+        health_snapshot = naiso_health_snapshot()
         payload = {
             "balance": bal,
             "free_balance": free_bal,
@@ -10725,7 +10727,8 @@ def data():
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
             "institutional_flow": institutional_flow_data,
             "last_live_refresh": DASHBOARD_STATE.get("last_live_refresh", time.time()),
-            "naiso_health": naiso_health_snapshot(),
+            "naiso_health": health_snapshot,
+            "readiness": _health_readiness(health_snapshot),
             "unified_decision": _unified_decision_dashboard_sections(),
             "cross_watchlist_delivery": dict(MEMORY.get("_cross_watchlist_delivery", {})),
             **live_data
@@ -10843,16 +10846,252 @@ def naiso_health_snapshot():
     }
 
 
+# Explicit readiness vocabulary. These are additive API states; legacy keys and
+# HTTP ports remain intact. A live HTTP response is PROCESS_LIVE by definition,
+# but it is never proof that the critical main_loop is progressing.
+HEALTH_PROCESS_LIVE = "PROCESS_LIVE"
+HEALTH_MAIN_LOOP_RUNNING = "MAIN_LOOP_RUNNING"
+HEALTH_MAIN_LOOP_STALLED = "MAIN_LOOP_STALLED"
+HEALTH_MAIN_LOOP_UNKNOWN = "MAIN_LOOP_UNKNOWN"
+HEALTH_RECOVERY_NONE = "NONE"
+HEALTH_RECOVERY_IN_PROGRESS = "RECOVERY_IN_PROGRESS"
+HEALTH_RECOVERY_FAILED = "RECOVERY_FAILED"
+HEALTH_TRADING_READY = "TRADING_READY"
+HEALTH_TRADING_BLOCKED = "TRADING_BLOCKED"
+_MAIN_LOOP_FAILED_STATUSES = {
+    "STALLED", "STALLED_SAFE_HOLD", "FAILED", "RESTART_FAILED",
+    "RECOVERY_DEFERRED", "RESTART_BUDGET_EXHAUSTED", "IDLE_SAFE_HOLD",
+}
+_RECOVERY_FAILED_STATUSES = {
+    "RESTART_FAILED", "RESTART_BUDGET_EXHAUSTED",
+    "SUPERVISOR_RESTART_LIMIT_EXHAUSTED", "STARTUP_RECOVERY_ERROR",
+    "MARKETS_UNAVAILABLE", "PERSISTED_RECOVERY_HOLD",
+}
+
+
+def _health_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _health_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _health_main_loop_state(snapshot):
+    """Report genuine main-loop progress without creating a beat."""
+    watchdog = globals().get("NAISO_WATCHDOG")
+    threads = snapshot.get("threads") if isinstance(snapshot, dict) else None
+    components = threads.get("components", {}) if isinstance(threads, dict) else {}
+    if not isinstance(components, dict):
+        components = {}
+    row = components.get("main_loop")
+    progress = None
+    progress_fn = getattr(watchdog, "progress_snapshot", None)
+    if callable(progress_fn):
+        try:
+            progress = progress_fn("main_loop")
+        except Exception:
+            progress = None
+    if not isinstance(row, dict):
+        row = progress if isinstance(progress, dict) else {}
+    diagnostics = row.get("diagnostics") if isinstance(row.get("diagnostics"), dict) else {}
+    owner = _main_loop_owner() if callable(globals().get("_main_loop_owner")) else {}
+    with _MAIN_LOOP_OWNER_LOCK:
+        last = dict(_MAIN_LOOP_LAST_OWNER_PROGRESS)
+    seq = _health_int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0))
+    monotonic_fn = getattr(watchdog, "monotonic", None)
+    try:
+        mono_now = float(monotonic_fn()) if callable(monotonic_fn) else time.monotonic()
+    except Exception:
+        mono_now = time.monotonic()
+    age_sec = float(row.get("age_sec") or 0.0)
+    last_mono = float(last.get("ts") or 0.0)
+    if seq > 0 and last_mono > 0:
+        progress_age = max(0.0, mono_now - last_mono)
+        age_sec = max(age_sec, progress_age)
+        last_progress_ts = round(time.time() - progress_age, 3)
+    elif age_sec > 0:
+        last_progress_ts = round(time.time() - age_sec, 3)
+    else:
+        last_progress_ts = None
+    try:
+        liveness = bool(_main_loop_liveness_confirmed())
+    except Exception:
+        liveness = False
+    status = str(row.get("status") or "UNKNOWN")
+    grace_sec = float(row.get("grace_sec") or _MAIN_LOOP_LIVENESS_WINDOW_SEC)
+    next_due_sec = row.get("next_due_sec")
+    bounded_startup = bool(
+        row and seq <= 0 and str(row.get("lifecycle") or "") == "BLOCKED"
+        and status not in _MAIN_LOOP_FAILED_STATUSES
+        and next_due_sec is not None and float(next_due_sec) > 0
+    )
+    if not row:
+        state = HEALTH_MAIN_LOOP_UNKNOWN
+        reason = "MAIN_LOOP_NOT_REGISTERED"
+    elif bounded_startup:
+        state = HEALTH_MAIN_LOOP_UNKNOWN
+        reason = "MAIN_LOOP_BOUNDED_STARTUP"
+    elif status in _MAIN_LOOP_FAILED_STATUSES or not liveness or age_sec > grace_sec:
+        state = HEALTH_MAIN_LOOP_STALLED
+        reason = str(row.get("reason") or diagnostics.get("verification_last_reason")
+                     or "MAIN_LOOP_LIVENESS_NOT_CONFIRMED")
+    else:
+        state = HEALTH_MAIN_LOOP_RUNNING
+        reason = ""
+    return {
+        "state": state,
+        "bounded_startup": bounded_startup,
+        "status": status,
+        "lifecycle": row.get("lifecycle", "UNKNOWN"),
+        "critical": bool(row.get("critical", True)),
+        "reason": str(reason)[:200],
+        "last_progress_ts": last_progress_ts,
+        "last_progress_monotonic": last_mono or row.get("last_progress_monotonic"),
+        "last_progress_age_sec": round(age_sec, 3),
+        "grace_sec": round(grace_sec, 3),
+        "next_due_sec": next_due_sec,
+        "progress_seq": seq,
+        "liveness_confirmed": liveness,
+        "owner_thread_name": str(owner.get("thread_name") or ""),
+        "owner_thread_registered": bool(owner.get("registered")),
+        "owner_thread_alive": bool(_main_loop_owner_alive()) if callable(globals().get("_main_loop_owner_alive")) else False,
+        "diagnostics": diagnostics,
+    }
+
+
+def _health_recovery_state(snapshot):
+    """Report persisted/runtime recovery state from real recovery sources."""
+    watchdog = globals().get("NAISO_WATCHDOG")
+    threads = snapshot.get("threads") if isinstance(snapshot, dict) else None
+    components = threads.get("components", {}) if isinstance(threads, dict) else {}
+    row = components.get("main_loop") if isinstance(components, dict) else {}
+    if not isinstance(row, dict):
+        row = {}
+    diagnostics = row.get("diagnostics") if isinstance(row.get("diagnostics"), dict) else {}
+    recovery = snapshot.get("recovery") if isinstance(snapshot, dict) else {}
+    if not isinstance(recovery, dict):
+        recovery = {}
+    restart = dict(globals().get("_MAIN_LOOP_RESTART_STATE") or {})
+    status = str(MEMORY.get("recovery_status") or "")
+    reason = str(STATE.get("recovery_reason") or recovery.get("reason")
+                 or row.get("reason") or diagnostics.get("verification_last_reason") or "")
+    failed = (
+        bool(restart.get("supervisor_exhausted"))
+        or status in _RECOVERY_FAILED_STATUSES
+        or str(row.get("status") or "") in {"RESTART_FAILED", "RESTART_BUDGET_EXHAUSTED"}
+        or _health_bool(diagnostics.get("verification_exhausted"))
+    )
+    in_progress = (
+        bool(restart.get("in_progress"))
+        or status in {"VERIFYING", "RECOVERY_IN_PROGRESS", "RECOVERY_HOLD"}
+        or str(row.get("status") or "") == "STALLED_SAFE_HOLD"
+        or bool(STATE.get("recovery_hold"))
+    )
+    if failed:
+        state = HEALTH_RECOVERY_FAILED
+    elif in_progress:
+        state = HEALTH_RECOVERY_IN_PROGRESS
+    else:
+        state = HEALTH_RECOVERY_NONE
+    return {
+        "state": state,
+        "reason": reason[:200],
+        "hold": bool(recovery.get("hold", STATE.get("recovery_hold"))),
+        "block_entries": bool(recovery.get("block_entries", globals().get("RECOVERY_BLOCK_ENTRIES", False))),
+        "execution_unresolved": bool(recovery.get("execution_unresolved", STATE.get("execution_unresolved"))),
+        "close_reconciliation_required": bool(recovery.get(
+            "close_reconciliation_required", STATE.get("close_reconciliation_required"))),
+        "status": status or None,
+        "restart_in_progress": bool(restart.get("in_progress")),
+        "supervisor_exhausted": bool(restart.get("supervisor_exhausted")),
+        "verification_attempts": _health_int(diagnostics.get("verification_attempts")),
+        "verification_exhausted": _health_bool(diagnostics.get("verification_exhausted")),
+        "watchdog_running": bool(getattr(watchdog, "_thread", None) is not None),
+    }
+
+
+def _health_readiness(snapshot):
+    """Return fail-closed readiness plus the explicit health-state vocabulary."""
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    main_loop = _health_main_loop_state(snapshot)
+    recovery = _health_recovery_state(snapshot)
+    blockers = []
+    process_failures = []
+    if main_loop["state"] != HEALTH_MAIN_LOOP_RUNNING:
+        blockers.append(main_loop["state"])
+        if not main_loop.get("bounded_startup"):
+            process_failures.append(main_loop["state"])
+    if recovery["state"] == HEALTH_RECOVERY_FAILED:
+        blockers.append(HEALTH_RECOVERY_FAILED)
+        process_failures.append(HEALTH_RECOVERY_FAILED)
+    elif recovery["state"] == HEALTH_RECOVERY_IN_PROGRESS:
+        blockers.append(HEALTH_RECOVERY_IN_PROGRESS)
+    if recovery["hold"]:
+        blockers.append("RECOVERY_HOLD")
+    if recovery["block_entries"]:
+        blockers.append("ENTRY_BLOCK")
+    if recovery["execution_unresolved"]:
+        blockers.append("EXECUTION_UNRESOLVED")
+    if recovery["close_reconciliation_required"]:
+        blockers.append("CLOSE_RECONCILIATION_REQUIRED")
+    positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), dict) else {}
+    if bool(positions.get("open")):
+        # Open-position management is a trading restriction, not a process failure.
+        blockers.append("OPEN_POSITION_MANAGEMENT")
+    daily_loss = snapshot.get("daily_loss") if isinstance(snapshot.get("daily_loss"), dict) else {}
+    if bool(daily_loss.get("active")):
+        blockers.append("DAILY_LOSS_COOLDOWN")
+    api = snapshot.get("api") if isinstance(snapshot.get("api"), dict) else {}
+    counters = api.get("counters") if isinstance(api.get("counters"), dict) else {}
+    if any(str((endpoint or {}).get("state", "")).upper() == "OPEN"
+           for endpoint in counters.values() if isinstance(endpoint, dict)):
+        blockers.append("API_CIRCUIT_OPEN")
+    threads = snapshot.get("threads") if isinstance(snapshot.get("threads"), dict) else {}
+    components = threads.get("components") if isinstance(threads.get("components"), dict) else {}
+    for name, component in sorted(components.items()):
+        if name == "main_loop" or not isinstance(component, dict) or not component.get("critical"):
+            continue
+        if str(component.get("status") or "") in _MAIN_LOOP_FAILED_STATUSES:
+            blocker = f"CRITICAL_COMPONENT_STALLED:{name}"
+            blockers.append(blocker)
+            process_failures.append(blocker)
+    readiness = HEALTH_TRADING_READY if not blockers else HEALTH_TRADING_BLOCKED
+    return {
+        "ok": readiness == HEALTH_TRADING_READY,
+        "status": readiness,
+        "readiness": readiness,
+        "process": {"state": HEALTH_PROCESS_LIVE, "pid": os.getpid()},
+        "main_loop": main_loop,
+        "recovery": recovery,
+        "blockers": blockers,
+        "process_failures": process_failures,
+        "http_status": 503 if process_failures else 200,
+    }
+
+
 @app.route("/naiso/health")
 def naiso_health():
-    return jsonify(safe_json(naiso_health_snapshot())), 200
+    snapshot = naiso_health_snapshot()
+    payload = safe_json(snapshot) if isinstance(snapshot, dict) else snapshot
+    report = _health_readiness(snapshot)
+    if isinstance(payload, dict):
+        payload.update({key: value for key, value in report.items() if key != "http_status"})
+    return jsonify(safe_json(payload)), int(report["http_status"])
 
 
 @app.route("/health")
 def health():
     snapshot = naiso_health_snapshot()
-    return jsonify({
-        "ok": True,
+    report = _health_readiness(snapshot)
+    return jsonify(safe_json({
+        "ok": report["ok"],
         "mode": "LIVE" if MODE_LIVE else "PAPER",
         "dashboard_ports": globals().get("DASHBOARD_ACTIVE_PORTS", []),
         "discovery_scanner": MEMORY.get("discovery_scanner", {}).get("state", "UNKNOWN"),
@@ -10861,15 +11100,22 @@ def health():
         "trade_management_events": len(TRADE_MANAGEMENT_LOG),
         "telegram": TELEGRAM_NOTIFIER.status(),
         "naiso": {
-            "resources": snapshot["resources"],
-            "threads": (snapshot["threads"]["components"] if snapshot["threads"] else None),
-            "api": snapshot["api"]["counters"] if snapshot["api"] else None,
-            "recovery": snapshot["recovery"],
-            "native_sl": snapshot["positions"],
-            "daily_loss": snapshot["daily_loss"],
-            "restart_count": snapshot["restart_count"],
+            "resources": snapshot.get("resources"),
+            "threads": (snapshot["threads"]["components"] if snapshot.get("threads") else None),
+            "api": snapshot["api"]["counters"] if snapshot.get("api") else None,
+            "recovery": snapshot.get("recovery"),
+            "native_sl": snapshot.get("positions"),
+            "daily_loss": snapshot.get("daily_loss"),
+            "restart_count": snapshot.get("restart_count", 0),
         },
-    })
+        "status": report["status"],
+        "readiness": report["readiness"],
+        "process": report["process"],
+        "main_loop": report["main_loop"],
+        "recovery_state": report["recovery"],
+        "blockers": report["blockers"],
+        "process_failures": report["process_failures"],
+    })), int(report["http_status"])
 
 app.add_url_rule('/narrative-debug', 'narrative_debug', narrative_debug)
 
@@ -12626,6 +12872,10 @@ def safe_main_loop():
     _main_loop_register_owner(force=True)
     consecutive_failures = 0
     while True:
+        requested = _shutdown_reason()
+        if requested:
+            log_execution(f"[SHUTDOWN] {requested} observed at supervisor boundary; deferring exit to safety gate", "WARN")
+            return requested
         reason = "CLEAN_EXIT"
         started = time.monotonic()
         try:
@@ -12687,6 +12937,11 @@ def safe_main_loop():
             STATE["recovery_reason"] = "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"
             MEMORY["recovery_status"] = "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"
             MEMORY["supervisor_restarts"] = len(_NAISO_LOOP_RESTARTS)
+            _persist_recovery_state("SUPERVISOR_RESTART_LIMIT_EXHAUSTED", "UNKNOWN",
+                                    safe_to_exit=False,
+                                    details={"phase": "supervisor_exhausted",
+                                             "attempt": attempt,
+                                             "last_reason": reason[:100]})
             log_execution(
                 f"[SUPERVISOR] restart budget exhausted after {attempt} attempts; "
                 "fail-closed hold, no further main_loop restart", "CRITICAL")
@@ -12718,6 +12973,265 @@ except Exception as _integration_init_error:
     INSTITUTIONAL_RESOURCE_MANAGER = None
     INSTITUTIONAL_TRADE_JOURNAL = None
     log_execution(f"[INTEGRATION] optional persistence unavailable: {_integration_init_error}", "WARN")
+
+
+# --- Controlled recovery-exit contract ------------------------------------ #
+# The process never exits to "ask" an unverified exposure to disappear. It may
+# exit only after a final read-only reconciliation proves FLAT or an open
+# position whose exchange-side native stop is still VERIFIED. The non-zero code
+# is the restart signal for an external supervisor (Railway ON_FAILURE) while a
+# failing /health state is the restart signal for Render health checks.
+_RECOVERY_STATE_KEY = "recovery_state_v1"
+EXIT_RECOVERY_EXHAUSTED = 3
+EXIT_SIGINT = 130
+EXIT_SIGTERM = 143
+RECOVERY_EXIT_RECHECK_SEC = 30.0
+_SHUTDOWN_STATE = {"requested": None, "reason": "", "reconciling": False,
+                   "trading_stopped": False}
+_SHUTDOWN_LOCK = threading.RLock()
+
+
+def _load_recovery_state():
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None or not hasattr(journal, "get_runtime_state"):
+        return None
+    try:
+        value = journal.get_runtime_state(_RECOVERY_STATE_KEY)
+        return value if isinstance(value, dict) else None
+    except Exception as exc:
+        log_execution(f"[RECOVERY_STATE] read failed: {type(exc).__name__}: {exc}", "ERROR")
+        return None
+
+
+def _persisted_recovery_hold_active():
+    record = _load_recovery_state()
+    return bool(record and not _health_bool(record.get("safe_to_exit", False)))
+
+
+def _mark_persisted_recovery_resolved(exposure_status, status_label):
+    """Clear an inherited hold only after this attempt's reconciliation succeeded."""
+    return _persist_recovery_state(status_label, exposure_status, safe_to_exit=True,
+                                   details={"phase": "startup_reconciled"})
+
+
+def _persist_recovery_state(reason, exposure_status, *, safe_to_exit=False, details=None):
+    """Persist the pre-exit safety contract before any process termination."""
+    payload = {
+        "version": 1,
+        "reason": str(reason or "UNKNOWN"),
+        "exposure_status": str(exposure_status or "UNKNOWN"),
+        "safe_to_exit": bool(safe_to_exit),
+        "ts": time.time(),
+        "pid": os.getpid(),
+        "symbol": str(STATE.get("current_symbol") or ""),
+        "side": str(STATE.get("side") or ""),
+        "trade_id": str(STATE.get("trade_id") or ""),
+        "remaining_qty": safe_float(STATE.get("remaining_qty"), 0.0),
+        "native_sl_status": str(STATE.get("native_sl_status") or "UNKNOWN"),
+        "native_sl_order_id": str(STATE.get("native_sl_order_id") or ""),
+        "native_sl_price": safe_float(STATE.get("native_sl_original_price")
+                                      or STATE.get("sl") or STATE.get("synthetic_sl"), 0.0),
+        "native_tp1_price": safe_float(STATE.get("tp1_price"), 0.0),
+        "native_tp2_price": safe_float(STATE.get("tp2_price"), 0.0),
+        "recovery_hold": bool(STATE.get("recovery_hold")),
+        "entry_blocked": bool(globals().get("RECOVERY_BLOCK_ENTRIES", False)),
+        "details": dict(details or {}),
+    }
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None or not hasattr(journal, "set_runtime_state"):
+        log_execution("[RECOVERY_STATE] persistence unavailable; exit gate remains fail-closed", "ERROR")
+        return False
+    try:
+        journal.set_runtime_state(_RECOVERY_STATE_KEY, payload)
+        return True
+    except Exception as exc:
+        log_execution(f"[RECOVERY_STATE] write failed; exit gate remains fail-closed: {type(exc).__name__}: {exc}", "ERROR")
+        return False
+
+
+def _verified_open_position_for_exit(positions):
+    """Read-only verification of exchange-side protection; never places orders."""
+    if PAPER_MODE:
+        trigger = safe_float(STATE.get("synthetic_sl") or STATE.get("sl"), 0.0)
+        return bool(STATE.get("open") and str(STATE.get("side") or "").upper() in {"BUY", "SELL"}
+                    and safe_float(STATE.get("remaining_qty"), 0.0) > 0 and trigger > 0
+                    and str(STATE.get("native_sl_status") or "PAPER_SIMULATED") in {"PAPER_SIMULATED", "VERIFIED"}
+                    and not STATE.get("execution_unresolved")
+                    and not STATE.get("close_reconciliation_required"))
+    if not isinstance(positions, (list, tuple)) or len(positions) != 1 or not STATE.get("open"):
+        return False
+    symbol = str(STATE.get("current_symbol") or "")
+    side = str(STATE.get("side") or "").upper()
+    qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty"), 0.0)
+    trigger = safe_float(STATE.get("native_sl_original_price")
+                         or STATE.get("sl") or STATE.get("synthetic_sl"), 0.0)
+    if not symbol or side not in {"BUY", "SELL"} or qty <= 0 or trigger <= 0:
+        return False
+    status, order_id, matched_price = verify_native_stop_loss_detailed(
+        symbol, side, trigger, qty, position_side=STATE.get("position_side"))
+    verified = status == "VERIFIED"
+    if verified:
+        STATE.update({"native_sl_status": "VERIFIED", "native_sl_verified": True,
+                      "native_sl_order_id": str(order_id or ""),
+                      "native_sl_original_price": safe_float(matched_price, trigger)})
+    return verified
+
+
+def _recovery_exit_gate(reason, *, requested_signal=None):
+    """Return True only when a controlled restart is safe; otherwise hold."""
+    global RECOVERY_BLOCK_ENTRIES
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_STATE["reconciling"]:
+            return False
+        _SHUTDOWN_STATE.update({"reconciling": True, "trading_stopped": True,
+                                "requested": requested_signal or _SHUTDOWN_STATE["requested"]})
+    try:
+        RECOVERY_BLOCK_ENTRIES = True
+        STATE["recovery_hold"] = True
+        STATE["recovery_reason"] = str(reason or "RECOVERY_EXIT_RECONCILIATION")
+        MEMORY["recovery_status"] = "RECOVERY_EXIT_RECONCILIATION"
+        _MAIN_LOOP_RESTART_STATE["supervisor_exhausted"] = True
+        persisted = _persist_recovery_state(
+            STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+            details={"phase": "reconciling",
+                     "requested_signal": requested_signal or _SHUTDOWN_STATE["requested"]})
+        if not PAPER_MODE and not persisted:
+            log_execution("[EXIT_GATE] Recovery state could not be persisted; refusing process exit", "CRITICAL")
+            return False
+        if _MAIN_LOOP_RESTART_STATE.get("in_progress"):
+            # No second verifier may be spawned while an older verifier is alive.
+            _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                                    details={"phase": "verifier_single_flight_hold"})
+            log_execution("[EXIT_GATE] Verifier already in progress; refusing a second verification", "WARN")
+            return False
+        status, positions = fetch_position_tri_state(None, strict_account_snapshot=True)
+        positions = positions or []
+        symbol = str(STATE.get("current_symbol") or "")
+        if status == "FLAT":
+            if STATE.get("open") and not symbol:
+                _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                                        details={"phase": "flat_without_symbol"})
+                return False
+            if STATE.get("open") and symbol and not _clear_confirmed_flat(symbol, reason):
+                _persist_recovery_state(STATE["recovery_reason"], "UNKNOWN", safe_to_exit=False,
+                                        details={"phase": "flat_finalization_failed"})
+                return False
+            STATE.update({"recovery_hold": False, "execution_unresolved": False,
+                          "close_reconciliation_required": False})
+            MEMORY["recovery_status"] = "EXIT_RECONCILED_FLAT"
+            persisted = _persist_recovery_state(
+                STATE["recovery_reason"], "FLAT", safe_to_exit=True,
+                details={"phase": "verified_flat", "exchange_flat_confirmed": True})
+            return True if PAPER_MODE or persisted else False
+        if status == "OPEN" and _verified_open_position_for_exit(positions):
+            MEMORY["recovery_status"] = "EXIT_VERIFIED_PROTECTED_OPEN"
+            persisted = _persist_recovery_state(
+                STATE["recovery_reason"], "OPEN", safe_to_exit=True,
+                details={"phase": "verified_open",
+                         "native_sl_verified": True,
+                         "position_count": len(positions),
+                         "exchange_native_stop_verified": not PAPER_MODE})
+            return True if PAPER_MODE or persisted else False
+        exposure = str(status or "UNKNOWN")
+        STATE["recovery_hold"] = True
+        RECOVERY_BLOCK_ENTRIES = True
+        MEMORY["recovery_status"] = "EXIT_REFUSED_UNVERIFIED_EXPOSURE"
+        _persist_recovery_state(STATE["recovery_reason"], exposure, safe_to_exit=False,
+                                details={"phase": "exit_refused",
+                                         "position_count": len(positions),
+                                         "paper_mode": bool(PAPER_MODE)})
+        log_execution(
+            f"[EXIT_GATE] Refusing process exit: exposure={exposure}; "
+            "position state and exchange-side protection are not verified. Holding lock and read-only recovery.",
+            "CRITICAL", debounce_key=f"exit_gate_refused:{exposure}", debounce_sec=30)
+        return False
+    finally:
+        with _SHUTDOWN_LOCK:
+            _SHUTDOWN_STATE["reconciling"] = False
+
+
+def _shutdown_reason():
+    with _SHUTDOWN_LOCK:
+        return str(_SHUTDOWN_STATE.get("requested") or "")
+
+
+def _request_shutdown(signum, _frame):
+    """Signals request shutdown; only _recovery_exit_gate may allow the exit."""
+    global RECOVERY_BLOCK_ENTRIES
+    name = "SIGINT" if int(signum) == int(signal.SIGINT) else "SIGTERM"
+    with _SHUTDOWN_LOCK:
+        _SHUTDOWN_STATE["requested"] = name
+        _SHUTDOWN_STATE["reason"] = name
+    # Stop new trading work immediately; the final gate still decides whether
+    # the process may exit or must remain in read-only recovery.
+    RECOVERY_BLOCK_ENTRIES = True
+    STATE["recovery_hold"] = True
+    STATE["recovery_reason"] = f"SHUTDOWN_{name}"
+    log_execution(f"[SHUTDOWN] {name} requested; entries blocked and exit deferred until exposure is verified", "WARN")
+
+
+def _install_shutdown_handlers():
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(signum, _request_shutdown)
+        except (ValueError, OSError):
+            pass
+
+
+def _stop_runtime_services():
+    watchdog = globals().get("NAISO_WATCHDOG")
+    if watchdog is not None and hasattr(watchdog, "stop"):
+        try:
+            watchdog.stop()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] watchdog stop failed: {type(exc).__name__}: {exc}", "WARN")
+    for server, thread in list(globals().get("DASHBOARD_SERVERS") or []):
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception as exc:
+            log_execution(f"[SHUTDOWN] dashboard stop failed: {type(exc).__name__}: {exc}", "WARN")
+        try:
+            thread.join(timeout=2.0)
+        except Exception:
+            pass
+
+
+def _release_runtime_lock(handle):
+    from ggp_instance_lock import release_instance_lock
+    return release_instance_lock(handle)
+
+
+def run_trade_supervisor(*, lock_handle=None, lock_path=None):
+    """Foreground runtime entry point implementing the controlled restart contract."""
+    _install_shutdown_handlers()
+    try:
+        try:
+            result = safe_main_loop()
+            requested = _shutdown_reason()
+            if requested:
+                reason = requested
+            elif result is False:
+                reason = "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"
+            else:
+                reason = "CLEAN_EXIT"
+        except KeyboardInterrupt:
+            reason = "SIGINT"
+        while not _recovery_exit_gate(reason, requested_signal=_shutdown_reason()):
+            log_execution("[EXIT_GATE] Holding read-only recovery; no new trading work and no process exit",
+                          "ERROR", debounce_key="exit_gate_hold", debounce_sec=60)
+            time.sleep(RECOVERY_EXIT_RECHECK_SEC)
+        _stop_runtime_services()
+        code = (EXIT_SIGTERM if reason == "SIGTERM" else
+                EXIT_SIGINT if reason == "SIGINT" else EXIT_RECOVERY_EXHAUSTED)
+        log_execution(f"[EXIT_GATE] Controlled restart exit code={code} reason={reason}; "
+                      f"lock={lock_path or 'managed-by-caller'}", "CRITICAL")
+        raise SystemExit(code)
+    finally:
+        _release_runtime_lock(lock_handle)
+
 
 # NAISO-LIVE v1.1.0 long-run support: API circuit breaker, watchdog and
 # trade-state-aware maintenance. Construction has no I/O side effects; services
@@ -14848,13 +15362,24 @@ def _attempt_runtime_trade_recovery(symbol, position=None, *, force=False):
 def startup_trade_recovery():
     """Reconcile persisted journal with BingX before any fresh entry is permitted."""
     global RECOVERY_BLOCK_ENTRIES
+    if _persisted_recovery_hold_active():
+        # A prior process refused exit because exposure was unverified. Keep the
+        # inherited hold until this restart's engine verification clears it.
+        RECOVERY_BLOCK_ENTRIES = True
+        STATE["recovery_hold"] = True
+        STATE["recovery_reason"] = "PERSISTED_RECOVERY_HOLD"
+        MEMORY["recovery_status"] = "PERSISTED_RECOVERY_HOLD"
     if PAPER_MODE:
         rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
         if not rows:
+            if _persisted_recovery_hold_active():
+                log_execution("[PAPER_RECOVERY] Persisted unverified recovery hold; entries remain blocked", "ERROR")
+                return False
             paper["position"] = None
             MEMORY["position_status"] = "FLAT"
             MEMORY["recovery_status"] = "PAPER_RECONCILED_FLAT"
             RECOVERY_BLOCK_ENTRIES = False
+            _mark_persisted_recovery_resolved("FLAT", "PAPER_RECONCILED_FLAT")
             return True
         if len(rows) != 1:
             MEMORY["position_status"] = "MULTIPLE_OPEN"
@@ -14884,6 +15409,7 @@ def startup_trade_recovery():
             MEMORY["position_status"] = "FLAT"
             MEMORY["recovery_status"] = "PAPER_CLOSED_TRADE_FINALIZED_AFTER_RESTART"
             RECOVERY_BLOCK_ENTRIES = False
+            _mark_persisted_recovery_resolved("FLAT", "PAPER_CLOSED_TRADE_FINALIZED_AFTER_RESTART")
             log_execution(f"[PAPER_RECOVERY] Finalized verified pre-restart close for {symbol}; no duplicate close action", "SUCCESS")
             return True
         side = str(saved.get("side") or row.get("side") or "").upper()
@@ -14931,6 +15457,7 @@ def startup_trade_recovery():
         MEMORY["recovery_status"] = "PAPER_TRADE_RESTORED_FROM_JOURNAL"
         update_position_dashboard(symbol, side, entry, remaining_qty)
         RECOVERY_BLOCK_ENTRIES = False
+        _mark_persisted_recovery_resolved("OPEN_RESTORED_FROM_JOURNAL", "PAPER_TRADE_RESTORED_FROM_JOURNAL")
         log_execution(f"[PAPER_RECOVERY] Restored trade={trade_id} {symbol} {side} remaining={remaining_qty:.10f} TP1={STATE.get('tp1_hit')} TP2={STATE.get('tp2_hit')} trail={STATE.get('trail_activated')}", "SUCCESS")
         return True
     RECOVERY_BLOCK_ENTRIES = True
@@ -14974,6 +15501,7 @@ def startup_trade_recovery():
         MEMORY["position_status"] = "FLAT"
         MEMORY["recovery_status"] = "RECONCILED_FLAT"
         RECOVERY_BLOCK_ENTRIES = False
+        _mark_persisted_recovery_resolved("FLAT", "RECONCILED_FLAT")
         return True
     if len(positions) != 1:
         MEMORY["position_status"] = "MULTIPLE_OPEN"
@@ -14994,6 +15522,7 @@ def startup_trade_recovery():
             log_execution("[RECOVERY] Position restored but TP/SL state incomplete; new entries blocked and manual review required", "ERROR")
         else:
             log_execution(f"[RECOVERY] Restored {symbol_key} {STATE.get('side')} and management stages from SQLite", "SUCCESS")
+            _mark_persisted_recovery_resolved("OPEN_RESTORED_FROM_JOURNAL", "LIVE_TRADE_RESTORED_FROM_JOURNAL")
         return critical
     # Exchange exposure exists but no unique durable trade state. Track exposure and stop all entries.
     if len(candidates) > 1:
@@ -15371,23 +15900,25 @@ def start_dashboard_servers():
 if __name__ == "__main__":
     # A single process must own execution, recovery, journal writes and dashboard.
     # The lock is OS-released on process exit/crash; it is not a stale PID flag.
-    from ggp_instance_lock import acquire_instance_lock
-    _GGP_INSTANCE_LOCK = acquire_instance_lock(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ggpbot.instance.lock"))
+    from ggp_instance_lock import acquire_instance_lock, release_instance_lock
+    _GGP_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ggpbot.instance.lock")
+    _GGP_INSTANCE_LOCK = acquire_instance_lock(_GGP_LOCK_PATH)
     if _GGP_INSTANCE_LOCK is None:
         raise SystemExit("[SINGLE_INSTANCE] Another JGB_GGP process already owns the runtime lock. No dashboard or orders started.")
     print("[SINGLE_INSTANCE] Runtime lock acquired.")
-    # Serve the local/hosted Dashboard independently while the trade supervisor
-    # stays on the foreground thread. This avoids daemon-only process exit.
-    start_dashboard_servers()
     try:
-        threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
-    except Exception as exc:
-        log_execution(f"[THREAD_START] keep_alive failed: {type(exc).__name__}: {exc}", "ERROR")
-    start_naiso_services()
-    try:
-        safe_main_loop()
-    except KeyboardInterrupt:
-        log_execution("[SHUTDOWN] KeyboardInterrupt received; stopping main supervisor.", "WARN")
+        # Serve the local/hosted Dashboard independently while the trade
+        # supervisor stays on the foreground thread. This avoids daemon-only
+        # process exit.
+        start_dashboard_servers()
+        try:
+            threading.Thread(target=keep_alive, daemon=True, name="keep_alive").start()
+        except Exception as exc:
+            log_execution(f"[THREAD_START] keep_alive failed: {type(exc).__name__}: {exc}", "ERROR")
+        start_naiso_services()
+        run_trade_supervisor(lock_handle=_GGP_INSTANCE_LOCK, lock_path=_GGP_LOCK_PATH)
     except Exception:
         log_execution(f"[SHUTDOWN] Fatal supervisor error: {traceback.format_exc()}", "ERROR")
         raise
+    finally:
+        release_instance_lock(_GGP_INSTANCE_LOCK)
