@@ -7977,7 +7977,8 @@ def _advance_cross_event_lifecycles(rows, progress_callback=None, max_items=None
     eligible = [
         row for row in list(rows or [])
         if isinstance(row, dict)
-        and str((row.get("metadata") or {}).get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA
+        and isinstance(row.get("metadata"), dict)
+        and str(row["metadata"].get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA
     ]
     if not eligible:
         return 0
@@ -14192,7 +14193,7 @@ def _run_unified_institutional_watchlist_refresh():
         _watchlist_worker_progress("CROSS_EVENT_SYNC")
         _sync_confirmed_cross_events(
             progress_callback=_watchlist_worker_progress,
-            lifecycle_max_items=INSTITUTIONAL_WATCHLIST_BATCH_SIZE,
+            lifecycle_max_items=max(1, INSTITUTIONAL_WATCHLIST_BATCH_SIZE * 2),
         )
 
         def tracked_fetch_frame(symbol):
