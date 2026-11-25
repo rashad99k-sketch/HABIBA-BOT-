@@ -416,3 +416,49 @@ def test_manual_entry_does_not_reuse_a_scanner_global_context():
     assert 'entry_lock.acquire(blocking=False)' in source
     assert 'globals()["_INSTITUTIONAL_ENTRY_CONTEXT"] = None' in source
     assert 'previous_entry_context' in source
+
+
+def test_async_watchlist_delivery_marks_cross_event_only_after_row_publish(monkeypatch):
+    marked_calls = []
+    memory = {
+        "_cross_watchlist_delivery": {
+            "event_ids": ["cross-1", "cross-2"], "detected_at": 100.0,
+            "reason": "WATCHLIST_REFRESH_SCHEDULED", "delivered": False,
+        },
+        "watchlist": {
+            "BTC/USDT": {"cross_event_id": "cross-1"},
+        },
+    }
+    monkeypatch.setattr(ggpbot, "MEMORY", memory)
+    monkeypatch.setattr(ggpbot, "_mark_cross_events_watchlist_delivered",
+                        lambda ids, _ts: marked_calls.append(list(ids)) or list(ids))
+
+    assert ggpbot._finalize_cross_watchlist_delivery_after_publish() is False
+    delivery = memory["_cross_watchlist_delivery"]
+    assert marked_calls == [["cross-1"]]
+    assert delivery["delivered"] is False
+    assert delivery["reason"] == "PARTIAL_WATCHLIST_DELIVERY"
+    assert delivery["delivered_ids"] == ["cross-1"]
+    assert delivery["same_cycle"] is False
+
+
+def test_async_watchlist_delivery_completes_when_all_durable_events_are_published(monkeypatch):
+    memory = {
+        "_cross_watchlist_delivery": {
+            "event_ids": ["cross-1"], "detected_at": 100.0,
+            "reason": "WATCHLIST_REFRESH_SCHEDULED", "delivered": False,
+        },
+        "watchlist": {
+            "BTC/USDT": {"cross_event_id": "cross-1"},
+        },
+    }
+    monkeypatch.setattr(ggpbot, "MEMORY", memory)
+    monkeypatch.setattr(ggpbot, "_mark_cross_events_watchlist_delivered",
+                        lambda ids, _ts: list(ids))
+
+    assert ggpbot._finalize_cross_watchlist_delivery_after_publish() is True
+    delivery = memory["_cross_watchlist_delivery"]
+    assert delivery["delivered"] is True
+    assert delivery["reason"] == "ACTIVE_WATCHLIST_DELIVERED"
+    assert delivery["lifecycle_status"] == ggpbot.ACTIVE_WATCHLIST_LIFECYCLE
+    assert delivery["same_cycle"] is False
