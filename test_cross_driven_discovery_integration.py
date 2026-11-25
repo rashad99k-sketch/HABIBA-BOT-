@@ -557,7 +557,9 @@ def test_active_cross_event_is_forced_into_each_watchlist_batch(monkeypatch):
     first = bridge.update_unified_watchlist(memory, lambda _: frame, max_items=10, batch_size=1)
     second = bridge.update_unified_watchlist(memory, lambda _: frame, max_items=10, batch_size=1)
     assert seen.count(("BTC", "BUY")) == 2
-    assert seen.count(("BTC", "SELL")) == 2
+    # A durable cross event is analyzed only in its immutable confirmed side.
+    # Scanner hints cannot create a second hypothesis for the same event.
+    assert seen == [("BTC", "BUY"), ("BTC", "BUY")]
     assert first["BTC"]["cross_event_id"] == event["event_id"]
     assert second["BTC"]["cross_event_analysis_required"] is True
     assert second["BTC"]["cross_event_direction"] == "BULLISH"
