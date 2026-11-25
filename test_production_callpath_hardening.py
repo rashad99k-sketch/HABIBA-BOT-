@@ -201,6 +201,7 @@ def test_partial_entry_fill_keeps_execution_lock_and_requires_reconciliation(mon
         def fetch_ticker(self, _symbol):
             return {"last": 100.0}
 
+    stop_calls = []
     class PartialFillService:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -214,9 +215,14 @@ def test_partial_entry_fill_keeps_execution_lock_and_requires_reconciliation(mon
                 filled_qty=0.4,
                 remaining_qty=0.6,
                 average_fill_price=100.0,
+                position_mode="ONE_WAY",
+                position_side="BOTH",
                 raw_position={"contracts": 0.4},
                 reason="partially filled",
             )
+        def place_and_verify_native_stop(self, **kwargs):
+            stop_calls.append(kwargs)
+            return "partial-native-stop"
 
     monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
     monkeypatch.setattr(ggpbot, "ex", Exchange())
@@ -247,7 +253,12 @@ def test_partial_entry_fill_keeps_execution_lock_and_requires_reconciliation(mon
     assert ggpbot.STATE["entry_remaining_qty"] == pytest.approx(0.6)
     assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
     assert ggpbot.MEMORY["position_status"] == "UNKNOWN"
-    assert ggpbot.MEMORY["recovery_status"] == "ENTRY_EXECUTION_RECONCILIATION_REQUIRED"
+    assert ggpbot.MEMORY["recovery_status"] == "PARTIAL_FILL_PROTECTION_VERIFIED_RECOVERY_REQUIRED"
+    assert ggpbot.STATE["native_sl_verified"] is True
+    assert ggpbot.STATE["native_sl_order_id"] == "partial-native-stop"
+    assert len(stop_calls) == 1
+    assert stop_calls[0]["quantity"] == pytest.approx(0.4)
+    assert stop_calls[0]["trigger_price"] == pytest.approx(90.0)
     assert ggpbot._ACTIVE_TRADE is True
 
 
