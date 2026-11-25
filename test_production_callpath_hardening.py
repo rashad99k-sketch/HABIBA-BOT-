@@ -395,20 +395,22 @@ def test_verified_flat_snapshot_releases_only_a_resolved_local_state(monkeypatch
     assert ggpbot.MEMORY["position_status"] == "FLAT"
 
 
-def test_entry_producing_scanner_tasks_share_one_single_flight_lock(monkeypatch):
+def test_entry_producing_scanner_wrappers_share_a_reentrant_context_lock():
     import threading
 
-    shared = threading.Lock()
-    shared.acquire()
-    monkeypatch.setattr(ggpbot, "_ENTRY_DISCOVERY_TASK_LOCK", shared)
-    monkeypatch.setattr(ggpbot, "_SCANNER_TASKS_LOCK", threading.Lock())
-    monkeypatch.setattr(ggpbot, "_SCANNER_TASK_LOCKS", {})
+    lock = ggpbot._ENTRY_DISCOVERY_TASK_LOCK
+    assert isinstance(lock, type(threading.RLock()))
+    assert lock.acquire(blocking=False)
+    assert lock.acquire(blocking=False)  # Same worker can re-enter at execute_entry.
+    lock.release()
+    lock.release()
 
-    assert ggpbot.dispatch_scanner_task("sniper_v2", lambda: None) is False
-    assert "sniper_v2" in ggpbot._SCANNER_TASK_LOCKS
-    assert ggpbot._SCANNER_TASK_LOCKS["sniper_v2"].locked() is False
-    assert shared.locked() is True
-    shared.release()
+    smart_source = inspect.getsource(ggpbot.smart_opportunity_selection)
+    sniper_source = inspect.getsource(ggpbot.sniper_engine_v2)
+    entry_source = inspect.getsource(ggpbot.execute_entry)
+    assert "_ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)" in smart_source
+    assert "_ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)" in sniper_source
+    assert "_ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)" in entry_source
 
 
 def test_manual_entry_does_not_reuse_a_scanner_global_context():
