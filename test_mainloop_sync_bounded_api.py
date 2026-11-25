@@ -173,3 +173,61 @@ def test_digitalocean_app_platform_identity_is_accepted_as_supervisor(monkeypatc
     assert context["process_supervisor_detected"] is True
     assert context["process_supervisor_kind"] == "DIGITALOCEAN_APP_PLATFORM"
     assert exits == [ggpbot.EXIT_RECOVERY_EXHAUSTED]
+
+
+def test_api_rate_limit_releases_global_lock_before_pacing_sleep(monkeypatch):
+    clock = [100.0]
+    sleeps = []
+    monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 1.0)
+    monkeypatch.setattr(ggpbot, "_API_METHOD_MIN_INTERVALS", {})
+    monkeypatch.setattr(ggpbot, "_last_api_call", 99.5)
+    monkeypatch.setattr(ggpbot.time, "monotonic", lambda: clock[0])
+
+    def fake_sleep(seconds):
+        assert not ggpbot._API_RATE_LOCK.locked()
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(ggpbot.time, "sleep", fake_sleep)
+    ggpbot.rate_limit(lambda: None)
+
+    assert sleeps
+    assert all(0 < delay <= 0.25 for delay in sleeps)
+    assert ggpbot._last_api_call >= 100.5
+
+
+def test_api_rate_lock_contention_fails_closed_with_bounded_wait(monkeypatch):
+    monkeypatch.setattr(ggpbot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.02)
+    assert ggpbot._API_RATE_LOCK.acquire(timeout=0.1)
+    try:
+        with pytest.raises(ggpbot.ApiRateLockTimeout, match="API_RATE_LOCK acquisition timed out"):
+            ggpbot.rate_limit(lambda: None)
+    finally:
+        ggpbot._API_RATE_LOCK.release()
+
+
+def test_api_rate_lock_timeout_does_not_send_exchange_request_or_retry(monkeypatch):
+    calls = []
+    resilience = ApiResilience(
+        max_attempts=3,
+        sleep_fn=lambda _seconds: pytest.fail("scheduler lock contention must not back off/retry"),
+        monotonic_fn=lambda: 1.0,
+    )
+
+    class Exchange:
+        def fetch_ohlcv(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return []
+
+    monkeypatch.setattr(ggpbot, "API_RESILIENCE", resilience)
+    monkeypatch.setattr(ggpbot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.02)
+    assert ggpbot._API_RATE_LOCK.acquire(timeout=0.1)
+    try:
+        with pytest.raises(ggpbot.ApiRateLockTimeout):
+            ggpbot.safe_api_call(Exchange().fetch_ohlcv, "BTC/USDT:USDT", "15m", limit=150)
+    finally:
+        ggpbot._API_RATE_LOCK.release()
+
+    assert calls == []
+    assert resilience.metrics()["counters"]["requests"] == 1
+    assert resilience.metrics()["counters"]["retries"] == 0
