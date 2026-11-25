@@ -10538,7 +10538,7 @@ function updateUI(d) {{
     document.getElementById("thesis_failure").innerHTML = d.thesis_failure_score || 0;
     document.getElementById("logs").innerHTML = (d.logs || []).slice(-15).join("<br>");
     const systemErrors = (d.system_errors || []).slice(-8).reverse();
-    const systemErrorHtml = systemErrors.map(function(e) {
+    const systemErrorHtml = systemErrors.map(function(e) {{
         const stack = e.stack_trace
             ? '<details><summary>MainThread stack trace</summary><pre>' + uniEsc(e.stack_trace) + '</pre></details>'
             : '';
@@ -10547,7 +10547,7 @@ function updateUI(d) {{
             ' · ' + uniEsc(e.timestamp || "-") + '</div><div>' + uniEsc(e.message || "-") +
             '</div><div><b>Cause:</b> ' + uniEsc(e.cause || "Not classified; inspect diagnostic details.") +
             '</div>' + stack + '</div><hr>';
-    }).join("");
+    }}).join("");
     document.getElementById("errors").innerHTML = systemErrorHtml ||
         (d.errors || []).slice(-5).map(uniEsc).join("<br>");
     let top5Html = "";
