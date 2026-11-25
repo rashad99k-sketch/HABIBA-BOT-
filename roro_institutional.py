@@ -576,6 +576,7 @@ class ContinuationEngine:
             # Strict location-first mode must retest an actual validated OB/FVG/SR zone.
             zones.insert(0, (float(causal_level), float(causal_level), "CAUSAL_LEVEL", int(x.timestamp.iloc[bos_idx])))
         retest_idx = None; pullback_type = None; retest_zone = None; retest_zone_ts = None
+        selected_zone: Dict[str, Any] = {}
         for r in range(bos_idx + 1, len(x) - 1):
             if r - bos_idx > 8:
                 break
@@ -589,6 +590,9 @@ class ContinuationEngine:
                 if touches and holds:
                     retest_idx, pullback_type, retest_zone = r, "RETEST" if zname == "BOS_LEVEL" else "PULLBACK", zname
                     retest_zone_ts = available_ts
+                    selected_zone = _zone_metadata_for_retest(
+                        context, side, zname, available_ts, zlow, zhigh
+                    )
                     break
             if retest_idx is not None:
                 break
