@@ -29,6 +29,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 from roro_watchlist_snapshot_cache import WATCHLIST_SNAPSHOT_CACHE
+from roro_watchlist_dashboard import build_watchlist_dashboard_payload
 from flask import Flask, jsonify, request
 import requests
 
@@ -10585,7 +10586,7 @@ function uniEsc(value) {{
 }}
 async function fetchData() {{
     const now = Date.now();
-    if (cachedData && (now - lastFetch) < 2000) {{
+    if (cachedData && (now - lastFetch) < 6000) {{
         updateUI(cachedData);
         return;
     }}
@@ -10738,86 +10739,20 @@ function updateUI(d) {{
         document.getElementById("proximity-scanner-panel").innerHTML = "Waiting for scanner data";
     }}
     if(d.watchlist) {{
-        let wHtml = "";
-        for (let sym in d.watchlist) {{
-            let w = d.watchlist[sym];
-            let sideIcon = w.side === "BUY" ? "🟢" : (w.side === "SELL" ? "🔴" : "⚪");
-            let state = w.decision_state || w.state || "UNKNOWN";
-            let stateColor = state === "ENTRY_READY" || state === "CONFIRMED" ? "#2ecc71" :
-                (String(state).startsWith("WAITING") || state === "NO_CHASE" ? "#f1c40f" :
-                (state === "INVALIDATED" || state === "REJECTED" ? "#e74c3c" : "#95a5a6"));
-            let ic = w.icons || {{}};
-            let iconRow = [ic.regime || "⚪", ic.structure || "⚪", ic.liquidity || "⚪", ic.sweep || "⚪", ic.failed_auction || "⚪", ic.ob || "⚪", ic.fvg || "⚪", ic.volume || "⚪", ic.smart_money || "⚪", ic.momentum || "⚪", ic.trend || "⚪", ic.setup || "⚪", ic.pullback || "⚪", ic.stop || "⚪"].join(" ");
-            let structure = w.market_structure || {{}};
-            let ob = w.order_block || {{}};
-            let fvg = w.fvg || {{}};
-            let liq = w.liquidity || {{}};
-            let sm = w.smart_money || {{}};
-            let mom = w.momentum || {{}};
-            let adxdi = w.adx_di || {{}};
-            let instTrend = w.institutional_trend || {{}};
-            let golden = w.golden_zone || {{}};
-            let sideAnalyses = w.side_analyses || {{}};
-            let buyHyp = sideAnalyses.BUY || {{}};
-            let sellHyp = sideAnalyses.SELL || {{}};
-            let reasonsStr = (w.evidence || w.reasons || []).join(", ");
-            let rejectStr = (w.rejection_reasons || (w.rejection_reason ? [w.rejection_reason] : [])).join(", ");
-            let priceText = Number.isFinite(Number(w.price)) ? Number(w.price).toPrecision(8) : "UNKNOWN";
-            let stopText = Number.isFinite(Number(w.structural_stop)) && Number(w.structural_stop) > 0 ? Number(w.structural_stop).toPrecision(8) : "UNKNOWN";
-            let lastTs = w.last_updated || w.last_update || 0;
-            let lastUpdate = lastTs ? new Date(lastTs * 1000).toLocaleTimeString() : "UNKNOWN";
-            let quality = w.data_quality || "UNKNOWN";
-            // Read-only projection of fields already produced for this same Watchlist
-            // record. No new scan, cache, event store or decision authority is used.
-            let cardDecision = w.decision_context || (w.unified_decision_context || {{}}).decision_context || {{}};
-            let cardCross = (w.unified_decision_context || {{}}).cross_context || cardDecision.cross_context || w.cross_context || {{}};
-            let cardZone = cardDecision.zone_context || (w.unified_decision_context || {{}}).zone_context || {{}};
-            let cardLiquidity = cardDecision.liquidity_context || (w.unified_decision_context || {{}}).liquidity_context || {{}};
-            let cardStructure = cardDecision.structure_context || (w.unified_decision_context || {{}}).structure_context || {{}};
-            let cardReadiness = cardDecision.entry_readiness || w.entry_readiness_context || (w.unified_decision_context || {{}}).entry_readiness || {{}};
-            let cardTimeframe = cardDecision.timeframe_view || (w.unified_decision_context || {{}}).timeframe_view || {{}};
-            let cardBehavior = cardDecision.entry_behavior_context || w.entry_behavior_context || {{}};
-            let cardLifecycle = cardDecision.lifecycle_context || w.lifecycle_context || {{}};
-            let cardInstitutional = w.institutional_report || (w.unified_decision_context || {{}}).institutional_report || {{}};
-            let cardClassification = cardInstitutional.entry_classification || {{}};
-            let cardCrossZone = cardInstitutional.location_gate || {{}};
-            let cardRoom = cardInstitutional.available_price_room || {{}};
-            let cardDelivery = d.cross_watchlist_delivery || {{}};
-            let cardCrossDurable = cardCross.durable_event === true && cardCross.authoritative === true;
-            let cardCrossState = cardCross.display_cross_state || cardCross.cross_state || w.cross_state || "NO_CROSS";
-            if (!cardCrossDurable && String(cardCrossState).startsWith("CONFIRMED_")) {{
-                cardCrossState = "RANKING_ONLY_" + cardCrossState + "_OBSERVATION";
-            }}
-            let cardCrossRole = cardCross.role || (cardCrossDurable ? "CONFIRMED_CROSS_EVENT" : "RANKING_ONLY_NOT_ENTRY_GATE");
-            let cardStopState = cardReadiness.sl_valid === true ? "VALID" : "STOP_INVALID_NOT_READY";
-            let cardDecisionState = cardDecision.decision_state || w.projected_decision_state || state;
-            let cardReadyState = (cardReadiness.conditions_complete === true && cardReadiness.sl_valid === true) ? "ENTRY_READY" : "NOT_READY";
-            let cardBlocking = (cardDecision.blocking_reasons || []).join(", ")
-                || (cardReadiness.missing || []).join(", ")
-                || (w.rejection_reasons || []).join(", ")
-                || w.rejection_reason || "none";
-            let cardNextEvent = cardDecision.required_next_event || w.required_next_event || "SETUP_DIAGNOSTICS_REQUIRED";
-            wHtml += `<div style="margin-bottom:10px;border:1px solid #26364a;border-radius:8px;padding:8px;background:#101a29;">
-              <div><b>${{sideIcon}} ${{w.symbol || sym}}</b> | ${{w.decision_setup_type || w.setup_type || w.trade_type || "UNCLASSIFIED"}} | Score: ${{w.score ?? w.discovery_score ?? "-"}} | <span style="color:${{stateColor}}">${{state}}</span></div>
-              <div style="font-size:17px;letter-spacing:2px;margin:4px 0;">${{iconRow}}</div>
-              <small>Price: ${{priceText}} | Regime: ${{w.market_regime || "UNKNOWN"}} | Structure: ${{structure.pattern || structure.direction || "UNKNOWN"}} | Liquidity: ${{liq.event || "UNKNOWN"}} / ${{liq.direction || "UNKNOWN"}}</small>
-              <br><small>OB: ${{ob.low ?? "?"}}–${{ob.high ?? "?"}} (${{w.order_block_state || "UNKNOWN"}}) | FVG: ${{fvg.lower ?? "?"}}–${{fvg.upper ?? "?"}} (${{fvg.status || "UNKNOWN"}})</small>
-              <br><small>Volume ratio: ${{w.volume_ratio ?? "UNKNOWN"}} | Smart Money: ${{sm.institutional_bias_detailed || "UNKNOWN"}} | Momentum: ${{mom.flow_bias || "UNKNOWN"}} / ${{mom.continuation_strength ?? "?"}} | ADX: ${{adxdi.adx ?? "?"}} (${{adxdi.adx_state || "UNKNOWN"}}) | DI: ${{adxdi.di_dominant || "UNKNOWN"}}</small>
-              <br><small>Golden Zone: ${{golden.state || "UNKNOWN"}} | Zone Confluence: ${{golden.score ?? "?"}}/100 (not entry-ready) | Decision: ${{w.projected_decision_state || state}} | OB/FVG overlap: ${{golden.ob_fvg_overlap ? "YES" : "NO"}} | FVG fill: ${{fvg.fill_pct ?? "?"}}%</small>
-              <br><small>BUY hypothesis: ${{buyHyp.state || "NOT_ANALYZED"}} / ${{buyHyp.setup || "-"}} | SELL hypothesis: ${{sellHyp.state || "NOT_ANALYZED"}} / ${{sellHyp.setup || "-"}}</small>
-              <br><small>Trend Engine: ${{instTrend.state || "UNKNOWN"}} / Health ${{instTrend.health ?? "?"}} | Trade State: ${{w.trade_state || "UNKNOWN"}}</small>
-              <br><small>SL: ${{stopText}} | Data: ${{quality}} | Updated: ${{lastUpdate}}</small>
-              <br><small>EMA9/EMA50/VWAP: mandatory execution gate | Evidence: ${{reasonsStr || "None"}} | Rejection: ${{rejectStr || "None"}}</small>
-              <br><small>Decision projection (read-only): ${{uniEsc(w.symbol || sym)}} / ${{uniEsc(w.side || "UNKNOWN")}} | Cross: ${{uniEsc(cardCrossState)}} | durable=${{uniEsc(cardCrossDurable)}} | role=${{uniEsc(cardCrossRole)}} | Context: ${{uniEsc(cardTimeframe.market_regime || w.market_regime || "UNKNOWN")}} / ${{uniEsc(cardTimeframe.trade_state || w.trade_state || "UNKNOWN")}}</small>
-              <br><small>Zone: quality=${{uniEsc(cardZone.zone_quality_score ?? w.zone_quality_score ?? "?")}}/100 | valid=${{uniEsc((cardZone.supply_demand || {{}}).valid ?? "UNKNOWN")}} | Liquidity: ${{uniEsc(cardLiquidity.state || "UNKNOWN")}} / ${{uniEsc(cardLiquidity.stage || "UNKNOWN")}} | Confirmation: ${{uniEsc(cardStructure.confirmation_status || "UNKNOWN")}} | Pullback/Retest: ${{uniEsc(cardDecision.setup_stage || "UNKNOWN")}}</small>
-              <br><small>Structural Stop: ${{uniEsc(cardStopState)}} | Validation: ${{uniEsc(w.structural_stop_status || cardDecision.stop_validation_status || "UNSPECIFIED")}} | Final decision: ${{uniEsc(cardDecisionState)}} (${{uniEsc(cardReadyState)}}) | Gate: ${{uniEsc(cardDecision.execution_gate_state || cardReadyState)}} | Blocking: ${{uniEsc(cardBlocking)}} | Next: ${{uniEsc(cardNextEvent)}} | authority=${{uniEsc(cardReadiness.authoritative_gate || "UNCHANGED_EXECUTE_ENTRY")}}</small>
-              <br><small>Entry type: ${{uniEsc(cardBehavior.entry_type || w.entry_type || "NOT_CLASSIFIED")}} | reason: ${{uniEsc(cardBehavior.reason || "none")}} | confirmation: ${{uniEsc(cardBehavior.confirmation ?? "?")}} | invalidation: ${{uniEsc((cardBehavior.invalidation || []).join(", ") || "none")}} | source: ${{uniEsc(cardBehavior.classification_source || "NONE")}}</small>
-              <br><small>Institutional report: cross=${{uniEsc((cardInstitutional.cross_location || {{}}).state || "UNKNOWN")}} | regime=${{uniEsc((cardInstitutional.market_regime || {{}}).state || "UNKNOWN")}} | zone=${{uniEsc((cardInstitutional.institutional_zone || {{}}).state || "UNKNOWN")}} | structure=${{uniEsc((cardInstitutional.structure_bias || {{}}).state || "UNKNOWN")}} | liquidity=${{uniEsc((cardInstitutional.liquidity_context || {{}}).event || "UNKNOWN")}}/${{uniEsc((cardInstitutional.liquidity_context || {{}}).direction || "UNKNOWN")}} | volume=${{uniEsc((cardInstitutional.volume_confirmation || {{}}).state || "UNKNOWN")}} | trend=${{uniEsc((cardInstitutional.trend_strength || {{}}).state || "UNKNOWN")}} | room=${{uniEsc(cardRoom.room_price_pct ?? "?")}}% (${{uniEsc(cardRoom.status || "UNKNOWN")}}) | invalidation=${{uniEsc((cardInstitutional.structural_invalidation || {{}}).valid ? "VALID" : "INVALID")}} | freshness=${{uniEsc((cardInstitutional.data_freshness || {{}}).state || "UNKNOWN")}} | confidence=${{uniEsc((cardInstitutional.analysis_confidence || {{}}).score ?? "?")}}</small>
-              <br><small>Entry classification: ${{uniEsc(cardClassification.entry_type || "NOT_CLASSIFIED")}} | reason: ${{uniEsc((cardClassification.reason_codes || []).join(", ") || "none")}} | cross-zone: ${{uniEsc(cardCrossZone.state || "UNKNOWN")}} (${{uniEsc((cardCrossZone.reasons || []).join(", ") || "none")}}) | authority: ${{uniEsc(cardClassification.final_authority || "UNIFIED_ENTRY_AUTHORITY_UNCHANGED")}}</small>
-              <br><small>Lifecycle: ${{uniEsc(cardDecision.lifecycle_status || cardLifecycle.lifecycle_status || "INSTITUTIONAL_ANALYSIS")}} | waiting: ${{uniEsc(cardDecision.waiting_condition || cardLifecycle.waiting_condition || "none")}} | analysis: ${{uniEsc(cardLifecycle.analysis_status || "PENDING")}} | durable=${{uniEsc(cardCrossDurable)}} | role=${{uniEsc(cardCrossRole)}}</small>
-              <br><small>Cross delivery: same_cycle=${{uniEsc(cardDelivery.same_cycle ?? false)}} | detected=${{uniEsc(cardDelivery.detected_at ?? 0)}} | delivered=${{uniEsc(cardDelivery.delivered_at ?? 0)}} | refresh_s=${{uniEsc(cardDelivery.refresh_seconds ?? 0)}} | new=${{uniEsc(cardDelivery.new_events ?? 0)}} | status=${{uniEsc(cardDelivery.reason || "NO_NEW_CROSS_EVENT")}}</small>
+        const entries = Object.entries(d.watchlist);
+        const wHtml = entries.map(([sym, w]) => {{
+            const sideIcon = w.side === "BUY" ? "🟢" : (w.side === "SELL" ? "🔴" : "⚪");
+            const state = w.state || "UNKNOWN";
+            const stateColor = state === "ENTRY_READY" ? "#2ecc71" :
+                (String(state).startsWith("WAITING") || state === "NO_CHASE" ? "#f1c40f" : "#95a5a6");
+            const price = Number.isFinite(Number(w.price)) ? Number(w.price).toPrecision(8) : "-";
+            const updated = w.updated_at ? new Date(w.updated_at * 1000).toLocaleTimeString() : "-";
+            return `<div style="margin-bottom:7px;border:1px solid #26364a;border-radius:7px;padding:7px;background:#101a29;">
+              <div><b>${{sideIcon}} ${{uniEsc(w.symbol || sym)}}</b> · ${{uniEsc(w.regime)}} · <span style="color:${{stateColor}}">${{uniEsc(state)}}</span> · Score ${{uniEsc(w.score)}}</div>
+              <small>Price ${{uniEsc(price)}} · Structure ${{uniEsc(w.structure)}} · Liquidity ${{uniEsc(w.liquidity)}}/${{uniEsc(w.liquidity_stage)}} · Zone ${{uniEsc(w.zone_quality ?? "-")}}/100 · Valid ${{uniEsc(w.zone_valid ?? "UNKNOWN")}}</small>
+              <br><small>Next: ${{uniEsc(w.next_event)}} · Block: ${{uniEsc(w.blocking || "none")}} · Stop: ${{uniEsc(w.stop_status)}} · Data: ${{uniEsc(w.freshness)}} · Cross: ${{uniEsc(w.cross)}} · Updated: ${{uniEsc(updated)}}</small>
             </div>`;
-        }}
+        }}).join("");
         document.getElementById("watchlist-panel").innerHTML = wHtml || "No active candidates";
     }} else {{
         document.getElementById("watchlist-panel").innerHTML = "No watchlist data";
@@ -10848,7 +10783,7 @@ function updateUI(d) {{
 }}
 async function manualTrade(side){{ const r=await fetch('/trade',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{side:side}})}}); const res=await r.json(); alert(res.message); }}
 async function manualClose(){{ const r=await fetch('/close',{{method:'POST'}}); const res=await r.json(); alert(res.message); }}
-setInterval(fetchData, 2000);
+setInterval(fetchData, 6000);
 async function loadDecision() {{
   const container = document.getElementById("decision-list");
   const summary = document.getElementById("decision-summary");
@@ -11021,6 +10956,7 @@ def data():
         top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
         cleanup_watchlist()
         watchlist_data = MEMORY.get("watchlist", {})
+        watchlist_dashboard = build_watchlist_dashboard_payload(watchlist_data, limit=30)
         no_entry_feed = MEMORY.get("no_entry_feed", [])[-5:]
         live_data = {}
         supervisor_data = None
@@ -11110,7 +11046,7 @@ def data():
             "scanner_tasks": MEMORY.get("scanner_tasks", {}),
             "ema9_vwap_proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner", [])[:30],
             "ema9_vwap_proximity_scanner_meta": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}),
-            "watchlist": watchlist_data,
+            "watchlist": watchlist_dashboard,
             "no_entry_feed": no_entry_feed,
             "entry_rejection_metrics": MEMORY.get("entry_rejection_metrics", {}),
             "last_closed_candle_validation": MEMORY.get("last_closed_candle_validation", {}),
