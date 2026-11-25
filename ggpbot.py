@@ -16950,83 +16950,83 @@ def execute_entry(*args, **kwargs):
         return False
     try:
         with _ENTRY_EVENT_EXECUTION_LOCK:
-        globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
-        result = _original_execute_entry_for_journal(*args, **kwargs)
-        gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
-        event_id = str(gate.get("durable_event_id") or "").strip()
-        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
-        if result and STATE.get("open"):
-            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-            _persist_trade_journal_start(ctx.get("setup_type"))
-            trade_id = str(STATE.get("trade_id") or "")
-            entry_context = dict(ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {})
-            sizing_decision = dict(STATE.get("sizing_decision") or ctx.get("sizing_decision") or {})
-            # The handoff is frozen after fill verification: planned values come
-            # from the immutable sizing decision, actual values from the exchange
-            # result (or the verified PAPER fill).
-            entry_context.update({
-                "requested_entry_price": sizing_decision.get("entry_price"),
-                "requested_qty": sizing_decision.get("final_exchange_qty")
-                or sizing_decision.get("final_qty"),
-                "actual_entry_price": STATE.get("entry"),
-                "actual_filled_qty": STATE.get("initial_qty") or STATE.get("qty"),
-                "fill_source": "EXCHANGE_VERIFIED_FILL" if not PAPER_MODE else "PAPER_VERIFIED_FILL",
-            })
-            STATE["entry_context_snapshot"] = dict(entry_context)
-            if journal is not None and entry_context:
-                try:
-                    if not journal.persist_entry_context(trade_id, entry_context):
+            globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
+            result = _original_execute_entry_for_journal(*args, **kwargs)
+            gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
+            event_id = str(gate.get("durable_event_id") or "").strip()
+            journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+            if result and STATE.get("open"):
+                ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+                _persist_trade_journal_start(ctx.get("setup_type"))
+                trade_id = str(STATE.get("trade_id") or "")
+                entry_context = dict(ctx.get("persistent_entry_context") or STATE.get("entry_context_snapshot") or {})
+                sizing_decision = dict(STATE.get("sizing_decision") or ctx.get("sizing_decision") or {})
+                # The handoff is frozen after fill verification: planned values come
+                # from the immutable sizing decision, actual values from the exchange
+                # result (or the verified PAPER fill).
+                entry_context.update({
+                    "requested_entry_price": sizing_decision.get("entry_price"),
+                    "requested_qty": sizing_decision.get("final_exchange_qty")
+                    or sizing_decision.get("final_qty"),
+                    "actual_entry_price": STATE.get("entry"),
+                    "actual_filled_qty": STATE.get("initial_qty") or STATE.get("qty"),
+                    "fill_source": "EXCHANGE_VERIFIED_FILL" if not PAPER_MODE else "PAPER_VERIFIED_FILL",
+                })
+                STATE["entry_context_snapshot"] = dict(entry_context)
+                if journal is not None and entry_context:
+                    try:
+                        if not journal.persist_entry_context(trade_id, entry_context):
+                            STATE["entry_context_persistence_failed"] = True
+                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                            log_execution(
+                                f"[ENTRY_CONTEXT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                                "has no durable entry context; new entries blocked",
+                                "ERROR",
+                            )
+                    except Exception as exc:
                         STATE["entry_context_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[ENTRY_CONTEXT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            "has no durable entry context; new entries blocked",
-                            "ERROR",
+                            f"[ENTRY_CONTEXT] CRITICAL: persistence failed for {trade_id}: "
+                            f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
                         )
-                except Exception as exc:
-                    STATE["entry_context_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[ENTRY_CONTEXT] CRITICAL: persistence failed for {trade_id}: "
-                        f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
-                    )
-            cross_event_id = str(ctx.get("cross_event_id") or "").strip()
-            if cross_event_id and journal is not None:
-                try:
-                    if not journal.consume_cross_event(cross_event_id, trade_id):
+                cross_event_id = str(ctx.get("cross_event_id") or "").strip()
+                if cross_event_id and journal is not None:
+                    try:
+                        if not journal.consume_cross_event(cross_event_id, trade_id):
+                            STATE["cross_event_persistence_failed"] = True
+                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                            log_execution(
+                                f"[CROSS_EVENT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                                f"but could not consume cross event {cross_event_id}; new entries blocked",
+                                "ERROR",
+                            )
+                    except Exception as exc:
                         STATE["cross_event_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[CROSS_EVENT] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            f"but could not consume cross event {cross_event_id}; new entries blocked",
-                            "ERROR",
+                            f"[CROSS_EVENT] CRITICAL: consumption failed for {cross_event_id}: "
+                            f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
                         )
-                except Exception as exc:
-                    STATE["cross_event_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[CROSS_EVENT] CRITICAL: consumption failed for {cross_event_id}: "
-                        f"{type(exc).__name__}: {exc}; new entries blocked", "ERROR",
-                    )
-            if event_id and journal is not None:
-                try:
-                    if not trade_id or not journal.consume_event(event_id, trade_id):
+                if event_id and journal is not None:
+                    try:
+                        if not trade_id or not journal.consume_event(event_id, trade_id):
+                            STATE["entry_event_persistence_failed"] = True
+                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                            log_execution(
+                                f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
+                                f"but could not durably consume signal {event_id}; new entries blocked",
+                                "ERROR",
+                            )
+                    except Exception as exc:
                         STATE["entry_event_persistence_failed"] = True
                         globals()["RECOVERY_BLOCK_ENTRIES"] = True
                         log_execution(
-                            f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            f"but could not durably consume signal {event_id}; new entries blocked",
+                            f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
+                            f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
                             "ERROR",
                         )
-                except Exception as exc:
-                    STATE["entry_event_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
-                        f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
-                        "ERROR",
-                    )
-            return result
+                return result
     finally:
         _ENTRY_DISCOVERY_TASK_LOCK.release()
 
