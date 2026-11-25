@@ -229,5 +229,19 @@ def test_api_rate_lock_timeout_does_not_send_exchange_request_or_retry(monkeypat
         ggpbot._API_RATE_LOCK.release()
 
     assert calls == []
-    assert resilience.metrics()["counters"]["requests"] == 1
-    assert resilience.metrics()["counters"]["retries"] == 0
+    counters = resilience.metrics()["counters"]
+    assert counters["requests"] == 0  # no exchange request was dispatched
+    assert counters["retries"] == 0
+    assert counters["scheduler_contention"] == 1
+    assert counters["business_rejections"] == 0
+
+
+def test_scheduler_contention_is_not_classified_as_exchange_failure():
+    from naiso_api_resilience import classify_api_error
+
+    failure = classify_api_error(
+        type("ApiRateLockTimeout", (RuntimeError,), {})("scheduler lock unavailable"),
+        method="fetch_ohlcv",
+    )
+    assert failure.kind == "LOCAL_SCHEDULER_CONTENTION"
+    assert failure.retryable is False
