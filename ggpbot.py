@@ -596,12 +596,12 @@ BINGX_KLINE_MIN_INTERVAL = _env_float_range("BINGX_KLINE_MIN_INTERVAL", 1.05, 1.
 BINGX_PUBLIC_MARKET_MIN_INTERVAL = _env_float_range(
     "BINGX_PUBLIC_MARKET_MIN_INTERVAL", BINGX_KLINE_MIN_INTERVAL, 1.0, 2.0
 )
-# Local safety caps, not BingX-published rate limits:
-# - Order placement/cancellation is locally capped at 1 request/second even
-#   though the current BingX swap order endpoint is documented at 10/s per UID.
-# - Leverage/margin/position-mode writes are locally capped at 2 requests/second.
-# Keep these caps conservative until end-to-end latency and account-tier behavior
-# are measured in BingX Demo; never describe them as exchange limits.
+# BingX's official Futures rate table distinguishes Ordinary and Trader tiers:
+# - Place order: 10/s Ordinary, 1/s Trader; cancel order: 5/s Ordinary, 1/s Trader.
+# - Account tier is not available from this process, so use the restrictive
+#   published Trader ceiling locally (1.05s); this is not an assertion of tier.
+# - Leverage/margin/position-mode writes use a conservative local 2/s ceiling.
+# The official cancelAllAfter reference is also conservatively paced at 1/s.
 BINGX_TRADE_WRITE_MIN_INTERVAL = _env_float_range(
     "BINGX_TRADE_WRITE_MIN_INTERVAL", 1.05, 1.0, 2.0
 )
