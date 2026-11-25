@@ -115,6 +115,63 @@ def test_durable_cross_event_analyzes_only_its_confirmed_side(monkeypatch):
     assert out["ETH"]["side_selection_reason"] == "durable_cross_direction_is_authoritative"
 
 
+def test_same_direction_durable_cross_events_select_newest_event(monkeypatch):
+    import ggp_institutional_bridge as bridge
+
+    seen = []
+    def fake_analyze(symbol, side, source_frame, now_ms=None):
+        seen.append(side)
+        return {"symbol": "ETH", "exchange_symbol": "ETH/USDT:USDT", "side": side,
+                "decision_state": "WAITING_FOR_CONFIRMATION", "entry_status": "WAITING_FOR_CONFIRMATION",
+                "score": 30, "decision_reason": "waiting", "rejection_reasons": [],
+                "event_id": "BUY-analysis", "structural_stop": None,
+                "data_quality": "VALID_CLOSED_CANDLES", "icons": {"status": "🟡"}, "evidence": []}
+    monkeypatch.setattr(bridge, "analyze_symbol", fake_analyze)
+    memory = {"confirmed_cross_events": [
+        {"symbol": "ETH", "side": "BUY", "cross_event_id": "old-buy", "cross_event_timestamp": 1000, "cross_event_status": "ACTIVE"},
+        {"symbol": "ETH", "side": "BUY", "cross_event_id": "new-buy", "cross_event_timestamp": 2000, "cross_event_status": "ACTIVE"},
+    ], "watchlist": {}}
+    fetches = []
+    out = bridge.update_unified_watchlist(memory, lambda symbol: fetches.append(symbol) or frame(), max_items=10, batch_size=10)
+    assert seen == ["BUY"]
+    assert len(fetches) == 1
+    assert out["ETH"]["cross_event_id"] == "new-buy"
+    assert out["ETH"]["cross_event_conflict"] is not True
+
+
+def test_opposite_direction_durable_cross_events_fail_closed(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    def unexpected_analyze(*args, **kwargs):
+        raise AssertionError("conflicting durable directions must not reach analysis")
+    monkeypatch.setattr(bridge, "analyze_symbol", unexpected_analyze)
+    memory = {"confirmed_cross_events": [
+        {"symbol": "ETH", "side": "BUY", "cross_event_id": "buy-event", "cross_event_timestamp": 1000, "cross_event_status": "ACTIVE"},
+        {"symbol": "ETH", "side": "SELL", "cross_event_id": "sell-event", "cross_event_timestamp": 2000, "cross_event_status": "ACTIVE"},
+    ], "watchlist": {}}
+    out = bridge.update_unified_watchlist(memory, lambda _: frame(), max_items=10, batch_size=10)
+    assert out["ETH"]["decision_state"] == "REJECTED"
+    assert out["ETH"]["decision_reason"] == "conflicting_or_missing_durable_cross_direction"
+    assert out["ETH"]["cross_event_conflict"] is True
+
+
+def test_duplicate_discovery_feeds_fetch_one_snapshot_and_analyze_both_sides(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    seen = []
+    def fake_analyze(symbol, side, source_frame, now_ms=None):
+        seen.append(side)
+        return {"symbol": "SOL", "exchange_symbol": "SOL/USDT:USDT", "side": side,
+                "decision_state": "WAITING_FOR_CONFIRMATION", "entry_status": "WAITING_FOR_CONFIRMATION",
+                "score": 10, "decision_reason": "waiting", "rejection_reasons": [],
+                "event_id": None, "structural_stop": None, "data_quality": "VALID_CLOSED_CANDLES",
+                "icons": {"status": "🟡"}, "evidence": []}
+    monkeypatch.setattr(bridge, "analyze_symbol", fake_analyze)
+    memory = {"scanner_v2_buy": [{"symbol": "SOLUSDT", "side": "BUY"}],
+              "scanner_v2_sell": [{"symbol": "SOLUSDT", "side": "SELL"}], "watchlist": {}}
+    fetches = []
+    bridge.update_unified_watchlist(memory, lambda symbol: fetches.append(symbol) or frame(), max_items=10, batch_size=10)
+    assert len(fetches) == 1
+    assert seen == ["BUY", "SELL"]
+
 def test_analyze_symbol_both_rejects_opposing_ready_hypotheses(monkeypatch):
     import ggp_institutional_bridge as bridge
     def fake_analyze(symbol, side, source_frame, now_ms=None):
