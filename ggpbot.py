@@ -15140,25 +15140,11 @@ def _finish_scanner_task(name, state, *, reason="", error=None):
     watchdog.beat(f"scanner:{name}", state=final_state, **details)
 
 
-# Candidate workers share one mutable institutional entry context. Keep all
-# entry-producing analysis single-flight across task names, not merely per-task.
-_ENTRY_DISCOVERY_TASK_NAMES = frozenset({
-    "institutional_entry_revalidation", "sniper_v2",
-})
-_ENTRY_DISCOVERY_TASK_LOCK = threading.Lock()
-
-
 def dispatch_scanner_task(name, function, *args, **kwargs):
-    entry_task_lock_acquired = False
     with _SCANNER_TASKS_LOCK:
         lock = _SCANNER_TASK_LOCKS.setdefault(name, threading.Lock())
         if not lock.acquire(blocking=False):
             return False
-        if name in _ENTRY_DISCOVERY_TASK_NAMES:
-            entry_task_lock_acquired = _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False)
-            if not entry_task_lock_acquired:
-                lock.release()
-                return False
         previous = _SCANNER_TASK_STATUS.get(name) or {}
         cycle_id = int(previous.get("cycle_id", 0)) + 1
         _SCANNER_TASK_CYCLES[name] = cycle_id
@@ -15193,8 +15179,6 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
                                          error="worker exited without a result")
             finally:
                 lock.release()
-                if entry_task_lock_acquired:
-                    _ENTRY_DISCOVERY_TASK_LOCK.release()
 
     watchdog = globals().get("NAISO_WATCHDOG")
     watchdog_name = f"scanner:{name}"
@@ -15221,11 +15205,6 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
                 lock.release()
             except RuntimeError:
                 pass
-            if entry_task_lock_acquired:
-                try:
-                    _ENTRY_DISCOVERY_TASK_LOCK.release()
-                except RuntimeError:
-                    pass
         log_execution(f"[SCANNER_TASK] {name} could not start: {error}", "ERROR")
         return False
 
@@ -16931,13 +16910,46 @@ def sync_all_states():
         _main_loop_progress("realized_pnl_complete", symbol=str(symbol))
 
 
+# Serialize every entry-producing analysis path because the legacy entry
+# context is process-global. The lock is acquired by the worker itself (not by
+# its dispatcher), so a reentrant execute_entry call from that worker is safe.
+_ENTRY_DISCOVERY_TASK_LOCK = threading.RLock()
+_original_smart_opportunity_selection_for_entry_lock = smart_opportunity_selection
+def smart_opportunity_selection(*args, **kwargs):
+    if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+        log_execution("[ENTRY_SCAN] Institutional revalidation deferred; another entry cycle owns context",
+                      "DEBUG", debounce_key="entry_scan_context_busy", debounce_sec=10)
+        return False
+    try:
+        return _original_smart_opportunity_selection_for_entry_lock(*args, **kwargs)
+    finally:
+        _ENTRY_DISCOVERY_TASK_LOCK.release()
+
+
+_original_sniper_engine_v2_for_entry_lock = sniper_engine_v2
+def sniper_engine_v2(*args, **kwargs):
+    if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+        log_execution("[ENTRY_SCAN] Sniper V2 deferred; another entry cycle owns context",
+                      "DEBUG", debounce_key="entry_scan_context_busy", debounce_sec=10)
+        return False
+    try:
+        return _original_sniper_engine_v2_for_entry_lock(*args, **kwargs)
+    finally:
+        _ENTRY_DISCOVERY_TASK_LOCK.release()
+
+
 # Serialize final entry authorization so one closed-candle trigger cannot
 # submit two orders from concurrent scanner paths. The current signal is checked
 # inside the original entry function after gate calculation and before any order.
 _ENTRY_EVENT_EXECUTION_LOCK = threading.RLock()
 _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
-    with _ENTRY_EVENT_EXECUTION_LOCK:
+    if not _ENTRY_DISCOVERY_TASK_LOCK.acquire(blocking=False):
+        log_execution("[ENTRY_BLOCKED] Another entry-producing cycle owns the shared context",
+                      "WARN", debounce_key="entry_context_locked", debounce_sec=5)
+        return False
+    try:
+        with _ENTRY_EVENT_EXECUTION_LOCK:
         globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
         result = _original_execute_entry_for_journal(*args, **kwargs)
         gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
@@ -17014,7 +17026,9 @@ def execute_entry(*args, **kwargs):
                         f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
                         "ERROR",
                     )
-        return result
+            return result
+    finally:
+        _ENTRY_DISCOVERY_TASK_LOCK.release()
 
 _original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
 def _manage_live_trade_with_journal(self):
