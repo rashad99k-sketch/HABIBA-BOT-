@@ -6547,11 +6547,31 @@ def update_stats(pnl_pct):
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
 def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
-    global _ACTIVE_TRADE
+    global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     sym = normalize_symbol(symbol)
     side = str(side or "").upper()
     if side not in ("BUY", "SELL"):
         log_execution(f"[ENTRY] Invalid order side: {side!r}", "ERROR")
+        return None
+    # The execution boundary repeats the account/exposure gate. Strategy callers
+    # are not trusted to be the only route into this non-idempotent operation.
+    blocked_position_state = str(MEMORY.get("position_status") or "").upper()
+    if (
+        STATE.get("open") or TRADE_STATE.get("in_position")
+        or STATE.get("execution_unresolved") or STATE.get("recovery_hold")
+        or STATE.get("close_reconciliation_required")
+        or RECOVERY_BLOCK_ENTRIES
+        or blocked_position_state in {"UNKNOWN", "OPEN", "MULTIPLE_OPEN"}
+    ):
+        log_execution(
+            f"[ENTRY_BLOCKED] {sym}: execution boundary exposure/recovery gate "
+            f"state_open={bool(STATE.get('open'))} "
+            f"trade_state_open={bool(TRADE_STATE.get('in_position'))} "
+            f"position_status={blocked_position_state or 'UNSET'} "
+            f"execution_unresolved={bool(STATE.get('execution_unresolved'))} "
+            f"recovery_hold={bool(STATE.get('recovery_hold'))}",
+            "WARN", debounce_key=f"entry_boundary_hold:{sym}", debounce_sec=10,
+        )
         return None
     with _TRADE_LOCK:
         if _ACTIVE_TRADE:
@@ -6624,12 +6644,44 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                 management_state=management_state,
             )
             if result.state not in {ExecutionState.FILLED}:
-                STATE.update({"execution_unresolved": result.state is ExecutionState.EXECUTION_UNCERTAIN,
-                              "recovery_hold": result.state is not ExecutionState.FILLED,
-                              "entry_execution_state": result.state.value,
-                              "entry_client_order_id": result.client_order_id,
-                              "entry_exchange_order_id": result.exchange_order_id})
-                log_execution(f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} ({result.reason})", "ERROR")
+                filled_qty = safe_float(getattr(result, "filled_qty", 0.0), 0.0)
+                raw_position = getattr(result, "raw_position", None)
+                # PARTIAL_FILL / ENTRY_PRICE_UNKNOWN can represent real exposure,
+                # not a clean rejection. Keep the single-entry lock and force an
+                # account-wide reconciliation before any new order is possible.
+                unresolved = bool(
+                    result.state is ExecutionState.EXECUTION_UNCERTAIN
+                    or result.state in {
+                        ExecutionState.PARTIAL_FILL,
+                        ExecutionState.ENTRY_PRICE_UNKNOWN,
+                        ExecutionState.PROTECTION_HOLD,
+                    }
+                    or filled_qty > 0
+                    or isinstance(raw_position, dict)
+                )
+                STATE.update({
+                    "execution_unresolved": unresolved,
+                    "recovery_hold": unresolved,
+                    "entry_execution_state": result.state.value,
+                    "entry_client_order_id": result.client_order_id,
+                    "entry_exchange_order_id": result.exchange_order_id,
+                    "entry_requested_qty": safe_float(getattr(result, "requested_qty", amount), amount),
+                    "entry_filled_qty": filled_qty,
+                    "entry_remaining_qty": safe_float(getattr(result, "remaining_qty", 0.0), 0.0),
+                    "current_symbol": sym if unresolved else STATE.get("current_symbol"),
+                    "side": side if unresolved else STATE.get("side"),
+                    "trade_id": str(trade_id or getattr(result, "trade_id", "") or STATE.get("trade_id") or ""),
+                })
+                if unresolved:
+                    RECOVERY_BLOCK_ENTRIES = True
+                    MEMORY["position_status"] = "UNKNOWN"
+                    MEMORY["recovery_status"] = "ENTRY_EXECUTION_RECONCILIATION_REQUIRED"
+                log_execution(
+                    f"[LIVE_SAFETY] Entry not fully verified: {result.state.value} "
+                    f"filled={filled_qty:.10f} remaining={safe_float(getattr(result, 'remaining_qty', 0.0), 0.0):.10f} "
+                    f"({result.reason}); entries held pending exchange reconciliation",
+                    "ERROR",
+                )
                 return None
             native_sl_id = service.place_and_verify_native_stop(
                 symbol=sym, side=side, quantity=result.filled_qty,
