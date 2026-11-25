@@ -135,3 +135,9 @@ def test_render_service_identity_is_accepted_as_process_supervisor(monkeypatch):
     assert context["process_supervisor_detected"] is True
     assert context["process_supervisor_kind"] == "RENDER"
     assert exits == [ggpbot.EXIT_RECOVERY_EXHAUSTED]
+
+
+def test_exchange_timeout_configuration_has_a_hard_15_second_ceiling(monkeypatch):
+    monkeypatch.setenv("EXCHANGE_HTTP_TIMEOUT_MS", "60000")
+    bounded = ggpbot._env_int_range("EXCHANGE_HTTP_TIMEOUT_MS", 12000, 5000, 15000)
+    assert bounded == 15000
