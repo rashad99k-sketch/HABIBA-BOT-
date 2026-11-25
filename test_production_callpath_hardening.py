@@ -479,3 +479,91 @@ def test_foreground_trade_supervisor_does_not_duplicate_market_reads_after_manag
     assert 'get_ohlcv_safe(sym, 50)' not in source
     assert 'scaling_logic(sym, df, None)' not in source
     assert 'open_trade_state_projection_complete' in source
+
+
+def test_partial_entry_remainder_is_canceled_once_and_verified_terminal(monkeypatch):
+    class Exchange:
+        def __init__(self):
+            self.fetch_count = 0
+            self.cancel_count = 0
+        def fetch_order(self, _order_id, _symbol, _params=None):
+            self.fetch_count += 1
+            if self.fetch_count == 1:
+                return {"status": "open", "amount": 1.0, "filled": 0.4, "remaining": 0.6}
+            return {"status": "canceled", "amount": 1.0, "filled": 0.4, "remaining": 0.6}
+        def cancel_order(self, _order_id, _symbol, _params=None):
+            self.cancel_count += 1
+            return {"status": "canceled"}
+
+    exchange = Exchange()
+    def api(func, *args, **kwargs):
+        kwargs.pop("_api_max_attempts", None)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "safe_api_call", api)
+
+    terminal, status = ggpbot._cancel_and_verify_entry_order_terminal(
+        "BTC/USDT:USDT", "entry-order-1", "client-entry-1"
+    )
+
+    assert terminal is True
+    assert status == "CANCELED"
+    assert exchange.cancel_count == 1
+    assert exchange.fetch_count == 2
+
+
+def test_entry_order_status_poll_never_repeats_cancel_write(monkeypatch):
+    class Exchange:
+        def __init__(self):
+            self.cancel_count = 0
+        def fetch_order(self, _order_id, _symbol, _params=None):
+            return {"status": "partially_filled", "amount": 1.0, "filled": 0.4, "remaining": 0.6}
+        def cancel_order(self, *_args, **_kwargs):
+            self.cancel_count += 1
+            return {"status": "canceled"}
+
+    exchange = Exchange()
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "safe_api_call",
+                        lambda func, *a, **k: func(*a, **{key: value for key, value in k.items()
+                                                         if key != "_api_max_attempts"}))
+
+    terminal, status = ggpbot._cancel_and_verify_entry_order_terminal(
+        "BTC/USDT:USDT", "entry-order-2", "client-entry-2", cancel_if_open=False
+    )
+
+    assert terminal is False
+    assert status == "ORDER_STILL_OPEN:PARTIALLY_FILLED"
+    assert exchange.cancel_count == 0
+
+
+def test_runtime_recovery_does_not_adopt_position_while_entry_order_remainder_is_open(monkeypatch):
+    position = {"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0.4}
+    recovery_calls = []
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "_main_loop_blocked_phase", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "_main_loop_progress", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda *_a, **_k: ("OPEN", [position]))
+    monkeypatch.setattr(ggpbot, "_cancel_and_verify_entry_order_terminal",
+                        lambda *_a, **_k: (False, "ORDER_STILL_OPEN:PARTIALLY_FILLED"))
+    monkeypatch.setattr(ggpbot, "_attempt_runtime_trade_recovery",
+                        lambda *a, **k: recovery_calls.append((a, k)) or False)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "execution_unresolved": True, "recovery_hold": True,
+        "entry_execution_state": "PARTIAL_FILL", "entry_order_terminal": False,
+        "entry_client_order_id": "client-entry-3", "entry_exchange_order_id": "entry-order-3",
+    })
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"position_status": "UNKNOWN"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", True)
+
+    ggpbot.sync_all_states()
+
+    assert recovery_calls == []
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.MEMORY["position_status"] == "UNKNOWN"
+    assert ggpbot.MEMORY["recovery_status"] == "ENTRY_ORDER_REMAINDER_UNRESOLVED"
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
