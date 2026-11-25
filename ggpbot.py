@@ -6555,6 +6555,74 @@ def update_stats(pnl_pct):
     total = DASHBOARD_STATE["stats"]["trades"]
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
+def _cancel_and_verify_entry_order_terminal(symbol, order_id=None, client_order_id=None):
+    """Cancel an unfilled market-order remainder once, then require terminal read-back."""
+    lookup_id = str(order_id or client_order_id or "").strip()
+    client_id = str(client_order_id or "").strip()
+    if not lookup_id:
+        return False, "ORDER_ID_UNAVAILABLE"
+    fetcher = getattr(ex, "fetch_order", None)
+    if not callable(fetcher):
+        return False, "FETCH_ORDER_UNAVAILABLE"
+    params = {"clientOrderId": client_id} if client_id else {}
+
+    def read_order():
+        if params:
+            return safe_api_call(fetcher, lookup_id, symbol, params, _api_max_attempts=1)
+        return safe_api_call(fetcher, lookup_id, symbol, _api_max_attempts=1)
+
+    def is_terminal(order):
+        if not isinstance(order, dict):
+            return False, "UNKNOWN", None
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        status = str(order.get("status") or info.get("status") or info.get("orderStatus") or "UNKNOWN").upper()
+        filled = safe_float(order.get("filled", info.get("executedQty", 0.0)), 0.0)
+        remaining_raw = order.get("remaining")
+        if remaining_raw in (None, ""):
+            amount_value = safe_float(order.get("amount", info.get("origQty", 0.0)), 0.0)
+            remaining = max(0.0, amount_value - filled) if amount_value > 0 else None
+        else:
+            remaining = max(0.0, safe_float(remaining_raw, 0.0))
+        terminal = status in {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+        if terminal or (remaining is not None and remaining <= 1e-12):
+            return True, status, {"filled": filled, "remaining": remaining}
+        return False, status, {"filled": filled, "remaining": remaining}
+
+    try:
+        observed = read_order()
+    except Exception as exc:
+        return False, f"FETCH_BEFORE_CANCEL_FAILED:{type(exc).__name__}"
+    terminal, status, details = is_terminal(observed)
+    if terminal:
+        return True, status
+    remaining = details.get("remaining") if isinstance(details, dict) else None
+    if remaining is None or remaining <= 1e-12:
+        return False, f"ORDER_REMAINING_UNKNOWN:{status}"
+    canceler = getattr(ex, "cancel_order", None)
+    if not callable(canceler):
+        return False, "CANCEL_ORDER_UNAVAILABLE"
+    try:
+        if params:
+            safe_api_call(canceler, lookup_id, symbol, params, _api_max_attempts=1)
+        else:
+            safe_api_call(canceler, lookup_id, symbol, _api_max_attempts=1)
+    except Exception as exc:
+        # Cancellation is one-shot. Read-back, not a blind retry, decides whether
+        # the remainder is still live.
+        log_execution(
+            f"[ENTRY_RECONCILE] cancel outcome uncertain for {lookup_id}: "
+            f"{type(exc).__name__}: {exc}", "WARN",
+        )
+    try:
+        observed = read_order()
+    except Exception as exc:
+        return False, f"FETCH_AFTER_CANCEL_FAILED:{type(exc).__name__}"
+    terminal, status, details = is_terminal(observed)
+    if terminal:
+        return True, status
+    return False, f"REMAINDER_STILL_UNRESOLVED:{status}:{details}"
+
+
 def open_position(side, amount, symbol, stop_loss=None, trade_id=None, management_state=None):
     global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     sym = normalize_symbol(symbol)
@@ -6668,6 +6736,17 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                     or filled_qty > 0
                     or isinstance(raw_position, dict)
                 )
+                entry_order_terminal = result.state is ExecutionState.REJECTED
+                entry_order_status = "REJECTED" if entry_order_terminal else "UNKNOWN"
+                if result.state in {
+                    ExecutionState.EXECUTION_UNCERTAIN,
+                    ExecutionState.PARTIAL_FILL,
+                    ExecutionState.ENTRY_PRICE_UNKNOWN,
+                }:
+                    entry_order_terminal, entry_order_status = _cancel_and_verify_entry_order_terminal(
+                        sym, getattr(result, "exchange_order_id", None),
+                        getattr(result, "client_order_id", None),
+                    )
                 partial_stop_id = None
                 if filled_qty > 0 and isinstance(raw_position, dict):
                     # A known partial fill is already exchange exposure. Protect
@@ -6697,6 +6776,8 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                     "entry_requested_qty": safe_float(getattr(result, "requested_qty", amount), amount),
                     "entry_filled_qty": filled_qty,
                     "entry_remaining_qty": safe_float(getattr(result, "remaining_qty", 0.0), 0.0),
+                    "entry_order_terminal": bool(entry_order_terminal),
+                    "entry_order_status": str(entry_order_status or "UNKNOWN"),
                     "current_symbol": sym if unresolved else STATE.get("current_symbol"),
                     "side": side if unresolved else STATE.get("side"),
                     "trade_id": str(trade_id or getattr(result, "trade_id", "") or STATE.get("trade_id") or ""),
@@ -16858,11 +16939,25 @@ def sync_all_states():
             # A flat position snapshot alone does not prove an ambiguous MARKET
             # order was rejected/canceled: it may still be pending or delayed.
             # Never release an entry/close uncertainty solely from "no position".
-            unresolved_order = bool(
+            entry_outcome_pending = bool(
                 STATE.get("execution_unresolved")
-                or STATE.get("close_reconciliation_required")
-                or STATE.get("pending_close_order_id")
-                or STATE.get("recovery_hold")
+                and STATE.get("entry_client_order_id")
+                and not STATE.get("entry_order_terminal")
+            )
+            close_outcome_pending = bool(
+                STATE.get("close_reconciliation_required") or STATE.get("pending_close_order_id")
+            )
+            durable_entry_hold = bool(
+                STATE.get("entry_context_persistence_failed")
+                or STATE.get("cross_event_persistence_failed")
+                or STATE.get("entry_event_persistence_failed")
+            )
+            unresolved_order = bool(
+                entry_outcome_pending or close_outcome_pending
+                or (STATE.get("execution_unresolved") and not STATE.get("entry_order_terminal"))
+                or (STATE.get("recovery_hold") and not STATE.get("entry_order_terminal")
+                    and not STATE.get("execution_unresolved"))
+                or durable_entry_hold
             )
             if unresolved_order:
                 MEMORY["position_status"] = "UNKNOWN"
@@ -16881,7 +16976,12 @@ def sync_all_states():
                 MEMORY["current_position"] = None
                 STATE["execution_unresolved"] = False
                 STATE["recovery_hold"] = False
-                RECOVERY_BLOCK_ENTRIES = False
+                if STATE.get("entry_order_terminal"):
+                    STATE["entry_execution_state"] = "RECONCILED_FLAT"
+                    STATE["entry_client_order_id"] = None
+                    STATE["entry_exchange_order_id"] = None
+                    STATE["entry_order_terminal"] = False
+                RECOVERY_BLOCK_ENTRIES = bool(durable_entry_hold)
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]
