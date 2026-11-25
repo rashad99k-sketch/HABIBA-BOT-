@@ -122,8 +122,9 @@ For authenticated USDT-M Futures endpoints, BingX publishes:
 - Cancel order: 5/s ordinary user, 1/s Trader tier.
 - Leverage/margin-mode/position-mode changes: 2/s.
 - Close all positions and cancel all orders: 5/s.
+- Cancel-all-after countdown: the current endpoint-level reference says 1/s per UID; the older rate announcement table says 2/s. The implementation keeps the stricter 1.05-second local interval until BingX confirms which current policy applies.
 
-Because the account's ordinary-vs-Trader entitlement is not visible from this repository, the code uses a conservative 1.05-second default for individual order writes and 0.55 seconds for leverage/margin/position-mode changes. The generic scheduler remains at 0.35 seconds, below the 5/s UID endpoints. These are safety ceilings, not throughput targets. Do not lower them without verifying the account's actual entitlement and current BingX documentation.
+Because the account's Ordinary-vs-Trader entitlement is not visible from this repository, the code uses a conservative 1.05-second default for individual order writes, matching the published Trader tier, and 0.55 seconds for leverage/margin/position-mode changes. The generic scheduler remains at 0.35 seconds, below the conservative 5/s UID endpoints. These are safety ceilings, not throughput targets. Do not lower them without verifying the account's actual entitlement and current BingX documentation.
 
 Sources:
 - BingX official rate announcement: https://bingx.com/en/support/articles/31103871611289
