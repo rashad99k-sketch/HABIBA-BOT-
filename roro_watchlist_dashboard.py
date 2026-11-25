@@ -76,6 +76,8 @@ def build_watchlist_dashboard_payload(watchlist: Any, limit: int = 30) -> Dict[s
             row.get("structural_stop_status"), decision.get("stop_validation_status"),
             default=stop_default,
         )
+        if stop_validation.upper() in {"UNSPECIFIED", "UNKNOWN", "NONE", "NULL"}:
+            stop_validation = stop_default
         diagnostics = {
             "decision_state": _first_text(decision.get("decision_state"), state),
             "cross_state": _first_text(cross.get("display_cross_state"), cross.get("cross_state"), row.get("cross_state"), default="NO_CROSS"),
