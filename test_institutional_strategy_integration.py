@@ -310,8 +310,8 @@ def test_dashboard_renders_institutional_report_and_exposes_nested_data(monkeypa
     assert "Institutional report:" in html
     assert "Entry classification:" in html
     assert "cross-zone:" in html
-    assert "cardInstitutional.cross_location" in html
-    assert "cardClassification.reason_codes" in html
+    assert "q.report_cross" in html
+    assert "q.classification_reasons" in html
 
     payload = client.get("/data").get_json()
     for key in ("confirmed_crosses", "watchlist_ranking", "institutional_analysis",

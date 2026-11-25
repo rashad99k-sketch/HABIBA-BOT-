@@ -109,14 +109,13 @@ def test_dashboard_and_data_expose_the_same_missing_stop_reason(monkeypatch):
 
     assert 'Number.isFinite(Number(w.structural_stop)) && Number(w.structural_stop) > 0' in html
     assert ': "UNKNOWN"' in html
-    assert 'cardStopState = cardReadiness.sl_valid === true ? "VALID" : "STOP_INVALID_NOT_READY"' in html
+    assert 'q.stop_valid ? "VALID" : "STOP_INVALID_NOT_READY"' in html
 
     exposed = payload["watchlist"]["IOTX"]
     assert exposed["structural_stop"] is None
-    readiness = exposed["decision_context"]["entry_readiness"]
-    assert "STRUCTURAL_STOP_UNKNOWN" in readiness["missing"]
-    assert readiness["sl_valid"] is False
-    assert readiness["state"] == "NOT_READY"
+    assert exposed["diagnostics"]["stop_valid"] is False
+    assert exposed["diagnostics"]["stop_validation"] == "missing_or_non_positive"
+    assert exposed["stop_status"] == "missing_or_non_positive"
 
 
 def test_bridge_and_execution_guards_preserve_the_existing_stop_contract():
