@@ -3665,11 +3665,12 @@ def safe_close_partial(symbol, ratio, *, close_reason="TP1", target_remaining_qt
 
 
 def move_native_stop_on_exchange(symbol, new_trigger_price, quantity, *, reason="BREAKEVEN"):
-    """Deprecated hard guard: the exchange-native SL is immutable after entry.
+    """Deprecated compatibility no-op for the old immutable-native-SL policy.
 
-    The function is retained for compatibility with older callers, but it must
-    never cancel, replace, resize, or otherwise modify the original BingX stop.
-    Profit protection belongs to the internal synthetic stop/trailing manager.
+    Active management uses ``_move_native_stop_verified`` and
+    ``TradeExecutionService.replace_native_stop``, which adopt a new native stop
+    only after a fresh exchange read-back proves MOVED. This wrapper is retained
+    only so historical callers cannot mutate the stop without that verification.
     """
     log_execution(
         f"[NATIVE_SL_FIXED] ignored post-entry stop modification for {symbol or STATE.get('current_symbol')}: "
