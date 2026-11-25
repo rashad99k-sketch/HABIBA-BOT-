@@ -721,6 +721,10 @@ def cache_set(key, value):
                 CACHE.pop(old_key, None)
 
 def safe_api_call(func, *args, **kwargs):
+    # Internal callers may lower the retry budget for latency-sensitive reads
+    # that run on the foreground trade-control loop. This never increases the
+    # configured global retry budget and is not forwarded to CCXT.
+    requested_attempts = kwargs.pop("_api_max_attempts", None)
     # Order creation is non-idempotent. Never automatically retry a timed-out
     # create_order call: BingX may have accepted the first request already.
     method_name = getattr(func, "__name__", "exchange_call")
@@ -764,7 +768,14 @@ def safe_api_call(func, *args, **kwargs):
         if resilience is not None:
             resilience.record_success(method_name)
         return result
-    attempts = int(getattr(resilience, "max_attempts", 3) or 3) if resilience is not None else 3
+    configured_attempts = int(getattr(resilience, "max_attempts", 3) or 3) if resilience is not None else 3
+    attempts = configured_attempts
+    if requested_attempts is not None:
+        try:
+            # A call-site override may only tighten the shared retry policy.
+            attempts = min(configured_attempts, max(1, int(requested_attempts)))
+        except (TypeError, ValueError):
+            attempts = configured_attempts
     for attempt in range(attempts):
         try:
             # The circuit gate must be enforced for every physical attempt. A
@@ -1236,10 +1247,10 @@ def fetch_ticker(symbol):
 def fetch_orderbook(symbol, limit=20):
     return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
 
-def get_balance():
+def get_balance(_api_max_attempts=None):
     if PAPER_MODE:
         return paper["balance"]
-    bal = safe_api_call(ex.fetch_balance)
+    bal = safe_api_call(ex.fetch_balance, _api_max_attempts=_api_max_attempts)
     if bal:
         return bal.get("total", {}).get("USDT", 0.0)
     return 0.0
@@ -1329,11 +1340,11 @@ def get_ticker_safe(symbol):
             return price
     return None
 
-def get_balance_safe():
+def get_balance_safe(*, api_max_attempts=None):
     cached = cache_get("balance", 5)  # 5 seconds
     if cached is not None:
         return cached
-    bal = get_balance()
+    bal = get_balance(_api_max_attempts=api_max_attempts)
     cache_set("balance", bal)
     return bal
 
@@ -12351,7 +12362,9 @@ def get_realized_pnl(symbol, limit=100):
         sym, reason, _diagnostics = resolve_position_symbol(symbol)
         if not sym:
             return 0.0, 0.0
-        trades = safe_api_call(ex.fetch_my_trades, sym, limit=limit)
+        # Main-loop accounting is best-effort: a transient read failure is
+        # retried on the next cycle, not three times while holding MainThread.
+        trades = safe_api_call(ex.fetch_my_trades, sym, limit=limit, _api_max_attempts=1)
         if not trades:
             return 0.0, 0.0
         buy_value = 0.0
@@ -12366,7 +12379,7 @@ def get_realized_pnl(symbol, limit=100):
             elif side == 'sell':
                 sell_value += cost
         pnl = sell_value - buy_value
-        balance = get_balance_safe()
+        balance = get_balance_safe(api_max_attempts=1)
         pnl_pct = (pnl / balance * 100) if balance > 0 else 0.0
         return pnl, pnl_pct
     except Exception as e:
@@ -14832,9 +14845,12 @@ def fetch_position_tri_state(symbol=None, *, strict_account_snapshot=False):
                     f"final={diagnostics.get('normalized_symbol')!r}",
                     "ERROR", debounce_key=f"tri_state_symbol_{reason}", debounce_sec=30)
                 return "UNKNOWN", None
-            result = safe_api_call(ex.fetch_positions, [resolved])
+            result = safe_api_call(ex.fetch_positions, [resolved], _api_max_attempts=1)
         else:
-            result = safe_api_call(ex.fetch_positions)
+            # Position state is safety-critical, but repeated synchronous retries
+            # can pin MainThread beyond the watchdog grace window. Treat a failed
+            # snapshot as UNKNOWN and let the next governed cycle retry once.
+            result = safe_api_call(ex.fetch_positions, _api_max_attempts=1)
         if result is None or not isinstance(result, (list, tuple)):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
