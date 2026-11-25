@@ -346,3 +346,50 @@ def test_sniper_due_check_only_dispatches_a_worker(monkeypatch):
 
     assert ggpbot._run_sniper_scan_if_due() is True
     assert calls == [("sniper_v2", ggpbot.sniper_engine_v2)]
+
+
+def test_flat_position_snapshot_does_not_clear_ambiguous_order_outcome(monkeypatch):
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "_main_loop_blocked_phase", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "_main_loop_progress", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda *_a, **_k: ("FLAT", []))
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "execution_unresolved": True, "recovery_hold": True,
+        "close_reconciliation_required": False, "entry_client_order_id": "client-uncertain",
+    })
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"position_status": "UNKNOWN"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+
+    ggpbot.sync_all_states()
+
+    assert ggpbot.STATE["execution_unresolved"] is True
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.MEMORY["position_status"] == "UNKNOWN"
+    assert ggpbot.MEMORY["recovery_status"] == "ORDER_OUTCOME_REQUIRES_RECONCILIATION"
+
+
+def test_verified_flat_snapshot_releases_only_a_resolved_local_state(monkeypatch):
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "_main_loop_blocked_phase", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "_main_loop_progress", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state",
+                        lambda *_a, **_k: ("FLAT", []))
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(ggpbot, "STATE", {
+        "open": False, "execution_unresolved": False, "recovery_hold": False,
+        "close_reconciliation_required": False,
+    })
+    monkeypatch.setattr(ggpbot, "TRADE_STATE", {"in_position": False})
+    monkeypatch.setattr(ggpbot, "MEMORY", {"position_status": "UNKNOWN"})
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", True)
+
+    ggpbot.sync_all_states()
+
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+    assert ggpbot.MEMORY["position_status"] == "FLAT"
