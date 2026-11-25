@@ -94,3 +94,17 @@ Do not point the liveness probe at `/health`: that route is diagnostic/readiness
 - Verify that open positions with UNKNOWN native protection prevent process exit; a verified exchange-side protective stop may permit a controlled restart.
 - Run the complete regression suite without increasing its timeout or suppressing hanging tests.
 - Run a staged PAPER soak, then BingX Demo soak, before any LIVE approval. A six-month uptime target is an operational objective, not a guarantee from unit tests.
+
+
+### Required DigitalOcean runtime environment binding
+
+DigitalOcean App Platform bindable variables are not assumed to be injected automatically. Add this runtime environment variable to the existing `habiba-bot` component:
+
+```yaml
+envs:
+  - key: DIGITALOCEAN_APP_ID
+    scope: RUN_TIME
+    value: ${APP_ID}
+```
+
+This is the supervisor identity consumed by the bot's process-restart guard. Without it, the bot deliberately refuses an automatic process exit because it cannot prove that an external supervisor will bring the service back. Preserve all existing environment variables and secrets when applying this change.
