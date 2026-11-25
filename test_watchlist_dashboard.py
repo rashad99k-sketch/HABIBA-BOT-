@@ -18,6 +18,7 @@ class WatchlistDashboardProjectionTests(unittest.TestCase):
         result = build_watchlist_dashboard_payload(source, limit=10)
         self.assertEqual(len(result), 10)
         self.assertIn("READY", result)
+        self.assertEqual(len(build_watchlist_dashboard_payload(source, limit=60)), 30)
 
     def test_cross_projection_keeps_durable_display_label(self):
         source = {"ETH": {"symbol": "ETH", "decision_state": "WAITING_FOR_RETEST",
