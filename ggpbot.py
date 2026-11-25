@@ -8718,7 +8718,7 @@ def _detect_confirmed_cross_events(symbols):
             continue
         for side in ("BUY", "SELL"):
             try:
-                gate = _validate_dual_ema_vwap_entry_gate(
+                gate = _validate_ema9_vwap_entry_gate(
                     frame, side, ema, timeframe_seconds=timeframe_seconds,
                     now_ms=now_ms, lookback_candles=2,
                 )
