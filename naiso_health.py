@@ -357,10 +357,25 @@ class HealthWatchdog:
                 matches_foreground = (component.name == "main_loop" and name.name == "MainThread")
                 if not matches_component and not matches_foreground:
                     continue
-                stacks[str(thread_id)] = "".join(traceback.format_stack(frame))[-2000:]
+                # Keep enough frames to identify the blocking call chain. This is
+                # diagnostic-only: no locals, credentials, or request payloads.
+                stacks[str(thread_id)] = "".join(traceback.format_stack(frame))[-6000:]
         except Exception as exc:
             stacks["error"] = f"{type(exc).__name__}: {exc}"
         return {"possible_stacks": stacks}
+
+    @staticmethod
+    def _main_thread_stack_excerpt(diagnostics: Dict[str, Any], limit: int = 2600) -> str:
+        """Return the captured foreground stack for incident alerts and reports."""
+        stacks = diagnostics.get("possible_stacks")
+        if not isinstance(stacks, dict) or not stacks:
+            return ""
+        preferred = []
+        for stack in stacks.values():
+            if isinstance(stack, str) and stack:
+                preferred.append(stack)
+        selected = preferred[0] if preferred else ""
+        return selected[-max(200, int(limit)):] if selected else ""
 
     @staticmethod
     def _invoke_restart(callback: Callable, context: Dict[str, Any]) -> bool:
@@ -601,12 +616,19 @@ class HealthWatchdog:
             component.status = "FAILED" if lifecycle == "FAILED" else "STALLED"
             diagnostics = self._stack_snapshot(component)
             component.diagnostics.update(diagnostics)
+            stack_excerpt = self._main_thread_stack_excerpt(diagnostics)
+            if stack_excerpt:
+                component.diagnostics["last_stall_stack"] = stack_excerpt
+                component.diagnostics["last_stall_stack_ts"] = round(now, 3)
             if lifecycle == "FAILED":
                 self._alert(f"failed:{component.name}", "ERROR",
                             f"[WATCHDOG] {component.name} failed: {component.reason or 'unknown error'}")
             else:
+                stack_note = (f"\\n[MAIN_THREAD_STACK]\\n{stack_excerpt}"
+                              if component.name == "main_loop" and stack_excerpt else "")
                 self._alert(f"stalled:{component.name}", "CRITICAL",
-                            f"[WATCHDOG] {component.name} stalled for {age:.1f}s (critical={component.critical})")
+                            f"[WATCHDOG] {component.name} stalled for {age:.1f}s "
+                            f"(critical={component.critical}){stack_note}")
             if not component.restartable or component.name not in self._restart_callbacks:
                 report[component.name] = {"status": component.status, "lifecycle": lifecycle,
                                           "age_sec": round(age, 3), "restart": "NOT_RESTARTABLE",
@@ -799,9 +821,12 @@ class HealthWatchdog:
                     f"recovery_guard={recovery_guard_reason}")
                 if exception_detail:
                     diagnostic += f" exception={exception_detail[:200]}"
+                stack_note = (f"\\n[MAIN_THREAD_STACK]\\n{component.diagnostics.get('last_stall_stack', '')}"
+                              if component.name == "main_loop" and component.diagnostics.get("last_stall_stack")
+                              else "")
                 self._alert(f"restart_failed:{component.name}", "CRITICAL",
                             f"[WATCHDOG] {component.name} restart failed: {result} {detail} "
-                            f"| {diagnostic}")
+                            f"| {diagnostic}{stack_note}")
                 report[component.name] = {
                     "status": component.status, "previous_status": previous_status,
                     "lifecycle": lifecycle, "age_sec": round(age, 3),
@@ -813,6 +838,7 @@ class HealthWatchdog:
                     "recovery_guard_reason": recovery_guard_reason,
                     "exception_detail": exception_detail,
                     "exception_traceback": exception_traceback,
+                    "main_thread_stack": str(component.diagnostics.get("last_stall_stack") or ""),
                     "recent_restarts": self.restart_policy.records(component.name, limit=5),
                 }
                 continue
