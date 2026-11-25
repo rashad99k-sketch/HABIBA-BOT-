@@ -276,6 +276,7 @@ def _stub_ohlcv_fetch(monkeypatch, rows):
     monkeypatch.setattr(ggpbot, "_ohlcv_rate_limit_cooldown_remaining", lambda _symbol: 0.0)
     monkeypatch.setattr(ggpbot, "safe_api_call", lambda *_args, **_kwargs: rows)
     monkeypatch.setattr(ggpbot, "OHLCV_FETCH_DIAGNOSTICS", {})
+    monkeypatch.setattr(ggpbot, "_LAST_API_RATE_LIMIT", {"ts": 0.0, "method": "", "message": ""})
     monkeypatch.setattr(ggpbot, "INTERVAL", "15m")
 
 
