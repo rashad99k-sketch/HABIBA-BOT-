@@ -26,6 +26,8 @@ class RestartRecord:
     delay: float
     result: str = "PENDING"
     detail: str = ""
+    # A deferred recovery performed no restart, so it must not consume budget.
+    counts: bool = True
 
 
 class RestartPolicy:
@@ -61,7 +63,8 @@ class RestartPolicy:
         now = float(self._monotonic())
         with self._lock:
             records = self._records.setdefault(str(name), [])
-            recent = [r for r in records if r.result != "PENDING" and now - r.ts <= self.window_sec]
+            recent = [r for r in records if r.counts and r.result != "PENDING"
+                      and now - r.ts <= self.window_sec]
             if len(recent) >= self.max_attempts:
                 return None
             attempt = len(recent)
@@ -70,9 +73,12 @@ class RestartPolicy:
 
     def begin(self, name: str, reason: str, delay: float) -> RestartRecord:
         record = RestartRecord(str(name), str(reason), float(self._monotonic()),
-                               len(self._records.get(str(name), [])) + 1, float(delay))
+                               0, float(delay))
         with self._lock:
             records = self._records.setdefault(str(name), [])
+            # Attempt IDs only advance on consumed attempts; deferred callbacks
+            # did not restart anything and must not inflate the next ID.
+            record.attempt = 1 + sum(1 for r in records if r.counts)
             records.append(record)
             # Restart history is diagnostic, not an audit ledger. Cap it so a
             # long-running process cannot grow memory without bound; the active
@@ -81,10 +87,12 @@ class RestartPolicy:
                 del records[:len(records) - self.MAX_RECORDS_PER_COMPONENT]
         return record
 
-    def finish(self, record: RestartRecord, result: str, detail: str = "") -> RestartRecord:
+    def finish(self, record: RestartRecord, result: str, detail: str = "",
+               *, counts: bool = True) -> RestartRecord:
         with self._lock:
             record.result = str(result)
             record.detail = str(detail)[:300]
+            record.counts = bool(counts)
         return record
 
     def records(self, name: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
@@ -95,6 +103,7 @@ class RestartPolicy:
         return [{
             "name": r.name, "reason": r.reason, "ts": r.ts, "attempt": r.attempt,
             "delay": round(r.delay, 3), "result": r.result, "detail": r.detail,
+            "counts": bool(r.counts),
         } for r in rows[:max(1, int(limit))]]
 
     def reset(self, name: str) -> None:
@@ -352,6 +361,57 @@ class HealthWatchdog:
             accepts_context = False
         return bool(callback(context) if accepts_context else callback())
 
+    @staticmethod
+    def _verifier_bound_sec(component: ComponentHealth) -> float:
+        """Verifier bound is strictly inside the component's existing grace window."""
+        grace = max(0.0, float(component.grace_sec))
+        return round(min(5.0, max(0.01, grace / 2.0), grace) if grace > 0 else 0.01, 4)
+
+    def _run_recovery_verifier(self, component: ComponentHealth):
+        """Run a verifier on a daemon worker; never block the watchdog thread.
+
+        Returns ``(verified, reason, context, timed_out)``. A verifier that hangs
+        is abandoned after the bounded join and reported as ``VERIFIER_TIMEOUT``
+        with no restart attempt consumed. Such workers are daemon threads by
+        design: a third-party verifier may block forever, so the watchdog cannot
+        join indefinitely or read its result after the bound; it does not keep the
+        process alive and is capped by the bounded verification retry policy.
+        """
+        outcome: Dict[str, Any] = {}
+
+        def worker():
+            try:
+                outcome["value"] = component.recovery_verifier()
+            except BaseException as exc:
+                outcome["exception"] = f"{type(exc).__name__}: {exc}"
+                outcome["traceback"] = traceback.format_exc()[-1200:]
+
+        bound = self._verifier_bound_sec(component)
+        thread = threading.Thread(target=worker, daemon=True,
+                                  name=f"naiso-verifier-{component.name}"[-80:])
+        thread.start()
+        thread.join(bound)
+        if thread.is_alive():
+            return False, "VERIFIER_TIMEOUT", {
+                "verifier_blocked": True, "verifier_timeout": True,
+                "verifier_timeout_sec": bound, "verifier_thread_name": thread.name,
+                "component": component.name,
+            }, True
+        if "exception" in outcome:
+            detail = str(outcome["exception"])
+            kind = detail.split(":", 1)[0]
+            return False, f"VERIFIER_EXCEPTION:{kind}", {
+                "verifier_exception_detail": detail,
+                "verifier_exception_traceback": outcome.get("traceback", ""),
+                "component": component.name,
+            }, False
+        value = outcome.get("value")
+        try:
+            verified, reason, context = value
+        except (TypeError, ValueError):
+            return False, "VERIFIER_INVALID_RESULT", {"component": component.name}, False
+        return bool(verified), str(reason), dict(context or {}), False
+
     def check(self) -> Dict[str, Any]:
         now = float(self._monotonic())
         report: Dict[str, Any] = {}
@@ -417,11 +477,8 @@ class HealthWatchdog:
                 verified = True
                 verify_reason = "SCHEDULED_DUE"
                 if callable(component.recovery_verifier):
-                    try:
-                        verified, verify_reason, raw_context = component.recovery_verifier()
-                        verification_context = dict(raw_context or {})
-                    except Exception as exc:
-                        verified, verify_reason = False, f"VERIFIER_EXCEPTION:{type(exc).__name__}"
+                    verified, verify_reason, raw_context, _timed_out = self._run_recovery_verifier(component)
+                    verification_context = dict(raw_context or {})
                 if not verified:
                     component.status = "IDLE_SAFE_HOLD"
                     component.idle_until = now + min(60.0, component.interval_sec * 0.25)
@@ -505,6 +562,7 @@ class HealthWatchdog:
             verification_context: Dict[str, Any] = {}
             verified_open_resume = False
             non_trading_resume = False
+            verifier_timed_out = False
             if callable(component.recovery_verifier):
                 diag = component.diagnostics
                 marker_raw = diag.get("verification_progress_at")
@@ -544,11 +602,12 @@ class HealthWatchdog:
                         "component": diag.get("verification_component", component.name),
                     }
                     continue
-                try:
-                    verified, verify_reason, context = component.recovery_verifier()
-                    verification_context = dict(context or {})
-                except Exception as exc:
-                    verified, verify_reason, verification_context = False, f"VERIFIER_EXCEPTION:{type(exc).__name__}", {}
+                verified, verify_reason, context, verifier_timed_out = self._run_recovery_verifier(component)
+                verification_context = dict(context or {})
+                if verifier_timed_out:
+                    # Fail closed before any restart budget is touched.
+                    verification_context["verifier_timeout"] = True
+                    verification_context["verifier_blocked"] = True
                 if not verified:
                     component.status = "STALLED_SAFE_HOLD"
                     diag["last_verification"] = str(verify_reason)[:120]
@@ -575,6 +634,9 @@ class HealthWatchdog:
                         "next_verification_sec": round(self.verification_retry_sec, 3),
                         "verification_attempts": attempts,
                         "verification_hold_sec": round(hold_sec, 3),
+                        "verifier_timeout": bool(verifier_timed_out),
+                        "verifier_timeout_sec": (self._verifier_bound_sec(component)
+                                                 if verifier_timed_out else None),
                         "caller": verification_context.get("caller", "direct"),
                         "component": verification_context.get("component", component.name),
                         "symbol_status": verification_context.get("symbol_status", ""),
@@ -590,8 +652,10 @@ class HealthWatchdog:
                     continue
                 verified_open_resume = bool(verification_context.get("open_position_verified"))
                 non_trading_resume = bool(verification_context.get("non_trading_engine"))
+            safety_gate_reason = "NOT_CONFIGURED"
             if callable(self.safety_gate):
                 allowed, reason = self.safety_gate()
+                safety_gate_reason = str(reason)
                 if not allowed and not (
                     verified_open_resume and str(reason) in {"OPEN_POSITION", "OPEN_POSITION_VERIFIED"}
                 ) and not (
@@ -614,6 +678,9 @@ class HealthWatchdog:
             self._sleep(delay)
             record = self.restart_policy.begin(component.name, f"stalled_{age:.1f}s", delay)
             callback = self._restart_callbacks[component.name]
+            previous_status = component.status
+            exception_detail = ""
+            exception_traceback = ""
             try:
                 restarted = self._invoke_restart(callback, verification_context)
                 result = "RESTARTED" if restarted else "RESTART_FAILED"
@@ -622,6 +689,8 @@ class HealthWatchdog:
                 restarted = False
                 result = "RESTART_EXCEPTION"
                 detail = f"{type(exc).__name__}: {exc}"
+                exception_detail = detail
+                exception_traceback = traceback.format_exc()[-1200:]
             liveness_confirmed = (
                 bool(verification_context.get("engine_resumed"))
                 if component.resume_requires_liveness else True)
@@ -632,7 +701,9 @@ class HealthWatchdog:
                 restarted = False
                 result = "RECOVERY_DEFERRED"
                 detail = "engine liveness not confirmed; no duplicate thread started"
-            self.restart_policy.finish(record, result, detail)
+            # No restart happened on deferral, so the attempt must not be charged.
+            consumed = result != "RECOVERY_DEFERRED"
+            self.restart_policy.finish(record, result, detail, counts=consumed)
             component.last_restart = float(self._monotonic())
             if restarted:
                 component.last_beat = float(self._monotonic())
@@ -645,10 +716,41 @@ class HealthWatchdog:
                             f"[WATCHDOG] {component.name} recovery deferred: {detail}")
             else:
                 component.status = "RESTART_FAILED"
+                thread_name = str(component.thread_name or "UNKNOWN")
+                thread_alive = self._thread_alive(component.thread_name) if component.thread_name else False
+                guard_reason = str(verification_context.get("restart_guard_reason") or
+                                   verification_context.get("restart_guard") or
+                                   component.diagnostics.get("restart_guard_reason") or "NOT_REPORTED")
+                recovery_guard_reason = str(
+                    verification_context.get("recovery_guard_reason") or
+                    component.diagnostics.get("recovery_guard_reason") or "NOT_REPORTED")
+                diagnostic = (
+                    f"attempt={component.name}:{record.attempt} status={component.status} "
+                    f"previous_status={previous_status} lifecycle={lifecycle} "
+                    f"thread={thread_name} thread_alive={thread_alive} "
+                    f"restart_guard={guard_reason} safety_gate={safety_gate_reason} "
+                    f"recovery_guard={recovery_guard_reason}")
+                if exception_detail:
+                    diagnostic += f" exception={exception_detail[:200]}"
                 self._alert(f"restart_failed:{component.name}", "CRITICAL",
-                            f"[WATCHDOG] {component.name} restart failed: {result} {detail}")
+                            f"[WATCHDOG] {component.name} restart failed: {result} {detail} "
+                            f"| {diagnostic}")
+                report[component.name] = {
+                    "status": component.status, "previous_status": previous_status,
+                    "lifecycle": lifecycle, "age_sec": round(age, 3),
+                    "restart": result, "attempt": record.attempt,
+                    "attempt_id": f"{component.name}:{record.attempt}",
+                    "thread_name": thread_name, "thread_alive": bool(thread_alive),
+                    "restart_guard": guard_reason, "safety_gate_reason": safety_gate_reason,
+                    "recovery_guard_reason": recovery_guard_reason,
+                    "exception_detail": exception_detail,
+                    "exception_traceback": exception_traceback,
+                    "recent_restarts": self.restart_policy.records(component.name, limit=5),
+                }
+                continue
             report[component.name] = {"status": component.status, "age_sec": round(age, 3),
-                                      "restart": result, "attempt": record.attempt}
+                                      "restart": result, "attempt": record.attempt,
+                                      "counts": bool(consumed)}
         return report
 
     def snapshot(self) -> Dict[str, Any]:

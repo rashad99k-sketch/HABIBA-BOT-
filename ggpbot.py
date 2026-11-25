@@ -11943,21 +11943,107 @@ main_loop = main_loop_sniper
 
 
 _MAIN_LOOP_PROGRESS_SEQ = 0
+# Liveness belongs to the single foreground supervisor thread. Other threads may
+# still report observations, but only the registered owner may advance the
+# progress sequence that the watchdog treats as proof of a live main_loop.
+_MAIN_LOOP_OWNER_LOCK = threading.Lock()
+_MAIN_LOOP_OWNER = {"thread_id": None, "thread_name": "MainThread", "registered": False}
+_MAIN_LOOP_LAST_OWNER_PROGRESS = {"seq": 0, "ts": 0.0, "thread_id": None, "thread_name": ""}
+# Existing main_loop grace window (60s); this is not a new/increased threshold.
+_MAIN_LOOP_LIVENESS_WINDOW_SEC = 60.0
+
+
+def _main_loop_register_owner(thread=None, *, force=False):
+    """Bind main_loop liveness ownership to the foreground thread (no new thread)."""
+    thread = thread or threading.current_thread()
+    with _MAIN_LOOP_OWNER_LOCK:
+        if force or not _MAIN_LOOP_OWNER["registered"]:
+            _MAIN_LOOP_OWNER.update({
+                "thread_id": thread.ident, "thread_name": str(thread.name), "registered": True,
+            })
+        return dict(_MAIN_LOOP_OWNER)
+
+
+def _main_loop_owner():
+    with _MAIN_LOOP_OWNER_LOCK:
+        return dict(_MAIN_LOOP_OWNER)
+
+
+def _main_loop_owner_alive():
+    """True only when the registered owner thread exists and is alive."""
+    owner = _main_loop_owner()
+    for thread in threading.enumerate():
+        if not thread.is_alive():
+            continue
+        if owner["thread_id"] is not None:
+            if thread.ident == owner["thread_id"] and thread.name == owner["thread_name"]:
+                return True
+        elif thread.name == owner["thread_name"]:
+            return True
+    return False
+
+
+def _main_loop_is_owner():
+    """Only the registered foreground thread may claim a progress beat."""
+    current = threading.current_thread()
+    owner = _main_loop_owner()
+    if owner["registered"] and owner["thread_id"] is not None:
+        return current.ident == owner["thread_id"] and current.name == owner["thread_name"]
+    # Before supervisor registration, only the process main thread may claim.
+    return current.name == (owner["thread_name"] or "MainThread")
+
+
+def _main_loop_liveness_confirmed():
+    """Owner progress must be recent *and* the watchdog must not be stalled."""
+    watchdog = globals().get("NAISO_WATCHDOG")
+    component = getattr(watchdog, "_components", {}).get("main_loop")
+    if component is None or getattr(component, "status", "") in {
+            "STALLED", "STALLED_SAFE_HOLD", "FAILED", "RESTART_FAILED",
+            "RECOVERY_DEFERRED", "RESTART_BUDGET_EXHAUSTED", "IDLE_SAFE_HOLD"}:
+        return False
+    owner = _main_loop_owner()
+    with _MAIN_LOOP_OWNER_LOCK:
+        last = dict(_MAIN_LOOP_LAST_OWNER_PROGRESS)
+    seq = int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0))
+    if seq <= 0 or last["seq"] < seq or last["thread_id"] != owner["thread_id"]:
+        return False
+    if last["thread_name"] != owner["thread_name"] or not _main_loop_owner_alive():
+        return False
+    return (time.monotonic() - float(last["ts"] or 0.0)) <= _MAIN_LOOP_LIVENESS_WINDOW_SEC
 
 
 def _main_loop_progress(phase, **details):
-    """Report a real loop phase, not an artificial keepalive."""
+    """Report a real loop phase, not an artificial keepalive.
+
+    Non-owner callers (tests, diagnostics, helper threads) downgrade to a
+    status-only observation and never advance the liveness sequence.
+    """
     global _MAIN_LOOP_PROGRESS_SEQ
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return
-    _MAIN_LOOP_PROGRESS_SEQ += 1
+    current = threading.current_thread()
+    if not _main_loop_is_owner():
+        status_details = dict(details)
+        status_details.pop("progress", None)
+        status_details.setdefault("caller_thread_name", current.name)
+        status_details.setdefault("owner_thread_name", _main_loop_owner()["thread_name"])
+        _main_loop_status(phase, "NON_OWNER_STATUS_ONLY", **status_details)
+        return
+    with _MAIN_LOOP_OWNER_LOCK:
+        _MAIN_LOOP_PROGRESS_SEQ += 1
+        seq = _MAIN_LOOP_PROGRESS_SEQ
+        _MAIN_LOOP_LAST_OWNER_PROGRESS.update({
+            "seq": seq, "ts": time.monotonic(), "thread_id": current.ident,
+            "thread_name": str(current.name),
+        })
     payload = {
         "state": "RUNNING", "phase": phase, "progress": True,
-        "progress_seq": _MAIN_LOOP_PROGRESS_SEQ,
-        "thread_name": threading.current_thread().name,
+        "progress_seq": seq, "thread_name": current.name,
+        "owner_thread_id": current.ident,
     }
     payload.update(details)
+    payload["progress"] = True
     watchdog.beat("main_loop", **payload)
 
 
@@ -11986,10 +12072,10 @@ def _main_loop_status(phase, reason, **details):
         return
     payload = {
         "state": "RUNNING", "phase": phase, "reason": reason,
-        "progress": False,
         "thread_name": threading.current_thread().name,
     }
     payload.update(details)
+    payload["progress"] = False
     watchdog.beat("main_loop", **payload)
 
 
@@ -12006,11 +12092,11 @@ def _main_loop_blocked_phase(phase, reason, *, timeout_sec=None, **details):
     deadline = max(5.0, float(timeout_sec or _exchange_call_phase_deadline_sec()))
     payload = {
         "state": "BLOCKED", "phase": phase, "reason": reason,
-        "progress": False,
         "thread_name": threading.current_thread().name,
         "blocked_until": watchdog.monotonic() + deadline,
     }
     payload.update(details)
+    payload["progress"] = False
     watchdog.beat("main_loop", **payload)
 
 
@@ -12034,10 +12120,52 @@ def _main_loop_manage_open_position():
 
 _ENGINE_RECOVERY_GUARD = {"ts": 0.0, "symbol": None}
 _ENGINE_RECOVERY_LOCK = threading.RLock()
+# Explicit single-flight guard for verifier-driven recovery. No main_loop thread
+# is ever created here; this only prevents overlapping recovery callbacks.
+_MAIN_LOOP_RESTART_LOCK = threading.RLock()
+_MAIN_LOOP_RESTART_STATE = {"in_progress": False, "attempts": 0, "last_reason": "",
+                            "supervisor_exhausted": False}
 
 
 def _named_thread_alive(name):
     return any(thread.name == name and thread.is_alive() for thread in threading.enumerate())
+
+
+def _engine_recovery_is_recent(symbol):
+    """Empty symbols are a distinct identity; a changed symbol is never recent."""
+    now = time.time()
+    with _ENGINE_RECOVERY_LOCK:
+        guard_symbol = _ENGINE_RECOVERY_GUARD.get("symbol")
+        guard_ts = float(_ENGINE_RECOVERY_GUARD.get("ts") or 0.0)
+    return (bool(guard_ts) and guard_symbol == symbol and (now - guard_ts) < 60.0)
+
+
+def _main_loop_restart_guard(symbol=""):
+    """Return (allowed, reason, details) for one verifier-driven restart.
+
+    An alive owner with confirmed recent liveness must not be restarted; a dead
+    or genuinely blocked owner is eligible for verifier-driven recovery only.
+    """
+    with _MAIN_LOOP_RESTART_LOCK:
+        in_progress = bool(_MAIN_LOOP_RESTART_STATE["in_progress"])
+        supervisor_exhausted = bool(_MAIN_LOOP_RESTART_STATE["supervisor_exhausted"])
+    owner = _main_loop_owner()
+    thread_alive = _main_loop_owner_alive()
+    liveness = _main_loop_liveness_confirmed()
+    details = {
+        "owner_thread_name": owner["thread_name"],
+        "owner_thread_id": owner["thread_id"],
+        "owner_thread_alive": thread_alive,
+        "liveness_confirmed": liveness,
+        "symbol": str(symbol or "")[:80],
+    }
+    if in_progress:
+        return False, "RESTART_IN_PROGRESS", details
+    if thread_alive and liveness:
+        return False, "MAIN_LOOP_ALIVE_AND_PROGRESSING", details
+    if supervisor_exhausted:
+        return False, "SUPERVISOR_RESTART_LIMIT_EXHAUSTED", details
+    return True, "RESTART_ALLOWED", details
 
 
 def _exchange_position_matches_control_state(row, symbol, side=None, qty=None):
@@ -12121,6 +12249,11 @@ def _verify_engine_recovery(symbol=None, *, caller="direct", component="engine",
         if not sym and local_open and symbol_status != "VALID":
             reason = ("engine_recovery_invalid_base_asset" if symbol_status == "INVALID"
                       else "engine_recovery_symbol_missing_open_exposure")
+            # Paper-mode exposure is still real control state: fail closed rather
+            # than pretending the symbol resolved or that management can proceed.
+            _recovery_hold(reason, symbol=sym, trade_id=STATE.get("trade_id"),
+                           details={"symbol_diagnostics": symbol_diagnostics,
+                                    "symbol_status": symbol_status, "paper_mode": True})
             return False, reason, context
         context.update({"open_position_verified": local_open, "flat_verified": not local_open,
                         "paper_only": True})
@@ -12305,7 +12438,7 @@ def _resume_scanner_after_flat_verification(context=None):
 
 
 def _wait_for_main_loop_progress(baseline, timeout_sec=2.0):
-    """Prove the foreground loop advanced before claiming it was restarted."""
+    """Prove the registered owner advanced before claiming a loop restart."""
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         # Direct/diagnostic calls are not watchdog-driven recovery; there is no
@@ -12316,43 +12449,80 @@ def _wait_for_main_loop_progress(baseline, timeout_sec=2.0):
         # A watchdog without a liveness-gated main_loop registration is not
         # claiming to have restarted the foreground loop.
         return True
+    owner = _main_loop_owner()
     deadline = time.monotonic() + max(0.0, float(timeout_sec))
-    while time.monotonic() < deadline:
-        if int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0)) > int(baseline):
+    while True:
+        seq = int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0))
+        with _MAIN_LOOP_OWNER_LOCK:
+            last = dict(_MAIN_LOOP_LAST_OWNER_PROGRESS)
+        owner_progress = (
+            seq > int(baseline) and last["seq"] >= seq and
+            last["thread_id"] is not None and last["thread_id"] == owner["thread_id"] and
+            last["thread_name"] == owner["thread_name"] and _main_loop_owner_alive())
+        if owner_progress:
             return True
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.05)
-    return int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0)) > int(baseline)
 
 
 def _resume_main_loop_after_verification(context=None):
-    """Resume verified open-trade management without opening a new trade."""
+    """Resume verified open-trade management without opening a new trade.
+
+    A restart is claimed only when no overlapping recovery is running and the
+    previous main_loop owner is dead or genuinely blocked. Recovery itself never
+    starts a replacement foreground thread.
+    """
     # Mutate the caller's verification context when possible: the watchdog reads
     # liveness proof from the same dict after this callback returns.
     context = context if isinstance(context, dict) else {}
     open_verified = bool(context.get("open_position_verified") or
                          (context.get("paper_mode") and context.get("paper_only")
                           and context.get("open_position")))
-    if open_verified:
-        progress_baseline = int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0))
-        symbol = str(context.get("symbol") or STATE.get("current_symbol") or "")
-        now = time.time()
-        with _ENGINE_RECOVERY_LOCK:
-            recent = (symbol and _ENGINE_RECOVERY_GUARD["symbol"] == symbol and
-                      now - float(_ENGINE_RECOVERY_GUARD["ts"]) < 60.0)
-        if recent:
-            resumed = not bool(STATE.get("recovery_hold"))
-        else:
-            if not startup_trade_recovery():
-                context["engine_resumed"] = False
-                return False
-            with _ENGINE_RECOVERY_LOCK:
-                _ENGINE_RECOVERY_GUARD.update({"ts": time.time(), "symbol": symbol})
-            resumed = not bool(STATE.get("recovery_hold"))
-        # Exchange verification alone does not prove the foreground loop is alive.
-        context["engine_resumed"] = bool(
-            resumed and _wait_for_main_loop_progress(progress_baseline))
-        return bool(context["engine_resumed"])
-    return _resume_scanner_after_flat_verification(context)
+    symbol = str(context.get("symbol") or STATE.get("current_symbol") or "")
+    allowed, guard_reason, guard_details = _main_loop_restart_guard(symbol)
+    context.update({
+        "restart_guard": guard_reason, "restart_guard_reason": guard_reason,
+        "restart_guard_details": guard_details,
+        "main_loop_thread_name": str(guard_details["owner_thread_name"]),
+        "main_loop_thread_alive": bool(guard_details["owner_thread_alive"]),
+    })
+    if not allowed:
+        context["engine_resumed"] = False
+        with _MAIN_LOOP_RESTART_LOCK:
+            _MAIN_LOOP_RESTART_STATE["last_reason"] = guard_reason
+        return False
+    with _MAIN_LOOP_RESTART_LOCK:
+        if _MAIN_LOOP_RESTART_STATE["in_progress"]:
+            context["engine_resumed"] = False
+            context["restart_guard_reason"] = "RESTART_IN_PROGRESS"
+            context["restart_guard"] = "RESTART_IN_PROGRESS"
+            return False
+        _MAIN_LOOP_RESTART_STATE["in_progress"] = True
+        _MAIN_LOOP_RESTART_STATE["attempts"] += 1
+    try:
+        if open_verified:
+            progress_baseline = int(globals().get("_MAIN_LOOP_PROGRESS_SEQ", 0))
+            recent = _engine_recovery_is_recent(symbol)
+            if recent:
+                resumed = not bool(STATE.get("recovery_hold"))
+            else:
+                if not startup_trade_recovery():
+                    context["engine_resumed"] = False
+                    return False
+                with _ENGINE_RECOVERY_LOCK:
+                    _ENGINE_RECOVERY_GUARD.update({"ts": time.time(), "symbol": symbol})
+                resumed = not bool(STATE.get("recovery_hold"))
+            # Exchange verification alone does not prove the foreground loop is alive.
+            context["engine_resumed"] = bool(
+                resumed and _wait_for_main_loop_progress(progress_baseline))
+            return bool(context["engine_resumed"])
+        return _resume_scanner_after_flat_verification(context)
+    finally:
+        with _MAIN_LOOP_RESTART_LOCK:
+            _MAIN_LOOP_RESTART_STATE["in_progress"] = False
+            _MAIN_LOOP_RESTART_STATE["last_reason"] = str(
+                context.get("restart_guard_reason") or guard_reason)
 
 
 def _resume_exchange_reconciliation_after_verification(_context=None):
@@ -12393,6 +12563,9 @@ def start_naiso_services():
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return False
+    # The supervisor runs on this foreground thread; bind liveness ownership
+    # before any recovery callback can inspect it.
+    _main_loop_register_owner()
     watchdog.register("main_loop", interval_sec=max(5.0, safe_float(BASE_SLEEP, 5.0)),
                       grace_sec=60.0, critical=True, restartable=True,
                       recovery_verifier=_verify_main_loop_recovery,
@@ -12427,24 +12600,63 @@ def start_naiso_services():
 
 
 _NAISO_LOOP_RESTARTS = []
+_NAISO_SUPERVISOR_MAX_RESTARTS = 3
+_NAISO_SUPERVISOR_LOCK = threading.RLock()
+_NAISO_SUPERVISOR_STATE = {"window_started": 0.0, "restarts": 0, "exhausted": False,
+                            "last_reason": "", "last_attempt": 0}
+
+
+def _naiso_supervisor_state():
+    with _NAISO_SUPERVISOR_LOCK:
+        return dict(_NAISO_SUPERVISOR_STATE)
+
+
+def _naiso_supervisor_reset():
+    """A genuine long healthy run re-arms the bounded supervisor budget."""
+    with _NAISO_SUPERVISOR_LOCK:
+        _NAISO_SUPERVISOR_STATE.update({
+            "window_started": 0.0, "restarts": 0, "exhausted": False,
+            "last_reason": "", "last_attempt": 0,
+        })
+        _MAIN_LOOP_RESTART_STATE["supervisor_exhausted"] = False
+
 
 def safe_main_loop():
-    """Foreground supervisor: bounded exponential backoff, reason/result logged."""
+    """Foreground supervisor: bounded backoff, reason/result logged, fail-closed."""
+    _main_loop_register_owner(force=True)
     consecutive_failures = 0
     while True:
         reason = "CLEAN_EXIT"
+        started = time.monotonic()
         try:
             main_loop()
             reason = "CLEAN_EXIT"
         except Exception as e:
             reason = f"{type(e).__name__}: {str(e)[:180]}"
             log_execution(f"CRITICAL EXCEPTION: {traceback.format_exc()}", "ERROR")
+        elapsed = time.monotonic() - started
         consecutive_failures += 1
         watchdog = globals().get("NAISO_WATCHDOG")
+        if reason == "CLEAN_EXIT" and elapsed >= _MAIN_LOOP_LIVENESS_WINDOW_SEC:
+            _naiso_supervisor_reset()
+            consecutive_failures = 0
+        with _NAISO_SUPERVISOR_LOCK:
+            state = _NAISO_SUPERVISOR_STATE
+            state["window_started"] = state["window_started"] or time.monotonic()
+            state["restarts"] += 1
+            attempt = state["restarts"]
+            state["last_reason"] = reason
+            state["last_attempt"] = attempt
+            exhausted = attempt >= _NAISO_SUPERVISOR_MAX_RESTARTS
+            state["exhausted"] = exhausted
+            _MAIN_LOOP_RESTART_STATE["supervisor_exhausted"] = exhausted
         if watchdog is not None:
             try:
-                watchdog.beat("main_loop", phase="supervisor_backoff",
-                              last_restart_reason=reason[:100])
+                # Status-only: a backoff beat must never mask a dead or hung loop.
+                watchdog.beat("main_loop", phase="supervisor_backoff", progress=False,
+                              state="RUNNING", last_restart_reason=reason[:100],
+                              supervisor_attempt=attempt, supervisor_exhausted=exhausted,
+                              thread_name=threading.current_thread().name)
             except Exception:
                 pass
         # Keep the bounded backoff strictly below the watchdog grace window.
@@ -12454,11 +12666,31 @@ def safe_main_loop():
         delay *= 1.0 + random.uniform(-0.10, 0.10)
         _NAISO_LOOP_RESTARTS.append({
             "ts": time.time(), "reason": reason, "backoff_sec": round(delay, 3),
-            "consecutive_failures": consecutive_failures,
+            "consecutive_failures": consecutive_failures, "supervisor_attempt": attempt,
         })
         if len(_NAISO_LOOP_RESTARTS) > 50:
             _NAISO_LOOP_RESTARTS.pop(0)
         log_execution(f"[SUPERVISOR] restart #{consecutive_failures} after {delay:.1f}s: {reason}", "WARN")
+        if exhausted:
+            # Fail closed: no further restart, no clean-looking heartbeats.
+            if watchdog is not None:
+                try:
+                    watchdog.beat("main_loop", state="FAILED",
+                                  phase="supervisor_restart_limit_exhausted",
+                                  reason="SUPERVISOR_RESTART_LIMIT_EXHAUSTED", progress=False,
+                                  supervisor_attempt=attempt, last_restart_reason=reason[:100],
+                                  thread_name=threading.current_thread().name)
+                except Exception:
+                    pass
+            globals()["RECOVERY_BLOCK_ENTRIES"] = True
+            STATE["recovery_hold"] = True
+            STATE["recovery_reason"] = "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"
+            MEMORY["recovery_status"] = "SUPERVISOR_RESTART_LIMIT_EXHAUSTED"
+            MEMORY["supervisor_restarts"] = len(_NAISO_LOOP_RESTARTS)
+            log_execution(
+                f"[SUPERVISOR] restart budget exhausted after {attempt} attempts; "
+                "fail-closed hold, no further main_loop restart", "CRITICAL")
+            return False
         time.sleep(delay)
         # Recovery always precedes scanner work in the restarted loop.
         MEMORY["supervisor_restarts"] = len(_NAISO_LOOP_RESTARTS)
