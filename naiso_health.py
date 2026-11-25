@@ -362,20 +362,22 @@ class HealthWatchdog:
                 stacks[str(thread_id)] = "".join(traceback.format_stack(frame))[-6000:]
         except Exception as exc:
             stacks["error"] = f"{type(exc).__name__}: {exc}"
-        return {"possible_stacks": stacks}
+        main_thread_stack = ""
+        if component.name == "main_loop":
+            for thread_id, frame in sys._current_frames().items():
+                thread = threading._active.get(thread_id)
+                if thread is not None and thread.name == "MainThread":
+                    main_thread_stack = "".join(traceback.format_stack(frame))[-6000:]
+                    break
+        return {"possible_stacks": stacks, "main_thread_stack": main_thread_stack}
 
     @staticmethod
     def _main_thread_stack_excerpt(diagnostics: Dict[str, Any], limit: int = 2600) -> str:
         """Return the captured foreground stack for incident alerts and reports."""
-        stacks = diagnostics.get("possible_stacks")
-        if not isinstance(stacks, dict) or not stacks:
+        stack = diagnostics.get("main_thread_stack")
+        if not isinstance(stack, str) or not stack:
             return ""
-        preferred = []
-        for stack in stacks.values():
-            if isinstance(stack, str) and stack:
-                preferred.append(stack)
-        selected = preferred[0] if preferred else ""
-        return selected[-max(200, int(limit)):] if selected else ""
+        return stack[-max(200, int(limit)):]
 
     @staticmethod
     def _invoke_restart(callback: Callable, context: Dict[str, Any]) -> bool:
@@ -624,7 +626,7 @@ class HealthWatchdog:
                 self._alert(f"failed:{component.name}", "ERROR",
                             f"[WATCHDOG] {component.name} failed: {component.reason or 'unknown error'}")
             else:
-                stack_note = (f"\\n[MAIN_THREAD_STACK]\\n{stack_excerpt}"
+                stack_note = (f"\n[MAIN_THREAD_STACK]\n{stack_excerpt}"
                               if component.name == "main_loop" and stack_excerpt else "")
                 self._alert(f"stalled:{component.name}", "CRITICAL",
                             f"[WATCHDOG] {component.name} stalled for {age:.1f}s "
@@ -821,7 +823,7 @@ class HealthWatchdog:
                     f"recovery_guard={recovery_guard_reason}")
                 if exception_detail:
                     diagnostic += f" exception={exception_detail[:200]}"
-                stack_note = (f"\\n[MAIN_THREAD_STACK]\\n{component.diagnostics.get('last_stall_stack', '')}"
+                stack_note = (f"\n[MAIN_THREAD_STACK]\n{component.diagnostics.get('last_stall_stack', '')}"
                               if component.name == "main_loop" and component.diagnostics.get("last_stall_stack")
                               else "")
                 self._alert(f"restart_failed:{component.name}", "CRITICAL",
