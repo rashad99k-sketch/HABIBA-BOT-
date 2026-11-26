@@ -18759,12 +18759,20 @@ def sync_all_states():
                     return
                 had_recovery_hold = bool(STATE.get("recovery_hold") or RECOVERY_BLOCK_ENTRIES)
                 _apply_runtime_flat_reconciliation(clear_trade_state=not active_items)
-                RECOVERY_BLOCK_ENTRIES = False
-                if had_recovery_hold:
+                # Preserve any independent uncertainty held by another registered
+                # portfolio slot; a single FLAT account snapshot cannot clear it.
+                _recompute_portfolio_globals(clear_recovery=True)
+                if had_recovery_hold and not RECOVERY_BLOCK_ENTRIES:
                     log_execution(
                         "[RECOVERY] Runtime FLAT reconciled; inherited hold released after "
                         "order-level and persistence verification",
                         "SUCCESS", debounce_key="runtime_flat_recovery_released", debounce_sec=60,
+                    )
+                elif had_recovery_hold and RECOVERY_BLOCK_ENTRIES:
+                    log_execution(
+                        "[RECOVERY] Runtime FLAT verified, but an independent portfolio "
+                        "uncertainty still blocks entries",
+                        "ERROR", debounce_key="runtime_flat_portfolio_hold", debounce_sec=60,
                     )
             else:
                 MEMORY["position_status"] = "FLAT"
