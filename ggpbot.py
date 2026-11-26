@@ -18155,6 +18155,13 @@ def _startup_flat_orders_reconciled(rows):
                      or info.get("orderStatus") or "UNKNOWN").upper()
         return (status in terminal_statuses, status)
 
+    durable_entry_hold = any(STATE.get(key) for key in (
+        "entry_context_persistence_failed",
+        "cross_event_persistence_failed",
+        "entry_event_persistence_failed",
+    ))
+    if durable_entry_hold:
+        return False, "DURABLE_ENTRY_PERSISTENCE_HOLD"
     symbol = str(STATE.get("current_symbol") or DEFAULT_SYMBOL)
     entry_id = STATE.get("entry_exchange_order_id")
     client_id = STATE.get("entry_client_order_id")
