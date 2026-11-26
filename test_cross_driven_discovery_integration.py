@@ -826,6 +826,84 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     assert unchanged["metadata"]["entry_ready"] is False
 
 
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_matching_watchlist_zone_authorizes_durable_cross_event(side, tmp_path, monkeypatch):
+    frame = _lifecycle_frame(side)
+    clock = [LIFECYCLE_NOW_MS / 1000.0]
+    monkeypatch.setattr(ggpbot.time, "time", lambda: clock[0])
+    journal = TradeJournal(str(tmp_path / f"authorized-{side.lower()}.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame)
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {})
+
+    event = _lifecycle_event(side)
+    event["expires_ts"] = clock[0] + 3600.0
+    assert journal.record_cross_event(**event) is True
+
+    # The lifecycle is confirmed, but no entry permission exists yet.
+    ggpbot._sync_confirmed_cross_events()
+    durable = journal.get_cross_event(event["event_id"])
+    assert durable["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
+    assert durable["metadata"]["entry_ready"] is False
+    assert ggpbot._cross_event_is_usable(event["event_id"], side) is False
+
+    price = float(frame["close"].iloc[-1])
+    atr = float(durable["metadata"]["atr"])
+    zone = {
+        "kind": "ORDER_BLOCK",
+        "side": side,
+        "zone_direction": "DEMAND" if side == "BUY" else "SUPPLY",
+        "zone_definition": "BULLISH_LOW_TO_OPEN" if side == "BUY" else "BEARISH_OPEN_TO_HIGH",
+        "low": price - atr * 0.20,
+        "high": price + atr * 0.20,
+        "available_timestamp": int(durable["metadata"]["latest_closed_timestamp"]),
+        "strength": 8.0,
+    }
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {
+        CANONICAL: {
+            "symbol": CANONICAL,
+            "exchange_symbol": SYMBOL,
+            "side": side,
+            "cross_event_id": event["event_id"],
+            "entry_zone": zone,
+            "entry_behavior": "WAIT_FOR_STRUCTURE",
+            "trading_mode": "TREND",
+            "decision_setup_type": "TREND_CONTINUATION_RETEST",
+        }
+    })
+
+    rows = journal.list_cross_events(("ACTIVE",))
+    assert ggpbot._advance_cross_event_lifecycles(rows) == 1
+    authorized = journal.get_cross_event(event["event_id"])
+    metadata = authorized["metadata"]
+    assert metadata["entry_ready"] is True
+    assert metadata["breakout_candidate"] is True
+    assert metadata["selected_entry_zone"] == zone
+    assert metadata["structural_zone_gate"]["allowed"] is True
+    assert metadata["structural_zone_gate"]["authority"] == "UNIFIED_WATCHLIST_ENTRY_ZONE"
+    assert ggpbot._cross_event_is_usable(event["event_id"], side) is True
+
+    # Hydration must carry the same exact selected zone into the execution gate.
+    ctx = {"entry_zone": dict(zone)}
+    hydrated_gate = {"ready": False}
+    assert ggpbot._hydrate_cross_lifecycle_context(
+        ctx, event["event_id"], hydrated_gate, side, SYMBOL, str(ggpbot.INTERVAL),
+    ) is True
+    assert hydrated_gate["ready"] is True
+    assert hydrated_gate["selected_entry_zone"] == zone
+    assert hydrated_gate["structural_zone_gate"]["allowed"] is True
+
+    # Wrong event, wrong side or stale structural evidence must fail closed.
+    mismatch_ctx = {"entry_zone": {**zone, "available_timestamp": zone["available_timestamp"] - 20 * TF_MS}}
+    mismatch_gate = {"ready": False}
+    ggpbot._hydrate_cross_lifecycle_context(
+        mismatch_ctx, event["event_id"], mismatch_gate, side, SYMBOL, str(ggpbot.INTERVAL),
+    )
+    assert mismatch_gate["selected_entry_zone"] == zone
+    assert ggpbot._cross_event_is_usable(event["event_id"], "SELL" if side == "BUY" else "BUY") is False
+
+
+
 # --------------------------------------------------------------------------- #
 # 8) The same-cycle handoff is bounded, idempotent and lifecycle-aware.
 # --------------------------------------------------------------------------- #
