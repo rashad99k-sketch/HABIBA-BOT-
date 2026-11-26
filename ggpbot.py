@@ -1045,9 +1045,12 @@ def _record_ohlcv_fetch_diagnostic(symbol, reason, *, received=0, detail=""):
 
 def fetch_ohlcv(symbol, limit=150):
     started_at = time.time()
-    sym = str(symbol or "")
+    sym = normalize_symbol(symbol)
+    if not sym:
+        _record_ohlcv_fetch_diagnostic(str(symbol or ""), "INVALID_SYMBOL",
+                                        detail="empty or malformed USDT swap symbol")
+        return None
     try:
-        sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
         if not data:
             rate = _LAST_API_RATE_LIMIT
@@ -1099,8 +1102,12 @@ def fetch_ohlcv(symbol, limit=150):
         return None
 
 def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
+    sym = normalize_symbol(symbol)
+    if not sym:
+        _record_ohlcv_fetch_diagnostic(str(symbol or ""), "INVALID_SYMBOL",
+                                        detail="empty or malformed USDT swap symbol")
+        return None
     try:
-        sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit)
         if not data or len(data) < 30:
             return None
@@ -1116,10 +1123,16 @@ def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
         return None
 
 def fetch_ticker(symbol):
-    return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol))
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return None
+    return safe_api_call(ex.fetch_ticker, sym)
 
 def fetch_orderbook(symbol, limit=20):
-    return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return None
+    return safe_api_call(ex.fetch_order_book, sym, limit)
 
 def get_balance():
     if PAPER_MODE:
@@ -1167,24 +1180,34 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
 
 
 def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
-    """Return (frame, source). `source` is CACHE_HIT or FRESH_REQUEST (or NONE).
+    """Return (frame, source); reject malformed symbols without requiring market metadata.
 
-    A CACHE_HIT means the frame was served from the local cache without any new
-    BingX request; it must never be logged as a new exchange request.
+    Market metadata is authoritative for position/order operations, but market-data
+    fetches must also work with CCXT-compatible exchanges and test doubles before
+    their markets dictionary has been populated. Normalize syntactically here;
+    the exchange remains responsible for confirming market availability.
     """
-    # Increase TTL during open trade to reduce API calls
+    sym = normalize_symbol(symbol)
+    if not sym:
+        _record_ohlcv_fetch_diagnostic(
+            str(symbol or ""), "INVALID_SYMBOL",
+            detail="empty or malformed USDT swap symbol",
+        )
+        return None, "INVALID_SYMBOL"
+
+    # Preserve the established cache namespace/threshold so existing cached
+    # frames remain reusable and market-data refresh cadence does not regress.
     ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 30)
     cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
     cached = cache_get(cache_key, ttl)
-    if cached is not None:
-        if len(cached) >= 100:
-            return cached, "CACHE_HIT"
+    if cached is not None and len(cached) >= 100:
+        return cached, "CACHE_HIT"
     if htf:
-        df = fetch_ohlcv_htf(symbol, '1h', limit)
+        df = fetch_ohlcv_htf(sym, "1h", limit)
     else:
-        df = fetch_ohlcv(symbol, limit)
+        df = fetch_ohlcv(sym, limit)
     if df is not None and validate_dataframe(df, min(limit, 100)):
         cache_set(cache_key, df)
         return df, "FRESH_REQUEST"
@@ -11227,22 +11250,45 @@ def _verify_engine_recovery(symbol=None):
     returns UNKNOWN-like failure, sets the recovery hold for an open exposure and
     never authorizes management or scanner work.
     """
+    global RECOVERY_BLOCK_ENTRIES
     raw_symbol = symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or ""
-    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
     local_open = bool(STATE.get("open") or TRADE_STATE.get("in_position"))
     expected_side = str(STATE.get("side") or TRADE_STATE.get("side") or "").upper()
     expected_qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty")
                               or TRADE_STATE.get("qty"), 0.0)
     context = {
-        "symbol": sym or normalize_symbol(raw_symbol) or str(raw_symbol)[:80],
+        "symbol": str(raw_symbol)[:80],
         "local_open": local_open, "open_position_verified": False,
         "flat_verified": False, "orders_verified": False, "stop_verified": False,
-        "paper_mode": bool(PAPER_MODE), "symbol_diagnostics": symbol_diagnostics,
+        "paper_mode": bool(PAPER_MODE), "symbol_diagnostics": {},
     }
+    # A flat runtime has no trade symbol by design. Verify account-wide exposure
+    # instead of sending an empty symbol through the position-symbol validator.
     if PAPER_MODE:
         context.update({"open_position_verified": local_open, "flat_verified": not local_open,
                         "paper_only": True})
         return True, "PAPER_MODE_RECOVERY", context
+    if not local_open:
+        status, positions = fetch_position_tri_state(None)
+        if status == "FLAT":
+            context.update({"flat_verified": True, "position_query_scope": "ALL_MARKETS"})
+            return True, "FLAT_VERIFIED", context
+        if status == "OPEN":
+            RECOVERY_BLOCK_ENTRIES = True
+            MEMORY["position_status"] = "OPEN"
+            MEMORY["recovery_status"] = "UNEXPECTED_EXCHANGE_EXPOSURE"
+            context["unexpected_open_positions"] = len(positions or [])
+            return False, "engine_recovery_unexpected_exchange_exposure", context
+        RECOVERY_BLOCK_ENTRIES = True
+        MEMORY["position_status"] = "UNKNOWN"
+        MEMORY["recovery_status"] = "EXCHANGE_SYNC_UNKNOWN"
+        return False, "engine_recovery_exchange_state_unknown", context
+
+    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
+    context.update({
+        "symbol": sym or normalize_symbol(raw_symbol) or str(raw_symbol)[:80],
+        "symbol_diagnostics": symbol_diagnostics,
+    })
     if not sym:
         reason = f"engine_recovery_{symbol_reason.lower()}"
         if local_open:
