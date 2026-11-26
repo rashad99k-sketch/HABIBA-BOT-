@@ -37,41 +37,58 @@ def _synthetic_cross_frame():
     return frame, now_ms, ema
 
 
-def test_synthetic_cross_retest_entry_ready_then_execution_rejection_is_traceable():
-    clear_entry_path_diagnostics()
-    frame, now_ms, ema = _synthetic_cross_frame()
-    gate = validate_dual_ema_vwap_entry_gate(
-        frame, "BUY", ema, timeframe_seconds=900, now_ms=now_ms,
-    )
-    assert gate["ready"] is True
+def test_synthetic_cross_retest_entry_ready_then_execution_rejection_is_traceable(monkeypatch, tmp_path):
+    from roro_institutional import InstitutionalDecision, DecisionState
+    import roro_opportunity_pipeline as pipeline_module
+    from roro_opportunity_pipeline import OpportunityPipeline, WatchlistStore
 
-    cross_ts = gate.get("ema9_cross_timestamp") or gate.get("latest_closed_timestamp")
-    record_entry_path_event(
-        "BTC/USDT", "CROSS_CONFIRMED", side="BUY",
-        decision_state="CROSS_CONFIRMED", cross_timestamp=cross_ts,
-        details={"gate_ready": gate["ready"]},
-    )
-    record_entry_path_event(
-        "BTC/USDT", "RETEST_CONFIRMED", side="BUY",
-        decision_state="RETEST_CONFIRMED", cross_timestamp=cross_ts,
-        details={"synthetic": True},
-    )
-    record_entry_path_event(
-        "BTC/USDT", "INSTITUTIONAL_DECISION", side="BUY",
-        decision_state="ENTRY_READY", cross_timestamp=cross_ts,
-        details={"event_id": "synthetic-event-1"},
-    )
+    clear_entry_path_diagnostics()
+
+    class ReadyReversal:
+        def analyze(self, symbol, side, frame, **kwargs):
+            if side == "BUY":
+                return InstitutionalDecision(
+                    DecisionState.ENTRY_READY.value, "FAILED_AUCTION_REVERSAL", side,
+                    "confirmed_failed_auction",
+                    ("failed_auction", "closed_mss", "post_mss_retest:synthetic"),
+                    (), "synthetic-event-1", int(frame.timestamp.iloc[-5]),
+                    100.0, 98.5, 82.0,
+                )
+            return InstitutionalDecision(
+                DecisionState.REJECTED.value, "UNKNOWN", side, "no_structural_setup",
+                rejection_reasons=("no_structural_setup",),
+            )
+
+    class NoContinuation:
+        def analyze(self, symbol, side, frame, **kwargs):
+            return InstitutionalDecision(
+                DecisionState.REJECTED.value, "UNKNOWN", side, "no_continuation",
+                rejection_reasons=("no_continuation",),
+            )
+
+    frame, now_ms, _ema = _synthetic_cross_frame()
+    cross_ts = int(frame.timestamp.iloc[-3])
+    monkeypatch.setattr(pipeline_module, "pre_cross_metrics", lambda *a, **k: {
+        "state": "CROSS_CONFIRMED", "cross": "BULLISH",
+        "candle_ts": cross_ts, "gap_atr": 0.05,
+        "direction": "BUY", "reason": "synthetic_closed_cross",
+    })
+    pipeline = OpportunityPipeline(WatchlistStore(str(tmp_path / "watchlist.json")))
+    pipeline.reversal_engine = ReadyReversal()
+    pipeline.continuation_engine = NoContinuation()
+    setup = pipeline.analyze("BTC/USDT", frame, now_ms=now_ms)
+    assert setup.decision_state == DecisionState.ENTRY_READY.value
+    assert setup.pullback_type == "post_mss_retest"
+
     record_entry_path_event(
         "BTC/USDT", "EMA9_VWAP_GATE", side="BUY",
         decision_state="REJECTED", rejection_reason="stale_ema9_vwap_cross",
-        cross_timestamp=cross_ts,
+        cross_timestamp=setup.crossover_ts,
     )
-
     events = get_entry_path_events("BTC/USDT")
-    assert [event["stage"] for event in events] == [
-        "CROSS_CONFIRMED", "RETEST_CONFIRMED",
-        "INSTITUTIONAL_DECISION", "EMA9_VWAP_GATE",
-    ]
+    stages = [event["stage"] for event in events]
+    assert "EMA9_VWAP_CROSS_OBSERVATION" in stages
+    assert "INSTITUTIONAL_RETEST_DECISION" in stages
     latest = get_entry_path_diagnostics("BTC/USDT")
     assert latest["decision_state"] == "REJECTED"
     assert latest["rejection_reason"] == "stale_ema9_vwap_cross"
