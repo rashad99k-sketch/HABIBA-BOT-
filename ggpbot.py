@@ -7544,6 +7544,27 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _hydrate_cross_lifecycle_context(
             institutional_entry_ctx, cross_event_id, gate_result, side, symbol, gate_tf,
         )
+        durable_zone = gate_result.get("selected_entry_zone")
+        supplied_zone = institutional_entry_ctx.get("entry_zone")
+        if not isinstance(durable_zone, dict) or not isinstance(supplied_zone, dict):
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: durable cross event has no matching selected structural zone",
+                "WARN", debounce_key=f"cross_zone_missing:{cross_event_id}", debounce_sec=10,
+            )
+            return False
+        zone_identity = ("kind", "side", "zone_direction", "available_timestamp")
+        try:
+            same_zone = all(str(supplied_zone.get(key)) == str(durable_zone.get(key)) for key in zone_identity)
+            same_zone = same_zone and math.isclose(float(supplied_zone.get("low")), float(durable_zone.get("low")), rel_tol=1e-10, abs_tol=1e-12)
+            same_zone = same_zone and math.isclose(float(supplied_zone.get("high")), float(durable_zone.get("high")), rel_tol=1e-10, abs_tol=1e-12)
+        except (TypeError, ValueError, OverflowError):
+            same_zone = False
+        if not same_zone:
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: Watchlist zone differs from durable cross-event zone",
+                "WARN", debounce_key=f"cross_zone_mismatch:{cross_event_id}", debounce_sec=10,
+            )
+            return False
         if gate_result.get("durable_event_id") and cross_event_id != gate_result["durable_event_id"]:
             log_execution(
                 f"[CROSS_EVENT] BLOCKED {symbol} {side}: watchlist event {cross_event_id} "
@@ -8913,6 +8934,12 @@ def _hydrate_cross_lifecycle_context(ctx, event_id, gate_result, side, symbol, t
         gate["durable_event_id"] = recomputed_event_id
     gate["lifecycle_phase"] = context["cross_event_phase"]
     gate["lifecycle_entry_ready"] = context["cross_event_entry_ready"]
+    selected_zone = metadata.get("selected_entry_zone")
+    zone_gate = metadata.get("structural_zone_gate")
+    if isinstance(selected_zone, dict):
+        gate["selected_entry_zone"] = dict(selected_zone)
+    if isinstance(zone_gate, dict):
+        gate["structural_zone_gate"] = dict(zone_gate)
     if context["cross_event_entry_ready"] and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED":
         gate["ready"] = True
         gate["authorization_state"] = "POST_CROSS_REJECTION_BREAKOUT_VALID"
