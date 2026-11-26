@@ -956,3 +956,48 @@ def test_dashboard_exposes_entry_lifecycle_stop_and_same_cycle_timing(monkeypatc
     for token in ("Entry type:", "Lifecycle:", "waiting:", "Cross delivery:",
                   "same_cycle=", "refresh_s=", "Validation:", "Gate:"):
         assert token in html
+
+
+
+def test_projection_uses_engine_cross_lifecycle_schema_and_structural_authorization():
+    assert proj.CROSS_LIFECYCLE_SCHEMA == ggpbot.CROSS_LIFECYCLE_SCHEMA
+    zone = {
+        "kind": "ORDER_BLOCK",
+        "side": "BUY",
+        "zone_direction": "DEMAND",
+        "zone_definition": "BULLISH_LOW_TO_OPEN",
+        "low": 99.8,
+        "high": 100.2,
+        "available_timestamp": 1_790_000_000_000,
+        "strength": 8.0,
+    }
+    authorized = _durable_record(
+        side="BUY", phase="BREAKOUT_CONFIRMED", entry_ready=True,
+    )
+    authorized["metadata"].update({
+        "lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA,
+        "breakout_candidate": True,
+        "selected_entry_zone": zone,
+        "structural_zone_gate": {
+            "allowed": True,
+            "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+        },
+    })
+    projected = proj.classify_cross_state(authorized, now_ts=FIXED_NOW)
+    assert projected["cross_event_entry_ready"] is True
+    assert projected["cross_event_phase"] == "BREAKOUT_CONFIRMED"
+
+    blocked = _durable_record(
+        side="BUY", phase="BREAKOUT_CONFIRMED", entry_ready=True,
+    )
+    blocked["metadata"].update({
+        "lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA,
+        "breakout_candidate": True,
+        "selected_entry_zone": zone,
+        "structural_zone_gate": {
+            "allowed": False,
+            "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+        },
+    })
+    rejected = proj.classify_cross_state(blocked, now_ts=FIXED_NOW)
+    assert rejected["cross_event_entry_ready"] is False

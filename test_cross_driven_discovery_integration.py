@@ -826,6 +826,95 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     assert unchanged["metadata"]["entry_ready"] is False
 
 
+    # Complete the positive path through the real serialized PAPER executor.
+    # The Watchlist-selected zone is the only new authority supplied here.
+    latest_closed = int(event["metadata"]["latest_closed_timestamp"])
+    zone = {
+        "kind": "ORDER_BLOCK",
+        "side": "BUY",
+        "zone_direction": "DEMAND",
+        "zone_definition": "BULLISH_LOW_TO_OPEN",
+        "low": price - 0.20 * 0.69,
+        "high": price + 0.20 * 0.69,
+        "available_timestamp": latest_closed,
+        "strength": 8.0,
+    }
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {
+        CANONICAL: {
+            "symbol": CANONICAL,
+            "exchange_symbol": SYMBOL,
+            "side": "BUY",
+            "cross_event_id": event["event_id"],
+            "entry_zone": zone,
+            "entry_behavior": "WAIT_FOR_STRUCTURE",
+            "trading_mode": "TREND",
+            "decision_setup_type": "TREND_CONTINUATION_RETEST",
+        }
+    })
+    assert ggpbot._advance_cross_event_lifecycles(
+        journal.list_cross_events(("ACTIVE",))
+    ) == 1
+    authorized = journal.get_cross_event(event["event_id"])
+    assert authorized["metadata"]["entry_ready"] is True
+    assert authorized["metadata"]["selected_entry_zone"] == zone
+
+    entry_ctx = {
+        "cross_event_id": event["event_id"],
+        "entry_zone": {**zone, "low": zone["low"] - 0.01},
+        "closed_candle_frame": lifecycle_frame,
+        "closed_candle_source": "DETERMINISTIC_TEST_CLOSED_CANDLES",
+        "candle_timeframe": str(ggpbot.INTERVAL),
+        "closed_candle_timestamp": latest_closed,
+        "timeframe_ms": TF_MS,
+        "setup_type": "TREND_CONTINUATION_RETEST",
+        "entry_behavior": "WAIT_FOR_STRUCTURE",
+        "trading_mode": "TREND",
+    }
+    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", entry_ctx, raising=False)
+    monkeypatch.setattr(ggpbot, "_validate_dual_ema_vwap_entry_gate",
+                        lambda *a, **k: {"ready": False, "reason": "delayed_cross"})
+    monkeypatch.setattr(ggpbot, "_entry_location_permission",
+                        lambda *a, **k: (True, {"allowed": True}, "paper_test_authorized"))
+    monkeypatch.setattr(ggpbot, "_rf_reentry_block_permission",
+                        lambda *a, **k: (True, "no_reentry_block"))
+    monkeypatch.setattr(ggpbot, "_rf_reentry_signal_timestamp",
+                        lambda *a, **k: float(latest_closed))
+    monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
+    monkeypatch.setattr(ggpbot, "_portfolio_uncertain", lambda: False)
+    monkeypatch.setattr(ggpbot, "_portfolio_trusted_hint", lambda *a, **k: "TECHNICAL")
+    monkeypatch.setattr(ggpbot, "get_available_balance_snapshot",
+                        lambda: (1000.0, "PAPER_TEST", clock[0]))
+    monkeypatch.setattr(ggpbot.PORTFOLIO_ALLOCATOR, "reserve",
+                        lambda *a, **k: type("Reservation", (), {"ok": True, "reason": "OK"})())
+    monkeypatch.setattr(ggpbot, "_portfolio_adopt_candidate", lambda *a, **k: True)
+    monkeypatch.setattr(ggpbot, "_recompute_portfolio_globals", lambda *a, **k: None)
+
+    # A mismatched Watchlist handoff must be rejected before PAPER exposure or
+    # durable event consumption.
+    assert ggpbot.execute_entry(
+        "BUY", SYMBOL, price, price - 2.0, price + 0.8, price + 1.5, 80,
+        "PAPER_EXECUTION_WITH_MISMATCHED_WATCHLIST_ZONE", 0.69,
+        "TREND", "TREND", "TREND",
+    ) is False
+    assert ggpbot.paper.get("position") is None
+    still_active = journal.get_cross_event(event["event_id"])
+    assert still_active["status"] == "ACTIVE"
+
+    # Exact same zone, event and direction may proceed through PAPER only.
+    entry_ctx["entry_zone"] = dict(zone)
+    assert ggpbot.execute_entry(
+        "BUY", SYMBOL, price, price - 2.0, price + 0.8, price + 1.5, 80,
+        "PAPER_EXECUTION_WITH_MATCHING_WATCHLIST_ZONE", 0.69,
+        "TREND", "TREND", "TREND",
+    ) is True
+    assert ggpbot.paper.get("position") is not None
+    assert ggpbot.STATE.get("open") is True
+    consumed = journal.get_cross_event(event["event_id"])
+    assert consumed["status"] == "ENTERED"
+    assert consumed.get("consumed_trade_id")
+    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
+
+
 @pytest.mark.parametrize("side", ["BUY", "SELL"])
 def test_matching_watchlist_zone_authorizes_durable_cross_event(side, tmp_path, monkeypatch):
     frame = _lifecycle_frame(side)
