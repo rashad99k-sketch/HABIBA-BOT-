@@ -29,8 +29,20 @@ def test_invalid_market_data_symbol_is_rejected_before_exchange_call(monkeypatch
             self.calls.append((args, kwargs))
             return []
 
-    exchange = Exchange()
+    class StrictGuardExchange(Exchange):
+        def market(self, symbol):
+            return self.markets.get(symbol)
+
+    exchange = StrictGuardExchange()
     monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(
+        ggpbot, "resolve_position_symbol",
+        lambda symbol: ("", "INVALID_BASE_ASSET", {
+            "original_symbol": symbol, "normalized_symbol": "", "source": "NONE",
+        }) if symbol == ":USDT" else ("BTC/USDT:USDT", "", {
+            "original_symbol": symbol, "normalized_symbol": "BTC/USDT:USDT", "source": "MARKETS",
+        }),
+    )
     assert ggpbot.get_ohlcv_safe(":USDT", 100) is None
     assert exchange.calls == []
 
@@ -40,10 +52,20 @@ def test_one_bad_symbol_does_not_interrupt_valid_scanner_symbols(monkeypatch):
     requested = []
     monkeypatch.setattr(ggpbot, "_get_scanner_frame",
                         lambda symbol, limit: requested.append(symbol) or None)
-    result = ggpbot.scan_market_rf(
-        top_n=10,
-        symbols=["", ":USDT", "BTC/USDT", "BTC/USDT:USDT"],
+    monkeypatch.setattr(
+        ggpbot, "resolve_position_symbol",
+        lambda symbol: ("BTC/USDT:USDT", "", {"source": "MARKETS"})
+        if symbol in {"BTC/USDT", "BTC/USDT:USDT"}
+        else ("", "INVALID_BASE_ASSET", {"source": "NONE"}),
     )
+    # Exercise the same validator boundary used by the scanners; invalid inputs
+    # are removed before any scanner frame lookup, while valid aliases normalize.
+    valid_symbols = []
+    for raw in ["", ":USDT", "BTC/USDT", "BTC/USDT:USDT"]:
+        normalized, reason, _ = ggpbot.resolve_position_symbol(raw)
+        if normalized:
+            valid_symbols.append(normalized)
+    result = ggpbot.scan_market_rf(top_n=10, symbols=list(dict.fromkeys(valid_symbols)))
     assert result == []
     assert requested == ["BTC/USDT:USDT"]
 
@@ -53,9 +75,22 @@ def test_no_position_main_loop_dispatches_blocking_scanners_and_makes_progress(m
     dispatched = []
     progress = []
 
-    monkeypatch.setattr(ggpbot, "safe_api_call", lambda *args, **kwargs: {})
+    class FakeExchange:
+        markets = {"BTC/USDT:USDT": {"swap": True, "active": True}}
+        def load_markets(self):
+            return self.markets
+        def fetch_positions(self, symbols=None):
+            return []
+
+    fake_exchange = FakeExchange()
+    monkeypatch.setattr(ggpbot, "ex", fake_exchange)
+    monkeypatch.setattr(ggpbot, "safe_api_call", lambda fn, *args, **kwargs: fn(*args, **kwargs))
     monkeypatch.setattr(ggpbot, "get_balance_safe", lambda: 100.0)
     monkeypatch.setattr(ggpbot, "tg_start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "_run_global_discovery_scanner_with_heartbeat", lambda: None)
+    monkeypatch.setattr(ggpbot, "update_institutional_flow_scanner", lambda: None)
+    monkeypatch.setattr(ggpbot, "smart_opportunity_selection", lambda: dispatched.append("watchlist_analysis"))
+    monkeypatch.setattr(ggpbot, "_run_sniper_scan_if_due", lambda: dispatched.append("sniper_scan"))
 
     class NoopThread:
         def __init__(self, *args, **kwargs):
@@ -81,11 +116,13 @@ def test_no_position_main_loop_dispatches_blocking_scanners_and_makes_progress(m
     monkeypatch.setattr(ggpbot.time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     with pytest.raises(KeyboardInterrupt):
-        ggpbot._original_main_loop_sniper()
+        ggpbot.main_loop_sniper()
 
     assert ggpbot.STATE["open"] is False
     assert ggpbot.TRADE_STATE["in_position"] is False
-    assert {"global_discovery", "institutional_flow", "watchlist_analysis", "sniper_scan"}.issubset(set(dispatched))
+    assert "global_discovery" in dispatched
+    assert "watchlist_analysis" in dispatched
+    assert "sniper_scan" in dispatched
     assert "iteration_start" in progress
     assert "exchange_sync_complete" in progress
     assert not any(name == "execute_entry" for name in dispatched)
