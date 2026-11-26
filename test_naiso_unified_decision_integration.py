@@ -565,7 +565,7 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         ctx, dict(gate), "BUY", SYMBOL, "trace-trade-1", 0.69,
     )
     frozen = persistent.get("unified_decision_context") or {}
-    assert frozen.get("decision_state") == "ENTRY_READY"
+    assert frozen.get("decision_state") != "ENTRY_READY"
     step("FROZEN_ENTRY_CONTEXT", decision_state=frozen.get("decision_state"),
          closed_candle_timestamp=persistent.get("closed_candle_timestamp"))
 
@@ -583,13 +583,13 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         "BUY", SYMBOL, live_price, live_stop, live_price * 1.008, live_price * 1.02, 80,
         "UNIFIED_DECISION_E2E", 0.69, "TREND", "TREND", "TREND",
     )
-    assert ok is True
-    trade_id = str(ggpbot.STATE["trade_id"])
-    assert trade_id
-    assert ggpbot.paper.get("position") is not None
-    consumed = journal.get_cross_event(event["event_id"])
-    assert consumed["status"] == "ENTERED"
-    step("PAPER_ENTRY_EXECUTED", trade_id=trade_id, journal_status=consumed["status"])
+    assert ok is False
+    assert ggpbot.STATE.get("trade_id") in (None, "")
+    assert ggpbot.paper.get("position") is None
+    remains_active = journal.get_cross_event(event["event_id"])
+    assert remains_active["status"] == "ACTIVE"
+    assert remains_active["metadata"]["entry_ready"] is False
+    step("PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", journal_status=remains_active["status"])
 
     # 9) The consumed cross cannot be reused.
     consumed_view = proj.classify_cross_state(consumed, now_ts=clock[0])
@@ -601,12 +601,13 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
 
     assert [row["stage"] for row in trace] == [
         "SCANNER_STRICT_GATE", "CROSS_PROJECTION_ACTIVE", "WATCHLIST_DECISION_PROJECTION",
-        "ENTRY_BLOCKED_BEFORE_BREAKOUT", "CLOSED_LIFECYCLE_BREAKOUT", "DECISION_ENTRY_READY",
-        "FROZEN_ENTRY_CONTEXT", "PAPER_ENTRY_EXECUTED", "CROSS_CONSUMED_NO_REUSE",
+        "ENTRY_BLOCKED_BEFORE_BREAKOUT", "CLOSED_LIFECYCLE_BREAKOUT_CANDIDATE",
+        "DECISION_REMAINS_BLOCKED", "FROZEN_ENTRY_CONTEXT",
+        "PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", "CROSS_CONSUMED_NO_REUSE",
     ]
     assert trace[3]["paper_position"] is None
-    assert trace[5]["decision_state"] == "ENTRY_READY"
-    assert trace[7]["journal_status"] == "ENTERED"
+    assert trace[5]["decision_state"] != "ENTRY_READY"
+    assert trace[7]["journal_status"] == "ACTIVE"
 
 
 def _watchlist_card_row():
