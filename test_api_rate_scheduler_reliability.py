@@ -369,13 +369,18 @@ def test_order_placement_and_cancellation_share_trade_write_quota(monkeypatch):
     def cancel_order():
         calls.append(("cancel", clock[0]))
 
+    def cancel_all_orders():
+        calls.append(("cancel_all", clock[0]))
+
     ggpbot.rate_limit(create_order)
     create_order()
     ggpbot.rate_limit(cancel_order)
     cancel_order()
+    ggpbot.rate_limit(cancel_all_orders)
+    cancel_all_orders()
 
-    assert [name for name, _ in calls] == ["create", "cancel"]
-    assert [value for _, value in calls] == pytest.approx([4001.05, 4002.10])
-    assert sleeps == pytest.approx([1.05, 1.05])
+    assert [name for name, _ in calls] == ["create", "cancel", "cancel_all"]
+    assert [value for _, value in calls] == pytest.approx([4001.05, 4002.10, 4003.15])
+    assert sleeps == pytest.approx([1.05, 1.05, 1.05])
     assert not ggpbot._API_RATE_LOCK.locked()
 
