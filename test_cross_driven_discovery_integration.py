@@ -927,3 +927,31 @@ def test_two_cross_symbols_keep_distinct_events_sides_and_stops(tmp_path, monkey
         assert row["cross_event_status"] == "ACTIVE"
         assert row["decision_context"]["authority"] == "UNIFIED_ENTRY_AUTHORITY_UNCHANGED"
         assert row["entry_behavior_context"]["classification_source"] in {"GGP_MARKET_INTELLIGENCE", "NONE"}
+
+
+@pytest.mark.parametrize(
+    "side,zone,price,expected",
+    [
+        ("BUY", {
+            "kind": "ORDER_BLOCK", "side": "BUY", "zone_direction": "DEMAND",
+            "zone_definition": "BULLISH_LOW_TO_OPEN", "low": 99.5, "high": 100.2,
+            "available_timestamp": 1_800_000_000_000, "strength": 8.0,
+        }, 100.0, (True, "selected_entry_zone_validated")),
+        ("SELL", {
+            "kind": "ORDER_BLOCK", "side": "SELL", "zone_direction": "SUPPLY",
+            "zone_definition": "BEARISH_OPEN_TO_HIGH", "low": 99.8, "high": 100.5,
+            "available_timestamp": 1_800_000_000_000, "strength": 8.0,
+        }, 100.0, (True, "selected_entry_zone_validated")),
+        ("BUY", {
+            "kind": "ORDER_BLOCK", "side": "SELL", "zone_direction": "SUPPLY",
+            "zone_definition": "BEARISH_OPEN_TO_HIGH", "low": 99.5, "high": 100.2,
+            "available_timestamp": 1_800_000_000_000, "strength": 8.0,
+        }, 100.0, (False, "entry_zone_side_mismatch")),
+    ],
+)
+def test_selected_entry_zone_validator_requires_exact_side_contract(side, zone, price, expected):
+    result = ggpbot._validate_selected_entry_zone(
+        zone, side, price=price, atr=1.0,
+        latest_timestamp=1_800_000_000_000, timeframe_ms=900_000,
+    )
+    assert result == expected
