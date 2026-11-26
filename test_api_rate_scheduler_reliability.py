@@ -325,8 +325,11 @@ def test_endpoint_pacing_lanes_do_not_serialize_unrelated_methods(monkeypatch):
         starts.append(("b", clock[0]))
 
     ggpbot.rate_limit(probe_a)
+    probe_a()
     ggpbot.rate_limit(probe_b)
+    probe_b()
     ggpbot.rate_limit(probe_a)
+    probe_a()
 
     assert [name for name, _ in starts] == ["a", "b", "a"]
     assert [value for _, value in starts] == pytest.approx([2001.0, 2001.1, 2002.0])
