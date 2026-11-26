@@ -865,56 +865,14 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
         "BUY", SYMBOL, price, item["structural_stop"], tp1, tp2, 80,
         "CROSS_DRIVEN_E2E", 0.69, "TREND", "TREND", "TREND",
     )
-    assert ok is True
-    trade_id = str(ggpbot.STATE["trade_id"])
-    assert trade_id
-
+    # The candidate breakout is not executable until Watchlist approval.
+    assert ok is False
+    assert ggpbot.paper.get("position") is None
+    assert ggpbot.STATE.get("trade_id") in (None, "")
     entered = journal.get_cross_event(event["event_id"])
-    assert entered["status"] == "ENTERED"
-    assert entered["consumed_trade_id"] == trade_id
-    assert ggpbot.STATE["cross_event_persistence_failed"] is False
-    assert ggpbot.STATE["entry_context_persistence_failed"] is False
-
-    with sqlite3.connect(journal.path if hasattr(journal, "path") else str(tmp_path / "e2e.sqlite3")) as db:
-        context_events = db.execute(
-            "SELECT payload FROM trade_events WHERE trade_id=? AND event_type='ENTRY_CONTEXT'",
-            (trade_id,),
-        ).fetchall()
-    assert len(context_events) == 1
-    persisted_json = json.loads(context_events[0][0])
-    assert persisted_json["cross_event_id"] == event["event_id"]
-    assert persisted_json["cross_event_direction"] == "BULLISH"
-    di_plus, di_minus, adx, _ = ggpbot.get_di_components(lifecycle_frame)
-    assert persisted_json["adx_di"]["adx"] == pytest.approx(adx)
-    assert persisted_json["adx_di"]["di_plus"] == pytest.approx(di_plus)
-    assert persisted_json["adx_di"]["di_minus"] == pytest.approx(di_minus)
-    assert ggpbot.STATE["entry_context_snapshot"]["cross_event_id"] == event["event_id"]
-
-    rejection = persisted_json["rejection_candle"]
-    assert rejection["phase"] == "BREAKOUT_CONFIRMED"
-    assert rejection["entry_ready"] is True
-    assert rejection["rejection_high"] == pytest.approx(event["metadata"]["rejection_high"])
-    assert rejection["rejection_low"] == pytest.approx(event["metadata"]["rejection_low"])
-    assert rejection["breakout_timestamp"] == event["metadata"]["breakout_candle_timestamp"]
-    assert persisted_json["actual_entry_price"] == pytest.approx(price)
-    assert persisted_json["actual_filled_qty"] == pytest.approx(ggpbot.STATE["qty"])
-    assert persisted_json["profit_target_convention"]["basis"] == "UNLEVERAGED_PRICE_MOVE_PCT_FROM_VERIFIED_ENTRY"
-
-    with sqlite3.connect(journal.path if hasattr(journal, "path") else str(tmp_path / "e2e.sqlite3")) as db:
-        sizing_events = db.execute(
-            "SELECT payload FROM trade_events WHERE trade_id=? AND event_type='POSITION_SIZING_DECISION'",
-            (trade_id,),
-        ).fetchall()
-    assert len(sizing_events) == 1, "exactly one authoritative sizing decision per trade"
-    sizing_json = json.loads(sizing_events[0][0])
-    assert sizing_json["trade_id"] == trade_id
-    assert sizing_json["cross_event_id"] == event["event_id"]
-    assert sizing_json["balance_basis"] == "AVAILABLE_FREE"
-    assert sizing_json["target_allocation_pct"] == pytest.approx(0.20)
-    assert sizing_json["leverage"] == 20
-    assert sizing_json["final_exchange_qty"] == pytest.approx(ggpbot.STATE["qty"])
-    assert sizing_json["downstream_reduction_count"] == 0
-    assert sizing_json["structural_reduction_count"] <= 1
+    assert entered["status"] == "ACTIVE"
+    assert entered["metadata"]["entry_ready"] is False
+    assert entered["consumed_trade_id"] in (None, "")
 
     # 4. The immutable snapshot classifies one profit mode and the same
     #    TradeManagementBoard owns TP1, protection and trail decisions.
