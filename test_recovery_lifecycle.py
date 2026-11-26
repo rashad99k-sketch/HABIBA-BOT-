@@ -1003,6 +1003,23 @@ def test_startup_flat_keeps_hold_when_pending_close_order_cannot_be_verified(tmp
     assert "CLOSE_ORDER" in str(ggpbot.STATE["recovery_reason"])
 
 
+def test_startup_flat_keeps_hold_for_pending_entry_state_without_order_id(tmp_path, monkeypatch):
+    journal = TradeJournal(str(Path(tmp_path) / "pending-entry-no-id.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "ex", MockExchange(position=None))
+    monkeypatch.setattr(ggpbot, "_persisted_recovery_hold_active", lambda: True)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "recovery_hold": True, "execution_unresolved": False,
+        "entry_execution_state": "ENTRY_PENDING", "entry_exchange_order_id": None,
+        "entry_client_order_id": None, "entry_order_terminal": False,
+    })
+    assert ggpbot.startup_trade_recovery() is False
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert "WITHOUT_ORDER_ID" in str(ggpbot.STATE["recovery_reason"])
+
+
 def test_startup_flat_releases_entry_hold_only_after_terminal_order_readback(tmp_path, monkeypatch):
     journal = TradeJournal(str(Path(tmp_path) / "terminal-entry.sqlite3"))
     monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
