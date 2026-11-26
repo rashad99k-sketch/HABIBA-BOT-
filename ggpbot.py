@@ -658,6 +658,12 @@ API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC = _env_float_range(
 _API_RATE_LOCK_OWNER = {
     "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
 }
+# Separate the shared request-start floor from endpoint-specific pacing.
+# Reservations are made atomically once; callers sleep outside the lock and never
+# repeatedly compete for the same slot.
+_API_RATE_METHOD_LAST_RESERVED = {}
+_API_RATE_METHOD_LAST_START = {}
+_API_RATE_LAST_START = 0.0
 _LAST_API_RATE_LIMIT = {"ts": 0.0, "method": "", "message": ""}
 
 # Overall pacing budget. The old loop only bounded each lock acquisition, so a
@@ -674,16 +680,17 @@ class ApiRateLockTimeout(RuntimeError):
 
 
 def rate_limit(func=None):
-    """Reserve the next request start with bounded, progress-checked pacing.
+    """Reserve a fair, bounded request slot using global and per-endpoint clocks.
 
-    The lock is held only while reading/reserving ``_last_api_call``; pacing
-    sleeps always happen after release. Every acquisition and the complete wait
-    are bounded by both the logical clock and a real monotonic clock captured
-    before any test can replace ``ggpbot.time``. A clock that makes no progress
-    fails closed instead of spinning in a zero-progress sleep loop.
+    The global floor remains MIN_API_INTERVAL. Endpoint-specific limits are
+    independent lanes, so (for example) OHLCV pacing cannot serialize ticker,
+    order-book, account, or execution endpoints at the OHLCV interval.
+    Reservation is atomic and happens once; waiting never holds the scheduler
+    lock and never loops by repeatedly reacquiring the same reservation.
     """
-    global _last_api_call
+    global _last_api_call, _API_RATE_LAST_START
     method_name = getattr(func, "__name__", "") if func is not None else ""
+    method_name = str(method_name or "exchange_call")
 
     def _finite(value):
         try:
@@ -691,231 +698,158 @@ def rate_limit(func=None):
         except (TypeError, ValueError, OverflowError):
             return False
 
-    configured_interval = _API_METHOD_MIN_INTERVALS.get(method_name, MIN_API_INTERVAL)
-    if not (_finite(MIN_API_INTERVAL) and _finite(configured_interval)):
+    base_interval = float(MIN_API_INTERVAL)
+    endpoint_interval = float(_API_METHOD_MIN_INTERVALS.get(method_name, base_interval))
+    if (not _finite(base_interval) or not _finite(endpoint_interval)
+            or base_interval <= 0.0 or endpoint_interval <= 0.0):
         raise ApiRateLockTimeout(
-            f"API_RATE rejected non-finite interval for {method_name or 'unknown'}; "
-            f"base={MIN_API_INTERVAL!r} endpoint={configured_interval!r}"
+            f"API_RATE rejected invalid interval for {method_name}; "
+            f"base={base_interval!r} endpoint={endpoint_interval!r}"
         )
-    min_interval = max(MIN_API_INTERVAL, configured_interval)
+    endpoint_interval = max(base_interval, endpoint_interval)
+    tolerance = max(1e-12, endpoint_interval * 1e-9)
 
-    # Non-finite clock values are never a reason to sleep or reserve a request
-    # start. Fail closed before acquiring the shared lock so no exchange call
-    # can be dispatched from an undefined pacing state.
-    real_now = _HARD_MONOTONIC()
-    logical_now = time.monotonic()
-    if not (_finite(real_now) and _finite(logical_now)
-            and _finite(min_interval) and _finite(_last_api_call)):
+    real_deadline = _HARD_MONOTONIC() + API_RATE_WAIT_TIMEOUT_SEC
+    logical_start = time.monotonic()
+    logical_deadline = logical_start + API_RATE_WAIT_TIMEOUT_SEC
+    if not (_finite(real_deadline) and _finite(logical_start)
+            and _finite(logical_deadline) and _finite(_last_api_call)):
         raise ApiRateLockTimeout(
-            f"API_RATE rejected non-finite pacing state for {method_name or 'unknown'}; "
-            f"real={real_now!r} logical={logical_now!r} interval={min_interval!r} "
+            f"API_RATE rejected non-finite pacing state for {method_name}; "
+            f"real_deadline={real_deadline!r} logical={logical_start!r} "
             f"last_call={_last_api_call!r}"
         )
 
-    # Two independent budgets: the logical clock may be replaced by tests, but
-    # real elapsed time is captured from the original monotonic function so a
-    # frozen/injected clock can never remove the hard termination guarantee.
-    real_deadline = real_now + API_RATE_WAIT_TIMEOUT_SEC
-    logical_deadline = logical_now + API_RATE_WAIT_TIMEOUT_SEC
-    # A reservation within one float ULP of its due time is already on time;
-    # this prevents sub-ULP residue from producing an endless one-nanosecond
-    # sleep loop.
-    interval_tolerance = max(1e-12, min_interval * 1e-9)
-
-    for _iteration in range(API_RATE_MAX_WAIT_ITERATIONS):
-        remaining_real = real_deadline - _HARD_MONOTONIC()
-        remaining_logical = logical_deadline - time.monotonic()
-        if remaining_real <= 0.0 or remaining_logical <= 0.0:
+    def _remaining():
+        real_left = real_deadline - _HARD_MONOTONIC()
+        logical_now = time.monotonic()
+        logical_left = logical_deadline - logical_now
+        if not (_finite(real_left) and _finite(logical_now) and _finite(logical_left)):
             raise ApiRateLockTimeout(
-                f"API_RATE pacing deadline exceeded for {method_name or 'unknown'}; "
-                f"remaining_logical={remaining_logical:.6f}s "
-                f"remaining_real={remaining_real:.6f}s"
+                f"API_RATE rejected non-finite clock while scheduling {method_name}"
             )
+        if real_left <= 0.0 or logical_left <= 0.0:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing deadline exceeded for {method_name}; "
+                f"remaining_logical={logical_left:.6f}s remaining_real={real_left:.6f}s"
+            )
+        return real_left, logical_left, logical_now
 
+    def _acquire_scheduler_lock():
+        real_left, logical_left, _ = _remaining()
         acquire_timeout = max(
             0.0,
-            min(API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC, remaining_real, remaining_logical),
+            min(API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC, real_left, logical_left),
         )
-        acquired = _API_RATE_LOCK.acquire(timeout=acquire_timeout)
-        if not acquired:
+        if not _API_RATE_LOCK.acquire(timeout=acquire_timeout):
             owner = dict(_API_RATE_LOCK_OWNER)
             owner_since = float(owner.get("since_monotonic") or 0.0)
             held_for = max(0.0, time.monotonic() - owner_since) if owner_since > 0 else 0.0
             raise ApiRateLockTimeout(
-                f"API_RATE_LOCK acquisition timed out after "
-                f"{acquire_timeout:.2f}s for {method_name or 'unknown'}; "
-                f"owner_thread={owner.get('thread_name') or 'unknown'} "
+                f"API_RATE_LOCK acquisition timed out after {acquire_timeout:.2f}s "
+                f"for {method_name}; owner_thread={owner.get('thread_name') or 'unknown'} "
                 f"owner_id={owner.get('thread_id')} held_for={held_for:.2f}s "
                 f"owner_method={owner.get('method') or 'unknown'}"
             )
-
-        wait_seconds = 0.0
-        owner_now = time.monotonic()
         _API_RATE_LOCK_OWNER.update({
             "thread_id": threading.get_ident(),
             "thread_name": threading.current_thread().name,
-            "since_monotonic": owner_now,
+            "since_monotonic": time.monotonic(),
             "method": method_name,
         })
-        try:
-            now = time.monotonic()
-            if not _finite(now):
+
+    def _release_scheduler_lock():
+        _API_RATE_LOCK_OWNER.update({
+            "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
+        })
+        _API_RATE_LOCK.release()
+
+    def _wait_until(target, phase):
+        for _iteration in range(API_RATE_MAX_WAIT_ITERATIONS):
+            real_left, logical_left, logical_now = _remaining()
+            wait_seconds = float(target) - logical_now
+            if not _finite(wait_seconds):
                 raise ApiRateLockTimeout(
-                    f"API_RATE rejected non-finite logical clock for {method_name or 'unknown'}"
+                    f"API_RATE rejected non-finite {phase} wait for {method_name}"
                 )
-            due = float(_last_api_call) + min_interval
-            if not _finite(due):
-                raise ApiRateLockTimeout(
-                    f"API_RATE rejected non-finite reservation deadline for {method_name or 'unknown'}"
-                )
-            if now + interval_tolerance >= due:
-                # Reserve at the exact due time so repeated small sleeps cannot
-                # accumulate drift across a high-iteration stress run.
-                _last_api_call = max(now, due)
+            if wait_seconds <= tolerance:
                 return
-            remaining_real = real_deadline - _HARD_MONOTONIC()
-            remaining_logical = logical_deadline - now
-            wait_seconds = min(due - now, remaining_real, remaining_logical)
-        finally:
-            _API_RATE_LOCK_OWNER.update({
-                "thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""
-            })
-            _API_RATE_LOCK.release()
-
-        if wait_seconds <= 0.0:
-            raise ApiRateLockTimeout(
-                f"API_RATE pacing budget exhausted before reservation for "
-                f"{method_name or 'unknown'}"
-            )
-
-        # Every sleep is strictly positive and at least one quantum. A coarse
-        # clock may not tick for a tiny sleep; that is safe because both the
-        # deadline and the iteration budget still bound the loop.
-        sleep_for = max(float(wait_seconds), API_RATE_MIN_SLEEP_SEC)
-        if sleep_for > remaining_real or sleep_for > remaining_logical:
-            raise ApiRateLockTimeout(
-                f"API_RATE pacing deadline would be exceeded by sleep for "
-                f"{method_name or 'unknown'}"
-            )
-        time.sleep(sleep_for)
-
-    raise ApiRateLockTimeout(
-        f"API_RATE pacing iteration budget ({API_RATE_MAX_WAIT_ITERATIONS}) "
-        f"exhausted for {method_name or 'unknown'}"
-    )
-
-CACHE_LOCK = threading.RLock()
-CACHE_MAX_ITEMS = _env_int_range("CACHE_MAX_ITEMS", 2500, 100, 10000)
-
-# One canonical market-data snapshot per symbol/timeframe. All callers (live
-# management, discovery scanners and the institutional Watchlist) share this
-# snapshot; caller-specific `limit` values only slice the cached frame.
-OHLCV_CACHE_LIMIT = 150
-OHLCV_RATE_LIMIT_COOLDOWN_SEC = _env_float_range("OHLCV_RATE_LIMIT_COOLDOWN_SEC", 3.0, 1.0, 15.0)
-_OHLCV_INFLIGHT_LOCKS = {}
-_OHLCV_INFLIGHT_GUARD = threading.Lock()
-_OHLCV_RATE_COOLDOWN = {"until": 0.0, "symbol_until": {}}
-
-
-def _ohlcv_inflight_lock(key):
-    """Return a stable per-key lock so concurrent callers cannot duplicate a fetch."""
-    with _OHLCV_INFLIGHT_GUARD:
-        lock = _OHLCV_INFLIGHT_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _OHLCV_INFLIGHT_LOCKS[key] = lock
-        return lock
-
-
-def _ohlcv_canonical_cache_key(symbol, limit, *, htf=False):
-    """Canonicalize symbol aliases and limit buckets into one cache identity."""
-    try:
-        canonical = normalize_symbol(symbol)
-    except Exception:
-        canonical = str(symbol or "").strip().upper()
-    timeframe = "1h" if htf else str(INTERVAL)
-    return canonical, f"ohlcv_v2_{canonical}_{timeframe}_{OHLCV_CACHE_LIMIT}", timeframe
-
-
-def _ohlcv_cache_get(key, ttl, timeframe):
-    """Read one canonical OHLCV snapshot while its bounded TTL is valid.
-
-    Candle-level staleness is evaluated by ``resolve_entry_closed_candles`` where
-    it can trigger one governed refresh. The shared cache itself deliberately
-    keeps the established TTL semantics so management/scanner callers do not
-    issue duplicate requests between candles.
-    """
-    with CACHE_LOCK:
-        item = CACHE.get(key)
-        if not isinstance(item, dict) or "value" not in item or "ts" not in item:
-            return None
-        if time.time() - float(item["ts"]) >= ttl:
-            CACHE.pop(key, None)
-            return None
-        return item["value"]
-
-
-def _ohlcv_cache_set(key, frame, timeframe):
-    with CACHE_LOCK:
-        CACHE[key] = {
-            "value": frame.copy(),
-            "ts": time.time(),
-            "timeframe": str(timeframe),
-        }
-        if len(CACHE) > CACHE_MAX_ITEMS:
-            dated = sorted(
-                ((float(v.get("ts", 0)), k) for k, v in CACHE.items()
-                 if isinstance(v, dict) and "ts" in v and "value" in v),
-                key=lambda item: item[0]
-            )
-            for _, old_key in dated[:max(1, len(CACHE) - CACHE_MAX_ITEMS)]:
-                CACHE.pop(old_key, None)
-
-
-def _ohlcv_rate_limit_cooldown_remaining(symbol):
-    now = time.monotonic()
-    with _OHLCV_INFLIGHT_GUARD:
-        until = max(
-            float(_OHLCV_RATE_COOLDOWN.get("until", 0.0)),
-            float(_OHLCV_RATE_COOLDOWN.get("symbol_until", {}).get(str(symbol), 0.0)),
+            if wait_seconds > real_left or wait_seconds > logical_left:
+                raise ApiRateLockTimeout(
+                    f"API_RATE pacing deadline exceeded for {method_name} during {phase}; "
+                    f"required={wait_seconds:.6f}s remaining_logical={logical_left:.6f}s "
+                    f"remaining_real={real_left:.6f}s"
+                )
+            sleep_for = max(float(wait_seconds), API_RATE_MIN_SLEEP_SEC)
+            if sleep_for > real_left or sleep_for > logical_left:
+                raise ApiRateLockTimeout(
+                    f"API_RATE pacing deadline would be exceeded for {method_name} during {phase}"
+                )
+            time.sleep(sleep_for)
+        raise ApiRateLockTimeout(
+            f"API_RATE pacing iteration budget ({API_RATE_MAX_WAIT_ITERATIONS}) "
+            f"exhausted for {method_name} during {phase}"
         )
-    return max(0.0, until - now)
 
-
-def _mark_ohlcv_rate_limit_cooldown(symbol):
-    """Fence repeat kline requests briefly after a confirmed exchange rate-limit."""
-    now = time.monotonic()
-    until = now + OHLCV_RATE_LIMIT_COOLDOWN_SEC
-    with _OHLCV_INFLIGHT_GUARD:
-        _OHLCV_RATE_COOLDOWN["until"] = max(float(_OHLCV_RATE_COOLDOWN.get("until", 0.0)), until)
-        symbol_until = _OHLCV_RATE_COOLDOWN.setdefault("symbol_until", {})
-        symbol_until[str(symbol)] = max(float(symbol_until.get(str(symbol), 0.0)), until)
-        if len(symbol_until) > 500:
-            for key in [k for k, v in symbol_until.items() if float(v) <= now]:
-                symbol_until.pop(key, None)
-
-
-def cache_get(key, ttl):
-    with CACHE_LOCK:
-        item = CACHE.get(key)
-        if isinstance(item, dict) and "ts" in item and "value" in item:
-            if time.time() - float(item["ts"]) < ttl:
-                return item["value"]
-            CACHE.pop(key, None)
-    return None
-
-def cache_set(key, value):
-    now = time.time()
-    with CACHE_LOCK:
-        CACHE[key] = {"value": value, "ts": now}
-        if len(CACHE) > CACHE_MAX_ITEMS:
-            dated = sorted(
-                ((float(v.get("ts", 0)), k) for k, v in CACHE.items()
-                 if isinstance(v, dict) and "ts" in v and "value" in v),
-                key=lambda item: item[0]
+    # Reserve one slot under a short critical section. The global floor protects
+    # aggregate traffic; each endpoint clock applies only to calls of that API.
+    _acquire_scheduler_lock()
+    try:
+        real_left, logical_left, now = _remaining()
+        global_due = float(_last_api_call) + base_interval
+        method_previous = _API_RATE_METHOD_LAST_RESERVED.get(method_name)
+        method_due = (
+            float(method_previous) + endpoint_interval
+            if method_previous is not None else now
+        )
+        if not (_finite(global_due) and _finite(method_due)):
+            raise ApiRateLockTimeout(
+                f"API_RATE rejected non-finite reservation deadline for {method_name}"
             )
-            for _, old_key in dated[:max(1, len(CACHE) - CACHE_MAX_ITEMS)]:
-                CACHE.pop(old_key, None)
+        reserved_at = max(now, global_due, method_due)
+        wait_seconds = reserved_at - now
+        if wait_seconds > real_left or wait_seconds > logical_left:
+            raise ApiRateLockTimeout(
+                f"API_RATE pacing deadline exceeded for {method_name}; "
+                f"reservation_wait={wait_seconds:.6f}s "
+                f"remaining_logical={logical_left:.6f}s remaining_real={real_left:.6f}s"
+            )
+        _last_api_call = reserved_at
+        _API_RATE_METHOD_LAST_RESERVED[method_name] = reserved_at
+    finally:
+        _release_scheduler_lock()
+
+    # No scheduler lock is held during pacing sleep.
+    _wait_until(reserved_at, "reserved_slot")
+
+    # Protect actual request starts against OS thread wake-up reordering. A
+    # delayed earlier thread cannot let a later thread violate either interval.
+    for _iteration in range(API_RATE_MAX_WAIT_ITERATIONS):
+        _acquire_scheduler_lock()
+        retry_at = None
+        try:
+            _, _, now = _remaining()
+            global_actual_due = (
+                _API_RATE_LAST_START + base_interval
+                if _API_RATE_LAST_START > 0.0 else now
+            )
+            method_actual = _API_RATE_METHOD_LAST_START.get(method_name)
+            method_actual_due = (
+                float(method_actual) + endpoint_interval
+                if method_actual is not None else now
+            )
+            actual_due = max(global_actual_due, method_actual_due)
+            if now + tolerance >= actual_due:
+                _API_RATE_LAST_START = now
+                _API_RATE_METHOD_LAST_START[method_name] = now
+                return
+            retry_at = actual_due
+        finally:
+            _release_scheduler_lock()
+        _wait_until(retry_at, "actual_start")
+    raise ApiRateLockTimeout(
+        f"API_RATE actual-start verification budget exhausted for {method_name}"
+    )
 
 def safe_api_call(func, *args, **kwargs):
     # Internal callers may lower the retry budget for latency-sensitive reads
@@ -1472,11 +1406,17 @@ def fetch_ohlcv(symbol, limit=150):
         return df
     except Exception as e:
         message = str(e).lower()
+        scheduler_contention = isinstance(e, ApiRateLockTimeout) or any(
+            base.__name__ == "ApiRateLockTimeout" for base in type(e).__mro__
+        )
         rate_limited = "rate limit" in message or "100410" in message
         circuit_open = "circuit open" in message or "probe already in flight" in message
         if rate_limited or circuit_open:
             _mark_ohlcv_rate_limit_cooldown(sym)
-        reason = "OHLCV_RATE_LIMITED" if (rate_limited or circuit_open) else "OHLCV_EMPTY"
+        if scheduler_contention:
+            reason = "LOCAL_SCHEDULER_CONTENTION"
+        else:
+            reason = "OHLCV_RATE_LIMITED" if (rate_limited or circuit_open) else "OHLCV_EMPTY"
         _record_ohlcv_fetch_diagnostic(sym, reason, detail=f"{type(e).__name__}: {e}")
         print(color_text(f"fetch_ohlcv error for {symbol}: {e}", YELLOW))
         return None
@@ -15938,13 +15878,12 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
         with state["lock"]:
             generation = int(state.get("generation", 0))
     if not _watchlist_worker_generation_active(generation):
-        # A worker that was already declared stalled/timed out may only mark the
-        # entry gate as failed. It must never publish staged rows or clear the
+        # A timed-out worker must never publish staged rows or clear the
         # process-level recovery fence, even if it completes late.
         with state["lock"]:
-            if (state.get("timed_out")
-                    and int(state.get("generation", 0)) == int(generation)):
+            if state.get("timed_out"):
                 MEMORY["_unified_watchlist_refresh_ok"] = False
+                MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
                 state["in_progress"] = False
                 state["worker_name"] = ""
                 state["last_completed_monotonic"] = time.monotonic()
@@ -16012,6 +15951,7 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
         with state["lock"]:
             if int(state.get("generation", 0)) == int(generation) and not state.get("timed_out"):
                 MEMORY["_unified_watchlist_refresh_ok"] = False
+                MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
                 state["last_error"] = f"{type(exc).__name__}: {exc}"
         log_execution(
             f"[INTEGRATION] watchlist refresh failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
@@ -16027,8 +15967,10 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
                     state["phase"] = "IDLE"
                     state["current_symbol"] = ""
                     MEMORY["_unified_watchlist_refresh_ok"] = True
+                    MEMORY["_unified_watchlist_refresh_status"] = "SUCCESS"
                 else:
                     MEMORY["_unified_watchlist_refresh_ok"] = False
+                    MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
 
 
 def refresh_unified_institutional_watchlist(force=False):
@@ -16045,6 +15987,7 @@ def refresh_unified_institutional_watchlist(force=False):
     with state["lock"]:
         if state.get("timed_out"):
             MEMORY["_unified_watchlist_refresh_ok"] = False
+            MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
             return MEMORY.setdefault("watchlist", {})
         if state["in_progress"]:
             last_progress = float(state.get("last_progress_monotonic") or state.get("started_monotonic") or now_mono)
@@ -16055,6 +15998,7 @@ def refresh_unified_institutional_watchlist(force=False):
                 state["restart_requested"] = True
                 state["last_error"] = f"WORKER_STALLED:{state.get('phase')}:{stale_for:.1f}s"
                 MEMORY["_unified_watchlist_refresh_ok"] = False
+                MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
                 globals()["RECOVERY_BLOCK_ENTRIES"] = True
                 restart_context = {
                     "reason": "UNIFIED_WATCHLIST_WORKER_STALLED",
@@ -16064,7 +16008,9 @@ def refresh_unified_institutional_watchlist(force=False):
                     "worker_stale_for_sec": round(stale_for, 3),
                 }
             else:
-                MEMORY["_unified_watchlist_refresh_ok"] = False
+                # IN_PROGRESS is not a refresh failure. The entry worker will
+                # defer candidate validation until this generation completes.
+                MEMORY["_unified_watchlist_refresh_status"] = "IN_PROGRESS"
                 return MEMORY.setdefault("watchlist", {})
         else:
             last_attempt = float(state.get("last_attempt_monotonic") or 0.0)
@@ -16083,6 +16029,7 @@ def refresh_unified_institutional_watchlist(force=False):
                 "worker_name": "unified-institutional-watchlist",
             })
             MEMORY["_unified_watchlist_refresh_ok"] = False
+            MEMORY["_unified_watchlist_refresh_status"] = "IN_PROGRESS"
 
     if restart_context is not None:
         log_execution(
@@ -16108,6 +16055,7 @@ def refresh_unified_institutional_watchlist(force=False):
             state["last_error"] = f"worker_start_failed:{type(exc).__name__}"
             state["last_completed_monotonic"] = time.monotonic()
         MEMORY["_unified_watchlist_refresh_ok"] = False
+        MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
         log_execution(f"[INTEGRATION] watchlist worker start failed: {type(exc).__name__}: {exc}", "ERROR")
     return MEMORY.setdefault("watchlist", {})
 
@@ -16168,10 +16116,25 @@ def smart_opportunity_selection():
     if daily_loss_cooldown_active():
         return False
     refresh_unified_institutional_watchlist()
-    # Never authorize a new entry from a stale Watchlist after an integration failure.
+    # An asynchronous refresh is neither success nor failure. Defer this entry
+    # cycle cleanly; the next cycle may consume the newly published snapshot.
+    watchlist_refresh_status = str(
+        MEMORY.get("_unified_watchlist_refresh_status") or ""
+    ).upper()
+    if watchlist_refresh_status == "IN_PROGRESS":
+        log_execution(
+            "[ENTRY_GUARD] unified Watchlist refresh in progress; candidate validation deferred",
+            "DEBUG", debounce_key="watchlist_refresh_in_progress", debounce_sec=10,
+        )
+        return False
+    # Never authorize a new entry from a stale Watchlist after a completed failure.
     # Existing position management runs in its independent lifecycle and is unaffected.
-    if MEMORY.get("_unified_watchlist_refresh_ok") is False:
-        log_execution("[ENTRY_GUARD] unified Watchlist refresh failed; stale candidates cannot authorize entries", "WARN")
+    if (watchlist_refresh_status == "FAILED"
+            or MEMORY.get("_unified_watchlist_refresh_ok") is False):
+        log_execution(
+            "[ENTRY_GUARD] unified Watchlist refresh failed; stale candidates cannot authorize entries",
+            "WARN", debounce_key="watchlist_refresh_failed", debounce_sec=10,
+        )
         return False
 
     watchlist = MEMORY.get("watchlist", {})
