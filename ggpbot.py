@@ -8882,9 +8882,16 @@ def _cross_event_is_usable(event_id, side=None):
         return False
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+        zone = metadata.get("selected_entry_zone")
+        zone_gate = metadata.get("structural_zone_gate")
         return (
             str(metadata.get("phase") or "").upper() == "BREAKOUT_CONFIRMED"
             and metadata.get("entry_ready") is True
+            and metadata.get("breakout_candidate") is True
+            and isinstance(zone, dict)
+            and isinstance(zone_gate, dict)
+            and zone_gate.get("allowed") is True
+            and str(zone_gate.get("authority") or "") == "UNIFIED_WATCHLIST_ENTRY_ZONE"
         )
     return True
 
