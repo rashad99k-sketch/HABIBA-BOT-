@@ -7571,6 +7571,26 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 f"does not match execution gate event {gate_result['durable_event_id']}", "ERROR",
             )
             return False
+        zone_ok, zone_reason = _validate_selected_entry_zone(
+            supplied_zone, side, price=price, atr=atr_val,
+            latest_timestamp=institutional_entry_ctx.get("closed_candle_timestamp"),
+            timeframe_ms=institutional_entry_ctx.get("timeframe_ms")
+                or int(_roro_timeframe_seconds(gate_tf) * 1000),
+        )
+        if not zone_ok:
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: durable Watchlist zone failed final validation: {zone_reason}",
+                "WARN", debounce_key=f"cross_zone_final:{cross_event_id}:{zone_reason}", debounce_sec=10,
+            )
+            return False
+        institutional_entry_ctx["entry_zone_gate"] = {
+            "allowed": True, "reason": zone_reason,
+            "kind": supplied_zone.get("kind"),
+            "zone_direction": supplied_zone.get("zone_direction"),
+            "low": supplied_zone.get("low"), "high": supplied_zone.get("high"),
+            "available_timestamp": supplied_zone.get("available_timestamp"),
+            "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+        }
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
     # Preserve the exact gate snapshot for the serialized final execution wrapper.
     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
