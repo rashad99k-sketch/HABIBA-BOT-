@@ -1045,9 +1045,12 @@ def _record_ohlcv_fetch_diagnostic(symbol, reason, *, received=0, detail=""):
 
 def fetch_ohlcv(symbol, limit=150):
     started_at = time.time()
-    sym = str(symbol or "")
+    sym = normalize_symbol(symbol)
+    if not sym:
+        _record_ohlcv_fetch_diagnostic(str(symbol or ""), "INVALID_SYMBOL",
+                                        detail="empty or malformed USDT swap symbol")
+        return None
     try:
-        sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, INTERVAL, limit=limit)
         if not data:
             rate = _LAST_API_RATE_LIMIT
@@ -1099,8 +1102,12 @@ def fetch_ohlcv(symbol, limit=150):
         return None
 
 def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
+    sym = normalize_symbol(symbol)
+    if not sym:
+        _record_ohlcv_fetch_diagnostic(str(symbol or ""), "INVALID_SYMBOL",
+                                        detail="empty or malformed USDT swap symbol")
+        return None
     try:
-        sym = normalize_symbol(symbol)
         data = safe_api_call(ex.fetch_ohlcv, sym, timeframe, limit=limit)
         if not data or len(data) < 30:
             return None
@@ -1116,10 +1123,16 @@ def fetch_ohlcv_htf(symbol, timeframe='1h', limit=200):
         return None
 
 def fetch_ticker(symbol):
-    return safe_api_call(ex.fetch_ticker, normalize_symbol(symbol))
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return None
+    return safe_api_call(ex.fetch_ticker, sym)
 
 def fetch_orderbook(symbol, limit=20):
-    return safe_api_call(ex.fetch_order_book, normalize_symbol(symbol), limit)
+    sym = normalize_symbol(symbol)
+    if not sym:
+        return None
+    return safe_api_call(ex.fetch_order_book, sym, limit)
 
 def get_balance():
     if PAPER_MODE:
@@ -1167,25 +1180,34 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
 
 
 def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
-    """Return (frame, source), rejecting invalid symbols before cache or API access."""
-    sym, reason, diagnostics = resolve_position_symbol(symbol)
+    """Return (frame, source); reject malformed symbols without requiring market metadata.
+
+    Market metadata is authoritative for position/order operations, but market-data
+    fetches must also work with CCXT-compatible exchanges and test doubles before
+    their markets dictionary has been populated. Normalize syntactically here;
+    the exchange remains responsible for confirming market availability.
+    """
+    sym = normalize_symbol(symbol)
     if not sym:
         _record_ohlcv_fetch_diagnostic(
             str(symbol or ""), "INVALID_SYMBOL",
-            detail=f"{reason}: {diagnostics.get('source', 'NONE')}",
+            detail="empty or malformed USDT swap symbol",
         )
         return None, "INVALID_SYMBOL"
 
+    # Preserve the established cache namespace/threshold so existing cached
+    # frames remain reusable and market-data refresh cadence does not regress.
     ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 30)
-    timeframe = "1h" if htf else INTERVAL
-    cache_key = f"ohlcv_{sym}_{timeframe}_{limit}"
+    cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
     cached = cache_get(cache_key, ttl)
-    if cached is not None and len(cached) >= min(limit, 100):
+    if cached is not None and len(cached) >= 100:
         return cached, "CACHE_HIT"
-
-    df = fetch_ohlcv_htf(sym, timeframe, limit) if htf else fetch_ohlcv(sym, limit)
+    if htf:
+        df = fetch_ohlcv_htf(sym, "1h", limit)
+    else:
+        df = fetch_ohlcv(sym, limit)
     if df is not None and validate_dataframe(df, min(limit, 100)):
         cache_set(cache_key, df)
         return df, "FRESH_REQUEST"
