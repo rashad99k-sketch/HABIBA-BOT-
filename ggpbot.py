@@ -18117,6 +18117,91 @@ def _portfolio_restore_live_rows(rows, positions):
         return False
 
 
+def _startup_flat_orders_reconciled(rows):
+    """Require order-level terminal proof before releasing a FLAT startup hold."""
+    terminal_statuses = {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+    checked = set()
+
+    def verify_entry(symbol, order_id, client_order_id, already_terminal=False):
+        key = ("ENTRY", str(order_id or ""), str(client_order_id or ""))
+        if already_terminal:
+            return True, "PERSISTED_TERMINAL"
+        if key in checked:
+            return True, "ALREADY_VERIFIED"
+        checked.add(key)
+        if not (order_id or client_order_id):
+            return False, "ENTRY_ORDER_ID_UNAVAILABLE"
+        return _cancel_and_verify_entry_order_terminal(
+            symbol, order_id, client_order_id, cancel_if_open=True
+        )
+
+    def verify_close(symbol, order_id):
+        key = ("CLOSE", str(order_id or ""))
+        if key in checked:
+            return True, "ALREADY_VERIFIED"
+        checked.add(key)
+        fetcher = getattr(ex, "fetch_order", None)
+        if not order_id or not callable(fetcher):
+            return False, "CLOSE_ORDER_LOOKUP_UNAVAILABLE"
+        try:
+            order = safe_api_call(fetcher, str(order_id), normalize_symbol(symbol),
+                                  _api_max_attempts=1)
+        except Exception as exc:
+            return False, f"CLOSE_ORDER_FETCH_FAILED:{type(exc).__name__}"
+        if not isinstance(order, dict):
+            return False, "CLOSE_ORDER_NOT_FOUND"
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        status = str(order.get("status") or info.get("status")
+                     or info.get("orderStatus") or "UNKNOWN").upper()
+        return (status in terminal_statuses, status)
+
+    symbol = str(STATE.get("current_symbol") or DEFAULT_SYMBOL)
+    entry_id = STATE.get("entry_exchange_order_id")
+    client_id = STATE.get("entry_client_order_id")
+    entry_terminal = bool(STATE.get("entry_order_terminal"))
+    if STATE.get("execution_unresolved") and not (entry_id or client_id) and not entry_terminal:
+        return False, "ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
+    if entry_id or client_id:
+        ok, reason = verify_entry(symbol, entry_id, client_id, entry_terminal)
+        if not ok:
+            return False, f"ENTRY_ORDER:{reason}"
+
+    close_id = STATE.get("pending_close_order_id")
+    if STATE.get("close_reconciliation_required") and not close_id:
+        return False, "CLOSE_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
+    if close_id:
+        ok, reason = verify_close(symbol, close_id)
+        if not ok:
+            return False, f"CLOSE_ORDER:{reason}"
+
+    for row in rows or []:
+        saved = row.get("state") if isinstance(row.get("state"), dict) else {}
+        row_symbol = str(row.get("symbol") or saved.get("current_symbol") or symbol)
+        row_entry_id = (saved.get("entry_exchange_order_id")
+                        or row.get("entry_exchange_order_id")
+                        or row.get("exchange_order_id"))
+        row_client_id = (saved.get("entry_client_order_id")
+                         or row.get("entry_client_order_id")
+                         or row.get("client_order_id"))
+        row_entry_terminal = bool(saved.get("entry_order_terminal"))
+        if saved.get("execution_unresolved") and not (row_entry_id or row_client_id) and not row_entry_terminal:
+            return False, "JOURNAL_ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
+        if row_entry_id or row_client_id:
+            ok, reason = verify_entry(row_symbol, row_entry_id, row_client_id,
+                                      row_entry_terminal)
+            if not ok:
+                return False, f"JOURNAL_ENTRY_ORDER:{reason}"
+        row_close_id = (saved.get("pending_close_order_id")
+                        or row.get("pending_close_order_id"))
+        if saved.get("close_reconciliation_required") and not row_close_id:
+            return False, "JOURNAL_CLOSE_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
+        if row_close_id:
+            ok, reason = verify_close(row_symbol, row_close_id)
+            if not ok:
+                return False, f"JOURNAL_CLOSE_ORDER:{reason}"
+    return True, "ALL_KNOWN_ORDERS_TERMINAL"
+
+
 def startup_trade_recovery():
     """Reconcile persisted journal with BingX before any fresh entry is permitted."""
     global RECOVERY_BLOCK_ENTRIES
@@ -18225,6 +18310,18 @@ def startup_trade_recovery():
     rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
     positions = positions or []
     if status == "FLAT":
+        orders_reconciled, order_reason = _startup_flat_orders_reconciled(rows)
+        if not orders_reconciled:
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "ORDER_OUTCOME_REQUIRES_RECONCILIATION"
+            STATE["recovery_hold"] = True
+            STATE["recovery_reason"] = str(order_reason)
+            RECOVERY_BLOCK_ENTRIES = True
+            log_execution(
+                f"[RECOVERY] BingX is FLAT but order-level reconciliation is incomplete: {order_reason}; entries remain blocked",
+                "CRITICAL", debounce_key="startup_flat_order_unresolved", debounce_sec=30,
+            )
+            return False
         for row in rows:
             try:
                 saved = row.get("state") if isinstance(row.get("state"), dict) else {}
@@ -18252,10 +18349,36 @@ def startup_trade_recovery():
                     log_execution(f"[RECOVERY_CLOSE_DIAG] {row.get('symbol')} reason={diagnostic.get('reason')} confidence={diagnostic.get('confidence')} evidence={diagnostic.get('evidence')}", "WARN")
             except Exception as exc:
                 log_execution(f"[RECOVERY] close diagnosis/finalization pending: {exc}", "WARN")
+        # Clear stale flags only after FLAT and order-level reconciliation.
+        STATE.update({
+            "open": False, "execution_unresolved": False,
+            "close_reconciliation_required": False, "recovery_hold": False,
+            "recovery_reason": None, "pending_close_order_id": None,
+            "pending_close_reason": None, "pending_close_before_qty": 0.0,
+            "pending_close_requested_qty": 0.0,
+            "pending_close_target_remaining_qty": None,
+            "pending_close_started_at": 0.0,
+            "entry_execution_state": "RECONCILED_FLAT",
+            "entry_client_order_id": None, "entry_exchange_order_id": None,
+            "entry_order_terminal": False,
+        })
+        TRADE_STATE["in_position"] = False
+        TRADE_STATE["qty"] = 0.0
         MEMORY["position_status"] = "FLAT"
+        MEMORY["current_position"] = None
         MEMORY["recovery_status"] = "RECONCILED_FLAT"
         RECOVERY_BLOCK_ENTRIES = False
-        _mark_persisted_recovery_resolved("FLAT", "RECONCILED_FLAT")
+        if not _mark_persisted_recovery_resolved("FLAT", "RECONCILED_FLAT"):
+            STATE["recovery_hold"] = True
+            STATE["recovery_reason"] = "PERSISTED_RECOVERY_RESOLUTION_FAILED"
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["recovery_status"] = "RECOVERY_STATE_PERSISTENCE_FAILED"
+            RECOVERY_BLOCK_ENTRIES = True
+            return False
+        log_execution(
+            "[RECOVERY] Startup FLAT reconciled; stale recovery flags cleared after order-level verification",
+            "SUCCESS",
+        )
         return True
     if len(positions) > 1:
         return _portfolio_restore_live_rows(rows, positions)
