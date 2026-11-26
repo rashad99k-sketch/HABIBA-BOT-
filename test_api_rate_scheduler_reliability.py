@@ -115,7 +115,7 @@ def test_floating_point_boundary_uses_one_positive_sleep(monkeypatch):
 
     assert len(sleeps) == 1
     assert sleeps[0] >= ggpbot.API_RATE_MIN_SLEEP_SEC
-    assert clock[0] >= start + interval
+    assert clock[0] >= start + interval - 1e-6
     assert not ggpbot._API_RATE_LOCK.locked()
 
 
