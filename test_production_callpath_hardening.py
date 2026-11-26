@@ -596,3 +596,50 @@ def test_runtime_recovery_does_not_adopt_position_while_entry_order_remainder_is
     assert ggpbot.MEMORY["position_status"] == "UNKNOWN"
     assert ggpbot.MEMORY["recovery_status"] == "ENTRY_ORDER_REMAINDER_UNRESOLVED"
     assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+
+def test_watchlist_in_progress_is_deferred_not_reported_as_failure(monkeypatch):
+    memory = {
+        "watchlist": {},
+        "_unified_watchlist_refresh_ok": False,
+        "_unified_watchlist_refresh_status": "IN_PROGRESS",
+        "position_status": "FLAT",
+    }
+    monkeypatch.setattr(ggpbot, "MEMORY", memory)
+    monkeypatch.setitem(ggpbot.STATE, "open", False)
+    monkeypatch.setitem(ggpbot.TRADE_STATE, "in_position", False)
+    monkeypatch.setattr(ggpbot, "RECOVERY_BLOCK_ENTRIES", False)
+    monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
+    monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", lambda: None)
+    messages = []
+    monkeypatch.setattr(ggpbot, "log_execution",
+                        lambda message, *_args, **_kwargs: messages.append(str(message)))
+
+    assert ggpbot.smart_opportunity_selection() is False
+    assert any("refresh in progress" in message for message in messages)
+    assert not any("refresh failed" in message for message in messages)
+
+
+def test_watchlist_worker_success_publishes_explicit_success_status(monkeypatch):
+    memory = {"watchlist": {}, "_unified_watchlist_refresh_ok": False}
+    monkeypatch.setattr(ggpbot, "MEMORY", memory)
+    state = ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        state.update({
+            "in_progress": True, "generation": 71, "timed_out": False,
+            "restart_requested": False, "phase": "TEST", "worker_name": "test-worker",
+            "last_error": "",
+        })
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        ggpbot, "update_unified_watchlist",
+        lambda staged, *_args, **_kwargs: staged["watchlist"],
+    )
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_args, **_kwargs: None)
+
+    ggpbot._run_unified_institutional_watchlist_refresh(71)
+
+    assert memory["_unified_watchlist_refresh_ok"] is True
+    assert memory["_unified_watchlist_refresh_status"] == "SUCCESS"
+    with state["lock"]:
+        assert state["in_progress"] is False
+
