@@ -186,6 +186,9 @@ def test_api_rate_limit_releases_global_lock_before_pacing_sleep(monkeypatch):
     monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 1.0)
     monkeypatch.setattr(ggpbot, "_API_METHOD_MIN_INTERVALS", {})
     monkeypatch.setattr(ggpbot, "_last_api_call", 99.5)
+    monkeypatch.setattr(ggpbot, "_API_RATE_METHOD_LAST_RESERVED", {})
+    monkeypatch.setattr(ggpbot, "_API_RATE_METHOD_LAST_START", {})
+    monkeypatch.setattr(ggpbot, "_API_RATE_LAST_START", 0.0)
     def fake_sleep(seconds):
         assert not ggpbot._API_RATE_LOCK.locked()
         sleeps.append(seconds)
