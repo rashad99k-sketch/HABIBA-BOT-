@@ -90,6 +90,7 @@ from ggp_market_intelligence import (
 from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
 from location_authority import validate_location_zone
+from entry_path_diagnostics import record_entry_path_event as _record_entry_path_diag
 
 # Observational only: all routine trade-management decisions still come from
 # TradeManagementBoard / LiveTradeManager. This bounded feed never sends orders.
@@ -6191,11 +6192,27 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
             )
+            _record_entry_path_diag(sym, "BINGX_SUBMIT_BEGIN", side=side,
+                                     decision_state="SUBMITTING",
+                                     details={"quantity": amount, "leverage": LEVERAGE},
+                                     logger=lambda message: log_execution(message, "INFO"))
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
                 structural_stop=stop_value, trade_id=str(trade_id or STATE.get("trade_id") or uuid.uuid4().hex),
                 management_state=management_state,
             )
+            _record_entry_path_diag(
+                sym, "BINGX_RESULT", side=side,
+                decision_state=str(getattr(result.state, "value", result.state)),
+                rejection_reason=None if result.state is ExecutionState.FILLED else str(result.reason or result.state),
+                details={"client_order_id": result.client_order_id,
+                         "exchange_order_id": result.exchange_order_id,
+                         "requested_qty": result.requested_qty,
+                         "filled_qty": result.filled_qty,
+                         "remaining_qty": result.remaining_qty,
+                         "average_price": result.average_price,
+                         "reason": result.reason},
+                logger=lambda message: log_execution(message, "INFO" if result.state is ExecutionState.FILLED else "WARN"))
             if result.state not in {ExecutionState.FILLED}:
                 STATE.update({"execution_unresolved": result.state is ExecutionState.EXECUTION_UNCERTAIN,
                               "recovery_hold": result.state is not ExecutionState.FILLED,
@@ -6587,6 +6604,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
     trade_id = uuid.uuid4().hex
     institutional_entry_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+    _entry_cross_ts = institutional_entry_ctx.get("cross_timestamp", institutional_entry_ctx.get("crossover_ts"))
+    _record_entry_path_diag(symbol, "EXECUTE_ENTRY_ENTERED", side=side,
+                             decision_state=institutional_entry_ctx.get("decision_state", "ENTRY_READY"),
+                             cross_timestamp=_entry_cross_ts,
+                             details={"trade_id": trade_id, "entry_type": entry_type,
+                                      "trade_type": trade_type},
+                             logger=lambda message: log_execution(message, "INFO"))
     # Final execution-boundary gate: no institutional, sniper, RF or legacy
     # setup can bypass the mandatory EMA9-to-session-VWAP closed-candle cross.
     gate_frame = institutional_entry_ctx.get("closed_candle_frame")
@@ -6605,6 +6629,17 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
+    _record_entry_path_diag(
+        symbol, "EMA9_VWAP_GATE", side=side,
+        decision_state="ENTRY_READY" if gate_result.get("ready") else "REJECTED",
+        rejection_reason=None if gate_result.get("ready") else gate_result.get("reason"),
+        cross_timestamp=gate_result.get("ema9_cross_timestamp") or _entry_cross_ts,
+        cross_age=gate_result.get("cross_age_seconds"),
+        details={"ready": bool(gate_result.get("ready")), "reason": gate_result.get("reason"),
+                 "ema9_cross": gate_result.get("ema9_cross"),
+                 "latest_closed_timestamp": gate_result.get("latest_closed_timestamp"),
+                 "frame_source": gate_result.get("frame_source")},
+        logger=lambda message: log_execution(message, "INFO" if gate_result.get("ready") else "WARN"))
     raw_signal_id = str(gate_result.get("signal_candle_id") or "").strip()
     if raw_signal_id:
         try:
@@ -6670,6 +6705,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         df = get_ohlcv_safe(symbol, 100)
     adx_series = compute_adx(df) if df is not None else None
     adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else None
+    _record_entry_path_diag(
+        symbol, "ADX_GATE", side=side,
+        decision_state="PASSED" if entry_adx_allowed(adx_val) else "REJECTED",
+        rejection_reason=None if entry_adx_allowed(adx_val) else "adx_below_minimum_or_unavailable",
+        cross_timestamp=_entry_cross_ts,
+        details={"adx": safe_float(adx_val, None), "minimum": 18.0},
+        logger=lambda message: log_execution(message, "INFO" if entry_adx_allowed(adx_val) else "WARN"))
     if not entry_adx_allowed(adx_val):
         log_execution(
             f"[ADX_ENTRY_FILTER] BLOCKED {symbol} {side}: ADX={adx_val!r}; minimum=18.0",
@@ -7062,8 +7104,21 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
         return False
+    _record_entry_path_diag(symbol, "OPEN_POSITION_DISPATCH", side=side,
+                             decision_state="SUBMITTED_TO_OPEN_POSITION",
+                             cross_timestamp=_entry_cross_ts,
+                             details={"quantity": qty, "trade_id": trade_id},
+                             logger=lambda message: log_execution(message, "INFO"))
     order = open_position(side, qty, symbol, stop_loss=sl, trade_id=trade_id,
                           management_state=pending_management_state)
+    _record_entry_path_diag(symbol, "OPEN_POSITION_RESULT", side=side,
+                             decision_state="RETURNED_ORDER" if order else "REJECTED_OR_UNVERIFIED",
+                             rejection_reason=None if order else "open_position_returned_none",
+                             cross_timestamp=_entry_cross_ts,
+                             details={"order_present": bool(order),
+                                      "filled": safe_float((order or {}).get("filled"), 0.0),
+                                      "average": safe_float((order or {}).get("average"), 0.0)},
+                             logger=lambda message: log_execution(message, "INFO" if order else "WARN"))
     if order:
         actual_filled_qty = safe_float(order.get("filled"), 0.0)
         actual_entry_price = safe_float(order.get("average"), 0.0)
@@ -12113,6 +12168,15 @@ def smart_opportunity_selection():
             fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
             item.update(fresh)
             item["source"] = item.get("source") or "unified_watchlist"
+            _record_entry_path_diag(
+                exchange_sym, "INSTITUTIONAL_DECISION", side=item.get("side"),
+                decision_state=item.get("decision_state"),
+                rejection_reason=item.get("rejection_reason") or item.get("decision_reason"),
+                cross_timestamp=item.get("crossover_ts"),
+                details={"setup_type": item.get("decision_setup_type") or item.get("setup_type"),
+                         "event_id": item.get("event_id"), "source": item.get("source"),
+                         "decision_reason": item.get("decision_reason")},
+                logger=lambda message: log_execution(message, "INFO" if item.get("decision_state") == "ENTRY_READY" else "WARN"))
             if item.get("decision_state") != "ENTRY_READY":
                 continue
             side = str(item.get("side", "")).upper()
@@ -12176,6 +12240,17 @@ def smart_opportunity_selection():
                 for zone in location_candidates
             ]
             actionable_locations = [check for check in location_checks if check.get("valid")]
+            _record_entry_path_diag(
+                exchange_sym, "LOCATION_GATE", side=side,
+                decision_state="PASSED" if actionable_locations else "REJECTED",
+                rejection_reason=None if actionable_locations else "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE",
+                cross_timestamp=item.get("crossover_ts"),
+                details={"candidate_zone_count": len(location_candidates),
+                         "valid_zone_count": len(actionable_locations),
+                         "checks": location_checks,
+                         "decision_state": item.get("decision_state"),
+                         "event_id": item.get("event_id")},
+                logger=lambda message: log_execution(message, "INFO" if actionable_locations else "WARN"))
             if not actionable_locations:
                 item["decision_state"] = "NO_CHASE"
                 item["rejection_reason"] = "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE"
@@ -12208,6 +12283,9 @@ def smart_opportunity_selection():
 
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
+                "decision_state": item.get("decision_state"),
+                "cross_timestamp": item.get("crossover_ts"),
+                "rejection_reason": item.get("rejection_reason"),
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
