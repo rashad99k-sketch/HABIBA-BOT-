@@ -591,7 +591,7 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     assert remains_active["metadata"]["entry_ready"] is False
     step("PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", journal_status=remains_active["status"])
 
-    # 9) The consumed cross cannot be reused.
+    # The active durable event remains a visible candidate, not consumed.
     active_view = proj.classify_cross_state(remains_active, now_ts=clock[0])
     assert active_view["cross_state"] == "CONFIRMED_BUY_CROSS"
     assert active_view["cross_event_entry_ready"] is False
@@ -599,6 +599,16 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
     step("CROSS_REMAINS_CANDIDATE", cross_state=active_view["cross_state"],
          entry_ready=active_view["cross_event_entry_ready"])
+
+    assert [row["stage"] for row in trace] == [
+        "SCANNER_STRICT_GATE", "CROSS_PROJECTION_ACTIVE", "WATCHLIST_DECISION_PROJECTION",
+        "ENTRY_BLOCKED_BEFORE_BREAKOUT", "CLOSED_LIFECYCLE_BREAKOUT_CANDIDATE",
+        "DECISION_REMAINS_BLOCKED", "FROZEN_ENTRY_CONTEXT",
+        "PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", "CROSS_REMAINS_CANDIDATE",
+    ]
+    assert trace[3]["paper_position"] is None
+    assert trace[5]["decision_state"] != "ENTRY_READY"
+    assert trace[7]["journal_status"] == "ACTIVE"
 
     assert [row["stage"] for row in trace] == [
         "SCANNER_STRICT_GATE", "CROSS_PROJECTION_ACTIVE", "WATCHLIST_DECISION_PROJECTION",
