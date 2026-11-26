@@ -645,3 +645,41 @@ def test_watchlist_worker_success_publishes_explicit_success_status(monkeypatch)
     with state["lock"]:
         assert state["in_progress"] is False
 
+def test_stale_watchlist_worker_does_not_fail_newer_generation(monkeypatch):
+    memory = {
+        "watchlist": {},
+        "_unified_watchlist_refresh_ok": False,
+        "_unified_watchlist_refresh_status": "IN_PROGRESS",
+    }
+    monkeypatch.setattr(ggpbot, "MEMORY", memory)
+    state = ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE
+    with state["lock"]:
+        state.update({
+            "in_progress": True, "generation": 81, "timed_out": False,
+            "restart_requested": False, "phase": "TEST", "worker_name": "old-worker",
+            "last_error": "",
+        })
+    
+    def update(staged, *_args, **_kwargs):
+        with state["lock"]:
+            state.update({
+                "in_progress": True, "generation": 82, "timed_out": False,
+                "restart_requested": False, "phase": "NEW_GENERATION",
+                "worker_name": "new-worker",
+            })
+        return staged["watchlist"]
+
+    monkeypatch.setattr(ggpbot, "_sync_confirmed_cross_events", lambda **_kwargs: [])
+    monkeypatch.setattr(ggpbot, "update_unified_watchlist", update)
+    monkeypatch.setattr(ggpbot, "_publish_watchlist_worker_delta", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *_args, **_kwargs: None)
+
+    ggpbot._run_unified_institutional_watchlist_refresh(81)
+
+    assert memory["_unified_watchlist_refresh_ok"] is False
+    assert memory["_unified_watchlist_refresh_status"] == "IN_PROGRESS"
+    with state["lock"]:
+        assert state["generation"] == 82
+        assert state["in_progress"] is True
+        assert state["timed_out"] is False
+
