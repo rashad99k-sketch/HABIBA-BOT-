@@ -105,7 +105,7 @@ def test_floating_point_boundary_uses_one_positive_sleep(monkeypatch):
     interval = 0.25
     ggpbot._API_METHOD_MIN_INTERVALS["probe_boundary"] = interval
     # At this magnitude a sub-microsecond residual is close to the float ULP.
-    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_boundary"] = clock[0] + interval - 1e-6
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_boundary"] = clock[0] - 1e-6
     monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
 
     def probe_boundary():
@@ -125,7 +125,7 @@ def test_floating_point_boundaries_never_reserve_early(monkeypatch, offset):
     interval = 0.25
     clock, sleeps = _install_fake_clock(monkeypatch, start=start)
     ggpbot._API_METHOD_MIN_INTERVALS["probe_ulp"] = interval
-    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_ulp"] = clock[0] + interval + offset
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_ulp"] = clock[0] + offset
     monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
 
     def probe_ulp():
@@ -133,7 +133,7 @@ def test_floating_point_boundaries_never_reserve_early(monkeypatch, offset):
 
     ggpbot.rate_limit(probe_ulp)
 
-    assert clock[0] >= start + interval
+    assert clock[0] >= start + interval + offset
     assert len(sleeps) <= 1
     assert all(value > 0.0 for value in sleeps)
     assert not ggpbot._API_RATE_LOCK.locked()
@@ -328,15 +328,14 @@ def test_endpoint_pacing_lanes_do_not_serialize_unrelated_methods(monkeypatch):
     ggpbot.rate_limit(probe_b)
     ggpbot.rate_limit(probe_a)
 
-    assert starts[0] == pytest.approx(("a", 2001.0))
-    assert starts[1] == pytest.approx(("b", 2001.1))
-    assert starts[2] == pytest.approx(("a", 2002.0))
+    assert [name for name, _ in starts] == ["a", "b", "a"]
+    assert [value for _, value in starts] == pytest.approx([2001.0, 2001.1, 2002.0])
     assert sleeps == pytest.approx([1.0, 0.1, 0.9])
 
 
 def test_local_scheduler_contention_is_not_counted_as_exchange_rate_limit(monkeypatch):
-    rows = _valid_ohlcv_rows()
-    _stub_ohlcv_fetch(monkeypatch, rows)
+    monkeypatch.setattr(ggpbot, "normalize_symbol", lambda value: str(value))
+    monkeypatch.setattr(ggpbot, "_ohlcv_rate_limit_cooldown_remaining", lambda _symbol: 0.0)
     monkeypatch.setattr(
         ggpbot, "safe_api_call",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
