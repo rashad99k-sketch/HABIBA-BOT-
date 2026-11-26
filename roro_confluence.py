@@ -414,11 +414,26 @@ def evaluate_post_cross_rejection_breakout(
     }
     # A durable confirmation is final. Never let a later frame (or a missing
     # candle) reinterpret an already-authorized breakout as unconfirmed.
-    if result["phase"] == "BREAKOUT_CONFIRMED" and metadata.get("entry_ready") is True:
+    if (result["phase"] == "BREAKOUT_CONFIRMED"
+            and int(metadata.get("breakout_candle_timestamp") or 0) > 0):
+        # Retain the closed breakout as a durable candidate while the
+        # downstream Watchlist structural-zone authority is still evaluating.
+        # This is not final entry authorization: ggpbot applies that gate.
         result.update({
             "entry_ready": True,
             "authorization_state": "POST_CROSS_REJECTION_BREAKOUT_VALID",
-            "reason": "previous_breakout_confirmation_retained",
+            "reason": (
+                "previous_breakout_confirmation_retained"
+                if metadata.get("entry_ready") is True
+                else "breakout_retained_pending_structural_zone_authorization"
+            ),
+            "breakout_candle_timestamp": int(metadata.get("breakout_candle_timestamp")),
+            "breakout_close": metadata.get("breakout_close"),
+            "rejection_high": metadata.get("rejection_high"),
+            "rejection_low": metadata.get("rejection_low"),
+            "rejection_candle_timestamp": metadata.get("rejection_candle_timestamp"),
+            "pullback_candle_timestamp": metadata.get("pullback_candle_timestamp"),
+            "chase_atr": metadata.get("chase_atr"),
         })
         return result
     if result["phase"] not in {"WAITING_FOR_PULLBACK", "PULLBACK_CONFIRMED",
