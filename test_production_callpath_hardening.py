@@ -71,6 +71,7 @@ def test_late_watchlist_worker_cannot_publish_after_generation_timeout(monkeypat
     assert memory["watchlist"] == baseline
     assert "ETH/USDT" not in memory["watchlist"]
     assert memory["_unified_watchlist_refresh_ok"] is False
+    assert memory["_unified_watchlist_refresh_status"] == "FAILED"
     with state["lock"]:
         assert state["generation"] == 42
         assert state["timed_out"] is True
@@ -115,6 +116,7 @@ def test_watchlist_worker_publishes_only_when_generation_is_current(monkeypatch)
     assert memory["watchlist"]["BTC/USDT"]["decision_state"] == "ENTRY_READY"
     assert memory["watchlist"]["ETH/USDT"]["decision_state"] == "ENTRY_READY"
     assert memory["_unified_watchlist_refresh_ok"] is True
+    assert memory["_unified_watchlist_refresh_status"] == "SUCCESS"
     with state["lock"]:
         assert state["generation"] == 51
         assert state["in_progress"] is False
