@@ -8581,14 +8581,21 @@ def _advance_cross_event_lifecycles(rows, progress_callback=None, max_items=None
                 ema_fn=ema, timeframe_seconds=_roro_timeframe_seconds(row.get("timeframe") or INTERVAL),
                 now_ms=int(time.time() * 1000), max_chase_atr=CROSS_REJECTION_MAX_CHASE_ATR,
             )
-            if lifecycle.get("entry_ready") and str(lifecycle.get("phase") or "") != "BREAKOUT_CONFIRMED":
-                lifecycle["entry_ready"] = False
-
-            # A price-only EMA9/VWAP-band retest is not, by itself, an
-            # institutional entry. Before a cross event becomes executable,
-            # bind its breakout to the exact structural zone selected by the
-            # existing Watchlist authority for this same durable event.
-            if lifecycle.get("entry_ready") is True:
+            breakout_confirmed = (
+                str(lifecycle.get("phase") or "").upper() == "BREAKOUT_CONFIRMED"
+                and lifecycle.get("entry_ready") is True
+            )
+            # Every breakout remains a candidate until the unified Watchlist
+            # has selected and validated a structural zone for this exact event.
+            lifecycle["breakout_candidate"] = bool(breakout_confirmed)
+            lifecycle["entry_ready"] = False
+            lifecycle["structural_zone_gate"] = {
+                "allowed": False,
+                "reason": "watchlist_structural_zone_not_yet_authorized",
+                "required": True,
+                "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+            }
+            if breakout_confirmed:
                 event_id = str(row.get("event_id") or "")
                 side = str(row.get("side") or "").upper()
                 watchlist = MEMORY.get("watchlist") if isinstance(MEMORY.get("watchlist"), dict) else {}
@@ -8598,46 +8605,46 @@ def _advance_cross_event_lifecycles(rows, progress_callback=None, max_items=None
                     and str(item.get("cross_event_id") or "") == event_id
                     and str(item.get("side") or "").upper() == side
                 ), None)
-                selected_zone = structural_row.get("entry_zone") if isinstance(structural_row, dict) else None
-                try:
-                    latest_price = float(frame["close"].iloc[-1])
-                    latest_ts = int(lifecycle.get("latest_closed_timestamp") or 0)
-                    atr_value = float(lifecycle.get("atr") or 0.0)
-                    tf_ms = int(_roro_timeframe_seconds(row.get("timeframe") or INTERVAL) * 1000)
-                    zone_ok, zone_reason = _validate_selected_entry_zone(
-                        selected_zone, side, price=latest_price, atr=atr_value,
-                        latest_timestamp=latest_ts, timeframe_ms=tf_ms,
-                    )
-                except Exception as zone_exc:
-                    zone_ok, zone_reason = False, f"structural_zone_validation_error:{type(zone_exc).__name__}"
-                if not zone_ok:
-                    lifecycle["entry_ready"] = False
-                    lifecycle["structural_zone_gate"] = {
-                        "allowed": False, "reason": zone_reason,
-                        "required": True, "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
-                    }
-                    lifecycle["reason"] = f"structural_zone_not_authorized:{zone_reason}"
+                if structural_row is None:
+                    lifecycle["structural_zone_gate"]["reason"] = "missing_matching_watchlist_event"
                 else:
-                    lifecycle["selected_entry_zone"] = dict(selected_zone)
-                    lifecycle["entry_behavior"] = str(
-                        structural_row.get("entry_behavior")
-                        or (structural_row.get("market_intelligence") or {}).get("entry_behavior")
-                        or "WAIT_FOR_STRUCTURE"
-                    ).upper()
-                    lifecycle["trading_mode"] = str(
-                        structural_row.get("trading_mode")
-                        or (structural_row.get("market_intelligence") or {}).get("mode")
-                        or "UNCLASSIFIED"
-                    ).upper()
-                    lifecycle["setup_type"] = str(
-                        structural_row.get("decision_setup_type")
-                        or structural_row.get("setup_type")
-                        or "UNCLASSIFIED"
-                    ).upper()
-                    lifecycle["structural_zone_gate"] = {
-                        "allowed": True, "reason": zone_reason,
-                        "required": True, "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
-                    }
+                    selected_zone = structural_row.get("entry_zone")
+                    try:
+                        latest_price = float(frame["close"].iloc[-1])
+                        latest_ts = int(lifecycle.get("latest_closed_timestamp") or 0)
+                        atr_value = float(lifecycle.get("atr") or 0.0)
+                        tf_ms = int(_roro_timeframe_seconds(row.get("timeframe") or INTERVAL) * 1000)
+                        zone_ok, zone_reason = _validate_selected_entry_zone(
+                            selected_zone, side, price=latest_price, atr=atr_value,
+                            latest_timestamp=latest_ts, timeframe_ms=tf_ms,
+                        )
+                    except Exception as zone_exc:
+                        zone_ok, zone_reason = False, f"structural_zone_validation_error:{type(zone_exc).__name__}"
+                    if zone_ok:
+                        lifecycle["selected_entry_zone"] = dict(selected_zone)
+                        lifecycle["entry_behavior"] = str(
+                            structural_row.get("entry_behavior")
+                            or (structural_row.get("market_intelligence") or {}).get("entry_behavior")
+                            or "WAIT_FOR_STRUCTURE"
+                        ).upper()
+                        lifecycle["trading_mode"] = str(
+                            structural_row.get("trading_mode")
+                            or (structural_row.get("market_intelligence") or {}).get("mode")
+                            or "UNCLASSIFIED"
+                        ).upper()
+                        lifecycle["setup_type"] = str(
+                            structural_row.get("decision_setup_type")
+                            or structural_row.get("setup_type")
+                            or "UNCLASSIFIED"
+                        ).upper()
+                        lifecycle["structural_zone_gate"] = {
+                            "allowed": True, "reason": zone_reason,
+                            "required": True, "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+                        }
+                        lifecycle["entry_ready"] = True
+                    else:
+                        lifecycle["structural_zone_gate"]["reason"] = zone_reason
+                        lifecycle["reason"] = f"structural_zone_not_authorized:{zone_reason}"
             if journal.update_cross_event_lifecycle(row.get("event_id"), lifecycle):
                 advanced += 1
         except Exception as exc:
