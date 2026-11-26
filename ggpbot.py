@@ -11498,9 +11498,8 @@ def _resume_main_loop_after_verification(context=None):
         # Exchange verification alone does not prove the foreground loop is alive.
         context["engine_resumed"] = bool(
             resumed and _wait_for_main_loop_progress(progress_baseline))
-        # Recovery callback completed, but cannot replace the foreground MainThread.
-        # HealthWatchdog will classify missing liveness as RECOVERY_DEFERRED.
-        return bool(resumed)
+        # Never claim recovery succeeded unless the foreground loop proves liveness.
+        return bool(context["engine_resumed"])
     return _resume_scanner_after_flat_verification(context)
 
 
