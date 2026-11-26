@@ -19,61 +19,63 @@ def _load(monkeypatch):
 
 def test_invalid_market_data_symbol_is_rejected_before_exchange_call(monkeypatch):
     ggpbot = _load(monkeypatch)
+    calls = []
 
-    class Exchange:
-        def __init__(self):
-            self.calls = []
-            self.markets = {"BTC/USDT:USDT": {"swap": True, "active": True}}
-
-        def fetch_ohlcv(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return []
-
-    class StrictGuardExchange(Exchange):
-        def market(self, symbol):
-            return self.markets.get(symbol)
-
-    exchange = StrictGuardExchange()
-    monkeypatch.setattr(ggpbot, "ex", exchange)
     monkeypatch.setattr(
         ggpbot, "resolve_position_symbol",
         lambda symbol: ("", "INVALID_BASE_ASSET", {
             "original_symbol": symbol, "normalized_symbol": "", "source": "NONE",
-        }) if symbol == ":USDT" else ("BTC/USDT:USDT", "", {
-            "original_symbol": symbol, "normalized_symbol": "BTC/USDT:USDT", "source": "MARKETS",
         }),
     )
-    assert ggpbot.get_ohlcv_safe(":USDT", 100) is None
-    assert exchange.calls == []
+
+    def forbidden_fetch(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("exchange must not be called with an invalid symbol")
+
+    monkeypatch.setattr(ggpbot, "fetch_ohlcv", forbidden_fetch)
+    frame, source = ggpbot.get_ohlcv_safe_meta(":USDT", 100)
+    assert frame is None
+    assert source == "INVALID_SYMBOL"
+    assert calls == []
 
 
 def test_one_bad_symbol_does_not_interrupt_valid_scanner_symbols(monkeypatch):
     ggpbot = _load(monkeypatch)
     requested = []
-    monkeypatch.setattr(ggpbot, "_get_scanner_frame",
-                        lambda symbol, limit: requested.append(symbol) or None)
+    raw_symbols = ["", ":USDT", "BTC/USDT", "BTC/USDT:USDT"]
+
+    def validate(symbol, exchange=None):
+        mapping = {
+            "": ("", "INVALID_BASE_ASSET", {"source": "NONE"}),
+            ":USDT": ("", "INVALID_BASE_ASSET", {"source": "NONE"}),
+            "BTC/USDT": ("BTC/USDT:USDT", "", {"source": "MARKETS"}),
+            "BTC/USDT:USDT": ("BTC/USDT:USDT", "", {"source": "MARKETS"}),
+        }
+        return mapping.get(symbol, ("", "MARKET_NOT_FOUND", {"source": "NONE"}))
+
+    monkeypatch.setattr(ggpbot, "resolve_position_symbol", validate)
     monkeypatch.setattr(
-        ggpbot, "resolve_position_symbol",
-        lambda symbol: ("BTC/USDT:USDT", "", {"source": "MARKETS"})
-        if symbol in {"BTC/USDT", "BTC/USDT:USDT"}
-        else ("", "INVALID_BASE_ASSET", {"source": "NONE"}),
+        ggpbot, "_get_scanner_frame",
+        lambda symbol, limit: requested.append(symbol) or None,
     )
-    # Exercise the same validator boundary used by the scanners; invalid inputs
-    # are removed before any scanner frame lookup, while valid aliases normalize.
-    valid_symbols = []
-    for raw in ["", ":USDT", "BTC/USDT", "BTC/USDT:USDT"]:
+
+    accepted = []
+    seen = set()
+    for raw in raw_symbols:
         normalized, reason, _ = ggpbot.resolve_position_symbol(raw)
-        if normalized:
-            valid_symbols.append(normalized)
-    result = ggpbot.scan_market_rf(top_n=10, symbols=list(dict.fromkeys(valid_symbols)))
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            accepted.append(normalized)
+
+    result = ggpbot.scan_market_rf(top_n=10, symbols=accepted)
     assert result == []
     assert requested == ["BTC/USDT:USDT"]
 
 
-def test_no_position_main_loop_dispatches_blocking_scanners_and_makes_progress(monkeypatch):
+def test_no_position_main_loop_continues_without_open_trade_and_keeps_loop_progress(monkeypatch):
     ggpbot = _load(monkeypatch)
-    dispatched = []
     progress = []
+    loop_calls = []
 
     class FakeExchange:
         markets = {"BTC/USDT:USDT": {"swap": True, "active": True}}
@@ -87,19 +89,15 @@ def test_no_position_main_loop_dispatches_blocking_scanners_and_makes_progress(m
     monkeypatch.setattr(ggpbot, "safe_api_call", lambda fn, *args, **kwargs: fn(*args, **kwargs))
     monkeypatch.setattr(ggpbot, "get_balance_safe", lambda: 100.0)
     monkeypatch.setattr(ggpbot, "tg_start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "dispatch_scanner_task",
+                        lambda name, function, *args, **kwargs: loop_calls.append(name) or True)
     monkeypatch.setattr(ggpbot, "_run_global_discovery_scanner_with_heartbeat", lambda: None)
-    monkeypatch.setattr(ggpbot, "update_institutional_flow_scanner", lambda: None)
-    monkeypatch.setattr(ggpbot, "smart_opportunity_selection", lambda: dispatched.append("watchlist_analysis"))
-    monkeypatch.setattr(ggpbot, "_run_sniper_scan_if_due", lambda: dispatched.append("sniper_scan"))
-
-    class NoopThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            return None
-
-    monkeypatch.setattr(ggpbot.threading, "Thread", NoopThread)
+    monkeypatch.setattr(ggpbot, "update_institutional_flow_scanner",
+                        lambda: loop_calls.append("institutional_flow"))
+    monkeypatch.setattr(ggpbot, "smart_opportunity_selection",
+                        lambda: loop_calls.append("watchlist_analysis"))
+    monkeypatch.setattr(ggpbot, "_run_sniper_scan_if_due",
+                        lambda: loop_calls.append("sniper_scan"))
     monkeypatch.setattr(ggpbot, "sync_all_states", lambda: None)
     monkeypatch.setattr(ggpbot, "sync_position_state", lambda: None)
     monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
@@ -107,25 +105,28 @@ def test_no_position_main_loop_dispatches_blocking_scanners_and_makes_progress(m
     monkeypatch.setattr(ggpbot, "print_snapshot", lambda: None)
     monkeypatch.setattr(ggpbot, "_main_loop_progress",
                         lambda phase, **details: progress.append(phase))
-    monkeypatch.setattr(ggpbot, "dispatch_scanner_task",
-                        lambda name, function, *args, **kwargs: dispatched.append(name) or True)
     monkeypatch.setattr(ggpbot, "GLOBAL_SCAN_INTERVAL", 0)
     monkeypatch.setattr(ggpbot, "CANDIDATE_SCAN_INTERVAL", 0)
     monkeypatch.setattr(ggpbot, "SNIPER_V2_ENABLED", True)
     monkeypatch.setattr(ggpbot, "_SNIPER_V2_LAST_SCAN", 0.0)
-    monkeypatch.setattr(ggpbot.time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
 
+    def stop_after_one_iteration(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ggpbot.time, "sleep", stop_after_one_iteration)
     with pytest.raises(KeyboardInterrupt):
         ggpbot.main_loop_sniper()
 
     assert ggpbot.STATE["open"] is False
     assert ggpbot.TRADE_STATE["in_position"] is False
-    assert "global_discovery" in dispatched
-    assert "watchlist_analysis" in dispatched
-    assert "sniper_scan" in dispatched
+    assert "global_discovery" in loop_calls
+    assert "watchlist_analysis" in loop_calls
+    assert "sniper_scan" in loop_calls
     assert "iteration_start" in progress
     assert "exchange_sync_complete" in progress
-    assert not any(name == "execute_entry" for name in dispatched)
+    assert "iteration_complete" not in progress or "cleanup" in progress
+    assert not any(name == "execute_entry" for name in loop_calls)
 
 
 def test_watchdog_recovery_flat_paper_mode_never_validates_empty_symbol(monkeypatch):
