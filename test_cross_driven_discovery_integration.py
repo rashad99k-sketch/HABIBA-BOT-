@@ -190,7 +190,7 @@ def test_cross_event_journal_lifecycle_survives_restart(tmp_path):
     assert row["source"] == ggpbot.CONFIRMED_CROSS_EVENT_SOURCE
     assert row["timeframe"] == str(ggpbot.INTERVAL)
     assert row["signal_candle_timestamp"] == payload["signal_candle_timestamp"]
-    assert row["metadata"]["detection_method"] == "validate_dual_ema_vwap_entry_gate"
+    assert row["metadata"]["detection_method"] == "validate_ema9_vwap_entry_gate"
     assert row["metadata"]["lookback_candles"] == 2
     assert [item["event_id"] for item in restarted.list_cross_events(("ACTIVE",))] == [payload["event_id"]]
 
@@ -386,10 +386,10 @@ def test_supplementary_scanner_rows_cannot_create_cross_events(tmp_path, monkeyp
     frame = _cross_frame("BUY")
     gate = _gate(frame, "BUY")
     assert gate["ready"] is True
-    assert gate["trigger"] == "EMA9_EMA15"
-    assert gate["ema9_15_cross"] == "BULLISH"
-    assert gate["ema9_15_cross_timestamp"] == gate["signal_candle_timestamp"]
-    assert gate["authorization_state"] == AUTH_EMA9_EMA15_TRIGGER_VALID
+    assert gate["trigger"] == "EMA9_SESSION_VWAP"
+    assert gate["ema9_vwap_cross"] == "BULLISH"
+    assert gate["ema9_vwap_cross_timestamp"] == gate["signal_candle_timestamp"]
+    assert gate["authorization_state"] == AUTH_EMA9_VWAP_TRIGGER_VALID
     monkeypatch.setattr(ggpbot.time, "time", lambda: NOW_SEC)
     monkeypatch.setattr(ggpbot, "_get_scanner_frame", lambda *a, **k: frame)
 
@@ -806,9 +806,12 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     ggpbot._sync_confirmed_cross_events()
     event = journal.get_cross_event(event["event_id"])
     assert event["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
-    assert event["metadata"]["entry_ready"] is True
+    # Breakout is a candidate; the Watchlist has not selected an entry zone yet.
+    assert event["metadata"]["entry_ready"] is False
+    assert event["metadata"]["structural_zone_gate"]["allowed"] is False
+    assert event["metadata"]["structural_zone_gate"]["reason"] == "missing_selected_entry_zone"
     assert event["metadata"]["rejection_high"] > event["metadata"]["rejection_low"]
-    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is True
+    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
 
     # A verified institutional authorization is replayed through the real
     # execution gate. The cross identity, frame and zones come from the
