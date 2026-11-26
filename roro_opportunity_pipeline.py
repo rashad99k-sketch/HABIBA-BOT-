@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from entry_path_diagnostics import record_entry_path_event
+
 import numpy as np
 import pandas as pd
 
@@ -384,6 +386,15 @@ class OpportunityPipeline:
         regime = classify_regime(x, setup.atr)
         pre = pre_cross_metrics(x, setup.atr)
         setup.zone, setup.regime = zone.name, regime.state
+        record_entry_path_event(
+            symbol, "EMA9_VWAP_CROSS_OBSERVATION",
+            side="BUY" if pre.get("cross") == "BULLISH" else "SELL" if pre.get("cross") == "BEARISH" else None,
+            decision_state=pre.get("state", "UNKNOWN"),
+            rejection_reason=pre.get("reason"),
+            cross_timestamp=pre.get("candle_ts"),
+            details={"cross": pre.get("cross"), "gap_atr": pre.get("gap_atr"),
+                     "direction": pre.get("direction"), "timeframe": "15m"},
+        )
         # EMA9/VWAP proximity remains visible but it is never a hard entry gate.
         setup.ema9_vwap_gap_atr = pre.get("gap_atr") if _finite(pre.get("gap_atr")) else None
         setup.dealing_range = asdict(zone.range) if zone.range else None
@@ -433,6 +444,16 @@ class OpportunityPipeline:
         setup.setup_type = decision.setup_type
         setup.decision_state = decision.state
         setup.decision_reason = decision.reason
+        record_entry_path_event(
+            symbol, "INSTITUTIONAL_RETEST_DECISION",
+            side=decision.side,
+            decision_state=decision.state,
+            rejection_reason=decision.reason if decision.state != DecisionState.ENTRY_READY.value else None,
+            cross_timestamp=setup.crossover_ts,
+            details={"setup_type": decision.setup_type, "event_id": decision.event_id,
+                     "evidence": list(decision.evidence),
+                     "rejection_reasons": list(decision.rejection_reasons)},
+        )
         setup.decision_evidence = list(decision.evidence) + [f"rejected:{r}" for r in decision.rejection_reasons]
         setup.structural_stop = decision.structural_stop
         setup.institutional_event_id = decision.event_id or None
