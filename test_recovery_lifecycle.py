@@ -969,6 +969,58 @@ def test_entry_pending_without_fill_evidence_still_holds(tmp_path, monkeypatch):
     assert ggpbot.STATE["recovery_hold"] is True
 
 
+def test_startup_flat_clears_stale_persisted_hold_when_no_orders_are_unresolved(tmp_path, monkeypatch):
+    journal = TradeJournal(str(Path(tmp_path) / "flat-recovery.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "ex", MockExchange(position=None))
+    monkeypatch.setattr(ggpbot, "_persisted_recovery_hold_active", lambda: True)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "recovery_hold": True, "recovery_reason": "PERSISTED_RECOVERY_HOLD",
+        "execution_unresolved": False, "close_reconciliation_required": False,
+    })
+    assert ggpbot.startup_trade_recovery() is True
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+    assert ggpbot.MEMORY["position_status"] == "FLAT"
+
+
+def test_startup_flat_keeps_hold_when_pending_close_order_cannot_be_verified(tmp_path, monkeypatch):
+    journal = TradeJournal(str(Path(tmp_path) / "pending-close.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "ex", MockExchange(position=None))
+    monkeypatch.setattr(ggpbot, "_persisted_recovery_hold_active", lambda: True)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "recovery_hold": True, "execution_unresolved": True,
+        "close_reconciliation_required": True, "pending_close_order_id": "close-pending",
+        "current_symbol": "BTC/USDT:USDT",
+    })
+    assert ggpbot.startup_trade_recovery() is False
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert "CLOSE_ORDER" in str(ggpbot.STATE["recovery_reason"])
+
+
+def test_startup_flat_releases_entry_hold_only_after_terminal_order_readback(tmp_path, monkeypatch):
+    journal = TradeJournal(str(Path(tmp_path) / "terminal-entry.sqlite3"))
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    terminal_order = {"id": "entry-1", "status": "canceled", "filled": 0.0,
+                      "remaining": 1.0, "amount": 1.0}
+    monkeypatch.setattr(ggpbot, "ex", MockExchange(position=None, entry_order=terminal_order))
+    monkeypatch.setattr(ggpbot, "_persisted_recovery_hold_active", lambda: True)
+    _fresh_state()
+    ggpbot.STATE.update({
+        "recovery_hold": True, "execution_unresolved": True,
+        "entry_exchange_order_id": "entry-1", "entry_order_terminal": False,
+        "current_symbol": "BTC/USDT:USDT",
+    })
+    assert ggpbot.startup_trade_recovery() is True
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+
+
 # --------------------------------------------------------------------------- #
 # Native-stop replacement gateway (direct, with mock exchange)
 # --------------------------------------------------------------------------- #
