@@ -445,8 +445,15 @@ class HealthWatchdog:
                 self._alert(f"failed:{component.name}", "ERROR",
                             f"[WATCHDOG] {component.name} failed: {component.reason or 'unknown error'}")
             else:
+                stack_map = diagnostics.get("possible_stacks", {})
+                stack_detail = next((value for value in stack_map.values()
+                                     if isinstance(value, str) and value), "")
+                stack_frames = [line.strip() for line in stack_detail.splitlines()
+                                if line.strip().startswith("File ") or line.strip().startswith("in ")]
+                stack_suffix = " | stack=" + " <- ".join(stack_frames)[-1200:] if stack_frames else ""
                 self._alert(f"stalled:{component.name}", "CRITICAL",
-                            f"[WATCHDOG] {component.name} stalled for {age:.1f}s (critical={component.critical})")
+                            f"[WATCHDOG] {component.name} stalled for {age:.1f}s "
+                            f"(critical={component.critical}){stack_suffix}")
             if not component.restartable or component.name not in self._restart_callbacks:
                 report[component.name] = {"status": component.status, "lifecycle": lifecycle,
                                           "age_sec": round(age, 3), "restart": "NOT_RESTARTABLE",
