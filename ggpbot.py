@@ -16089,7 +16089,7 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
             # Record its terminal state explicitly; do not leave the refresh
             # looking permanently in progress after the stale worker exits.
             with state["lock"]:
-                if state.get("timed_out") or int(state.get("generation", 0)) != int(generation):
+                if state.get("timed_out"):
                     MEMORY["_unified_watchlist_refresh_ok"] = False
                     MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
             return
