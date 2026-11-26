@@ -120,6 +120,10 @@ def test_symbol_normalization_rejects_empty_base_and_wrong_quote(bad):
 def test_invalid_symbol_never_reaches_bingx_position_read(monkeypatch):
     exchange = StrictExchange()
     ggpbot = _runtime(monkeypatch, exchange)
+    # An empty symbol is invalid only when local state claims an open trade.
+    # A genuinely flat account must use account-wide position verification.
+    ggpbot.STATE["open"] = True
+    ggpbot.TRADE_STATE["in_position"] = True
 
     verified, reason, context = ggpbot._verify_engine_recovery("")
     assert verified is False
