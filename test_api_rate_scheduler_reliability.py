@@ -353,3 +353,28 @@ def test_local_scheduler_contention_is_not_counted_as_exchange_rate_limit(monkey
     assert diagnostic["reason"] == "LOCAL_SCHEDULER_CONTENTION"
     assert "pacing deadline exceeded" in diagnostic["detail"]
 
+def test_order_placement_and_cancellation_share_trade_write_quota(monkeypatch):
+    clock, sleeps = _install_fake_clock(monkeypatch, start=4000.0)
+    monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 0.10)
+    ggpbot._API_METHOD_MIN_INTERVALS.update({
+        "create_order": 1.05,
+        "cancel_order": 1.05,
+    })
+    calls = []
+
+    def create_order():
+        calls.append(("create", clock[0]))
+
+    def cancel_order():
+        calls.append(("cancel", clock[0]))
+
+    ggpbot.rate_limit(create_order)
+    create_order()
+    ggpbot.rate_limit(cancel_order)
+    cancel_order()
+
+    assert [name for name, _ in calls] == ["create", "cancel"]
+    assert [value for _, value in calls] == pytest.approx([4001.05, 4002.10])
+    assert sleeps == pytest.approx([1.05, 1.05])
+    assert not ggpbot._API_RATE_LOCK.locked()
+
