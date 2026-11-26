@@ -670,6 +670,10 @@ _API_RATE_METHOD_LANES = {
     "add_margin": "config_write",
     "reduce_margin": "config_write",
 }
+_API_RATE_LANE_MIN_INTERVALS = {
+    "trade_write": BINGX_TRADE_WRITE_MIN_INTERVAL,
+    "config_write": BINGX_CONFIG_WRITE_MIN_INTERVAL,
+}
 _API_RATE_LOCK = threading.Lock()
 # Never let API scheduler contention pin MainThread indefinitely. A timeout is
 # fail-closed: the exchange call is not sent and the next loop can try again.
@@ -732,7 +736,15 @@ def rate_limit(func=None):
             f"API_RATE rejected invalid interval for {method_name}; "
             f"base={base_interval!r} endpoint={endpoint_interval!r}"
         )
-    endpoint_interval = max(base_interval, endpoint_interval)
+    lane_interval = float(
+        _API_RATE_LANE_MIN_INTERVALS.get(lane_name, endpoint_interval)
+    )
+    if not _finite(lane_interval) or lane_interval <= 0.0:
+        raise ApiRateLockTimeout(
+            f"API_RATE rejected invalid lane interval for {lane_name}; "
+            f"interval={lane_interval!r}"
+        )
+    endpoint_interval = max(base_interval, endpoint_interval, lane_interval)
     tolerance = max(1e-12, endpoint_interval * 1e-9)
 
     real_deadline = _HARD_MONOTONIC() + API_RATE_WAIT_TIMEOUT_SEC
