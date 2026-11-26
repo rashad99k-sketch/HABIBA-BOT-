@@ -1080,8 +1080,6 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
 
     import ggpbot as bot
 
-    # Isolate every mutable scheduler primitive. Background threads created by
-    # earlier integration tests must not contend with or advance this test.
     real_monotonic = real_time.monotonic
     real_sleep = real_time.sleep
     clock = [100.0]
@@ -1101,8 +1099,7 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        bot,
-        "time",
+        bot, "time",
         SimpleNamespace(monotonic=fake_monotonic, sleep=fake_sleep),
     )
     monkeypatch.setattr(bot, "_API_RATE_LOCK", threading.Lock())
@@ -1110,21 +1107,36 @@ def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
         bot, "_API_RATE_LOCK_OWNER",
         {"thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""},
     )
+    monkeypatch.setattr(bot, "_API_RATE_METHOD_LAST_RESERVED", {"fetch_ohlcv": 100.0})
+    monkeypatch.setattr(bot, "_API_RATE_METHOD_LAST_START", {})
+    monkeypatch.setattr(bot, "_API_RATE_LAST_START", 0.0)
     monkeypatch.setattr(bot, "_last_api_call", 100.0)
+    monkeypatch.setattr(bot, "MIN_API_INTERVAL", 0.35)
     monkeypatch.setattr(bot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(bot, "API_RATE_WAIT_TIMEOUT_SEC", 5.0)
     monkeypatch.setitem(bot._API_METHOD_MIN_INTERVALS, "fetch_ohlcv", 1.05)
+    monkeypatch.setitem(bot._API_METHOD_MIN_INTERVALS, "fetch_ticker", 1.05)
 
     assert real_time.monotonic is real_monotonic
     assert real_time.sleep is real_sleep
 
     bot.rate_limit(fetch_ohlcv)
+    fetch_ohlcv()
     assert sum(waits) == pytest.approx(1.05)
+
+    # A different endpoint follows the shared global floor (.35s), not
+    # another endpoint's 1.05s reservation.
+    waits.clear()
+    bot.rate_limit(fetch_ticker)
+    fetch_ticker()
+    assert sum(waits) == pytest.approx(0.35)
     assert not bot._API_RATE_LOCK.locked()
 
+    # Reusing OHLCV observes its own 1.05s endpoint lane.
     waits.clear()
-    monkeypatch.setattr(bot, "_last_api_call", clock[0])
-    bot.rate_limit(fetch_ticker)
-    assert sum(waits) == pytest.approx(bot._API_METHOD_MIN_INTERVALS["fetch_ticker"])
+    bot.rate_limit(fetch_ohlcv)
+    fetch_ohlcv()
+    assert sum(waits) == pytest.approx(0.70)
     assert not bot._API_RATE_LOCK.locked()
 
 
