@@ -610,16 +610,6 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     assert trace[5]["decision_state"] != "ENTRY_READY"
     assert trace[7]["journal_status"] == "ACTIVE"
 
-    assert [row["stage"] for row in trace] == [
-        "SCANNER_STRICT_GATE", "CROSS_PROJECTION_ACTIVE", "WATCHLIST_DECISION_PROJECTION",
-        "ENTRY_BLOCKED_BEFORE_BREAKOUT", "CLOSED_LIFECYCLE_BREAKOUT_CANDIDATE",
-        "DECISION_REMAINS_BLOCKED", "FROZEN_ENTRY_CONTEXT",
-        "PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", "CROSS_REMAINS_CANDIDATE",
-    ]
-    assert trace[3]["paper_position"] is None
-    assert trace[5]["decision_state"] != "ENTRY_READY"
-    assert trace[7]["journal_status"] == "ACTIVE"
-
 
 def _watchlist_card_row():
     """One original Watchlist row carrying its already-produced diagnostics."""
