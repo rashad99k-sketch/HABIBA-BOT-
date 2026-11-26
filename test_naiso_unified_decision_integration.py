@@ -512,13 +512,16 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     ggpbot._sync_confirmed_cross_events()
     completed = journal.get_cross_event(event["event_id"])
     assert completed["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
-    assert completed["metadata"]["entry_ready"] is True
+    # Confirmed breakout is not execution authorization without Watchlist zone approval.
+    assert completed["metadata"]["entry_ready"] is False
+    assert completed["metadata"]["structural_zone_gate"]["allowed"] is False
+    assert completed["metadata"]["structural_zone_gate"]["reason"] == "missing_selected_entry_zone"
     completed_projection = ggpbot._project_confirmed_cross_row(completed)
     assert completed_projection["cross_state"] == "CONFIRMED_BUY_CROSS"
     assert completed_projection["cross_event_phase"] == "BREAKOUT_CONFIRMED"
-    assert completed_projection["cross_event_entry_ready"] is True
-    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is True
-    step("CLOSED_LIFECYCLE_BREAKOUT", phase=completed_projection["cross_event_phase"],
+    assert completed_projection["cross_event_entry_ready"] is False
+    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
+    step("CLOSED_LIFECYCLE_BREAKOUT_CANDIDATE", phase=completed_projection["cross_event_phase"],
          entry_ready=completed_projection["cross_event_entry_ready"])
 
     # 6) A complete authoritative setup is projected ENTRY_READY with all context.
@@ -546,12 +549,12 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         "entry_zone_high": price + 0.2, "atr": 0.69,
         "evidence": ["closed_ema9_vwap_cross", "fresh_institutional_zone"],
     })
+    # A complete generic institutional projection cannot override the
+    # independent structural-zone authorization attached to the cross event.
     decision = proj.project_decision_context(authorized_row, cross=cross_view, now_ts=clock[0])
-    assert decision["decision_state"] == "ENTRY_READY"
-    assert decision["entry_readiness"]["conditions_complete"] is True
-    assert decision["entry_readiness"]["sl_valid"] is True
-    assert decision["required_next_event"] == "NONE_ALL_CONDITIONS_COMPLETE"
-    step("DECISION_ENTRY_READY", decision_state=decision["decision_state"],
+    assert decision["decision_state"] != "ENTRY_READY"
+    assert decision["required_next_event"] != "NONE_ALL_CONDITIONS_COMPLETE"
+    step("DECISION_REMAINS_BLOCKED", decision_state=decision["decision_state"],
          snapshot_id=decision["source_snapshot_id"])
 
     # 7) The projection is frozen into the existing persistent entry context.
