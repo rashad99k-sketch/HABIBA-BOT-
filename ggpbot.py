@@ -18171,7 +18171,15 @@ def _startup_flat_orders_reconciled(rows):
         "PARTIAL_FILL", "PROTECTION_HOLD",
     }
     entry_state = str(STATE.get("entry_execution_state") or "").upper()
-    if ((STATE.get("execution_unresolved") or entry_state in pending_entry_states)
+    close_id = STATE.get("pending_close_order_id")
+    # execution_unresolved is shared by entry and close paths. An explicitly
+    # pending close must not be misclassified as an entry missing its order ID.
+    # A separately persisted pending-entry state still requires entry identity.
+    entry_execution_unresolved = bool(
+        STATE.get("execution_unresolved")
+        and not (STATE.get("close_reconciliation_required") or close_id)
+    )
+    if ((entry_execution_unresolved or entry_state in pending_entry_states)
             and not (entry_id or client_id) and not entry_terminal):
         return False, "ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
     if entry_id or client_id:
@@ -18179,7 +18187,6 @@ def _startup_flat_orders_reconciled(rows):
         if not ok:
             return False, f"ENTRY_ORDER:{reason}"
 
-    close_id = STATE.get("pending_close_order_id")
     if STATE.get("close_reconciliation_required") and not close_id:
         return False, "CLOSE_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
     if close_id:
@@ -18198,7 +18205,13 @@ def _startup_flat_orders_reconciled(rows):
                          or row.get("client_order_id"))
         row_entry_terminal = bool(saved.get("entry_order_terminal"))
         row_entry_state = str(saved.get("entry_execution_state") or row.get("status") or "").upper()
-        if ((saved.get("execution_unresolved") or row_entry_state in pending_entry_states)
+        row_close_id = (saved.get("pending_close_order_id")
+                        or row.get("pending_close_order_id"))
+        row_entry_execution_unresolved = bool(
+            saved.get("execution_unresolved")
+            and not (saved.get("close_reconciliation_required") or row_close_id)
+        )
+        if ((row_entry_execution_unresolved or row_entry_state in pending_entry_states)
                 and not (row_entry_id or row_client_id) and not row_entry_terminal):
             return False, "JOURNAL_ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
         if row_entry_id or row_client_id:
@@ -18206,8 +18219,6 @@ def _startup_flat_orders_reconciled(rows):
                                       row_entry_terminal)
             if not ok:
                 return False, f"JOURNAL_ENTRY_ORDER:{reason}"
-        row_close_id = (saved.get("pending_close_order_id")
-                        or row.get("pending_close_order_id"))
         if saved.get("close_reconciliation_required") and not row_close_id:
             return False, "JOURNAL_CLOSE_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
         if row_close_id:
