@@ -449,7 +449,8 @@ class HealthWatchdog:
                 stack_detail = next((value for value in stack_map.values()
                                      if isinstance(value, str) and value), "")
                 stack_frames = [line.strip() for line in stack_detail.splitlines()
-                                if line.strip().startswith("File ") or line.strip().startswith("in ")]
+                                if line.strip().startswith("File ") or
+                                (line.strip() and not line.startswith("  "))]
                 stack_suffix = " | stack=" + " <- ".join(stack_frames)[-1200:] if stack_frames else ""
                 self._alert(f"stalled:{component.name}", "CRITICAL",
                             f"[WATCHDOG] {component.name} stalled for {age:.1f}s "
