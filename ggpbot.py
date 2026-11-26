@@ -8976,8 +8976,6 @@ def _hydrate_cross_lifecycle_context(ctx, event_id, gate_result, side, symbol, t
         gate["selected_entry_zone"] = dict(selected_zone)
     if isinstance(zone_gate, dict):
         gate["structural_zone_gate"] = dict(zone_gate)
-    selected_zone = metadata.get("selected_entry_zone")
-    zone_gate = metadata.get("structural_zone_gate")
     zone_authorized = (
         context["cross_event_entry_ready"] is True
         and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED"
