@@ -8878,6 +8878,8 @@ def _cross_event_is_usable(event_id, side=None):
         return False
     if side and str(row.get("side") or "").upper() != str(side).upper():
         return False
+    if str(row.get("event_id") or "") != event_id:
+        return False
     if float(row.get("expires_ts") or 0.0) <= time.time():
         return False
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -8954,10 +8956,25 @@ def _hydrate_cross_lifecycle_context(ctx, event_id, gate_result, side, symbol, t
         gate["selected_entry_zone"] = dict(selected_zone)
     if isinstance(zone_gate, dict):
         gate["structural_zone_gate"] = dict(zone_gate)
-    if context["cross_event_entry_ready"] and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED":
+    selected_zone = metadata.get("selected_entry_zone")
+    zone_gate = metadata.get("structural_zone_gate")
+    zone_authorized = (
+        context["cross_event_entry_ready"] is True
+        and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED"
+        and metadata.get("breakout_candidate") is True
+        and isinstance(selected_zone, dict)
+        and isinstance(zone_gate, dict)
+        and zone_gate.get("allowed") is True
+        and str(zone_gate.get("authority") or "") == "UNIFIED_WATCHLIST_ENTRY_ZONE"
+    )
+    if zone_authorized:
         gate["ready"] = True
-        gate["authorization_state"] = "POST_CROSS_REJECTION_BREAKOUT_VALID"
-        gate["reason"] = "closed_rejection_high_low_breakout_confirmed"
+        gate["authorization_state"] = "WATCHLIST_STRUCTURAL_ZONE_AUTHORIZED"
+        gate["reason"] = "breakout_and_matching_watchlist_zone_confirmed"
+    else:
+        gate["ready"] = False
+        gate["authorization_state"] = "BREAKOUT_CANDIDATE_AWAITING_STRUCTURAL_ZONE"
+        gate["reason"] = str((zone_gate or {}).get("reason") or "watchlist_structural_zone_not_authorized")
     return True
 
 
