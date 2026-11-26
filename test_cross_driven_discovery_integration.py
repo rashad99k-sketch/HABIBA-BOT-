@@ -25,8 +25,8 @@ from ggp_profit_brain import (
 )
 from ggpbot import TradeDecisionType
 from roro_confluence import (
-    AUTH_EMA9_EMA15_TRIGGER_VALID, evaluate_post_cross_rejection_breakout,
-    validate_dual_ema_vwap_entry_gate,
+    AUTH_EMA9_EMA15_TRIGGER_VALID, AUTH_EMA9_VWAP_TRIGGER_VALID,
+    evaluate_post_cross_rejection_breakout, validate_dual_ema_vwap_entry_gate,
 )
 from roro_trade_journal import TradeJournal
 
@@ -138,7 +138,7 @@ def _payload(event_id="BTC:15m:BUY:1795203900000", expires_ts=None):
         "metadata": {
             "ready": True,
             "authorization_state": AUTH_EMA9_EMA15_TRIGGER_VALID,
-            "detection_method": "validate_dual_ema_vwap_entry_gate",
+            "detection_method": "validate_ema9_vwap_entry_gate",
             "lookback_candles": 2,
         },
     }
