@@ -310,7 +310,7 @@ def test_main_loop_recovery_distinguishes_verified_recovery_from_liveness(monkey
     monkeypatch.setattr(ggpbot, "_wait_for_main_loop_progress", lambda _baseline: False)
     monkeypatch.setattr(ggpbot, "STATE", {"recovery_hold": False, "current_symbol": SYMBOL})
 
-    assert ggpbot._resume_main_loop_after_verification(context) is True
+    assert ggpbot._resume_main_loop_after_verification(context) is False
     assert context["engine_resumed"] is False
 
 
