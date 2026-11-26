@@ -7665,7 +7665,12 @@ def smart_opportunity_selection():
     candidates = list(seen.values())
     best_setup = None
     best_score = -1
-    for cand in candidates[:15]:
+    _main_loop_progress("institutional_candidate_batch_start", candidate_count=min(15, len(candidates)))
+    for candidate_index, cand in enumerate(candidates[:15], start=1):
+        sym = str(cand.get("symbol") or "")
+        _main_loop_progress("institutional_candidate_start",
+                            candidate_index=candidate_index, candidate_count=min(15, len(candidates)),
+                            symbol=sym)
         try:
             sym = cand["symbol"]
             side = cand["side"]
@@ -7703,8 +7708,13 @@ def smart_opportunity_selection():
             if total > best_score:
                 best_score = total
                 best_setup = (sym, side, total, narrative, zones, df, ob, atr)
-        except Exception:
-            continue
+        except Exception as exc:
+            log_execution(f"[WATCHLIST_CANDIDATE] {sym} analysis failed: {type(exc).__name__}: {exc}", "WARN")
+        finally:
+            _main_loop_progress("institutional_candidate_complete",
+                                candidate_index=candidate_index, symbol=sym)
+    _main_loop_progress("institutional_candidate_batch_complete",
+                        candidate_count=min(15, len(candidates)))
     if best_setup and best_score >= 9:
         sym, side, score, narrative, zones, df, ob, atr = best_setup
         price = df['close'].iloc[-1]
@@ -11103,6 +11113,7 @@ def main_loop_sniper():
             now = time.time()
             _main_loop_progress("iteration_start",
                                 recovery_hold=bool(STATE.get("recovery_hold")))
+            _main_loop_progress("exchange_sync_start")
             sync_all_states()
             _main_loop_progress("exchange_sync_complete")
             cooldown_active_now = daily_loss_cooldown_active()
@@ -11114,8 +11125,10 @@ def main_loop_sniper():
                 continue
 
             if now - last_flow_update > 60:
+                _main_loop_progress("institutional_flow_start")
                 update_institutional_flow_scanner()
                 last_flow_update = now
+                _main_loop_progress("institutional_flow_complete")
 
             if not (TRADE_STATE["in_position"] or STATE["open"]):
                 sync_position_state()
@@ -11139,11 +11152,15 @@ def main_loop_sniper():
                 # sharing the exact OHLCV frame with OB/FVG/liquidity/structure analysis.
                 if not (INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL):
                     if now - last_candidate_scan >= CANDIDATE_SCAN_INTERVAL:
+                        _main_loop_progress("institutional_watchlist_scan_start")
                         smart_opportunity_selection()
                         last_candidate_scan = now
+                        _main_loop_progress("institutional_watchlist_scan_complete")
                     # Sniper is an entry-only candidate engine; it never runs while
                     # a position is open and uses the same bounded scanner cache.
+                    _main_loop_progress("sniper_scan_start")
                     _run_sniper_scan_if_due()
+                    _main_loop_progress("sniper_scan_complete")
                     time.sleep(1)
                 else:
                     time.sleep(1)
@@ -11481,7 +11498,9 @@ def _resume_main_loop_after_verification(context=None):
         # Exchange verification alone does not prove the foreground loop is alive.
         context["engine_resumed"] = bool(
             resumed and _wait_for_main_loop_progress(progress_baseline))
-        return bool(context["engine_resumed"])
+        # Recovery callback completed, but cannot replace the foreground MainThread.
+        # HealthWatchdog will classify missing liveness as RECOVERY_DEFERRED.
+        return bool(resumed)
     return _resume_scanner_after_flat_verification(context)
 
 
