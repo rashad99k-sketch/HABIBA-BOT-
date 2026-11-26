@@ -23,6 +23,7 @@ from ggp_institutional_strategy import build_institutional_report
 from roro_confluence import AUTH_EMA9_EMA15_TRIGGER_VALID
 
 SCHEMA_VERSION = "NAISO_UNIFIED_DECISION_CONTEXT_V1"
+CROSS_LIFECYCLE_SCHEMA = "CROSS_REJECTION_V1"
 
 CROSS_STATES = (
     "CONFIRMED_BUY_CROSS",
@@ -258,6 +259,16 @@ def classify_cross_state(record: Any = None, *, proximity: Any = None, gate: Any
     if phase and phase not in CROSS_PHASES:
         phase = "WAITING_FOR_PULLBACK"
     entry_ready = metadata.get("entry_ready", row.get("cross_event_entry_ready")) is True
+    if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+        selected_zone = metadata.get("selected_entry_zone")
+        structural_gate = _mapping(metadata.get("structural_zone_gate"))
+        entry_ready = bool(
+            entry_ready
+            and metadata.get("breakout_candidate") is True
+            and isinstance(selected_zone, Mapping)
+            and structural_gate.get("allowed") is True
+            and structural_gate.get("authority") == "UNIFIED_WATCHLIST_ENTRY_ZONE"
+        )
     direction = _direction_from_cross(
         row.get("side") or row.get("direction") or row.get("cross_event_direction")
     )

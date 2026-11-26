@@ -7544,12 +7544,53 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         _hydrate_cross_lifecycle_context(
             institutional_entry_ctx, cross_event_id, gate_result, side, symbol, gate_tf,
         )
+        durable_zone = gate_result.get("selected_entry_zone")
+        supplied_zone = institutional_entry_ctx.get("entry_zone")
+        if not isinstance(durable_zone, dict) or not isinstance(supplied_zone, dict):
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: durable cross event has no matching selected structural zone",
+                "WARN", debounce_key=f"cross_zone_missing:{cross_event_id}", debounce_sec=10,
+            )
+            return False
+        zone_identity = ("kind", "side", "zone_direction", "available_timestamp")
+        try:
+            same_zone = all(str(supplied_zone.get(key)) == str(durable_zone.get(key)) for key in zone_identity)
+            same_zone = same_zone and math.isclose(float(supplied_zone.get("low")), float(durable_zone.get("low")), rel_tol=1e-10, abs_tol=1e-12)
+            same_zone = same_zone and math.isclose(float(supplied_zone.get("high")), float(durable_zone.get("high")), rel_tol=1e-10, abs_tol=1e-12)
+        except (TypeError, ValueError, OverflowError):
+            same_zone = False
+        if not same_zone:
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: Watchlist zone differs from durable cross-event zone",
+                "WARN", debounce_key=f"cross_zone_mismatch:{cross_event_id}", debounce_sec=10,
+            )
+            return False
         if gate_result.get("durable_event_id") and cross_event_id != gate_result["durable_event_id"]:
             log_execution(
                 f"[CROSS_EVENT] BLOCKED {symbol} {side}: watchlist event {cross_event_id} "
                 f"does not match execution gate event {gate_result['durable_event_id']}", "ERROR",
             )
             return False
+        zone_ok, zone_reason = _validate_selected_entry_zone(
+            supplied_zone, side, price=price, atr=atr_val,
+            latest_timestamp=institutional_entry_ctx.get("closed_candle_timestamp"),
+            timeframe_ms=institutional_entry_ctx.get("timeframe_ms")
+                or int(_roro_timeframe_seconds(gate_tf) * 1000),
+        )
+        if not zone_ok:
+            log_execution(
+                f"[ENTRY_ZONE_GATE] BLOCKED {symbol} {side}: durable Watchlist zone failed final validation: {zone_reason}",
+                "WARN", debounce_key=f"cross_zone_final:{cross_event_id}:{zone_reason}", debounce_sec=10,
+            )
+            return False
+        institutional_entry_ctx["entry_zone_gate"] = {
+            "allowed": True, "reason": zone_reason,
+            "kind": supplied_zone.get("kind"),
+            "zone_direction": supplied_zone.get("zone_direction"),
+            "low": supplied_zone.get("low"), "high": supplied_zone.get("high"),
+            "available_timestamp": supplied_zone.get("available_timestamp"),
+            "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+        }
     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
     # Preserve the exact gate snapshot for the serialized final execution wrapper.
     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
@@ -8560,8 +8601,70 @@ def _advance_cross_event_lifecycles(rows, progress_callback=None, max_items=None
                 ema_fn=ema, timeframe_seconds=_roro_timeframe_seconds(row.get("timeframe") or INTERVAL),
                 now_ms=int(time.time() * 1000), max_chase_atr=CROSS_REJECTION_MAX_CHASE_ATR,
             )
-            if lifecycle.get("entry_ready") and str(lifecycle.get("phase") or "") != "BREAKOUT_CONFIRMED":
-                lifecycle["entry_ready"] = False
+            breakout_confirmed = (
+                str(lifecycle.get("phase") or "").upper() == "BREAKOUT_CONFIRMED"
+                and lifecycle.get("entry_ready") is True
+            )
+            # Every breakout remains a candidate until the unified Watchlist
+            # has selected and validated a structural zone for this exact event.
+            lifecycle["breakout_candidate"] = bool(breakout_confirmed)
+            lifecycle["entry_ready"] = False
+            lifecycle["structural_zone_gate"] = {
+                "allowed": False,
+                "reason": "watchlist_structural_zone_not_yet_authorized",
+                "required": True,
+                "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+            }
+            if breakout_confirmed:
+                event_id = str(row.get("event_id") or "")
+                side = str(row.get("side") or "").upper()
+                watchlist = MEMORY.get("watchlist") if isinstance(MEMORY.get("watchlist"), dict) else {}
+                structural_row = next((
+                    item for item in watchlist.values()
+                    if isinstance(item, dict)
+                    and str(item.get("cross_event_id") or "") == event_id
+                    and str(item.get("side") or "").upper() == side
+                ), None)
+                if structural_row is None:
+                    lifecycle["structural_zone_gate"]["reason"] = "missing_matching_watchlist_event"
+                else:
+                    selected_zone = structural_row.get("entry_zone")
+                    try:
+                        latest_price = float(frame["close"].iloc[-1])
+                        latest_ts = int(lifecycle.get("latest_closed_timestamp") or 0)
+                        atr_value = float(lifecycle.get("atr") or 0.0)
+                        tf_ms = int(_roro_timeframe_seconds(row.get("timeframe") or INTERVAL) * 1000)
+                        zone_ok, zone_reason = _validate_selected_entry_zone(
+                            selected_zone, side, price=latest_price, atr=atr_value,
+                            latest_timestamp=latest_ts, timeframe_ms=tf_ms,
+                        )
+                    except Exception as zone_exc:
+                        zone_ok, zone_reason = False, f"structural_zone_validation_error:{type(zone_exc).__name__}"
+                    if zone_ok:
+                        lifecycle["selected_entry_zone"] = dict(selected_zone)
+                        lifecycle["entry_behavior"] = str(
+                            structural_row.get("entry_behavior")
+                            or (structural_row.get("market_intelligence") or {}).get("entry_behavior")
+                            or "WAIT_FOR_STRUCTURE"
+                        ).upper()
+                        lifecycle["trading_mode"] = str(
+                            structural_row.get("trading_mode")
+                            or (structural_row.get("market_intelligence") or {}).get("mode")
+                            or "UNCLASSIFIED"
+                        ).upper()
+                        lifecycle["setup_type"] = str(
+                            structural_row.get("decision_setup_type")
+                            or structural_row.get("setup_type")
+                            or "UNCLASSIFIED"
+                        ).upper()
+                        lifecycle["structural_zone_gate"] = {
+                            "allowed": True, "reason": zone_reason,
+                            "required": True, "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+                        }
+                        lifecycle["entry_ready"] = True
+                    else:
+                        lifecycle["structural_zone_gate"]["reason"] = zone_reason
+                        lifecycle["reason"] = f"structural_zone_not_authorized:{zone_reason}"
             if journal.update_cross_event_lifecycle(row.get("event_id"), lifecycle):
                 advanced += 1
         except Exception as exc:
@@ -8718,18 +8821,18 @@ def _detect_confirmed_cross_events(symbols):
             continue
         for side in ("BUY", "SELL"):
             try:
-                gate = _validate_dual_ema_vwap_entry_gate(
+                gate = _validate_ema9_vwap_entry_gate(
                     frame, side, ema, timeframe_seconds=timeframe_seconds,
                     now_ms=now_ms, lookback_candles=2,
                 )
             except Exception:
                 continue
             authorization_state = str(gate.get("authorization_state") or "")
-            if not gate.get("ready") or authorization_state != str(_AUTH_EMA9_EMA15_TRIGGER_VALID):
+            if not gate.get("ready") or authorization_state != str(_AUTH_EMA9_VWAP_TRIGGER_VALID):
                 continue
-            # The authoritative new trigger is the strict EMA9/EMA15 cross. The
-            # legacy EMA9/VWAP-only gate is no longer accepted as authorization.
-            direction = str(gate.get("ema9_15_cross") or "").upper()
+            # The authoritative trigger is the strict EMA9/Session-VWAP cross.
+            # EMA15 is deliberately not part of scanner authorization.
+            direction = str(gate.get("ema9_vwap_cross") or gate.get("ema9_cross") or "").upper()
             expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
             if direction != expected_direction:
                 continue
@@ -8739,7 +8842,7 @@ def _detect_confirmed_cross_events(symbols):
             metadata = dict(gate)
             metadata.update({
                 "source": CONFIRMED_CROSS_EVENT_SOURCE,
-                "detection_method": "validate_dual_ema_vwap_entry_gate",
+                "detection_method": "validate_ema9_vwap_entry_gate",
                 "lookback_candles": 2,
                 "lifecycle_schema": CROSS_LIFECYCLE_SCHEMA,
                 "lifecycle_status": CROSS_WATCHLIST_LIFECYCLE,
@@ -8795,13 +8898,22 @@ def _cross_event_is_usable(event_id, side=None):
         return False
     if side and str(row.get("side") or "").upper() != str(side).upper():
         return False
+    if str(row.get("event_id") or "") != event_id:
+        return False
     if float(row.get("expires_ts") or 0.0) <= time.time():
         return False
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     if str(metadata.get("lifecycle_schema") or "") == CROSS_LIFECYCLE_SCHEMA:
+        zone = metadata.get("selected_entry_zone")
+        zone_gate = metadata.get("structural_zone_gate")
         return (
             str(metadata.get("phase") or "").upper() == "BREAKOUT_CONFIRMED"
             and metadata.get("entry_ready") is True
+            and metadata.get("breakout_candidate") is True
+            and isinstance(zone, dict)
+            and isinstance(zone_gate, dict)
+            and zone_gate.get("allowed") is True
+            and str(zone_gate.get("authority") or "") == "UNIFIED_WATCHLIST_ENTRY_ZONE"
         )
     return True
 
@@ -8858,10 +8970,29 @@ def _hydrate_cross_lifecycle_context(ctx, event_id, gate_result, side, symbol, t
         gate["durable_event_id"] = recomputed_event_id
     gate["lifecycle_phase"] = context["cross_event_phase"]
     gate["lifecycle_entry_ready"] = context["cross_event_entry_ready"]
-    if context["cross_event_entry_ready"] and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED":
+    selected_zone = metadata.get("selected_entry_zone")
+    zone_gate = metadata.get("structural_zone_gate")
+    if isinstance(selected_zone, dict):
+        gate["selected_entry_zone"] = dict(selected_zone)
+    if isinstance(zone_gate, dict):
+        gate["structural_zone_gate"] = dict(zone_gate)
+    zone_authorized = (
+        context["cross_event_entry_ready"] is True
+        and str(context["cross_event_phase"]).upper() == "BREAKOUT_CONFIRMED"
+        and metadata.get("breakout_candidate") is True
+        and isinstance(selected_zone, dict)
+        and isinstance(zone_gate, dict)
+        and zone_gate.get("allowed") is True
+        and str(zone_gate.get("authority") or "") == "UNIFIED_WATCHLIST_ENTRY_ZONE"
+    )
+    if zone_authorized:
         gate["ready"] = True
-        gate["authorization_state"] = "POST_CROSS_REJECTION_BREAKOUT_VALID"
-        gate["reason"] = "closed_rejection_high_low_breakout_confirmed"
+        gate["authorization_state"] = "WATCHLIST_STRUCTURAL_ZONE_AUTHORIZED"
+        gate["reason"] = "breakout_and_matching_watchlist_zone_confirmed"
+    else:
+        gate["ready"] = False
+        gate["authorization_state"] = "BREAKOUT_CANDIDATE_AWAITING_STRUCTURAL_ZONE"
+        gate["reason"] = str((zone_gate or {}).get("reason") or "watchlist_structural_zone_not_authorized")
     return True
 
 
@@ -14672,11 +14803,14 @@ from ggp_institutional_bridge import (
 )
 from ggp_discovery_scanner import professional_lightweight_scan as _professional_lightweight_scan
 from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
-                             validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                             validate_ema9_vwap_entry_gate as _validate_ema9_vwap_entry_gate,
                              evaluate_post_cross_rejection_breakout as _evaluate_post_cross_rejection_breakout,
                              closed_candles as _roro_closed_candles,
-                             AUTH_EMA9_EMA15_TRIGGER_VALID as _AUTH_EMA9_EMA15_TRIGGER_VALID,
+                             AUTH_EMA9_VWAP_TRIGGER_VALID as _AUTH_EMA9_VWAP_TRIGGER_VALID,
                              timeframe_seconds as _roro_timeframe_seconds)
+# Preserve the legacy monkeypatch/import seam while the canonical implementation
+# and scanner authorization are EMA9/Session-VWAP only.
+_validate_dual_ema_vwap_entry_gate = _validate_ema9_vwap_entry_gate
 try:
     from roro_resource_manager import ResourceManager
     from roro_trade_journal import TradeJournal

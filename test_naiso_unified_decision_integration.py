@@ -512,13 +512,16 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     ggpbot._sync_confirmed_cross_events()
     completed = journal.get_cross_event(event["event_id"])
     assert completed["metadata"]["phase"] == "BREAKOUT_CONFIRMED"
-    assert completed["metadata"]["entry_ready"] is True
+    # Confirmed breakout is not execution authorization without Watchlist zone approval.
+    assert completed["metadata"]["entry_ready"] is False
+    assert completed["metadata"]["structural_zone_gate"]["allowed"] is False
+    assert completed["metadata"]["structural_zone_gate"]["reason"] == "missing_selected_entry_zone"
     completed_projection = ggpbot._project_confirmed_cross_row(completed)
     assert completed_projection["cross_state"] == "CONFIRMED_BUY_CROSS"
     assert completed_projection["cross_event_phase"] == "BREAKOUT_CONFIRMED"
-    assert completed_projection["cross_event_entry_ready"] is True
-    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is True
-    step("CLOSED_LIFECYCLE_BREAKOUT", phase=completed_projection["cross_event_phase"],
+    assert completed_projection["cross_event_entry_ready"] is False
+    assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
+    step("CLOSED_LIFECYCLE_BREAKOUT_CANDIDATE", phase=completed_projection["cross_event_phase"],
          entry_ready=completed_projection["cross_event_entry_ready"])
 
     # 6) A complete authoritative setup is projected ENTRY_READY with all context.
@@ -546,12 +549,12 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         "entry_zone_high": price + 0.2, "atr": 0.69,
         "evidence": ["closed_ema9_vwap_cross", "fresh_institutional_zone"],
     })
+    # A complete generic institutional projection cannot override the
+    # independent structural-zone authorization attached to the cross event.
     decision = proj.project_decision_context(authorized_row, cross=cross_view, now_ts=clock[0])
-    assert decision["decision_state"] == "ENTRY_READY"
-    assert decision["entry_readiness"]["conditions_complete"] is True
-    assert decision["entry_readiness"]["sl_valid"] is True
-    assert decision["required_next_event"] == "NONE_ALL_CONDITIONS_COMPLETE"
-    step("DECISION_ENTRY_READY", decision_state=decision["decision_state"],
+    assert decision["decision_state"] != "ENTRY_READY"
+    assert decision["required_next_event"] != "NONE_ALL_CONDITIONS_COMPLETE"
+    step("DECISION_REMAINS_BLOCKED", decision_state=decision["decision_state"],
          snapshot_id=decision["source_snapshot_id"])
 
     # 7) The projection is frozen into the existing persistent entry context.
@@ -562,11 +565,12 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         ctx, dict(gate), "BUY", SYMBOL, "trace-trade-1", 0.69,
     )
     frozen = persistent.get("unified_decision_context") or {}
-    assert frozen.get("decision_state") == "ENTRY_READY"
+    assert frozen.get("decision_state") != "ENTRY_READY"
     step("FROZEN_ENTRY_CONTEXT", decision_state=frozen.get("decision_state"),
          closed_candle_timestamp=persistent.get("closed_candle_timestamp"))
 
-    # 8) PAPER execution succeeds only after the conditions are complete.
+    # 8) execute_entry is given an otherwise convincing generic context,
+    #    but the durable event still has no Watchlist structural-zone approval.
     ctx.update({
         "closed_candle_frame": frames["current"].copy(),
         "closed_candle_timestamp": int(frames["current"]["timestamp"].iloc[-1]),
@@ -580,30 +584,32 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
         "BUY", SYMBOL, live_price, live_stop, live_price * 1.008, live_price * 1.02, 80,
         "UNIFIED_DECISION_E2E", 0.69, "TREND", "TREND", "TREND",
     )
-    assert ok is True
-    trade_id = str(ggpbot.STATE["trade_id"])
-    assert trade_id
-    assert ggpbot.paper.get("position") is not None
-    consumed = journal.get_cross_event(event["event_id"])
-    assert consumed["status"] == "ENTERED"
-    step("PAPER_ENTRY_EXECUTED", trade_id=trade_id, journal_status=consumed["status"])
+    assert ok is False
+    assert ggpbot.STATE.get("trade_id") in (None, "")
+    assert ggpbot.paper.get("position") is None
+    remains_active = journal.get_cross_event(event["event_id"])
+    assert remains_active["status"] == "ACTIVE"
+    assert remains_active["metadata"]["entry_ready"] is False
+    step("PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", journal_status=remains_active["status"])
 
-    # 9) The consumed cross cannot be reused.
-    consumed_view = proj.classify_cross_state(consumed, now_ts=clock[0])
-    assert consumed_view["cross_state"] == "CROSS_ALREADY_CONSUMED"
-    assert consumed_view["authoritative"] is False
+    # The active event remains a candidate, not a consumed trade.
+    active_view = proj.classify_cross_state(remains_active, now_ts=clock[0])
+    assert active_view["cross_state"] == "CONFIRMED_BUY_CROSS"
+    assert active_view["cross_event_entry_ready"] is False
+    assert active_view["authoritative"] is True
     assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
-    step("CROSS_CONSUMED_NO_REUSE", cross_state=consumed_view["cross_state"],
-         authoritative=consumed_view["authoritative"])
+    step("CROSS_REMAINS_CANDIDATE", cross_state=active_view["cross_state"],
+         entry_ready=active_view["cross_event_entry_ready"])
 
     assert [row["stage"] for row in trace] == [
         "SCANNER_STRICT_GATE", "CROSS_PROJECTION_ACTIVE", "WATCHLIST_DECISION_PROJECTION",
-        "ENTRY_BLOCKED_BEFORE_BREAKOUT", "CLOSED_LIFECYCLE_BREAKOUT", "DECISION_ENTRY_READY",
-        "FROZEN_ENTRY_CONTEXT", "PAPER_ENTRY_EXECUTED", "CROSS_CONSUMED_NO_REUSE",
+        "ENTRY_BLOCKED_BEFORE_BREAKOUT", "CLOSED_LIFECYCLE_BREAKOUT_CANDIDATE",
+        "DECISION_REMAINS_BLOCKED", "FROZEN_ENTRY_CONTEXT",
+        "PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", "CROSS_REMAINS_CANDIDATE",
     ]
     assert trace[3]["paper_position"] is None
-    assert trace[5]["decision_state"] == "ENTRY_READY"
-    assert trace[7]["journal_status"] == "ENTERED"
+    assert trace[5]["decision_state"] != "ENTRY_READY"
+    assert trace[7]["journal_status"] == "ACTIVE"
 
 
 def _watchlist_card_row():
@@ -950,3 +956,48 @@ def test_dashboard_exposes_entry_lifecycle_stop_and_same_cycle_timing(monkeypatc
     for token in ("Entry type:", "Lifecycle:", "waiting:", "Cross delivery:",
                   "same_cycle=", "refresh_s=", "Validation:", "Gate:"):
         assert token in html
+
+
+
+def test_projection_uses_engine_cross_lifecycle_schema_and_structural_authorization():
+    assert proj.CROSS_LIFECYCLE_SCHEMA == ggpbot.CROSS_LIFECYCLE_SCHEMA
+    zone = {
+        "kind": "ORDER_BLOCK",
+        "side": "BUY",
+        "zone_direction": "DEMAND",
+        "zone_definition": "BULLISH_LOW_TO_OPEN",
+        "low": 99.8,
+        "high": 100.2,
+        "available_timestamp": 1_790_000_000_000,
+        "strength": 8.0,
+    }
+    authorized = _durable_record(
+        side="BUY", phase="BREAKOUT_CONFIRMED", entry_ready=True,
+    )
+    authorized["metadata"].update({
+        "lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA,
+        "breakout_candidate": True,
+        "selected_entry_zone": zone,
+        "structural_zone_gate": {
+            "allowed": True,
+            "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+        },
+    })
+    projected = proj.classify_cross_state(authorized, now_ts=FIXED_NOW)
+    assert projected["cross_event_entry_ready"] is True
+    assert projected["cross_event_phase"] == "BREAKOUT_CONFIRMED"
+
+    blocked = _durable_record(
+        side="BUY", phase="BREAKOUT_CONFIRMED", entry_ready=True,
+    )
+    blocked["metadata"].update({
+        "lifecycle_schema": ggpbot.CROSS_LIFECYCLE_SCHEMA,
+        "breakout_candidate": True,
+        "selected_entry_zone": zone,
+        "structural_zone_gate": {
+            "allowed": False,
+            "authority": "UNIFIED_WATCHLIST_ENTRY_ZONE",
+        },
+    })
+    rejected = proj.classify_cross_state(blocked, now_ts=FIXED_NOW)
+    assert rejected["cross_event_entry_ready"] is False
