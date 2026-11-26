@@ -1167,24 +1167,25 @@ def get_ohlcv_safe(symbol, limit=120, htf=False):
 
 
 def get_ohlcv_safe_meta(symbol, limit=120, htf=False):
-    """Return (frame, source). `source` is CACHE_HIT or FRESH_REQUEST (or NONE).
+    """Return (frame, source), rejecting invalid symbols before cache or API access."""
+    sym, reason, diagnostics = resolve_position_symbol(symbol)
+    if not sym:
+        _record_ohlcv_fetch_diagnostic(
+            str(symbol or ""), "INVALID_SYMBOL",
+            detail=f"{reason}: {diagnostics.get('source', 'NONE')}",
+        )
+        return None, "INVALID_SYMBOL"
 
-    A CACHE_HIT means the frame was served from the local cache without any new
-    BingX request; it must never be logged as a new exchange request.
-    """
-    # Increase TTL during open trade to reduce API calls
     ttl = 10 if (STATE.get("open") or TRADE_STATE["in_position"]) else 30
     if htf:
         ttl = max(ttl, 30)
-    cache_key = f"ohlcv_{symbol}_{INTERVAL}_{limit}_htf" if htf else f"ohlcv_{symbol}_{INTERVAL}_{limit}"
+    timeframe = "1h" if htf else INTERVAL
+    cache_key = f"ohlcv_{sym}_{timeframe}_{limit}"
     cached = cache_get(cache_key, ttl)
-    if cached is not None:
-        if len(cached) >= 100:
-            return cached, "CACHE_HIT"
-    if htf:
-        df = fetch_ohlcv_htf(symbol, '1h', limit)
-    else:
-        df = fetch_ohlcv(symbol, limit)
+    if cached is not None and len(cached) >= min(limit, 100):
+        return cached, "CACHE_HIT"
+
+    df = fetch_ohlcv_htf(sym, timeframe, limit) if htf else fetch_ohlcv(sym, limit)
     if df is not None and validate_dataframe(df, min(limit, 100)):
         cache_set(cache_key, df)
         return df, "FRESH_REQUEST"
