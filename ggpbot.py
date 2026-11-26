@@ -11227,22 +11227,45 @@ def _verify_engine_recovery(symbol=None):
     returns UNKNOWN-like failure, sets the recovery hold for an open exposure and
     never authorizes management or scanner work.
     """
+    global RECOVERY_BLOCK_ENTRIES
     raw_symbol = symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or ""
-    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
     local_open = bool(STATE.get("open") or TRADE_STATE.get("in_position"))
     expected_side = str(STATE.get("side") or TRADE_STATE.get("side") or "").upper()
     expected_qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty")
                               or TRADE_STATE.get("qty"), 0.0)
     context = {
-        "symbol": sym or normalize_symbol(raw_symbol) or str(raw_symbol)[:80],
+        "symbol": str(raw_symbol)[:80],
         "local_open": local_open, "open_position_verified": False,
         "flat_verified": False, "orders_verified": False, "stop_verified": False,
-        "paper_mode": bool(PAPER_MODE), "symbol_diagnostics": symbol_diagnostics,
+        "paper_mode": bool(PAPER_MODE), "symbol_diagnostics": {},
     }
+    # A flat runtime has no trade symbol by design. Verify account-wide exposure
+    # instead of sending an empty symbol through the position-symbol validator.
     if PAPER_MODE:
         context.update({"open_position_verified": local_open, "flat_verified": not local_open,
                         "paper_only": True})
         return True, "PAPER_MODE_RECOVERY", context
+    if not local_open:
+        status, positions = fetch_position_tri_state(None)
+        if status == "FLAT":
+            context.update({"flat_verified": True, "position_query_scope": "ALL_MARKETS"})
+            return True, "FLAT_VERIFIED", context
+        if status == "OPEN":
+            RECOVERY_BLOCK_ENTRIES = True
+            MEMORY["position_status"] = "OPEN"
+            MEMORY["recovery_status"] = "UNEXPECTED_EXCHANGE_EXPOSURE"
+            context["unexpected_open_positions"] = len(positions or [])
+            return False, "engine_recovery_unexpected_exchange_exposure", context
+        RECOVERY_BLOCK_ENTRIES = True
+        MEMORY["position_status"] = "UNKNOWN"
+        MEMORY["recovery_status"] = "EXCHANGE_SYNC_UNKNOWN"
+        return False, "engine_recovery_exchange_state_unknown", context
+
+    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
+    context.update({
+        "symbol": sym or normalize_symbol(raw_symbol) or str(raw_symbol)[:80],
+        "symbol_diagnostics": symbol_diagnostics,
+    })
     if not sym:
         reason = f"engine_recovery_{symbol_reason.lower()}"
         if local_open:
