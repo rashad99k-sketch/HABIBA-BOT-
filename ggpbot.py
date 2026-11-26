@@ -856,6 +856,119 @@ def rate_limit(func=None):
         f"API_RATE actual-start verification budget exhausted for {method_name}"
     )
 
+CACHE_LOCK = threading.RLock()
+CACHE_MAX_ITEMS = _env_int_range("CACHE_MAX_ITEMS", 2500, 100, 10000)
+
+# One canonical market-data snapshot per symbol/timeframe. All callers (live
+# management, discovery scanners and the institutional Watchlist) share this
+# snapshot; caller-specific `limit` values only slice the cached frame.
+OHLCV_CACHE_LIMIT = 150
+OHLCV_RATE_LIMIT_COOLDOWN_SEC = _env_float_range("OHLCV_RATE_LIMIT_COOLDOWN_SEC", 3.0, 1.0, 15.0)
+_OHLCV_INFLIGHT_LOCKS = {}
+_OHLCV_INFLIGHT_GUARD = threading.Lock()
+_OHLCV_RATE_COOLDOWN = {"until": 0.0, "symbol_until": {}}
+
+
+def _ohlcv_inflight_lock(key):
+    """Return a stable per-key lock so concurrent callers cannot duplicate a fetch."""
+    with _OHLCV_INFLIGHT_GUARD:
+        lock = _OHLCV_INFLIGHT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _OHLCV_INFLIGHT_LOCKS[key] = lock
+        return lock
+
+
+def _ohlcv_canonical_cache_key(symbol, limit, *, htf=False):
+    """Canonicalize symbol aliases and limit buckets into one cache identity."""
+    try:
+        canonical = normalize_symbol(symbol)
+    except Exception:
+        canonical = str(symbol or "").strip().upper()
+    timeframe = "1h" if htf else str(INTERVAL)
+    return canonical, f"ohlcv_v2_{canonical}_{timeframe}_{OHLCV_CACHE_LIMIT}", timeframe
+
+
+def _ohlcv_cache_get(key, ttl, timeframe):
+    """Read one canonical OHLCV snapshot while its bounded TTL is valid.
+
+    Candle-level staleness is evaluated by ``resolve_entry_closed_candles`` where
+    it can trigger one governed refresh. The shared cache itself deliberately
+    keeps the established TTL semantics so management/scanner callers do not
+    issue duplicate requests between candles.
+    """
+    with CACHE_LOCK:
+        item = CACHE.get(key)
+        if not isinstance(item, dict) or "value" not in item or "ts" not in item:
+            return None
+        if time.time() - float(item["ts"]) >= ttl:
+            CACHE.pop(key, None)
+            return None
+        return item["value"]
+
+
+def _ohlcv_cache_set(key, frame, timeframe):
+    with CACHE_LOCK:
+        CACHE[key] = {
+            "value": frame.copy(),
+            "ts": time.time(),
+            "timeframe": str(timeframe),
+        }
+        if len(CACHE) > CACHE_MAX_ITEMS:
+            dated = sorted(
+                ((float(v.get("ts", 0)), k) for k, v in CACHE.items()
+                 if isinstance(v, dict) and "ts" in v and "value" in v),
+                key=lambda item: item[0]
+            )
+            for _, old_key in dated[:max(1, len(CACHE) - CACHE_MAX_ITEMS)]:
+                CACHE.pop(old_key, None)
+
+
+def _ohlcv_rate_limit_cooldown_remaining(symbol):
+    now = time.monotonic()
+    with _OHLCV_INFLIGHT_GUARD:
+        until = max(
+            float(_OHLCV_RATE_COOLDOWN.get("until", 0.0)),
+            float(_OHLCV_RATE_COOLDOWN.get("symbol_until", {}).get(str(symbol), 0.0)),
+        )
+    return max(0.0, until - now)
+
+
+def _mark_ohlcv_rate_limit_cooldown(symbol):
+    """Fence repeat kline requests briefly after a confirmed exchange rate-limit."""
+    now = time.monotonic()
+    until = now + OHLCV_RATE_LIMIT_COOLDOWN_SEC
+    with _OHLCV_INFLIGHT_GUARD:
+        _OHLCV_RATE_COOLDOWN["until"] = max(float(_OHLCV_RATE_COOLDOWN.get("until", 0.0)), until)
+        symbol_until = _OHLCV_RATE_COOLDOWN.setdefault("symbol_until", {})
+        symbol_until[str(symbol)] = max(float(symbol_until.get(str(symbol), 0.0)), until)
+        if len(symbol_until) > 500:
+            for key in [k for k, v in symbol_until.items() if float(v) <= now]:
+                symbol_until.pop(key, None)
+
+
+def cache_get(key, ttl):
+    with CACHE_LOCK:
+        item = CACHE.get(key)
+        if isinstance(item, dict) and "ts" in item and "value" in item:
+            if time.time() - float(item["ts"]) < ttl:
+                return item["value"]
+            CACHE.pop(key, None)
+    return None
+
+def cache_set(key, value):
+    now = time.time()
+    with CACHE_LOCK:
+        CACHE[key] = {"value": value, "ts": now}
+        if len(CACHE) > CACHE_MAX_ITEMS:
+            dated = sorted(
+                ((float(v.get("ts", 0)), k) for k, v in CACHE.items()
+                 if isinstance(v, dict) and "ts" in v and "value" in v),
+                key=lambda item: item[0]
+            )
+            for _, old_key in dated[:max(1, len(CACHE) - CACHE_MAX_ITEMS)]:
+                CACHE.pop(old_key, None)
+
 def safe_api_call(func, *args, **kwargs):
     # Internal callers may lower the retry budget for latency-sensitive reads
     # that run on the foreground trade-control loop. This never increases the
