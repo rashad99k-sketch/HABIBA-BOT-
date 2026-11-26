@@ -18171,7 +18171,15 @@ def _startup_flat_orders_reconciled(rows):
         "PARTIAL_FILL", "PROTECTION_HOLD",
     }
     entry_state = str(STATE.get("entry_execution_state") or "").upper()
-    if ((STATE.get("execution_unresolved") or entry_state in pending_entry_states)
+    close_id = STATE.get("pending_close_order_id")
+    # execution_unresolved is shared by entry and close paths. An explicitly
+    # pending close must not be misclassified as an entry missing its order ID.
+    # A separately persisted pending-entry state still requires entry identity.
+    entry_execution_unresolved = bool(
+        STATE.get("execution_unresolved")
+        and not (STATE.get("close_reconciliation_required") or close_id)
+    )
+    if ((entry_execution_unresolved or entry_state in pending_entry_states)
             and not (entry_id or client_id) and not entry_terminal):
         return False, "ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
     if entry_id or client_id:
@@ -18179,7 +18187,6 @@ def _startup_flat_orders_reconciled(rows):
         if not ok:
             return False, f"ENTRY_ORDER:{reason}"
 
-    close_id = STATE.get("pending_close_order_id")
     if STATE.get("close_reconciliation_required") and not close_id:
         return False, "CLOSE_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
     if close_id:
@@ -18198,7 +18205,13 @@ def _startup_flat_orders_reconciled(rows):
                          or row.get("client_order_id"))
         row_entry_terminal = bool(saved.get("entry_order_terminal"))
         row_entry_state = str(saved.get("entry_execution_state") or row.get("status") or "").upper()
-        if ((saved.get("execution_unresolved") or row_entry_state in pending_entry_states)
+        row_close_id = (saved.get("pending_close_order_id")
+                        or row.get("pending_close_order_id"))
+        row_entry_execution_unresolved = bool(
+            saved.get("execution_unresolved")
+            and not (saved.get("close_reconciliation_required") or row_close_id)
+        )
+        if ((row_entry_execution_unresolved or row_entry_state in pending_entry_states)
                 and not (row_entry_id or row_client_id) and not row_entry_terminal):
             return False, "JOURNAL_ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
         if row_entry_id or row_client_id:
@@ -18206,8 +18219,6 @@ def _startup_flat_orders_reconciled(rows):
                                       row_entry_terminal)
             if not ok:
                 return False, f"JOURNAL_ENTRY_ORDER:{reason}"
-        row_close_id = (saved.get("pending_close_order_id")
-                        or row.get("pending_close_order_id"))
         if saved.get("close_reconciliation_required") and not row_close_id:
             return False, "JOURNAL_CLOSE_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
         if row_close_id:
@@ -18570,6 +18581,83 @@ def sync_position_state(symbol=None):
     return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
 
 
+
+_RUNTIME_FLAT_RECOVERY_RECHECK_SEC = 10.0
+_RUNTIME_FLAT_RECOVERY_LOCK = threading.Lock()
+_RUNTIME_FLAT_RECOVERY_CACHE = {
+    "checked_at": 0.0, "fingerprint": None, "ok": False, "reason": "NOT_CHECKED",
+}
+
+
+def _verify_runtime_flat_recovery_orders():
+    """Reuse startup's order-level proof before releasing a runtime FLAT recovery hold.
+
+    A stale recovery_hold flag is not, by itself, proof of an in-flight order.
+    Conversely, a FLAT position snapshot does not resolve a known pending order,
+    missing order identity, or failed durable entry-event persistence.
+    """
+    global RECOVERY_BLOCK_ENTRIES
+    fingerprint_keys = (
+        "recovery_hold", "execution_unresolved", "close_reconciliation_required",
+        "pending_close_order_id", "entry_exchange_order_id", "entry_client_order_id",
+        "entry_order_terminal", "entry_execution_state",
+        "entry_context_persistence_failed", "cross_event_persistence_failed",
+        "entry_event_persistence_failed",
+    )
+    fingerprint = tuple((key, repr(STATE.get(key))) for key in fingerprint_keys)
+    now = time.time()
+
+    with _RUNTIME_FLAT_RECOVERY_LOCK:
+        cached = _RUNTIME_FLAT_RECOVERY_CACHE
+        if (cached.get("fingerprint") == fingerprint
+                and now - safe_float(cached.get("checked_at"), 0.0) < _RUNTIME_FLAT_RECOVERY_RECHECK_SEC):
+            return bool(cached.get("ok")), str(cached.get("reason") or "CACHED_RESULT")
+
+        try:
+            journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+            rows = list(journal.open_trades()) if journal is not None else []
+            ok, reason = _startup_flat_orders_reconciled(rows)
+        except Exception as exc:
+            ok, reason = False, f"ORDER_RECONCILIATION_FAILED:{type(exc).__name__}"
+
+        if ok and not _mark_persisted_recovery_resolved(
+                "FLAT", "RUNTIME_RECONCILED_FLAT"):
+            ok, reason = False, "RECOVERY_STATE_PERSISTENCE_FAILED"
+
+        _RUNTIME_FLAT_RECOVERY_CACHE.update({
+            "checked_at": now, "fingerprint": fingerprint,
+            "ok": bool(ok), "reason": str(reason),
+        })
+        return bool(ok), str(reason)
+
+
+def _apply_runtime_flat_reconciliation(*, clear_trade_state=False):
+    """Commit the in-memory FLAT state only after order and recovery persistence proof."""
+    STATE.update({
+        "open": False,
+        "execution_unresolved": False,
+        "close_reconciliation_required": False,
+        "recovery_hold": False,
+        "recovery_reason": None,
+        "pending_close_order_id": None,
+        "pending_close_reason": None,
+        "pending_close_before_qty": 0.0,
+        "pending_close_requested_qty": 0.0,
+        "pending_close_target_remaining_qty": None,
+        "pending_close_started_at": 0.0,
+        "entry_execution_state": "RECONCILED_FLAT",
+        "entry_client_order_id": None,
+        "entry_exchange_order_id": None,
+        "entry_order_terminal": False,
+    })
+    if clear_trade_state:
+        TRADE_STATE["in_position"] = False
+        TRADE_STATE["qty"] = 0.0
+    MEMORY["position_status"] = "FLAT"
+    MEMORY["current_position"] = None
+    MEMORY["recovery_status"] = "RUNTIME_RECONCILED_FLAT"
+
+
 def sync_all_states():
     global RECOVERY_BLOCK_ENTRIES
     runtime = globals().get("PORTFOLIO_RUNTIME")
@@ -18645,52 +18733,61 @@ def sync_all_states():
             MEMORY["current_position"] = None
             RECOVERY_BLOCK_ENTRIES = True
         elif status == "FLAT":
-            # A flat position snapshot alone does not prove an ambiguous MARKET
-            # order was rejected/canceled: it may still be pending or delayed.
-            # Never release an entry/close uncertainty solely from "no position".
-            entry_outcome_pending = bool(
-                STATE.get("execution_unresolved")
-                and STATE.get("entry_client_order_id")
-                and not STATE.get("entry_order_terminal")
-            )
-            close_outcome_pending = bool(
-                STATE.get("close_reconciliation_required") or STATE.get("pending_close_order_id")
-            )
-            durable_entry_hold = bool(
-                STATE.get("entry_context_persistence_failed")
+            # Do not infer an unresolved order merely from a stale recovery_hold.
+            # Run the same order/journal proof used by startup recovery; only
+            # explicit pending execution state or failed persistence keeps entries blocked.
+            recovery_gate_active = bool(
+                RECOVERY_BLOCK_ENTRIES
+                or STATE.get("recovery_hold")
+                or STATE.get("execution_unresolved")
+                or STATE.get("close_reconciliation_required")
+                or STATE.get("pending_close_order_id")
+                or STATE.get("entry_exchange_order_id")
+                or STATE.get("entry_client_order_id")
+                or STATE.get("entry_context_persistence_failed")
                 or STATE.get("cross_event_persistence_failed")
                 or STATE.get("entry_event_persistence_failed")
+                or str(MEMORY.get("position_status") or "").upper() == "UNKNOWN"
             )
-            unresolved_order = bool(
-                entry_outcome_pending or close_outcome_pending
-                or (STATE.get("execution_unresolved") and not STATE.get("entry_order_terminal"))
-                or (STATE.get("recovery_hold") and not STATE.get("entry_order_terminal")
-                    and not STATE.get("execution_unresolved"))
-                or durable_entry_hold
-            )
-            if unresolved_order:
-                MEMORY["position_status"] = "UNKNOWN"
-                MEMORY["current_position"] = None
-                MEMORY["recovery_status"] = "ORDER_OUTCOME_REQUIRES_RECONCILIATION"
-                STATE["recovery_hold"] = True
-                STATE["recovery_reason"] = "flat_snapshot_does_not_resolve_pending_order"
-                RECOVERY_BLOCK_ENTRIES = True
-                log_execution(
-                    "[RECOVERY] Exchange reports FLAT but an order outcome remains unresolved; "
-                    "entries stay blocked until order-level reconciliation proves terminal state",
-                    "CRITICAL", debounce_key="flat_with_unresolved_order", debounce_sec=60,
-                )
+            if recovery_gate_active:
+                reconciled, order_reason = _verify_runtime_flat_recovery_orders()
+                if not reconciled:
+                    MEMORY["position_status"] = "UNKNOWN"
+                    MEMORY["current_position"] = None
+                    MEMORY["recovery_status"] = "ORDER_OUTCOME_REQUIRES_RECONCILIATION"
+                    STATE["recovery_hold"] = True
+                    STATE["recovery_reason"] = str(order_reason)
+                    RECOVERY_BLOCK_ENTRIES = True
+                    log_execution(
+                        "[RECOVERY] BingX reports FLAT, but order-level reconciliation is not complete "
+                        f"({order_reason}); entries remain blocked",
+                        "CRITICAL",
+                        debounce_key=f"runtime_flat_recovery:{order_reason}",
+                        debounce_sec=60,
+                    )
+                    status = "UNKNOWN"
+                    _main_loop_progress("position_sync_complete", status=status)
+                    return
+                had_recovery_hold = bool(STATE.get("recovery_hold") or RECOVERY_BLOCK_ENTRIES)
+                _apply_runtime_flat_reconciliation(clear_trade_state=not active_items)
+                # Preserve any independent uncertainty held by another registered
+                # portfolio slot; a single FLAT account snapshot cannot clear it.
+                _recompute_portfolio_globals(clear_recovery=True)
+                if had_recovery_hold and not RECOVERY_BLOCK_ENTRIES:
+                    log_execution(
+                        "[RECOVERY] Runtime FLAT reconciled; inherited hold released after "
+                        "order-level and persistence verification",
+                        "SUCCESS", debounce_key="runtime_flat_recovery_released", debounce_sec=60,
+                    )
+                elif had_recovery_hold and RECOVERY_BLOCK_ENTRIES:
+                    log_execution(
+                        "[RECOVERY] Runtime FLAT verified, but an independent portfolio "
+                        "uncertainty still blocks entries",
+                        "ERROR", debounce_key="runtime_flat_portfolio_hold", debounce_sec=60,
+                    )
             else:
                 MEMORY["position_status"] = "FLAT"
                 MEMORY["current_position"] = None
-                STATE["execution_unresolved"] = False
-                STATE["recovery_hold"] = False
-                if STATE.get("entry_order_terminal"):
-                    STATE["entry_execution_state"] = "RECONCILED_FLAT"
-                    STATE["entry_client_order_id"] = None
-                    STATE["entry_exchange_order_id"] = None
-                    STATE["entry_order_terminal"] = False
-                RECOVERY_BLOCK_ENTRIES = bool(durable_entry_hold)
         elif status == "OPEN" and positions:
             if len(positions) == 1:
                 position = positions[0]

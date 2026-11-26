@@ -398,6 +398,11 @@ def test_flat_position_snapshot_does_not_clear_ambiguous_order_outcome(monkeypat
 
 def test_verified_flat_snapshot_releases_only_a_resolved_local_state(monkeypatch):
     monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    # This test covers the single local-state path, not registered portfolio slots.
+    # Isolate the process-wide portfolio registry so earlier tests cannot leak
+    # active reservations into its flat-state assertion.
+    monkeypatch.setattr(ggpbot, "PORTFOLIO_RUNTIME", None)
+    monkeypatch.setattr(ggpbot, "PORTFOLIO_ALLOCATOR", None)
     monkeypatch.setattr(ggpbot, "_main_loop_blocked_phase", lambda *_a, **_k: None)
     monkeypatch.setattr(ggpbot, "_main_loop_progress", lambda *_a, **_k: None)
     monkeypatch.setattr(ggpbot, "fetch_position_tri_state",

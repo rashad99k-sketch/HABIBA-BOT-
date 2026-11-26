@@ -1157,3 +1157,102 @@ def test_restart_hedge_short_position_restores(tmp_path, monkeypatch):
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["side"] == "SELL"
     assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+
+# --------------------------------------------------------------------------- #
+# Runtime FLAT synchronization must use startup's order-level recovery proof.
+# --------------------------------------------------------------------------- #
+def _prepare_runtime_flat_sync(monkeypatch):
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "PORTFOLIO_RUNTIME", None)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", None)
+    monkeypatch.setattr(
+        ggpbot, "fetch_position_tri_state",
+        lambda *args, **kwargs: ("FLAT", []),
+    )
+    monkeypatch.setattr(
+        ggpbot, "_mark_persisted_recovery_resolved",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(ggpbot, "_RUNTIME_FLAT_RECOVERY_CACHE", {
+        "checked_at": 0.0, "fingerprint": None, "ok": False, "reason": "NOT_CHECKED",
+    })
+    _fresh_state()
+    ggpbot.TRADE_STATE.update({"in_position": False, "qty": 0.0})
+    ggpbot.MEMORY["position_status"] = "UNKNOWN"
+
+
+def test_runtime_flat_releases_stale_recovery_hold_without_pending_order(monkeypatch):
+    _prepare_runtime_flat_sync(monkeypatch)
+    ggpbot.STATE.update({
+        "recovery_hold": True,
+        "recovery_reason": "PERSISTED_RECOVERY_HOLD",
+        "execution_unresolved": False,
+        "close_reconciliation_required": False,
+        "entry_execution_state": "RECONCILED_FLAT",
+        "entry_order_terminal": False,
+    })
+
+    ggpbot.sync_all_states()
+
+    assert ggpbot.STATE["recovery_hold"] is False
+    assert ggpbot.STATE["execution_unresolved"] is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is False
+    assert ggpbot.MEMORY["position_status"] == "FLAT"
+    assert ggpbot.STATE["entry_execution_state"] == "RECONCILED_FLAT"
+
+
+def test_runtime_flat_keeps_hold_for_pending_entry_without_order_identity(monkeypatch):
+    _prepare_runtime_flat_sync(monkeypatch)
+    ggpbot.STATE.update({
+        "recovery_hold": True,
+        "execution_unresolved": False,
+        "close_reconciliation_required": False,
+        "entry_execution_state": "ENTRY_PENDING",
+        "entry_exchange_order_id": None,
+        "entry_client_order_id": None,
+        "entry_order_terminal": False,
+    })
+
+    ggpbot.sync_all_states()
+
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert "WITHOUT_ORDER_ID" in str(ggpbot.STATE["recovery_reason"])
+    assert ggpbot.MEMORY["position_status"] == "UNKNOWN"
+
+
+def test_runtime_flat_keeps_hold_when_entry_event_persistence_failed(monkeypatch):
+    _prepare_runtime_flat_sync(monkeypatch)
+    ggpbot.STATE.update({
+        "recovery_hold": True,
+        "execution_unresolved": False,
+        "close_reconciliation_required": False,
+        "entry_execution_state": "RECONCILED_FLAT",
+        "entry_event_persistence_failed": True,
+    })
+
+    ggpbot.sync_all_states()
+
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert "DURABLE_ENTRY_PERSISTENCE_HOLD" in str(ggpbot.STATE["recovery_reason"])
+
+
+def test_runtime_flat_keeps_hold_if_recovery_resolution_cannot_be_persisted(monkeypatch):
+    _prepare_runtime_flat_sync(monkeypatch)
+    monkeypatch.setattr(
+        ggpbot, "_mark_persisted_recovery_resolved",
+        lambda *args, **kwargs: False,
+    )
+    ggpbot.STATE.update({
+        "recovery_hold": True,
+        "execution_unresolved": False,
+        "close_reconciliation_required": False,
+        "entry_execution_state": "RECONCILED_FLAT",
+    })
+
+    ggpbot.sync_all_states()
+
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.STATE["recovery_reason"] == "RECOVERY_STATE_PERSISTENCE_FAILED"
