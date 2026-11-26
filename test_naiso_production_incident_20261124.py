@@ -297,6 +297,40 @@ def test_main_loop_phase_progress_is_reported(monkeypatch):
     assert phases == ["iteration_start", "open_trade_management"]
 
 
+def test_main_loop_recovery_distinguishes_verified_recovery_from_liveness(monkeypatch):
+    import ggpbot
+
+    context = {"open_position_verified": True, "symbol": SYMBOL}
+    component = SimpleNamespace(resume_requires_liveness=True)
+    watchdog = SimpleNamespace(_components={"main_loop": component})
+    monkeypatch.setattr(ggpbot, "NAISO_WATCHDOG", watchdog)
+    monkeypatch.setattr(ggpbot, "_MAIN_LOOP_PROGRESS_SEQ", 10)
+    monkeypatch.setattr(ggpbot, "_ENGINE_RECOVERY_GUARD", {"ts": 0.0, "symbol": None})
+    monkeypatch.setattr(ggpbot, "startup_trade_recovery", lambda: True)
+    monkeypatch.setattr(ggpbot, "_wait_for_main_loop_progress", lambda _baseline: False)
+    monkeypatch.setattr(ggpbot, "STATE", {"recovery_hold": False, "current_symbol": SYMBOL})
+
+    assert ggpbot._resume_main_loop_after_verification(context) is True
+    assert context["engine_resumed"] is False
+
+
+def test_watchdog_stall_alert_includes_captured_main_thread_stack():
+    clock = [0.0]
+    alerts = []
+    watchdog = _watchdog(clock, alerts)
+    watchdog.register("main_loop", interval_sec=5.0, grace_sec=5.0,
+                      critical=True, restartable=False)
+    watchdog.beat("main_loop", state="RUNNING", phase="before_blocking_call")
+    watchdog._stack_snapshot = lambda _component: {
+        "possible_stacks": {"main": '  File "ggpbot.py", line 123, in main_loop_sniper\n    sync_all_states()\n'}}
+    clock[0] = 6.0
+
+    report = watchdog.check()["main_loop"]
+    assert report["status"] == "STALLED"
+    message = next(message for message, _level in alerts if "stalled for" in message)
+    assert "sync_all_states" in message
+
+
 def _watchdog(clock, alerts):
     return HealthWatchdog(
         restart_policy=RestartPolicy(max_attempts=3, monotonic_fn=lambda: clock[0]),
