@@ -653,7 +653,9 @@ def test_stale_watchlist_worker_does_not_fail_newer_generation(monkeypatch):
     }
     monkeypatch.setattr(ggpbot, "MEMORY", memory)
     state = ggpbot._UNIFIED_WATCHLIST_REFRESH_STATE
-    with state["lock"]:
+    state_lock = state["lock"]
+    with state_lock:
+        original_state = {key: value for key, value in state.items() if key != "lock"}
         state.update({
             "in_progress": True, "generation": 81, "timed_out": False,
             "restart_requested": False, "phase": "TEST", "worker_name": "old-worker",
@@ -678,8 +680,11 @@ def test_stale_watchlist_worker_does_not_fail_newer_generation(monkeypatch):
 
     assert memory["_unified_watchlist_refresh_ok"] is False
     assert memory["_unified_watchlist_refresh_status"] == "IN_PROGRESS"
-    with state["lock"]:
+    with state_lock:
         assert state["generation"] == 82
         assert state["in_progress"] is True
         assert state["timed_out"] is False
+        state.clear()
+        state["lock"] = state_lock
+        state.update(original_state)
 
