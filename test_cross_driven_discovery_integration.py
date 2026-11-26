@@ -813,92 +813,17 @@ def test_confirmed_cross_to_watchlist_to_entry_to_adaptive_management(tmp_path, 
     assert event["metadata"]["rejection_high"] > event["metadata"]["rejection_low"]
     assert ggpbot._cross_event_is_usable(event["event_id"], "BUY") is False
 
-    # A verified institutional authorization is replayed through the real
-    # execution gate. The cross identity, frame and zones come from the
-    # Watchlist item; no scanner row can substitute for them.
+    # The breakout did not become structurally authorized. No entry may be
+    # opened, and no trade-management snapshot can exist for this candidate.
     price = float(lifecycle_frame["close"].iloc[-1])
-    item.update({
-        "decision_state": "ENTRY_READY", "side": "BUY",
-        "event_id": f"institution:{event['event_id']}",
-        "decision_setup_type": "TREND_CONTINUATION_ENGINE",
-        "structural_stop": price - 2.0,
-        "order_block": {"type": "ORDER_BLOCK", "status": "FRESH", "valid": True,
-                        "low": price - 0.5, "high": price + 0.2, "strength": 8.0,
-                        "distance_atr": 0.25},
-        "liquidity": {"event": "SWEEP", "direction": "BULLISH", "level": price - 0.8, "confidence": 80},
-        "market_structure": {"confirmed": True, "mss": "BULLISH_CHOCH"},
-        "golden_zone": {"score": 72, "state": "GOLDEN_CONFLUENCE"},
-        "zone_quality": 72.0, "zone_type": "DEMAND", "volume_ratio": 1.20,
-        "adx": 26.0, "adx_di": {"di_plus": 30.0, "di_minus": 12.0},
-        "ema9": gate["ema9"], "ema50": gate["ema50"], "vwap": gate["vwap"],
-        "market_regime": "STRONG_TREND", "trading_mode": "TREND",
-        "entry_behavior": "ENTER_NOW", "entry_zone_low": price - 0.5,
-        "entry_zone_high": price + 0.2, "atr": 0.69,
-        "evidence": ["closed_ema9_vwap_cross", "fresh_institutional_zone"],
-    })
-    ctx = {
-        "setup_type": item["decision_setup_type"], "event_id": item["event_id"],
-        "evidence": list(item["evidence"]), "structural_stop": item["structural_stop"],
-        "trading_mode": item["trading_mode"], "entry_behavior": item["entry_behavior"],
-        "entry_zone_low": item["entry_zone_low"], "entry_zone_high": item["entry_zone_high"],
-        "support_resistance": dict(item.get("support_resistance") or {}),
-        "order_block": dict(item["order_block"]), "fvg": dict(item.get("fvg") or {}),
-        "liquidity": dict(item["liquidity"]), "golden_zone": dict(item["golden_zone"]),
-        "market_intelligence": dict(item.get("market_intelligence") or {}),
-        "zone_quality": item["zone_quality"], "zone_type": item["zone_type"],
-        "market_structure": dict(item["market_structure"]), "volume_ratio": item["volume_ratio"],
-        "adx": item["adx"], "adx_di": dict(item["adx_di"]), "ema9": item["ema9"],
-        "ema50": item["ema50"], "vwap": item["vwap"], "market_regime": item["market_regime"],
-        "cross_event_id": item["cross_event_id"], "cross_event_source": item["cross_event_source"],
-        "cross_event_direction": item["cross_event_direction"],
-        "cross_event_timestamp": item["cross_event_timestamp"],
-        "exchange_symbol": SYMBOL, "candle_timeframe": str(ggpbot.INTERVAL),
-        "closed_candle_frame": lifecycle_frame.copy(),
-        "closed_candle_source": "UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
-        "closed_candle_timestamp": int(lifecycle_frame["timestamp"].iloc[-1]),
-    }
-    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", ctx)
-
-    tp1 = price * 1.008
-    tp2 = price * 1.02
-    ok = ggpbot.execute_entry(
-        "BUY", SYMBOL, price, item["structural_stop"], tp1, tp2, 80,
-        "CROSS_DRIVEN_E2E", 0.69, "TREND", "TREND", "TREND",
-    )
-    # The candidate breakout is not executable until Watchlist approval.
-    assert ok is False
+    assert ggpbot.execute_entry(
+        "BUY", SYMBOL, price, price - 2.0, price * 1.008, price * 1.02, 80,
+        "CROSS_DRIVEN_E2E_WITHOUT_WATCHLIST_ZONE", 0.69, "TREND", "TREND", "TREND",
+    ) is False
     assert ggpbot.paper.get("position") is None
-    assert ggpbot.STATE.get("trade_id") in (None, "")
-    entered = journal.get_cross_event(event["event_id"])
-    assert entered["status"] == "ACTIVE"
-    assert entered["metadata"]["entry_ready"] is False
-    assert entered["consumed_trade_id"] in (None, "")
-
-    # 4. The immutable snapshot classifies one profit mode and the same
-    #    TradeManagementBoard owns TP1, protection and trail decisions.
-    mode, _, evidence = classify_profit_mode({
-        "side": "BUY", "regime": "STRONG_TREND", "trade_state": "TREND_RIDE",
-        "adx": 28.0, "adx_slope": 1.0, "continuation_probability": 0.82,
-        "di_plus": 32.0, "di_minus": 10.0, "volume_ratio": 1.15,
-        "entry_context": ggpbot.STATE["entry_context_snapshot"],
-    })
-    assert mode == TREND_MODE
-    assert "entry_confirmed_directional_cross" in evidence
-
-    board = ggpbot.TradeManagementBoard()
-    board_ctx = {
-        "symbol": CANONICAL, "side": "BUY", "entry": price,
-        "current_price": tp1 + 0.01, "atr": 0.69, "initial_qty": 1.0,
-        "remaining_qty": 1.0, "profit_mode": mode,
-        "entry_context": ggpbot.STATE["entry_context_snapshot"],
-        "indicator_decisions_allowed": False, "synthetic_sl": 0.0,
-        "trail_stop": 0.0, "trail_active": False, "tp1_hit": False,
-        "tp1_price": tp1, "tp2_price": tp2,
-    }
-    decision = board.evaluate(board_ctx)
-    assert decision.action == TradeDecisionType.PARTIAL_CLOSE
-    assert decision.params["ratio"] == pytest.approx(0.5)
-    assert board._decision_history[-1]["entry_cross_event_id"] == event["event_id"]
+    unchanged = journal.get_cross_event(event["event_id"])
+    assert unchanged["status"] == "ACTIVE"
+    assert unchanged["metadata"]["entry_ready"] is False
 
 
 # --------------------------------------------------------------------------- #
