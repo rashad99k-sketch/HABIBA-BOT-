@@ -401,7 +401,7 @@ def test_supplementary_scanner_rows_cannot_create_cross_events(tmp_path, monkeyp
     assert row["direction"] == "BULLISH"
     assert row["source"] == ggpbot.CONFIRMED_CROSS_EVENT_SOURCE
     assert row["event_id"] == f"{SYMBOL}:{ggpbot.INTERVAL}:{gate['signal_candle_id']}"
-    assert row["metadata"]["detection_method"] == "validate_dual_ema_vwap_entry_gate"
+    assert row["metadata"]["detection_method"] == "validate_ema9_vwap_entry_gate"
     assert row["metadata"]["lookback_candles"] == 2
 
     feed = ggpbot.MEMORY["confirmed_cross_events"]
