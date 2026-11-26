@@ -829,11 +829,16 @@ def rate_limit(func=None):
         retry_at = None
         try:
             _, _, now = _remaining()
+            method_actual = _API_RATE_METHOD_LAST_START.get(method_name)
+            if (not _finite(_API_RATE_LAST_START)
+                    or (method_actual is not None and not _finite(method_actual))):
+                raise ApiRateLockTimeout(
+                    f"API_RATE rejected non-finite actual-start state for {method_name}"
+                )
             global_actual_due = (
                 _API_RATE_LAST_START + base_interval
                 if _API_RATE_LAST_START > 0.0 else now
             )
-            method_actual = _API_RATE_METHOD_LAST_START.get(method_name)
             method_actual_due = (
                 float(method_actual) + endpoint_interval
                 if method_actual is not None else now
