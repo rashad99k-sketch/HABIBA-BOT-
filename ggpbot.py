@@ -700,8 +700,12 @@ def rate_limit(func=None):
 
     base_interval = float(MIN_API_INTERVAL)
     endpoint_interval = float(_API_METHOD_MIN_INTERVALS.get(method_name, base_interval))
-    if (not _finite(base_interval) or not _finite(endpoint_interval)
-            or base_interval <= 0.0 or endpoint_interval <= 0.0):
+    if not (_finite(base_interval) and _finite(endpoint_interval)):
+        raise ApiRateLockTimeout(
+            f"API_RATE rejected non-finite interval for {method_name}; "
+            f"base={base_interval!r} endpoint={endpoint_interval!r}"
+        )
+    if base_interval <= 0.0 or endpoint_interval <= 0.0:
         raise ApiRateLockTimeout(
             f"API_RATE rejected invalid interval for {method_name}; "
             f"base={base_interval!r} endpoint={endpoint_interval!r}"
@@ -16047,6 +16051,13 @@ def _run_unified_institutional_watchlist_refresh(generation=None):
             enrich=tracked_enrich
         )
         if not _publish_watchlist_worker_delta(staged_memory, baseline_watchlist, baseline_refs, generation):
+            # A timed-out generation is intentionally fenced from publishing.
+            # Record its terminal state explicitly; do not leave the refresh
+            # looking permanently in progress after the stale worker exits.
+            with state["lock"]:
+                if state.get("timed_out") or int(state.get("generation", 0)) != int(generation):
+                    MEMORY["_unified_watchlist_refresh_ok"] = False
+                    MEMORY["_unified_watchlist_refresh_status"] = "FAILED"
             return
         _finalize_cross_watchlist_delivery_after_publish()
         proximity_meta = MEMORY.setdefault("ema9_vwap_proximity_scanner_meta", {})
