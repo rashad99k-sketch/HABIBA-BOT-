@@ -11,6 +11,13 @@ import pytest
 import ggpbot
 
 
+@pytest.fixture(autouse=True)
+def _isolate_scheduler_reservations(monkeypatch):
+    monkeypatch.setattr(ggpbot, "_API_RATE_METHOD_LAST_RESERVED", {})
+    monkeypatch.setattr(ggpbot, "_API_RATE_METHOD_LAST_START", {})
+    monkeypatch.setattr(ggpbot, "_API_RATE_LAST_START", 0.0)
+
+
 def _install_fake_clock(monkeypatch, *, start=1000.0, advance=True):
     clock = [float(start)]
     sleeps = []
@@ -37,6 +44,9 @@ def _install_fake_clock(monkeypatch, *, start=1000.0, advance=True):
         {"thread_id": None, "thread_name": "", "since_monotonic": 0.0, "method": ""},
     )
     monkeypatch.setattr(ggpbot, "_last_api_call", float(start))
+    monkeypatch.setattr(ggpbot, "_API_RATE_METHOD_LAST_RESERVED", {})
+    monkeypatch.setattr(ggpbot, "_API_RATE_METHOD_LAST_START", {})
+    monkeypatch.setattr(ggpbot, "_API_RATE_LAST_START", 0.0)
     monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 0.001)
     monkeypatch.setattr(ggpbot, "_API_METHOD_MIN_INTERVALS", {})
     monkeypatch.setattr(ggpbot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.05)
@@ -49,6 +59,7 @@ def _install_fake_clock(monkeypatch, *, start=1000.0, advance=True):
 def test_fake_clock_pacing_reserves_after_endpoint_interval(monkeypatch):
     clock, sleeps = _install_fake_clock(monkeypatch)
     ggpbot._API_METHOD_MIN_INTERVALS["probe_endpoint"] = 1.05
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_endpoint"] = clock[0]
     monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
 
     def probe_endpoint():
@@ -72,6 +83,7 @@ def test_real_monotonic_pacing_never_starts_early(monkeypatch):
     monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 0.02)
     monkeypatch.setattr(ggpbot, "_API_METHOD_MIN_INTERVALS", {"probe_real": 0.02})
     monkeypatch.setattr(ggpbot, "_last_api_call", real_time.monotonic())
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_real"] = real_time.monotonic()
     monkeypatch.setattr(ggpbot, "API_RATE_LOCK_ACQUIRE_TIMEOUT_SEC", 0.1)
     monkeypatch.setattr(ggpbot, "API_RATE_WAIT_TIMEOUT_SEC", 2.0)
     monkeypatch.setattr(ggpbot, "API_RATE_MIN_SLEEP_SEC", 0.001)
@@ -93,7 +105,8 @@ def test_floating_point_boundary_uses_one_positive_sleep(monkeypatch):
     interval = 0.25
     ggpbot._API_METHOD_MIN_INTERVALS["probe_boundary"] = interval
     # At this magnitude a sub-microsecond residual is close to the float ULP.
-    monkeypatch.setattr(ggpbot, "_last_api_call", clock[0] + interval - 1e-6)
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_boundary"] = clock[0] + interval - 1e-6
+    monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
 
     def probe_boundary():
         return None
@@ -112,7 +125,8 @@ def test_floating_point_boundaries_never_reserve_early(monkeypatch, offset):
     interval = 0.25
     clock, sleeps = _install_fake_clock(monkeypatch, start=start)
     ggpbot._API_METHOD_MIN_INTERVALS["probe_ulp"] = interval
-    monkeypatch.setattr(ggpbot, "_last_api_call", clock[0] + interval + offset)
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_ulp"] = clock[0] + interval + offset
+    monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
 
     def probe_ulp():
         return None
@@ -172,6 +186,7 @@ def test_non_finite_logical_clock_fails_closed_without_sleep(monkeypatch):
 def test_frozen_clock_fails_closed_without_zero_progress_livelock(monkeypatch):
     clock, sleeps = _install_fake_clock(monkeypatch, advance=False)
     ggpbot._API_METHOD_MIN_INTERVALS["probe_frozen"] = 0.25
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_frozen"] = clock[0]
     monkeypatch.setattr(ggpbot, "API_RATE_MAX_WAIT_ITERATIONS", 4)
 
     def probe_frozen():
@@ -259,6 +274,7 @@ def test_actual_request_starts_only_after_required_interval(monkeypatch):
     clock, sleeps = _install_fake_clock(monkeypatch)
     interval = 0.75
     ggpbot._API_METHOD_MIN_INTERVALS["exchange_read"] = interval
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["exchange_read"] = clock[0]
     monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
     monkeypatch.setattr(ggpbot, "API_RESILIENCE", None)
     request_starts = []
@@ -278,6 +294,7 @@ def test_high_iteration_pacing_stress(monkeypatch):
     interval = 0.001
     iterations = 2000
     ggpbot._API_METHOD_MIN_INTERVALS["probe_stress"] = interval
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["probe_stress"] = clock[0]
     monkeypatch.setattr(ggpbot, "_last_api_call", clock[0])
 
     def probe_stress():
@@ -291,3 +308,46 @@ def test_high_iteration_pacing_stress(monkeypatch):
     assert clock[0] == pytest.approx(1000.0 + iterations * interval)
     assert not ggpbot._API_RATE_LOCK.locked()
     assert ggpbot._API_RATE_LOCK_OWNER["thread_id"] is None
+
+def test_endpoint_pacing_lanes_do_not_serialize_unrelated_methods(monkeypatch):
+    clock, sleeps = _install_fake_clock(monkeypatch, start=2000.0)
+    monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 0.10)
+    ggpbot._API_METHOD_MIN_INTERVALS.update({"probe_a": 1.0, "probe_b": 1.0})
+    ggpbot._API_RATE_METHOD_LAST_RESERVED.update({
+        "probe_a": clock[0], "probe_b": clock[0],
+    })
+    starts = []
+
+    def probe_a():
+        starts.append(("a", clock[0]))
+
+    def probe_b():
+        starts.append(("b", clock[0]))
+
+    ggpbot.rate_limit(probe_a)
+    ggpbot.rate_limit(probe_b)
+    ggpbot.rate_limit(probe_a)
+
+    assert starts[0] == pytest.approx(("a", 2001.0))
+    assert starts[1] == pytest.approx(("b", 2001.1))
+    assert starts[2] == pytest.approx(("a", 2002.0))
+    assert sleeps == pytest.approx([1.0, 0.1, 0.9])
+
+
+def test_local_scheduler_contention_is_not_counted_as_exchange_rate_limit(monkeypatch):
+    rows = _valid_ohlcv_rows()
+    _stub_ohlcv_fetch(monkeypatch, rows)
+    monkeypatch.setattr(
+        ggpbot, "safe_api_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ggpbot.ApiRateLockTimeout("API_RATE pacing deadline exceeded for fetch_ohlcv")
+        ),
+    )
+    monkeypatch.setattr(ggpbot, "_mark_ohlcv_rate_limit_cooldown",
+                        lambda _symbol: pytest.fail("local contention must not trigger exchange cooldown"))
+
+    assert ggpbot.fetch_ohlcv("BTC/USDT:USDT") is None
+    diagnostic = ggpbot.OHLCV_FETCH_DIAGNOSTICS["BTC/USDT:USDT"]
+    assert diagnostic["reason"] == "LOCAL_SCHEDULER_CONTENTION"
+    assert "pacing deadline exceeded" in diagnostic["detail"]
+
