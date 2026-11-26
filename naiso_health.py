@@ -448,9 +448,15 @@ class HealthWatchdog:
                 stack_map = diagnostics.get("possible_stacks", {})
                 stack_detail = next((value for value in stack_map.values()
                                      if isinstance(value, str) and value), "")
-                stack_frames = [line.strip() for line in stack_detail.splitlines()
-                                if line.strip().startswith("File ") or
-                                (line.strip() and not line.startswith("  "))]
+                stack_frames = []
+                for line in stack_detail.splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    # traceback.format_stack indents source lines beneath File
+                    # frames; retain those source expressions for actionable alerts.
+                    if stripped.startswith("File ") or (line.startswith("    ") and not line.startswith("        ")):
+                        stack_frames.append(stripped)
                 stack_suffix = " | stack=" + " <- ".join(stack_frames)[-1200:] if stack_frames else ""
                 self._alert(f"stalled:{component.name}", "CRITICAL",
                             f"[WATCHDOG] {component.name} stalled for {age:.1f}s "
