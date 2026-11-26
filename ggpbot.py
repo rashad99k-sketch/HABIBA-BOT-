@@ -649,6 +649,27 @@ _API_METHOD_MIN_INTERVALS = {
     # BingX cancelAllAfter is documented at 1/s per UID; retain local 1/s cap.
     "cancel_all_orders_after": BINGX_TRADE_WRITE_MIN_INTERVAL,
 }
+# Endpoints sharing one conservative exchange quota share a pacing lane.
+# In particular, order placement and cancellation must not each consume an
+# independent 1/s local allowance.
+_API_RATE_METHOD_LANES = {
+    "create_order": "trade_write",
+    "create_market_order": "trade_write",
+    "create_limit_order": "trade_write",
+    "create_orders": "trade_write",
+    "cancel_order": "trade_write",
+    "cancel_orders": "trade_write",
+    "cancel_all_orders": "trade_write",
+    "cancel_all_orders_after": "trade_write",
+    "swapV1PrivatePostTradeCancelReplace": "trade_write",
+    "set_leverage": "config_write",
+    "fetch_margin_mode": "config_write",
+    "set_margin_mode": "config_write",
+    "fetch_position_mode": "config_write",
+    "set_position_mode": "config_write",
+    "add_margin": "config_write",
+    "reduce_margin": "config_write",
+}
 _API_RATE_LOCK = threading.Lock()
 # Never let API scheduler contention pin MainThread indefinitely. A timeout is
 # fail-closed: the exchange call is not sent and the next loop can try again.
@@ -691,6 +712,7 @@ def rate_limit(func=None):
     global _last_api_call, _API_RATE_LAST_START
     method_name = getattr(func, "__name__", "") if func is not None else ""
     method_name = str(method_name or "exchange_call")
+    lane_name = str(_API_RATE_METHOD_LANES.get(method_name, method_name))
 
     def _finite(value):
         try:
@@ -801,7 +823,7 @@ def rate_limit(func=None):
     try:
         real_left, logical_left, now = _remaining()
         global_due = float(_last_api_call) + base_interval
-        method_previous = _API_RATE_METHOD_LAST_RESERVED.get(method_name)
+        method_previous = _API_RATE_METHOD_LAST_RESERVED.get(lane_name)
         method_due = (
             float(method_previous) + endpoint_interval
             if method_previous is not None else now
@@ -819,7 +841,7 @@ def rate_limit(func=None):
                 f"remaining_logical={logical_left:.6f}s remaining_real={real_left:.6f}s"
             )
         _last_api_call = reserved_at
-        _API_RATE_METHOD_LAST_RESERVED[method_name] = reserved_at
+        _API_RATE_METHOD_LAST_RESERVED[lane_name] = reserved_at
     finally:
         _release_scheduler_lock()
 
@@ -833,7 +855,7 @@ def rate_limit(func=None):
         retry_at = None
         try:
             _, _, now = _remaining()
-            method_actual = _API_RATE_METHOD_LAST_START.get(method_name)
+            method_actual = _API_RATE_METHOD_LAST_START.get(lane_name)
             if (not _finite(_API_RATE_LAST_START)
                     or (method_actual is not None and not _finite(method_actual))):
                 raise ApiRateLockTimeout(
@@ -850,7 +872,7 @@ def rate_limit(func=None):
             actual_due = max(global_actual_due, method_actual_due)
             if now + tolerance >= actual_due:
                 _API_RATE_LAST_START = now
-                _API_RATE_METHOD_LAST_START[method_name] = now
+                _API_RATE_METHOD_LAST_START[lane_name] = now
                 return
             retry_at = actual_due
         finally:
