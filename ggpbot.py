@@ -18159,7 +18159,13 @@ def _startup_flat_orders_reconciled(rows):
     entry_id = STATE.get("entry_exchange_order_id")
     client_id = STATE.get("entry_client_order_id")
     entry_terminal = bool(STATE.get("entry_order_terminal"))
-    if STATE.get("execution_unresolved") and not (entry_id or client_id) and not entry_terminal:
+    pending_entry_states = {
+        "ENTRY_PENDING", "EXECUTION_UNCERTAIN", "ENTRY_PRICE_UNKNOWN",
+        "PARTIAL_FILL", "PROTECTION_HOLD",
+    }
+    entry_state = str(STATE.get("entry_execution_state") or "").upper()
+    if ((STATE.get("execution_unresolved") or entry_state in pending_entry_states)
+            and not (entry_id or client_id) and not entry_terminal):
         return False, "ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
     if entry_id or client_id:
         ok, reason = verify_entry(symbol, entry_id, client_id, entry_terminal)
@@ -18184,7 +18190,9 @@ def _startup_flat_orders_reconciled(rows):
                          or row.get("entry_client_order_id")
                          or row.get("client_order_id"))
         row_entry_terminal = bool(saved.get("entry_order_terminal"))
-        if saved.get("execution_unresolved") and not (row_entry_id or row_client_id) and not row_entry_terminal:
+        row_entry_state = str(saved.get("entry_execution_state") or row.get("status") or "").upper()
+        if ((saved.get("execution_unresolved") or row_entry_state in pending_entry_states)
+                and not (row_entry_id or row_client_id) and not row_entry_terminal):
             return False, "JOURNAL_ENTRY_OUTCOME_UNRESOLVED_WITHOUT_ORDER_ID"
         if row_entry_id or row_client_id:
             ok, reason = verify_entry(row_symbol, row_entry_id, row_client_id,
