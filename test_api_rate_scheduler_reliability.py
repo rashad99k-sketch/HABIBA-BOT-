@@ -356,6 +356,7 @@ def test_local_scheduler_contention_is_not_counted_as_exchange_rate_limit(monkey
 def test_order_placement_and_cancellation_share_trade_write_quota(monkeypatch):
     clock, sleeps = _install_fake_clock(monkeypatch, start=4000.0)
     monkeypatch.setattr(ggpbot, "MIN_API_INTERVAL", 0.10)
+    ggpbot._API_RATE_METHOD_LAST_RESERVED["trade_write"] = clock[0]
     ggpbot._API_METHOD_MIN_INTERVALS.update({
         "create_order": 1.05,
         "cancel_order": 1.05,
