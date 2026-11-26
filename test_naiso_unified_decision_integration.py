@@ -569,7 +569,8 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     step("FROZEN_ENTRY_CONTEXT", decision_state=frozen.get("decision_state"),
          closed_candle_timestamp=persistent.get("closed_candle_timestamp"))
 
-    # 8) PAPER execution succeeds only after the conditions are complete.
+    # 8) execute_entry is given an otherwise convincing generic context,
+    #    but the durable event still has no Watchlist structural-zone approval.
     ctx.update({
         "closed_candle_frame": frames["current"].copy(),
         "closed_candle_timestamp": int(frames["current"]["timestamp"].iloc[-1]),
@@ -591,7 +592,7 @@ def test_full_scanner_to_watchlist_to_entry_projection_paper_trace(tmp_path, mon
     assert remains_active["metadata"]["entry_ready"] is False
     step("PAPER_ENTRY_BLOCKED_WITHOUT_STRUCTURAL_ZONE", journal_status=remains_active["status"])
 
-    # The active durable event remains a visible candidate, not consumed.
+    # The active event remains a candidate, not a consumed trade.
     active_view = proj.classify_cross_state(remains_active, now_ts=clock[0])
     assert active_view["cross_state"] == "CONFIRMED_BUY_CROSS"
     assert active_view["cross_event_entry_ready"] is False
