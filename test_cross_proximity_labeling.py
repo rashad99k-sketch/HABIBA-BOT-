@@ -139,11 +139,12 @@ def test_ema50_only_cross_is_ranking_and_never_creates_durable_event(tmp_path, m
     assert gate["ready"] is False
     assert gate.get("authorization_state") != AUTH_EMA9_EMA15_TRIGGER_VALID
     assert gate["reason"] == "missing_fresh_directional_ema9_vwap_cross"
-    assert proximity["state"] == "CROSS_CONFIRMED"
+    # EMA50/VWAP is context only: it must not be represented as an EMA9/VWAP cross.
+    assert proximity["state"] == "ALIGNED_NOT_CROSSING"
     assert proximity["cross_ema9"] is None
     assert proximity["cross_ema50"] == "BULLISH"
-    assert proximity["cross_any"] == "BULLISH"
-    assert proximity["cross_trigger"] == "EMA50_VWAP"
+    assert proximity["cross_any"] is None
+    assert proximity["cross_trigger"] == "NONE"
     assert "entry_ready" not in proximity
     assert "allow_entry" not in proximity
 
@@ -155,10 +156,10 @@ def test_ema50_only_cross_is_ranking_and_never_creates_durable_event(tmp_path, m
     ggpbot._enrich_with_existing_gpp_engines(frame, "BUY", analysis)
 
     row = ggpbot.MEMORY["ema9_vwap_proximity_scanner"][0]
-    assert row["state"] == "CROSS_CONFIRMED"
+    assert row["state"] == "ALIGNED_NOT_CROSSING"
     assert row["cross_ema9"] is None
     assert row["cross_ema50"] == "BULLISH"
-    assert row["cross_trigger"] == "EMA50_VWAP"
+    assert row["cross_trigger"] == "NONE"
     assert row["cross_state_display"] == EXPECTED_DISPLAY
     assert row["cross_context"]["durable_event"] is False
     assert row["cross_context"]["authoritative"] is False
