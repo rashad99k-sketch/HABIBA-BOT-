@@ -1,7 +1,7 @@
 # Adaptive Scalp & Trend Trade Management — تقرير هندسي
 
-الفرع: `main`  
-الـCommit قبل التعديل: `6b993c17b07703f99a8f63c2f5f3d8da5078e939`  
+الفرع: `main`<br>
+الـCommit قبل التعديل: `6b993c17b07703f99a8f63c2f5f3d8da5078e939`<br>
 لا توجد مفاتيح حقيقية ولا أوامر ولا صفقات ولا استدعاءات BingX حية أثناء هذا العمل.
 
 ---

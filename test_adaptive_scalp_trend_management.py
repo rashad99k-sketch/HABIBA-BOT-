@@ -4,6 +4,7 @@ The tests deliberately exercise pure policy helpers and TradeManagementBoard;
 they never submit orders and never use live credentials.
 """
 import pandas as pd
+import pytest
 
 import ggpbot
 from ggp_profit_brain import (
@@ -335,3 +336,38 @@ def test_distribution_and_institutional_exit_are_distinct():
     behavior, _, _ = analyze_post_entry_behavior(
         frame, "BUY", 100.0, 1.0, {"structural_invalidation": True})
     assert behavior == BEHAVIOR_INSTITUTIONAL_EXIT
+
+
+def test_exit_required_regime_forces_full_close():
+    decision = _board().evaluate(_base_context(trade_regime_state=EXIT_REQUIRED_STATE))
+    assert decision.action is ggpbot.TradeDecisionType.FULL_CLOSE
+    assert decision.params["close_reason"] == "EXIT_REQUIRED"
+
+
+def test_adverse_rejection_blocks_scalp_to_trend_upgrade():
+    state, reason, _ = transition_trade_regime(
+        SCALP_STATE, TREND_STATE, BEHAVIOR_TREND_CONTINUATION, 2,
+        {"adverse_rejection": True})
+    assert state == SCALP_STATE
+    assert "rejected" in reason
+
+
+def test_short_roe_net_of_fees_uses_actual_leverage():
+    context = {
+        "side": "SELL", "entry": 100.0, "mark_price": 98.0, "qty": 2.0,
+        "initial_margin": 20.0, "unrealized_pnl": 4.0,
+        "actual_leverage": 10.0, "leverage_verified": True,
+        "reported_roe_pct": 16.25, "fees_usdt": 0.5, "funding_usdt": 0.25,
+    }
+    check = verify_roe_inputs(context)
+    assert check["ok"] is True
+    assert check["computed_roe_pct"] == pytest.approx(16.25)
+    assert check["net_unrealized_pnl"] == pytest.approx(3.25)
+    # SHORT target is below entry; 2 USDT x 2 qty / 20 margin = 20% ROE.
+    assert roe_target_price(check, 40.0) == pytest.approx(96.0)
+    assert roe_target_price(check, 60.0) == pytest.approx(94.0)
+
+    context["reported_roe_pct"] = 20.0  # gross ROE must not satisfy a net basis
+    mismatch = verify_roe_inputs(context)
+    assert mismatch["ok"] is False
+    assert "reported_roe_mismatch" in mismatch["reason"]

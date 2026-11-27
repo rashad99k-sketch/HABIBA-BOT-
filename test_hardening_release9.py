@@ -351,6 +351,8 @@ def test_native_sl_precheck_rejects_stop_on_wrong_side_of_market():
 # --------------------------------------------------------------------------- #
 def _tp1_probe(side="BUY", position_side="LONG", mode="HEDGE", expected=1.0, order=None,
                close_order_ids=None, entry_ts=None):
+    if entry_ts is None:
+        entry_ts = time.time() - 60
     class Ex(MockExchange):
         def fetch_closed_orders(self, symbol=None, since=None, limit=None):
             return [order] if order else []
@@ -362,6 +364,8 @@ def _tp1_probe(side="BUY", position_side="LONG", mode="HEDGE", expected=1.0, ord
 
 def _tp1_order(position_side="LONG", side="SELL", filled=1.0, status="CLOSED", oid="tp1-1",
                symbol="BTC-USDT", type_="MARKET", ts=None):
+    if ts is None:
+        ts = int(time.time() * 1000)
     info = {"orderId": oid, "type": type_, "side": side, "positionSide": position_side,
             "status": status, "executedQty": str(filled), "symbol": symbol}
     if ts is not None:

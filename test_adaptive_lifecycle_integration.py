@@ -608,3 +608,79 @@ def test_one_way_close_uses_reduce_only_and_verify_quantity_delta(harness):
     assert ggpbot._position_contracts(position) == 1.0
     assert ggpbot.STATE["remaining_qty"] == 1.0
     assert ggpbot.STATE["close_verified"] is False
+
+
+def test_runtime_reconcile_holds_on_external_quantity_increase(harness):
+    """An exchange quantity increase must not silently rewrite managed exposure."""
+    exchange = harness["exchange"]
+    _open_trade(harness, "RUNTIME-QTY-HOLD")
+    before_calls = len(exchange.create_calls)
+
+    exchange.position["contracts"] = 3.0
+    exchange.set_mark(100.0)
+    result = ggpbot.sync_position_state(SYMBOL)
+
+    assert result == (None, None, None, None)
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert "quantity_exceeds_original_fill" in ggpbot.STATE["recovery_reason"]
+    assert "quantity_increased_since_last_sync" in ggpbot.STATE["recovery_reason"]
+    assert ggpbot.STATE["remaining_qty"] == 2.0
+    assert ggpbot.STATE["exchange_qty"] == 2.0
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert len(exchange.create_calls) == before_calls
+
+
+def test_runtime_reconcile_holds_on_position_identity_drift(harness):
+    """A hedge-leg flip must hold management instead of adopting the wrong leg."""
+    exchange = harness["exchange"]
+    _open_trade(harness, "RUNTIME-SIDE-HOLD")
+    before_calls = len(exchange.create_calls)
+
+    exchange.position["info"]["positionSide"] = "SHORT"
+    exchange.set_mark(100.0)
+    result = ggpbot.sync_position_state(SYMBOL)
+
+    assert result == (None, None, None, None)
+    assert ggpbot.STATE["recovery_hold"] is True
+    assert "position_side_drift" in ggpbot.STATE["recovery_reason"]
+    assert "hedge_leg_mismatch" in ggpbot.STATE["recovery_reason"]
+    assert ggpbot.STATE["side"] == "BUY"
+    assert ggpbot.STATE["remaining_qty"] == 2.0
+    assert len(exchange.create_calls) == before_calls
+
+
+def test_exchange_reported_roe_mismatch_blocks_roe_targets(harness):
+    """Only an independent venue ROE value may cross-check the computed basis."""
+    exchange = harness["exchange"]
+    _open_trade(harness, "ROE-MISMATCH-HOLD")
+
+    harness["scenario"]["mark"] = 100.10
+    _run_cycle(harness)  # classify and select a SCALP target
+    closes_before = len([c for c in exchange.create_calls if c[1] == "market"])
+
+    exchange.set_mark(100.25)
+    exchange.position["roe"] = 20.0  # venue disagrees with computed 5%
+    decision = _run_cycle(harness)
+
+    assert ggpbot.STATE["roe_verified"] is False
+    assert "reported_roe_mismatch" in ggpbot.STATE["roe_diagnostic"]
+    assert decision is None or decision.action is ggpbot.TradeDecisionType.HOLD
+    assert len([c for c in exchange.create_calls if c[1] == "market"]) == closes_before
+
+
+def test_venue_fees_and_funding_are_deducted_before_targets(harness):
+    """Net ROE, not gross unrealized PnL, drives ROE target decisions."""
+    exchange = harness["exchange"]
+    _open_trade(harness, "NET-ROE-FEES")
+    exchange.position["fee"] = 0.5
+    exchange.position["fundingFee"] = 0.25
+    closes_before = len([c for c in exchange.create_calls if c[1] == "market"])
+
+    harness["scenario"]["mark"] = 100.25  # 0.50 gross PnL, -0.25 net on 10 margin
+    decision = _run_cycle(harness)
+
+    assert ggpbot.STATE["roe_verified"] is True
+    assert abs(ggpbot.STATE["computed_roe_pct"] + 2.5) < 1e-6
+    assert abs(ggpbot.STATE["net_roe_pct"] + 2.5) < 1e-6
+    assert decision is None or decision.action is ggpbot.TradeDecisionType.HOLD
+    assert len([c for c in exchange.create_calls if c[1] == "market"]) == closes_before

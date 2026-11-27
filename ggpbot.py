@@ -1862,6 +1862,11 @@ class PositionSnapshot:
         self.unrealized_pnl = 0.0
         self.realized_pnl = 0.0
         self.roe_pct = 0.0
+        # Only an exchange-reported ROE field may be cross-checked. `roe_pct`
+        # above is derived locally and must not be mistaken for venue evidence.
+        self.reported_roe_pct = None
+        self.fees_usdt = 0.0
+        self.funding_usdt = 0.0
         self.leverage = LEVERAGE
         self.leverage_verified = False
         self.contract_size = 0.0
@@ -1887,6 +1892,9 @@ class PositionSnapshot:
             "unrealized_pnl": self.unrealized_pnl,
             "realized_pnl": self.realized_pnl,
             "roe_pct": self.roe_pct,
+            "reported_roe_pct": self.reported_roe_pct,
+            "fees_usdt": self.fees_usdt,
+            "funding_usdt": self.funding_usdt,
             "leverage": self.leverage,
             "leverage_verified": self.leverage_verified,
             "contract_size": self.contract_size,
@@ -2017,6 +2025,9 @@ class ExchangeSyncService:
                 STATE["mark_price"] = snap.mark_price
                 STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
                 STATE["roe_pct"] = snap.roe_pct
+                STATE["exchange_reported_roe_pct"] = getattr(snap, "reported_roe_pct", None)
+                STATE["fees_usdt"] = safe_float(getattr(snap, "fees_usdt", 0.0), 0.0)
+                STATE["funding_usdt"] = safe_float(getattr(snap, "funding_usdt", 0.0), 0.0)
                 STATE["margin"] = snap.margin
                 STATE["liquidation_price"] = snap.liquidation_price
                 TRADE_STATE.update({
@@ -2427,6 +2438,9 @@ class TradeManagementBoard:
             return decision(TradeDecisionType.HOLD, "exchange_execution_or_recovery_unresolved")
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
+        if str(ctx.get("trade_regime_state") or "").upper() == EXIT_REQUIRED_STATE:
+            return decision(TradeDecisionType.FULL_CLOSE, "institutional_exit_required_by_regime",
+                            close_reason="EXIT_REQUIRED")
 
         thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
         thesis_action, thesis_reason = thesis_failure_action(
@@ -2996,6 +3010,9 @@ class LiveTradeManager:
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        # External-close diagnostic ids belong to a prior trade and must never be
+        # reused as TP1 evidence after this start.
+        STATE["last_exchange_close_order_id"] = None
         # A NEW position must never inherit a prior trade's SCALP/TREND decision.
         # Startup/runtime recovery is different: the persisted regime and ROE
         # targets were already proven from completed candles before the restart,
@@ -3016,6 +3033,13 @@ class LiveTradeManager:
             STATE["tp1_target_roe_pct"] = 0.0
             STATE["tp2_target_roe_pct"] = 0.0
             STATE["exit_required_reason"] = ""
+            # A fresh trade must not inherit the previous trade's ROE basis.
+            STATE.update({
+                "roe_pct": 0.0, "computed_roe_pct": 0.0, "net_roe_pct": 0.0,
+                "exchange_reported_roe_pct": None, "fees_usdt": 0.0, "funding_usdt": 0.0,
+                "roe_verified": False, "roe_diagnostic": "", "margin": 0.0,
+                "unrealized_pnl_usdt": 0.0,
+            })
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -3223,7 +3247,9 @@ class LiveTradeManager:
             "unrealized_pnl": safe_float(STATE.get("unrealized_pnl_usdt")),
             "actual_leverage": safe_float(STATE.get("leverage")),
             "leverage_verified": bool(STATE.get("leverage_verified", False)),
-            "reported_roe_pct": roe,
+            # Do not cross-check ROE against our own derived value; only an
+            # explicit exchange-reported field is independent evidence.
+            "reported_roe_pct": STATE.get("exchange_reported_roe_pct"),
             "contract_size": safe_float(STATE.get("contract_size"), 0.0),
             "fees_usdt": safe_float(STATE.get("fees_usdt"), 0.0),
             "funding_usdt": safe_float(STATE.get("funding_usdt"), 0.0),
@@ -3232,6 +3258,11 @@ class LiveTradeManager:
         STATE["roe_diagnostic"] = str(roe_check.get("reason") or "")
         STATE["computed_roe_pct"] = safe_float(roe_check.get("computed_roe_pct"), 0.0)
         STATE["actual_leverage"] = roe_check.get("leverage")
+        if STATE["roe_verified"]:
+            # Board decisions use the verified net ROE, not the venue's gross
+            # unrealized/margin value. Fees and funding are already deducted.
+            roe = safe_float(roe_check.get("computed_roe_pct"), roe)
+        STATE["net_roe_pct"] = roe
         if not STATE["roe_verified"]:
             log_execution(f"[ROE_GATE] {symbol}: ROE targets held; {STATE['roe_diagnostic']}",
                           "WARN", debounce_key=f"roe_gate_{symbol}", debounce_sec=30)
@@ -3389,14 +3420,18 @@ class LiveTradeManager:
                     "structure_broken": bool(STATE.get("structure_broken", False)),
                     "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
                 })
-            STATE["post_entry_behavior"] = behavior
-            STATE["post_entry_behavior_reason"] = behavior_reason
-            STATE["post_entry_behavior_evidence"] = behavior_evidence
             adverse_rejection = bool(
                 behavior == BEHAVIOR_DISTRIBUTION or counter_displacement > 0
                 or (safe_float(behavior_evidence.get("counter_candles"), 0.0) >= 1
                     and safe_float(behavior_evidence.get("adverse_atr"), 0.0) >= 0.5)
             )
+            # Hysteresis checks these keys; without them observed rejection/structure
+            # failure was persisted but never actually consulted on upgrade.
+            behavior_evidence["adverse_rejection"] = adverse_rejection
+            behavior_evidence["structural_invalidation"] = bool(STATE.get("structural_invalidation", False))
+            STATE["post_entry_behavior"] = behavior
+            STATE["post_entry_behavior_reason"] = behavior_reason
+            STATE["post_entry_behavior_evidence"] = behavior_evidence
             STATE["adverse_rejection"] = adverse_rejection
 
             candidate_regime = map_profit_mode_to_regime(candidate_mode, behavior)
@@ -3950,6 +3985,9 @@ def sync_position_state(symbol=None):
         STATE["margin"] = snap.margin
         STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
         STATE["roe_pct"] = snap.roe_pct
+        STATE["exchange_reported_roe_pct"] = getattr(snap, "reported_roe_pct", None)
+        STATE["fees_usdt"] = safe_float(getattr(snap, "fees_usdt", 0.0), 0.0)
+        STATE["funding_usdt"] = safe_float(getattr(snap, "funding_usdt", 0.0), 0.0)
         STATE["leverage"] = snap.leverage
         STATE["leverage_verified"] = bool(getattr(snap, "leverage_verified", False))
         STATE["leverage_source"] = "exchange_snapshot" if STATE["leverage_verified"] else "unverified_config_default"
@@ -4898,7 +4936,8 @@ STATE = {
     "trade_regime_state": None, "trade_regime_reason": "",
     "post_entry_behavior": "INSUFFICIENT_DATA", "post_entry_behavior_reason": "",
     "post_entry_behavior_evidence": {}, "adverse_rejection": False,
-    "roe_verified": False, "roe_diagnostic": "", "computed_roe_pct": 0.0,
+    "roe_verified": False, "roe_diagnostic": "", "computed_roe_pct": 0.0, "net_roe_pct": 0.0,
+    "exchange_reported_roe_pct": None, "fees_usdt": 0.0, "funding_usdt": 0.0,
     "leverage_verified": False, "leverage_source": "UNKNOWN", "contract_size": 0.0,
     "scalp_target_roe_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_reason": "",
     "tp1_target_roe_pct": 0.0, "tp2_target_roe_pct": 0.0,
@@ -7101,7 +7140,14 @@ def finalize_trade_with_reality(symbol, close_reason=None):
                   "range_target_move_pct": 0.0, "tp1_filled_qty": 0.0, "tp2_filled_qty": 0.0,
                   "last_close_verified": False, "last_close_order_id": None,
                   "last_close_filled_qty": 0.0, "last_close_realized_pnl": 0.0,
-                  "last_close_pnl_complete": True, "bot_close_order_ids": []})
+                  "last_close_pnl_complete": True, "bot_close_order_ids": [],
+                  "last_exchange_close_order_id": None,
+                  # Keep ROE verification diagnostics, but retire the input basis
+                  # so a later trade cannot inherit fees/funding or venue ROE.
+                  "roe_pct": 0.0, "exchange_reported_roe_pct": None,
+                  "fees_usdt": 0.0, "funding_usdt": 0.0, "margin": 0.0,
+                  "unrealized_pnl_usdt": 0.0, "leverage_verified": False,
+                  "leverage_source": "UNKNOWN", "contract_size": 0.0})
     STATE.update(preserved)
     TRADE_STATE.update({"in_position": False, "symbol": None, "side": None, "entry": 0.0,
                         "qty": 0.0, "tp1_hit": False, "tp2_hit": False,
@@ -9562,6 +9608,15 @@ def fetch_position_tri_state(symbol=None):
 def _snapshot_from_position(symbol, pos):
     snap = PositionSnapshot()
     info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+
+    def _first_present(*sources, keys):
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in keys:
+                if key in source and source[key] is not None:
+                    return source[key]
+        return None
     raw_side = str(pos.get("side") or info.get("positionSide") or info.get("side") or "").lower()
     snap.side = "BUY" if raw_side in ("long", "buy") else "SELL" if raw_side in ("short", "sell") else ""
     if not snap.side:
@@ -9572,6 +9627,15 @@ def _snapshot_from_position(symbol, pos):
     snap.mark_price = safe_float(pos.get("markPrice") or info.get("markPrice"))
     snap.unrealized_pnl = safe_float(pos.get("unrealizedPnl") or info.get("unrealizedProfit"))
     snap.margin = safe_float(pos.get("initialMargin") or info.get("initialMargin"))
+    # Fees/funding are only used when the venue actually reports them. A missing
+    # value stays 0 and is disclosed by the absence of a venue ROE cross-check;
+    # an explicitly reported ROE is always compared against the net computation.
+    snap.reported_roe_pct = safe_float(_first_present(
+        pos, info, keys=("roe", "roePct", "ROE", "returnOnEquity")), None)
+    snap.fees_usdt = safe_float(_first_present(
+        pos, info, keys=("fee", "fees", "feeUsdt", "commission", "cumFee", "cumCommission")), 0.0)
+    snap.funding_usdt = safe_float(_first_present(
+        pos, info, keys=("fundingFee", "fundingUsdt", "funding", "cumFundingFee", "cumFunding")), 0.0)
     raw_leverage = pos.get("leverage") if pos.get("leverage") is not None else info.get("leverage")
     verified_leverage = safe_float(raw_leverage, 0.0)
     snap.leverage_verified = verified_leverage > 0
@@ -9912,7 +9976,7 @@ def _resolve_pending_close_from_snapshot(symbol, snap):
 
 
 def _apply_open_snapshot(symbol, snap):
-    global _ACTIVE_TRADE
+    global _ACTIVE_TRADE, RECOVERY_BLOCK_ENTRIES
     with _TRADE_LOCK:
         _ACTIVE_TRADE = True
         was_open = bool(STATE.get("open"))
@@ -9929,9 +9993,48 @@ def _apply_open_snapshot(symbol, snap):
             TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": snap.side,
                                 "entry": snap.entry_price, "qty": snap.qty, "last_update_ts": time.time()})
         else:
+            # Runtime reconciliation must not silently adopt an exchange position
+            # that no longer matches the journal/managed trade. Quantity increases,
+            # side flips and position-side mode drift are fail-closed holds.
+            raw_position = getattr(snap, "raw_position", None)
+            raw_position = raw_position if isinstance(raw_position, dict) else {}
+            raw_info = raw_position.get("info") if isinstance(raw_position.get("info"), dict) else {}
+            raw_position_side = str(
+                raw_position.get("positionSide") or raw_position.get("posSide") or
+                raw_info.get("positionSide") or raw_info.get("posSide") or "").upper()
+            stored_mode = str(STATE.get("position_mode") or "").upper().replace("-", "_").replace(" ", "_")
+            stored_side = str(STATE.get("position_side") or "").upper()
+            original_qty = safe_float(STATE.get("initial_qty"), 0.0)
+            previous_qty = safe_float(STATE.get("remaining_qty"), safe_float(STATE.get("exchange_qty"), 0.0))
+            mismatches = []
+            if roro_canonical_symbol(STATE.get("current_symbol")) != roro_canonical_symbol(symbol):
+                mismatches.append("symbol_drift")
+            if str(STATE.get("side") or "").upper() != snap.side:
+                mismatches.append("side_drift")
+            if stored_side and raw_position_side and stored_side not in {"BOTH"} and stored_side != raw_position_side:
+                mismatches.append("position_side_drift")
+            if stored_mode == "HEDGE":
+                expected_side = "LONG" if snap.side == "BUY" else "SHORT"
+                if raw_position_side and raw_position_side not in {"BOTH", expected_side}:
+                    mismatches.append("hedge_leg_mismatch")
+            elif stored_mode == "ONE_WAY" and raw_position_side in {"LONG", "SHORT"}:
+                mismatches.append("one_way_leg_conflict")
+            if original_qty > 0 and snap.qty > original_qty + max(original_qty * 0.001, 1e-10):
+                mismatches.append("quantity_exceeds_original_fill")
+            if previous_qty > 0 and snap.qty > previous_qty + max(previous_qty * 0.001, 1e-10):
+                mismatches.append("quantity_increased_since_last_sync")
+            if STATE.get("tp1_hit") and original_qty > 0 and snap.qty > original_qty * 0.5 + max(original_qty * 0.002, 1e-10):
+                mismatches.append("tp1_but_quantity_above_half")
+            if mismatches:
+                STATE["recovery_hold"] = True
+                STATE["recovery_reason"] = "runtime_exchange_journal_mismatch:" + ",".join(mismatches)
+                RECOVERY_BLOCK_ENTRIES = True
+                MEMORY["recovery_status"] = "EXCHANGE_STATE_MISMATCH"
+                log_execution(f"[RECONCILIATION] {symbol} hold: {STATE['recovery_reason']}; local management state preserved", "ERROR")
+                return None
+
             # Exchange quantity is authoritative for remaining exposure, while the
             # original filled quantity remains immutable for TP1/TP2 accounting.
-            original_qty = safe_float(STATE.get("initial_qty"), 0.0)
             if original_qty > 0:
                 STATE["qty"] = original_qty
             else:
@@ -9946,6 +10049,9 @@ def _apply_open_snapshot(symbol, snap):
         STATE["margin"] = snap.margin
         STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
         STATE["roe_pct"] = snap.roe_pct
+        STATE["exchange_reported_roe_pct"] = getattr(snap, "reported_roe_pct", None)
+        STATE["fees_usdt"] = safe_float(getattr(snap, "fees_usdt", 0.0), 0.0)
+        STATE["funding_usdt"] = safe_float(getattr(snap, "funding_usdt", 0.0), 0.0)
         STATE["leverage"] = snap.leverage
         # ROE targets are margin-normalized but require an exchange-proven
         # leverage value. Never let a configured 20x default satisfy this gate.
@@ -10116,10 +10222,11 @@ def _collect_tp1_close_order_ids(saved_state, journal_row=None):
     for container in (saved_state, journal_row):
         if not isinstance(container, dict):
             continue
+        # Only bot-created reduce orders are TP1 evidence. `last_exchange_close_order_id`
+        # comes from external-close diagnostics and may belong to a previous trade.
         sources.append(container.get("bot_close_order_ids"))
         sources.append([container.get("pending_close_order_id")])
         sources.append([container.get("last_close_order_id")])
-        sources.append([container.get("last_exchange_close_order_id")])
     for source in sources:
         if isinstance(source, (list, tuple, set)):
             for value in source:
@@ -10147,8 +10254,9 @@ def _tp1_fill_verified_on_exchange(symbol, side, expected_fill_qty=None, toleran
       4. its side is the opposite close side;
       5. its status proves an actual fill and `filled > 0`;
       6. its filled quantity matches the TP1 policy (50% of the original fill);
-      7. it is linked to THIS trade, either by a recorded bot close-order id, or by
-         a TP/partial tag combined with an order timestamp at/after entry.
+      7. it is linked to THIS trade by a recorded bot close-order id or a TP/partial
+         tag, AND its exchange timestamp is at/after this trade's entry (with a
+         small clock-skew allowance). No timestamp means no proof.
 
     `close_order_ids` should be supplied explicitly by the caller (from the journal
     row) so recovery never depends on the live STATE. When omitted, the ids are
@@ -10168,7 +10276,13 @@ def _tp1_fill_verified_on_exchange(symbol, side, expected_fill_qty=None, toleran
 
     close_side = "SELL" if str(side).upper() == "BUY" else "BUY"
     want_symbol = str(symbol).upper().replace("/", "-").split(":")[0]
-    since = int((safe_float(STATE.get("entry_time"), time.time() - 86400)) * 1000)
+    entry_ts_ms = safe_float(trade_entry_ts, safe_float(STATE.get("entry_time"), 0.0))
+    if entry_ts_ms and entry_ts_ms < 1e12:
+        entry_ts_ms *= 1000.0
+    if not entry_ts_ms or entry_ts_ms <= 0:
+        log_execution("[RECOVERY] TP1 proof refused: trade entry timestamp unavailable", "WARN")
+        return False
+    since = int(entry_ts_ms)
     orders = []
     for method_name in ("fetch_closed_orders", "fetch_orders"):
         method = getattr(ex, method_name, None)
@@ -10183,9 +10297,6 @@ def _tp1_fill_verified_on_exchange(symbol, side, expected_fill_qty=None, toleran
             orders.extend(fetched)
 
     expected = safe_float(expected_fill_qty, 0.0)
-    entry_ts_ms = safe_float(trade_entry_ts, 0.0)
-    if entry_ts_ms and entry_ts_ms < 1e12:
-        entry_ts_ms *= 1000.0
     for order in orders:
         if not isinstance(order, dict):
             continue
@@ -10233,17 +10344,12 @@ def _tp1_fill_verified_on_exchange(symbol, side, expected_fill_qty=None, toleran
         linked_by_id = bool(order_id and order_id in recorded_ids)
         type_blob = " ".join(type_values)
         tagged = any(tag in type_blob for tag in ("PARTIAL", "TP1", "TAKE_PROFIT"))
-        if not linked_by_id:
-            # Without a recorded id, require a TP/partial tag AND a timestamp that
-            # proves the order belongs to the current trade (not a previous one on
-            # the same symbol). A missing timestamp cannot prove linkage.
-            if not tagged:
-                continue
-            if entry_ts_ms and order_ts:
-                if order_ts < entry_ts_ms - 300000:  # 5-minute clock-skew tolerance
-                    continue
-            elif entry_ts_ms and not order_ts:
-                continue
+        # A recorded id alone is not enough: an old diagnostic/close id from a previous
+        # trade on the same symbol must never relabel this trade's reduction as TP1.
+        if not (linked_by_id or tagged):
+            continue
+        if not order_ts or order_ts < entry_ts_ms - 300000:  # 5-minute clock-skew tolerance
+            continue
         log_execution(f"[RECOVERY] TP1 fill proven order={order_id} qty={filled} "
                       f"positionSide={order_position_side or 'n/a'} mode={mode} "
                       f"linked={'id' if linked_by_id else 'tag+time'}", "SUCCESS")
@@ -10561,7 +10667,9 @@ def startup_trade_recovery():
     rows = list(INSTITUTIONAL_TRADE_JOURNAL.open_trades()) if INSTITUTIONAL_TRADE_JOURNAL else []
     positions = positions or []
     if status == "FLAT":
+        unresolved_rows = []
         for row in rows:
+            trade_id = str(row.get("trade_id") or "")
             try:
                 saved = row.get("state") if isinstance(row.get("state"), dict) else {}
                 diagnostic = _fetch_external_close_diagnostic(
@@ -10572,11 +10680,14 @@ def startup_trade_recovery():
                 diagnostic["detected_at"] = time.time()
                 diagnostic["symbol"] = row.get("symbol")
                 MEMORY["last_close_diagnostic"] = diagnostic
-                trade_id = str(row.get("trade_id"))
-                INSTITUTIONAL_TRADE_JOURNAL.finalize_once(
+                finalized = INSTITUTIONAL_TRADE_JOURNAL.finalize_once(
                     trade_id, diagnostic.get("reason", "EXTERNAL_CLOSE_UNKNOWN"),
                     diagnostic.get("close_price"), diagnostic.get("realized_pnl"),
                     confidence=str(diagnostic.get("confidence", "UNKNOWN")))
+                if not finalized:
+                    existing = INSTITUTIONAL_TRADE_JOURNAL.get(trade_id) if INSTITUTIONAL_TRADE_JOURNAL else None
+                    if not (existing and existing.get("finalized")):
+                        unresolved_rows.append(trade_id or "unknown")
                 INSTITUTIONAL_TRADE_JOURNAL.event(
                     trade_id, f"external-close-diagnostic:{int(diagnostic['detected_at'])}",
                     "EXTERNAL_CLOSE_DIAGNOSTIC", diagnostic)
@@ -10587,7 +10698,17 @@ def startup_trade_recovery():
                 else:
                     log_execution(f"[RECOVERY_CLOSE_DIAG] {row.get('symbol')} reason={diagnostic.get('reason')} confidence={diagnostic.get('confidence')} evidence={diagnostic.get('evidence')}", "WARN")
             except Exception as exc:
+                unresolved_rows.append(trade_id or "unknown")
                 log_execution(f"[RECOVERY] close diagnosis/finalization pending: {exc}", "WARN")
+        if unresolved_rows:
+            # Exchange is flat, but the journal still has open rows. Unblocking here
+            # would create a second open trade and split PnL/recovery attribution.
+            MEMORY["position_status"] = "UNKNOWN"
+            MEMORY["current_position"] = None
+            MEMORY["recovery_status"] = "JOURNAL_CLOSE_DIAGNOSIS_PENDING"
+            RECOVERY_BLOCK_ENTRIES = True
+            log_execution(f"[RECOVERY] Journal finalization pending for {unresolved_rows}; entries remain blocked", "ERROR")
+            return False
         MEMORY["position_status"] = "FLAT"
         MEMORY["recovery_status"] = "RECONCILED_FLAT"
         RECOVERY_BLOCK_ENTRIES = False
@@ -10655,6 +10776,7 @@ def _exchange_fetch_live_snapshot(self, symbol):
         return None
     try:
         snap = _snapshot_from_position(symbol, pos)
+        snap.raw_position = pos
         self._last_snapshot = snap
         return snap
     except Exception as exc:
@@ -10718,7 +10840,8 @@ def _exchange_reconcile(self, symbol, local_state, *, force=False):
 
         if STATE.get("pending_close_order_id"):
             _resolve_pending_close_from_snapshot(symbol, snap)
-        _apply_open_snapshot(symbol, snap)
+        if _apply_open_snapshot(symbol, snap) is None:
+            return "UNKNOWN"
         self._last_snapshot = snap
         self.event_bus.emit("reconciled", snap)
         return "OPEN"
@@ -10756,7 +10879,8 @@ def sync_position_state(symbol=None):
         return None, None, None, None
     if STATE.get("pending_close_order_id"):
         _resolve_pending_close_from_snapshot(symbol, snap)
-    _apply_open_snapshot(symbol, snap)
+    if _apply_open_snapshot(symbol, snap) is None:
+        return None, None, None, None
     if STATE.get("recovery_hold") or not STATE.get("trade_id"):
         _attempt_runtime_trade_recovery(symbol, position=None, force=False)
     if not STATE.get("recovery_hold") and not STATE.get("execution_unresolved"):

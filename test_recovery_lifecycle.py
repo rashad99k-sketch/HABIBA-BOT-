@@ -331,6 +331,7 @@ def test_partial_tp1_fill_with_exchange_evidence_reconciles(tmp_path, monkeypatc
         def fetch_closed_orders(self, symbol=None, since=None, limit=None):
             return [{"id": "close-tp1", "status": "closed", "side": "sell",
                      "filled": 1.0, "average": 105.0, "symbol": "BTC-USDT",
+                     "timestamp": int(time.time() * 1000),
                      "info": {"orderId": "close-tp1", "type": "MARKET",
                               "positionSide": "LONG", "symbol": "BTC-USDT"}}]
 
@@ -862,3 +863,68 @@ def test_restart_hedge_short_position_restores(tmp_path, monkeypatch):
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["side"] == "SELL"
     assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+
+
+# --------------------------------------------------------------------------- #
+# Pre-push hardening: TP1 evidence linkage and pending journal finalization
+# --------------------------------------------------------------------------- #
+def test_external_close_diagnostic_id_is_not_tp1_evidence():
+    saved = {
+        "bot_close_order_ids": ["real-tp1"],
+        "last_exchange_close_order_id": "old-external-close",
+    }
+    ids = ggpbot._collect_tp1_close_order_ids(saved, None)
+    assert ids == {"real-tp1"}
+    assert "old-external-close" not in ids
+
+
+def test_tp1_id_link_requires_timestamp_at_or_after_entry(monkeypatch):
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    entry_ms = int(time.time() * 1000)
+    holder = {"order": None}
+
+    class IdLinkedOrders:
+        def fetch_closed_orders(self, symbol=None, since=None, limit=None):
+            return [] if holder["order"] is None else [dict(holder["order"])]
+
+    monkeypatch.setattr(ggpbot, "ex", IdLinkedOrders())
+    kwargs = {
+        "symbol": "BTC/USDT:USDT", "side": "BUY", "expected_fill_qty": 1.0,
+        "position_side": "LONG", "position_mode": "HEDGE",
+        "close_order_ids": {"close-tp1"}, "trade_entry_ts": entry_ms,
+    }
+    base = {"id": "close-tp1", "status": "closed", "side": "sell",
+            "filled": 1.0, "symbol": "BTC-USDT",
+            "info": {"orderId": "close-tp1", "type": "MARKET", "positionSide": "LONG"}}
+
+    holder["order"] = {**base, "timestamp": entry_ms - 600000}
+    assert ggpbot._tp1_fill_verified_on_exchange(**kwargs) is False
+
+    holder["order"] = {**base}  # recorded id but no exchange timestamp
+    assert ggpbot._tp1_fill_verified_on_exchange(**kwargs) is False
+
+    holder["order"] = {**base, "timestamp": entry_ms + 1000}
+    assert ggpbot._tp1_fill_verified_on_exchange(**kwargs) is True
+
+
+def test_startup_flat_with_pending_journal_finalization_blocks_entries(tmp_path, monkeypatch):
+    journal, _ = _seed_journal(tmp_path)
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "INSTITUTIONAL_TRADE_JOURNAL", journal)
+    monkeypatch.setattr(ggpbot, "send_once", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        ggpbot, "_fetch_external_close_diagnostic",
+        lambda *_a, **_k: {"reason": "EXTERNAL_CLOSE_UNKNOWN", "confidence": "UNKNOWN", "evidence": {}})
+    monkeypatch.setattr(ggpbot, "fetch_position_tri_state", lambda _symbol: ("FLAT", []))
+
+    def _finalization_unavailable(*_a, **_k):
+        raise RuntimeError("journal busy")
+
+    monkeypatch.setattr(journal, "finalize_once", _finalization_unavailable)
+    _fresh_state()
+    assert ggpbot.startup_trade_recovery() is False
+    assert ggpbot.RECOVERY_BLOCK_ENTRIES is True
+    assert ggpbot.MEMORY["recovery_status"] == "JOURNAL_CLOSE_DIAGNOSIS_PENDING"
+    assert ggpbot.MEMORY["position_status"] != "FLAT"
+    assert journal.open_trades(), "an unfinalized journal row must keep entries blocked"
