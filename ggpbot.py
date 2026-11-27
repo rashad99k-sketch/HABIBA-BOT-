@@ -10945,15 +10945,19 @@ def update_institutional_flow_scanner():
         log_execution(f"[SCANNER] Error updating institutional flow: {e}", "ERROR")
 
 # ========== LIVE INSTITUTIONAL UPDATER THREAD (PAUSED DURING TRADE) ==========
-def live_institutional_updater():
-    while True:
+def live_institutional_updater(stop_event=None):
+    """Refresh institutional flow until an optional orderly-stop event is set."""
+    while stop_event is None or not stop_event.is_set():
         try:
             watchdog = globals().get("NAISO_WATCHDOG")
             if watchdog is not None:
                 watchdog.beat("institutional_updater", paused=bool(STATE.get("open")))
             # Do not run during open trade to avoid duplicate API calls and thread contention
             if STATE.get("open"):
-                time.sleep(5)
+                if stop_event is None:
+                    time.sleep(5)
+                else:
+                    stop_event.wait(5)
                 continue
             symbol = DEFAULT_SYMBOL
             df = get_ohlcv_safe(symbol, 100)
@@ -10981,7 +10985,10 @@ def live_institutional_updater():
                 update_institutional_flow_scanner()
         except Exception as e:
             log_execution(f"[LIVE_UPDATER] Error: {e}", "ERROR")
-        time.sleep(5)
+        if stop_event is None:
+            time.sleep(5)
+        else:
+            stop_event.wait(5)
 
 # ========== MAIN LOOP ==========
 MEMORY = {
@@ -11137,8 +11144,15 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
-def main_loop_sniper():
+def main_loop_sniper(stop_event=None):
+    """Run the production loop; an optional event enables orderly test shutdown."""
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, RECOVERY_BLOCK_ENTRIES
+    def _wait(seconds):
+        if stop_event is None:
+            _wait(seconds)
+        else:
+            stop_event.wait(seconds)
+
     last_scan = 0
     last_candidate_scan = 0
     last_flow_update = 0
@@ -11156,14 +11170,15 @@ def main_loop_sniper():
         log_execution("[SCANNER_1] Initial bounded global discovery dispatched", "INFO")
     else:
         log_execution("[SCANNER_1] Initial discovery dispatch refused; next due unchanged", "WARN")
+    updater_thread = None
     try:
-        updater_thread = threading.Thread(target=live_institutional_updater, daemon=True,
-                                          name="live_institutional_updater")
+        updater_thread = threading.Thread(target=live_institutional_updater, args=(stop_event,),
+                                          daemon=True, name="live_institutional_updater")
         updater_thread.start()
     except Exception as exc:
         log_execution(f"[THREAD_START] live_institutional_updater failed: {type(exc).__name__}: {exc}",
                       "ERROR")
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             now = time.time()
             _main_loop_progress("iteration_start",
@@ -11176,7 +11191,7 @@ def main_loop_sniper():
                 # Keep the normal bounded TTL/resource cleanup alive while entry scanning is paused.
                 # Do not force full GC on every one-second cooldown poll.
                 hourly_cleanup()
-                time.sleep(1)
+                _wait(1)
                 continue
 
             if now - last_flow_update > 60:
@@ -11191,11 +11206,11 @@ def main_loop_sniper():
                     continue
             if TRADE_STATE["in_position"] or STATE["open"]:
                 if not _main_loop_manage_open_position():
-                    time.sleep(BASE_SLEEP)
+                    _wait(BASE_SLEEP)
                     continue
             else:
                 if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
-                    time.sleep(1)
+                    _wait(1)
                     continue
                 if now - last_scan >= GLOBAL_SCAN_INTERVAL:
                     if dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat):
@@ -11216,9 +11231,9 @@ def main_loop_sniper():
                     _main_loop_progress("sniper_scan_start")
                     _run_sniper_scan_if_due()
                     _main_loop_progress("sniper_scan_complete")
-                    time.sleep(1)
+                    _wait(1)
                 else:
-                    time.sleep(1)
+                    _wait(1)
                 continue
             if STATE["open"] and STATE.get("current_symbol"):
                 sym = STATE["current_symbol"]
@@ -11239,10 +11254,15 @@ def main_loop_sniper():
             _main_loop_progress("cleanup")
             hourly_cleanup()
             _main_loop_progress("iteration_complete")
-            time.sleep(BASE_SLEEP)
+            _wait(BASE_SLEEP)
         except Exception as e:
             log_execution(f"Main loop error: {traceback.format_exc()}", "ERROR")
-            time.sleep(BASE_SLEEP)
+            _wait(BASE_SLEEP)
+
+    if stop_event is not None:
+        stop_event.set()
+        if updater_thread is not None:
+            updater_thread.join(timeout=6.0)
 
 main_loop = main_loop_sniper
 
