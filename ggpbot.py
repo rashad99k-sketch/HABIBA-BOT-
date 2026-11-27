@@ -11149,7 +11149,7 @@ def main_loop_sniper(stop_event=None):
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, RECOVERY_BLOCK_ENTRIES
     def _wait(seconds):
         if stop_event is None:
-            _wait(seconds)
+            time.sleep(seconds)
         else:
             stop_event.wait(seconds)
 
