@@ -110,7 +110,9 @@ def test_no_position_main_loop_continues_without_open_trade_and_keeps_loop_progr
 
     def record_progress(phase, **details):
         progress.append(phase)
-        if phase == "iteration_complete":
+        # Flat-position scanner path exits the iteration before iteration_complete.
+        # Stop after the real Scanner 2 + Sniper cycle has completed once.
+        if phase == "sniper_scan_complete":
             stop_event.set()
 
     monkeypatch.setattr(ggpbot, "_main_loop_progress", record_progress)
