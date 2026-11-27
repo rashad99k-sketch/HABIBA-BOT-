@@ -1,6 +1,8 @@
 """Runtime regressions for the zero-open-position scanner incident."""
 from __future__ import annotations
 
+import threading
+
 import pandas as pd
 import pytest
 
@@ -103,20 +105,35 @@ def test_no_position_main_loop_continues_without_open_trade_and_keeps_loop_progr
     monkeypatch.setattr(ggpbot, "daily_loss_cooldown_active", lambda: False)
     monkeypatch.setattr(ggpbot, "hourly_cleanup", lambda: None)
     monkeypatch.setattr(ggpbot, "print_snapshot", lambda: None)
-    monkeypatch.setattr(ggpbot, "_main_loop_progress",
-                        lambda phase, **details: progress.append(phase))
+    stop_event = threading.Event()
+    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *args, **kwargs: None)
+
+    def record_progress(phase, **details):
+        progress.append(phase)
+        if phase == "iteration_complete":
+            stop_event.set()
+
+    monkeypatch.setattr(ggpbot, "_main_loop_progress", record_progress)
     monkeypatch.setattr(ggpbot, "GLOBAL_SCAN_INTERVAL", 0)
     monkeypatch.setattr(ggpbot, "CANDIDATE_SCAN_INTERVAL", 0)
     monkeypatch.setattr(ggpbot, "SNIPER_V2_ENABLED", True)
     monkeypatch.setattr(ggpbot, "_SNIPER_V2_LAST_SCAN", 0.0)
     monkeypatch.setattr(ggpbot, "PAPER_MODE", True)
 
-    def stop_after_one_iteration(_seconds):
-        raise KeyboardInterrupt
+    created_threads = []
+    original_thread = ggpbot.threading.Thread
 
-    monkeypatch.setattr(ggpbot.time, "sleep", stop_after_one_iteration)
-    with pytest.raises(KeyboardInterrupt):
-        ggpbot.main_loop_sniper()
+    def tracking_thread(*args, **kwargs):
+        thread = original_thread(*args, **kwargs)
+        created_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(ggpbot.threading, "Thread", tracking_thread)
+    ggpbot.main_loop_sniper(stop_event=stop_event)
+
+    assert stop_event.is_set()
+    assert len(created_threads) == 1
+    assert not created_threads[0].is_alive()
 
     assert ggpbot.STATE["open"] is False
     assert ggpbot.TRADE_STATE["in_position"] is False
