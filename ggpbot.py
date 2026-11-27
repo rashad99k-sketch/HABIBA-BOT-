@@ -70,6 +70,7 @@ from ggp_position_sizing import (
     effective_sizing_classification,
     extract_leverage_value,
     is_strong_candidate,
+    validate_execution_stop,
     validate_trade_geometry,
 )
 from bingx_execution import (TradeExecutionService, BingXPositionModeAdapter,
@@ -6730,11 +6731,28 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         if not math.isfinite(structural_stop) or structural_stop <= 0:
             raise ValueError("structural stop must be finite and positive")
         try:
+            validate_execution_stop(
+                side=side, entry_price=reference_price, stop_price=structural_stop,
+            )
             validate_trade_geometry(
                 side=side, entry_price=reference_price, stop_price=structural_stop,
                 tp1_price=tp1, tp2_price=tp2,
             )
         except ValueError as geometry_exc:
+            _record_entry_path_diag(
+                symbol, "PROTECTIVE_GEOMETRY_GATE", side=side,
+                decision_state="REJECTED",
+                rejection_reason="protective_geometry_invalid",
+                cross_timestamp=_entry_cross_ts,
+                details={
+                    "reason": str(geometry_exc),
+                    "entry_reference_price": safe_float(price, None),
+                    "structural_stop": safe_float(sl, None),
+                    "tp1": safe_float(tp1, None),
+                    "tp2": safe_float(tp2, None),
+                },
+                logger=lambda message: log_execution(message, "WARN"),
+            )
             raise ValueError(
                 f"{geometry_exc}; side={side} entry={reference_price:.12g} "
                 f"SL={structural_stop:.12g} TP1={float(tp1):.12g} TP2={float(tp2):.12g}"
@@ -12195,7 +12213,10 @@ def smart_opportunity_selection():
             _record_entry_path_diag(
                 exchange_sym, "INSTITUTIONAL_DECISION", side=item.get("side"),
                 decision_state=item.get("decision_state"),
-                rejection_reason=item.get("rejection_reason") or item.get("decision_reason"),
+                rejection_reason=(
+                    item.get("rejection_reason") or item.get("decision_reason")
+                    if item.get("decision_state") != "ENTRY_READY" else None
+                ),
                 cross_timestamp=item.get("crossover_ts"),
                 details={"setup_type": item.get("decision_setup_type") or item.get("setup_type"),
                          "event_id": item.get("event_id"), "source": item.get("source"),
@@ -12224,6 +12245,46 @@ def smart_opportunity_selection():
                 continue
             live_price = get_ticker_safe(exchange_sym)
             price = float(live_price if live_price and live_price > 0 else closed_df["close"].iloc[-1])
+
+            # The bridge's stop is anchored to the closed-candle analysis price.
+            # Revalidate it against the live execution reference before sizing.
+            # Never "repair" a crossed invalidation level by moving the stop:
+            # that would silently revive a setup whose thesis has already failed.
+            sl = item.get("structural_stop")
+            closed_reference_price = float(closed_df["close"].iloc[-1])
+            try:
+                validate_execution_stop(side=side, entry_price=price, stop_price=sl)
+                sl = float(sl)
+            except (TypeError, ValueError, OverflowError) as stop_exc:
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "structural_stop_invalidated_before_execution"
+                _record_entry_path_diag(
+                    exchange_sym, "STRUCTURAL_STOP_GATE", side=side,
+                    decision_state="REJECTED",
+                    rejection_reason="structural_stop_invalidated_before_execution",
+                    cross_timestamp=item.get("cross_timestamp") or item.get("crossover_ts"),
+                    details={
+                        "reason": str(stop_exc),
+                        "execution_reference_price": price,
+                        "closed_candle_close": closed_reference_price,
+                        "structural_stop": safe_float(sl, None),
+                        "price_drift_atr": abs(price - closed_reference_price) / float(atr_value),
+                    },
+                    logger=lambda message: log_execution(message, "WARN"),
+                )
+                continue
+            _record_entry_path_diag(
+                exchange_sym, "STRUCTURAL_STOP_GATE", side=side,
+                decision_state="PASSED",
+                cross_timestamp=item.get("cross_timestamp") or item.get("crossover_ts"),
+                details={
+                    "execution_reference_price": price,
+                    "closed_candle_close": closed_reference_price,
+                    "structural_stop": sl,
+                    "price_drift_atr": abs(price - closed_reference_price) / float(atr_value),
+                },
+                logger=lambda message: log_execution(message, "INFO"),
+            )
 
             # Final no-chase check uses the latest execution reference price.
             # The exact same authority used by RORO analysis validates the zone again.
@@ -12294,12 +12355,10 @@ def smart_opportunity_selection():
                 item["rejection_reason"] = "unsupported_setup_type"
                 continue
             classification = "REVERSAL" if "REVERSAL" in setup else "TREND"
-            sl = item.get("structural_stop")
-            if sl is None or not np.isfinite(float(sl)) or float(sl) <= 0:
-                item["decision_state"] = "REJECTED"
-                item["rejection_reason"] = "structural_stop_missing"
-                continue
-            _, tp1, tp2 = compute_sl_tp(
+            # The bridge structural stop remains authoritative. compute_sl_tp's
+            # ATR stop is retained only as a diagnostic comparison; it must not
+            # replace a structural invalidation level that price has crossed.
+            atr_comparison_stop, tp1, tp2 = compute_sl_tp(
                 price, side, classification, float(atr_value), closed_df, symbol=exchange_sym
             )
             if not (tp1 and tp2 and np.isfinite(float(tp1)) and np.isfinite(float(tp2))):
@@ -12319,6 +12378,7 @@ def smart_opportunity_selection():
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
+                "atr_comparison_stop": float(atr_comparison_stop),
                 "trading_mode": str(item.get("trading_mode") or market_intelligence.get("mode") or "UNCLASSIFIED"),
                 "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
