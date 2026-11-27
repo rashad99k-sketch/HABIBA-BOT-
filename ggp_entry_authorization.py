@@ -49,6 +49,15 @@ def validate_ema9_vwap_cross_authorization(
         return False, "cross_timestamp_missing"
     if gate_cross_ts <= 0:
         return False, "cross_timestamp_invalid"
+    # The signal identity itself carries the closed candle timestamp. Validate
+    # it independently so a correctly-prefixed but stale/mismatched event cannot
+    # authorize a different cross.
+    try:
+        signal_timestamp = int(signal_id.split(":", 1)[1])
+    except (IndexError, TypeError, ValueError, OverflowError):
+        return False, "signal_candle_timestamp_invalid"
+    if signal_timestamp != gate_cross_ts:
+        return False, "signal_candle_timestamp_mismatch"
     if cross_timestamp is not None:
         try:
             if int(cross_timestamp) != gate_cross_ts:
