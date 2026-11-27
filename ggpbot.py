@@ -14115,7 +14115,8 @@ LiveTradeManager.manage_live_trade = _manage_live_trade_with_journal
 
 # Start-up recovery must complete before Scanner can authorize a new order.
 _original_main_loop_sniper = main_loop_sniper
-def main_loop_sniper():
+def main_loop_sniper(stop_event=None):
+    """Run startup recovery, then the supervisor; optional event is for orderly shutdown."""
     try:
         if not PAPER_MODE:
             try:
@@ -14136,7 +14137,7 @@ def main_loop_sniper():
         log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
     _main_loop_progress("startup_recovery_complete",
                         recovery_hold=bool(STATE.get("recovery_hold")))
-    return _original_main_loop_sniper()
+    return _original_main_loop_sniper(stop_event=stop_event)
 
 
 # safe_main_loop resolves this alias dynamically; point it at the recovery wrapper.
