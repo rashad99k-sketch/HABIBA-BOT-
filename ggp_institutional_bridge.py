@@ -423,6 +423,9 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         ("scanner_v2_sell", memory.get("scanner_v2_sell", []), "SELL"),
         ("radar_watchlist", memory.get("radar_watchlist", []), None),
         ("radar_top5", memory.get("radar_top5", []), None),
+        # Cross-observed symbols must become first-class Watchlist candidates;
+        # side remains a soft hint because both hypotheses are re-analyzed.
+        ("ema9_vwap_proximity_scanner", memory.get("ema9_vwap_proximity_scanner", []), None),
         ("top_candidates", memory.get("top_candidates", []), None),
         ("candidates", memory.get("candidates", []), None),
         ("roro_watchlist", memory.get("roro_watchlist", {}), None),
@@ -445,7 +448,9 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 entry["sources"].append(source)
             side = str(item.get("side") or item.get("rf_signal") or "").upper()
             if side not in {"BUY", "SELL"}:
-                side = str(item.get("side_hint") or implied_side or "").upper()
+                cross_direction = str(item.get("cross_ema9") or item.get("cross_any") or item.get("cross") or "").upper()
+                cross_side = "BUY" if cross_direction == "BULLISH" else "SELL" if cross_direction == "BEARISH" else ""
+                side = str(item.get("side_hint") or implied_side or cross_side or "").upper()
             if side in {"BUY", "SELL"}:
                 entry["sides"].add(side)
             try:

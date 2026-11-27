@@ -203,3 +203,19 @@ def test_ema9_vwap_cross_does_not_authorize_without_fresh_cross(monkeypatch):
         "BTC/USDT:USDT", "BUY", df, {}, SimpleNamespace(structural_stop=None),
         now_ms=1700072000000,
     ) is None
+
+
+
+def test_proximity_scanner_crosses_are_merged_into_unified_watchlist_candidates():
+    merged = merge_candidates({
+        "ema9_vwap_proximity_scanner": [
+            {"symbol": "SOL", "exchange_symbol": "SOL/USDT:USDT",
+             "cross_ema9": "BULLISH", "cross_fresh": True, "score": 91},
+            {"symbol": "XRP", "exchange_symbol": "XRP/USDT:USDT",
+             "cross_ema9": "BEARISH", "cross_fresh": True, "score": 88},
+        ],
+    })
+    assert set(merged) == {"SOL", "XRP"}
+    assert merged["SOL"]["sides"] == ["BUY"]
+    assert merged["XRP"]["sides"] == ["SELL"]
+    assert "ema9_vwap_proximity_scanner" in merged["SOL"]["sources"]

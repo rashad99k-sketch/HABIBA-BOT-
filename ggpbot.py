@@ -11937,7 +11937,11 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     rows = [x for x in rows if x.get("symbol") != symbol_key]
                     rows.append(proximity_item)
                     rows.sort(key=lambda x: (float(x.get("score", 0) or 0), float(x.get("updated_at", 0) or 0)), reverse=True)
-                    MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
+                    # Preserve more recent observations and keep confirmed fresh crosses
+                    # ahead of proximity-only rows so they can enter the unified Watchlist.
+                    rows.sort(key=lambda x: (bool(x.get("cross_fresh")), float(x.get("score", 0) or 0),
+                                             float(x.get("updated_at", 0) or 0)), reverse=True)
+                    MEMORY["ema9_vwap_proximity_scanner"] = rows[:80]
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
                 icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
