@@ -6610,8 +6610,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     _record_entry_path_diag(symbol, "EXECUTE_ENTRY_ENTERED", side=side,
                              decision_state=institutional_entry_ctx.get("decision_state", "ENTRY_READY"),
                              cross_timestamp=_entry_cross_ts,
-                             details={"trade_id": trade_id, "entry_type": entry_type,
-                                      "trade_type": trade_type},
+                             details={
+                                 "trade_id": trade_id, "entry_type": entry_type,
+                                 "trade_type": trade_type,
+                                 "setup_type": institutional_entry_ctx.get("setup_type"),
+                                 "event_id": institutional_entry_ctx.get("event_id"),
+                                 "closed_candle_source": institutional_entry_ctx.get("closed_candle_source"),
+                             },
                              logger=lambda message: log_execution(message, "INFO"))
     # Final execution-boundary gate: no institutional, sniper, RF or legacy
     # setup can bypass the mandatory EMA9-to-session-VWAP closed-candle cross.
@@ -6757,11 +6762,31 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             else:
                 valid = False
             if not valid:
+                _record_entry_path_diag(
+                    symbol, "FINAL_ENTRY_AUTHORIZATION", side=side,
+                    decision_state="REJECTED", rejection_reason=authorization_reason,
+                    cross_timestamp=_entry_cross_ts,
+                    details={"setup_type": setup,
+                             "event_id": institutional_entry_ctx.get("event_id"),
+                             "closed_candle_source": institutional_entry_ctx.get("closed_candle_source"),
+                             "adx": safe_float(adx_val, None)},
+                    logger=lambda message: log_execution(message, "ERROR"),
+                )
                 log_execution(
                     f"[ENTRY] Institutional authorization incomplete for {setup}; "
                     f"reason={authorization_reason}; LIVE blocked", "ERROR",
                 )
                 return False
+            _record_entry_path_diag(
+                symbol, "FINAL_ENTRY_AUTHORIZATION", side=side,
+                decision_state="AUTHORIZED", cross_timestamp=_entry_cross_ts,
+                details={"setup_type": setup,
+                         "event_id": institutional_entry_ctx.get("event_id"),
+                         "closed_candle_source": institutional_entry_ctx.get("closed_candle_source"),
+                         "authorization_reason": authorization_reason,
+                         "adx": safe_float(adx_val, None)},
+                logger=lambda message: log_execution(message, "INFO"),
+            )
             log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f}", "INFO")
         else:
             # Legacy/manual entry path keeps its existing stricter safeguards.
