@@ -213,6 +213,10 @@ def test_proximity_scanner_crosses_are_merged_into_unified_watchlist_candidates(
              "cross_ema9": "BULLISH", "cross_fresh": True, "score": 91},
             {"symbol": "XRP", "exchange_symbol": "XRP/USDT:USDT",
              "cross_ema9": "BEARISH", "cross_fresh": True, "score": 88},
+            {"symbol": "OLD", "exchange_symbol": "OLD/USDT:USDT",
+             "cross_ema9": "BULLISH", "cross_fresh": False, "score": 99},
+            {"symbol": "NEAR", "exchange_symbol": "NEAR/USDT:USDT",
+             "cross_ema9": None, "cross_fresh": True, "score": 98},
         ],
     })
     assert set(merged) == {"SOL", "XRP"}

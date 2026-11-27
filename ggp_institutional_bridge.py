@@ -435,6 +435,10 @@ def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         for item in values:
             if not isinstance(item, dict) or not item.get("symbol"):
                 continue
+            if source == "ema9_vwap_proximity_scanner" and not (
+                item.get("cross_ema9") and bool(item.get("cross_fresh"))
+            ):
+                continue
             original = str(item["symbol"]).strip()
             key = canonical_symbol(original)
             exchange = exchange_symbol(original)
