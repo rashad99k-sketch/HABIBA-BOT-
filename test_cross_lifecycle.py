@@ -18,7 +18,7 @@ from ggp_cross_lifecycle import (
     rank_cross_candidates, transition_state, HIGH_QUALITY, GOOD_QUALITY, WEAK_QUALITY,
     INVALID_QUALITY,
 )
-from ggp_institutional_bridge import _select_cross_event
+from ggp_institutional_bridge import _select_cross_event, cross_event_authorization_block
 from ggp_profit_brain import resolve_trend_targets, select_range_target_pct
 
 ROOT = Path(__file__).resolve().parent
@@ -345,6 +345,21 @@ def test_bridge_selects_newest_unconsumed_cross_not_a_stale_consumed_id():
            "cross_event_id": make_cross_event_id(symbol, 900, "BUY", new_ts)}
     assert _select_cross_event([old, new], "BUY")["cross_event_id"] == new["cross_event_id"]
     assert _select_cross_event([old, new], "BUY", old["cross_event_id"])["cross_event_id"] == new["cross_event_id"]
+    assert _select_cross_event([old], "BUY") is None
+    approaching = {**_confirmed("BUY", old_ts), "cross_status": "APPROACHING"}
+    assert _select_cross_event([approaching], "BUY") is None
+    expired = {**_confirmed("BUY", old_ts),
+               "final_rejection_reason": "cross_signal_expired_without_reentry"}
+    assert _select_cross_event([expired, new], "BUY", expired["cross_event_id"])["cross_event_id"] == new["cross_event_id"]
+
+
+def test_bridge_authorization_block_rejects_consumed_and_nonconfirmed_events():
+    event = _confirmed("BUY", 1795132800000)
+    assert cross_event_authorization_block(event) is None
+    assert cross_event_authorization_block(None) == "cross_event_missing"
+    assert cross_event_authorization_block({**event, "cross_event_id_consumed": True}) == "cross_event_already_consumed"
+    assert cross_event_authorization_block({**event, "cross_status": "APPROACHING"}) == "cross_event_not_confirmed"
+    assert cross_event_authorization_block({**event, "final_rejection_reason": "duplicate_cross_event_id"}) == "duplicate_cross_event_id"
 
 
 def test_price_space_uses_nearest_opposing_boundary_not_ema_vwap_gap():
@@ -389,12 +404,17 @@ def test_production_cross_path_reaches_execute_entry_with_approved_event(monkeyp
         "data_freshness": "FRESH", "candle_timestamp": candle_ts,
         "ema9": 101.0, "ema50": 99.5, "vwap": 100.0, "gap_atr": 0.10,
     }
+    stale_proximity = {**proximity, "candle_timestamp": candle_ts - 900000}
+    stale_event = normalize_cross_event(exchange_symbol, 900, stale_proximity, 26.0,
+                                        candle_ts + 900000)
+    stale_event["cross_status"] = "EXPIRED"
+    stale_event["final_rejection_reason"] = "cross_signal_expired_without_reentry"
     event = normalize_cross_event(exchange_symbol, 900, proximity, 26.0, candle_ts + 900000)
     watch_key = "BTCUSDT"
     watch_item = {
         "symbol": watch_key, "exchange_symbol": exchange_symbol, "side": "BUY",
         "decision_state": "ENTRY_READY", "cross_status": "CONFIRMED",
-        "cross_event_id": event["cross_event_id"], "score": 80.0,
+        "cross_event_id": stale_event["cross_event_id"], "score": 80.0,
         "price": 100.0, "atr": 1.0,
     }
     fresh = {
@@ -433,6 +453,15 @@ def test_production_cross_path_reaches_execute_entry_with_approved_event(monkeyp
     frame = _closed_frame()
     logs = []
     calls = []
+    bridge_calls = []
+
+    def fake_bridge(symbol, df, **kwargs):
+        events = list(kwargs.get("cross_events") or [])
+        ids = {str(row.get("cross_event_id") or "") for row in events if isinstance(row, dict)}
+        bridge_calls.append(ids)
+        # Canonical watchlist key and exchange-qualified event symbol must match.
+        assert ids == {stale_event["cross_event_id"], event["cross_event_id"]}
+        return dict(fresh)
 
     def fake_execute_entry(*args, **kwargs):
         calls.append({"args": args, "kwargs": kwargs,
@@ -446,7 +475,10 @@ def test_production_cross_path_reaches_execute_entry_with_approved_event(monkeyp
     authority = type("Authority", (), {"consume": lambda self, event_id: True})()
     monkeypatch.setattr(bot, "MEMORY", {
         "watchlist": {watch_key: watch_item},
-        "cross_events": {event["cross_event_id"]: event},
+        "cross_events": {
+            stale_event["cross_event_id"]: stale_event,
+            event["cross_event_id"]: event,
+        },
         "_unified_watchlist_refresh_ok": True,
     })
     monkeypatch.setattr(bot, "STATE", {"open": False})
@@ -461,7 +493,7 @@ def test_production_cross_path_reaches_execute_entry_with_approved_event(monkeyp
     monkeypatch.setattr(bot, "_integration_fetch_frame", lambda _: frame)
     monkeypatch.setattr(bot, "roro_validate_closed_frame", lambda df, **kwargs: df)
     monkeypatch.setattr(bot, "validate_dataframe", lambda *args, **kwargs: True)
-    monkeypatch.setattr(bot, "roro_analyze_symbol_both", lambda *args, **kwargs: dict(fresh))
+    monkeypatch.setattr(bot, "roro_analyze_symbol_both", fake_bridge)
     monkeypatch.setattr(bot, "_enrich_with_existing_gpp_engines",
                         lambda *args, **kwargs: dict(enrichment))
     monkeypatch.setattr(bot, "validate_location_zone", lambda *args, **kwargs: {"valid": True})
@@ -482,8 +514,12 @@ def test_production_cross_path_reaches_execute_entry_with_approved_event(monkeyp
     assert len(calls) == 1
     assert calls[0]["context"]["cross_event_id"] == event["cross_event_id"]
     assert calls[0]["context"]["cross_direction"] == "BUY"
+    assert bridge_calls and len(bridge_calls) == 1
     assert event["institutional_analysis_status"] == CrossLifecycleState.ENTRY_FILLED.value
     assert event["cross_event_id_consumed"] is True
+    assert stale_event["institutional_analysis_status"] != CrossLifecycleState.ENTRY_FILLED.value
+    assert stale_event["cross_status"] == "EXPIRED"
+    assert watch_item["cross_event_id"] == event["cross_event_id"]
     assert watch_item["cross_quality"] == HIGH_QUALITY
     assert any("execute_entry called" in message and event["cross_event_id"] in message
                for message in logs)

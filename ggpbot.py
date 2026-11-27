@@ -12224,6 +12224,14 @@ def smart_opportunity_selection():
         except Exception:
             return True
 
+    def _cross_event_usable_for_authorization(event):
+        if _cross_event_consumed(event):
+            return False
+        reason = str(event.get("final_rejection_reason") or "")
+        if reason in {"duplicate_cross_event_id", "cross_signal_expired_without_reentry"}:
+            return False
+        return str(event.get("cross_status") or "").upper() == "CONFIRMED"
+
     def _select_cross_event_for_item(sym, exchange_sym_value, side, preferred_id):
         canonical = roro_canonical_symbol(sym)
         events = [
@@ -12234,26 +12242,22 @@ def smart_opportunity_selection():
                  or str(event.get("exchange_symbol") or "").upper() == str(exchange_sym_value).upper())
             and str(event.get("cross_direction") or "").upper() == side
         ]
+        usable = [event for event in events if _cross_event_usable_for_authorization(event)]
         preferred_id = str(preferred_id or "")
         if preferred_id:
-            exact = next((event for event in events
+            exact = next((event for event in usable
                           if str(event.get("cross_event_id") or "") == preferred_id), None)
-            if exact is not None and not _cross_event_consumed(exact):
+            if exact is not None:
                 return exact
-        confirmed = [
-            event for event in events
-            if str(event.get("cross_status") or "").upper() == "CONFIRMED"
-            and str(event.get("final_rejection_reason") or "") not in {
-                "duplicate_cross_event_id", "cross_signal_expired_without_reentry"
-            }
-        ]
+        confirmed = [event for event in usable
+                     if str(event.get("cross_status") or "").upper() == "CONFIRMED"]
         confirmed.sort(key=lambda event: (
             int(event.get("candle_timestamp") or 0),
             int(event.get("last_seen_ms") or 0),
             int(event.get("first_seen_ms") or 0),
         ), reverse=True)
-        # Never let an older, already-consumed cross block a newer valid cross.
-        return next((event for event in confirmed if not _cross_event_consumed(event)), None)
+        # Never let an older, consumed, expired or duplicate cross block a newer valid one.
+        return confirmed[0] if confirmed else None
 
     def _apply_cross_transition(target, state, reason):
         updated = _cross_transition_state(target, state, reason)
@@ -12404,7 +12408,9 @@ def smart_opportunity_selection():
             _cross_events_for_symbol = [
                 event for event in cross_event_map.values()
                 if isinstance(event, dict)
-                and (str(event.get("symbol") or "").upper() == str(canonical).upper()
+                and (roro_canonical_symbol(event.get("symbol")) == roro_canonical_symbol(canonical)
+                     or roro_canonical_symbol(event.get("exchange_symbol")) == roro_canonical_symbol(canonical)
+                     or str(event.get("symbol") or "").upper() == str(exchange_sym).upper()
                      or str(event.get("exchange_symbol") or "").upper() == str(exchange_sym).upper())
             ]
             fresh = roro_analyze_symbol_both(

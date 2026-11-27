@@ -31,6 +31,23 @@ CONTINUATION = ContinuationEngine()
 AUTHORITY = UnifiedEntryAuthority()
 
 TIMEFRAME_SECONDS = 900
+PERMANENT_CROSS_REJECTIONS = {
+    "duplicate_cross_event_id", "cross_signal_expired_without_reentry",
+}
+
+
+def cross_event_authorization_block(event: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the reason a cross event cannot be used for authorization."""
+    if not isinstance(event, dict):
+        return "cross_event_missing"
+    if event.get("cross_event_id_consumed"):
+        return "cross_event_already_consumed"
+    reason = str(event.get("final_rejection_reason") or "")
+    if reason in PERMANENT_CROSS_REJECTIONS:
+        return reason
+    if str(event.get("cross_status") or "").upper() != "CONFIRMED":
+        return "cross_event_not_confirmed"
+    return None
 
 
 def canonical_symbol(symbol: Any) -> str:
@@ -660,11 +677,14 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     if isinstance(cross_context, dict):
         _cross_features.update(cross_context)
     _cross_result = evaluate_cross_location(_cross_features, side)
-    _structural_ready = decision.state == DecisionState.ENTRY_READY.value
-    _cross_approved = bool(_structural_ready and _cross_result.get("approved"))
-    _cross_rejection = ("" if _cross_approved else
-                        "cross_location_" + str(_cross_result.get("quality", "UNRATED")).lower())
     _cross_dict = cross_event if isinstance(cross_event, dict) else {}
+    _cross_block = cross_event_authorization_block(cross_event) if isinstance(cross_event, dict) else None
+    _structural_ready = decision.state == DecisionState.ENTRY_READY.value
+    _cross_approved = bool(
+        _cross_block is None and _structural_ready and _cross_result.get("approved")
+    )
+    _cross_rejection = ("" if _cross_approved else
+                        (_cross_block or "cross_location_" + str(_cross_result.get("quality", "UNRATED")).lower()))
     _lifecycle_status = (CrossLifecycleState.INSTITUTIONAL_APPROVED.value if _cross_approved
                          else CrossLifecycleState.INSTITUTIONAL_REJECTED.value)
     _lifecycle_rejection = _cross_rejection or None
@@ -757,24 +777,21 @@ def _select_cross_event(cross_events: Optional[Any], side: str,
     matches = [event for event in candidates
                if isinstance(event, dict)
                and str(event.get("cross_direction") or "").upper() == wanted_side]
+    usable = [event for event in matches if cross_event_authorization_block(event) is None]
     preferred = str(preferred_event_id or "")
     if preferred:
-        exact = next((event for event in matches
-                      if str(event.get("cross_event_id") or "") == preferred
-                      and not event.get("cross_event_id_consumed")), None)
+        exact = next((event for event in usable
+                      if str(event.get("cross_event_id") or "") == preferred), None)
         if exact is not None:
             return exact
-    confirmed = [event for event in matches
+    confirmed = [event for event in usable
                  if str(event.get("cross_status") or "").upper() == "CONFIRMED"]
     confirmed.sort(key=lambda event: (
         int(event.get("candle_timestamp") or 0),
         int(event.get("last_seen_ms") or 0),
         int(event.get("first_seen_ms") or 0),
     ), reverse=True)
-    for event in confirmed:
-        if not event.get("cross_event_id_consumed"):
-            return event
-    return confirmed[0] if confirmed else next((event for event in matches), None)
+    return confirmed[0] if confirmed else None
 
 
 def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] = None,

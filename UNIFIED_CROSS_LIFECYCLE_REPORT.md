@@ -56,6 +56,9 @@ diff code review, and remaining-risk assessment. They confirmed:
 | `HIGHER_VOL` bypassed the inherited weak/thin/ADX guard | Volatility bands are applied only after the mandatory weak-market guard. |
 | Verification log read a non-existent `STATE["order"]` key | The wrapper logs `entry_exchange_order_id`, actual filled quantity (`actual_filled_qty`/`qty`), `entry_execution_state` and `native_sl_verified`. |
 | Focused tests did not exercise the production authorization path | A production-shaped offline test drives `smart_opportunity_selection()` through frame validation, cross selection, location analysis, readiness and a monkeypatched `execute_entry()`. |
+| Independent re-review: bridge could relabel consumed/APPROACHING events as approved | `cross_event_authorization_block()` now requires CONFIRMED, unconsumed and non-permanently-rejected state before bridge approval; `_select_cross_event()` returns `None` when no valid event exists. |
+| Independent re-review: preferred expired/rejected Event ID could block a newer cross | Both bridge and Watchlist selectors apply the same validity filter to the preferred ID and fall back to the newest valid confirmed event. |
+| Independent re-review: pre-authorization bridge filter used raw string equality | The pre-authorization event filter now canonicalizes both Watchlist keys and exchange-qualified event symbols; the production-shaped test asserts the bridge receives both events. |
 
 ## 4. Modified files and functions
 
@@ -63,9 +66,9 @@ diff code review, and remaining-risk assessment. They confirmed:
 |---|---|
 | `ggp_cross_lifecycle.py` (new) | `CrossLifecycleState`, `adx_gate`, `make_cross_event_id`, `normalize_cross_event`, `merge_cross_events`, `transition_state`, `_zone_quality`, `evaluate_cross_location`, `build_location_features`, `cross_rank`, `rank_cross_candidates`, `execution_readiness`. Execution-free: no data fetch and no order call. Fixed permanent-rejection handling, duplicate rank and nearest-boundary price space. |
 | `ggpbot.py` | Imports the lifecycle module; `_enrich_with_existing_gpp_engines()` converts existing Scanner-2 proximity into retained cross events; `smart_opportunity_selection()` adds unresolved-state guard, cross ranking, duplicate exclusion, canonical event selection, state write-back, side re-analysis, enriched readiness and ADX gate; `execute_entry()` uses the cross Event ID as durable identity; the serialized wrapper logs authoritative fill/protection state; `LiveTradeManager._apply_management()` supplies ATR% and volatility band context. |
-| `ggp_institutional_bridge.py` | `analyze_symbol()` evaluates the cross's own location and mutates the supplied cross event with the result; `_select_cross_event()` chooses the exact/newest unconsumed confirmed event; `analyze_symbol_both()` and `update_unified_watchlist()` use canonical symbol matching and the same selection rule. |
+| `ggp_institutional_bridge.py` | `analyze_symbol()` evaluates the cross's own location and mutates the supplied cross event with the result; `cross_event_authorization_block()` guards approval; `_select_cross_event()` chooses the exact/newest valid confirmed event; `analyze_symbol_both()` and `update_unified_watchlist()` use canonical symbol matching and the same selection rule. |
 | `ggp_profit_brain.py` | `select_range_target_pct()` maps `LOW_VOL -> 0.25%` and `HIGHER_VOL -> 0.50%` after the weak-market guard. |
-| `test_cross_lifecycle.py` (new) | 24 offline tests: mandatory scenarios, AST protected-area checks, enriched-readiness proof, duplicate blocking, bridge Event-ID selection, nearest-boundary space, production-shaped authorization path and verification-log fields. |
+| `test_cross_lifecycle.py` (new) | 25 offline tests: mandatory scenarios, AST protected-area checks, enriched-readiness proof, duplicate blocking, bridge Event-ID selection and authorization block, nearest-boundary space, production-shaped authorization path with stale preferred ID / canonical filter and verification-log fields. |
 | `UNIFIED_CROSS_LIFECYCLE_PLAN.md` (new) | File/function-linked implementation plan written before edits. |
 | `UNIFIED_CROSS_LIFECYCLE_DIFF.txt` (new) | Exact Git diff for the change set. |
 | `UNIFIED_CROSS_LIFECYCLE_REPORT.md` (new) | This report. |
@@ -154,10 +157,11 @@ ROE.
 | Command | Result |
 |---|---|
 | `python -m py_compile ggp_cross_lifecycle.py ggp_institutional_bridge.py ggp_profit_brain.py ggpbot.py test_cross_lifecycle.py` | clean |
-| `python -m pytest -q test_cross_lifecycle.py` | **24 passed in 11.15s** |
-| Focused + integration subset (`test_cross_lifecycle.py`, `test_entry_event_idempotency.py`, `test_ema9_vwap_soft_gate.py`, `test_profit_brain.py`, `test_profit_target_ladder.py`, `test_dual_scanner_dashboard.py`, `test_ggp_roro_integration.py`) | **93 passed in 26.80s** |
+| `python -m pytest -q test_cross_lifecycle.py` | **25 passed in 11.29s** |
+| Focused + integration subset (`test_cross_lifecycle.py`, `test_entry_event_idempotency.py`, `test_ema9_vwap_soft_gate.py`, `test_profit_brain.py`, `test_profit_target_ladder.py`, `test_dual_scanner_dashboard.py`, `test_ggp_roro_integration.py`) | **94 passed in 28.28s** |
 | Full offline regression before merging `origin/main` | **642 passed, 1 warning in 124.51s** |
 | Full offline regression after merging owner commit `59eeffd` | **642 passed, 1 warning in 126.45s** |
+| Final full offline regression after independent re-review fixes | **643 passed, 1 warning in 130.83s** |
 
 Baseline before edits was `618 passed, 1 warning in 177.13s`. No Timeout was raised, no
 test was skipped or marked xfail, and no failing test was ignored. The single warning is
