@@ -375,3 +375,26 @@ PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/45 .
 The first branch commit `5f8f151a7703042fbca0f0964fd00e4c6446bc9b` had GitHub Actions
 `python-tests: success`. The review-fix commit is rechecked by CI before merge.
 No GitHub review or check reported a blocker.
+
+### 12.10 Final merge record
+
+| Item | Value |
+|---|---|
+| Starting commit | `a7d72f225523e3fdb3026ade30f710e3b3dab569` |
+| Branch | `institutional-cross-lifecycle-hardening` |
+| Branch commits | `5f8f151a7703042fbca0f0964fd00e4c6446bc9b`, `66ba9f307ee631ccbc9611f18e21d077fc36c230` |
+| PR | https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/45 |
+| PR final head | `66ba9f307ee631ccbc9611f18e21d077fc36c230` |
+| PR state | closed / merged at `2026-11-27T21:52:26Z` |
+| Merge commit on `main` | `073a3cc21bb8ad362f3d90ef7524eb1c22dd9812` |
+| GitHub Actions | run `46072784258`, `Sniper V2 integration CI`, completed `success` |
+| Final local regression | `656 passed, 1 pre-existing warning in 128.09s` |
+| GitHub REST API | authenticated via git credential helper; `rate_limit.remaining=4982` at verification time |
+| Exchange API/rate-limit behavior | not exercised |
+| Demo result | **not performed** |
+| LIVE result | **not performed** |
+
+No force push, rebase or history rewrite was used. The merged workflow is still the single
+scanner → Watchlist → institutional analysis → ranked authorization → existing BingX execution
+→ verified management/close path. **No demo or LIVE verification was performed; this build is
+not LIVE-ready.**
