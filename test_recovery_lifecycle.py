@@ -1121,3 +1121,20 @@ def test_restart_hedge_short_position_restores(tmp_path, monkeypatch):
     assert ggpbot.startup_trade_recovery() is True
     assert ggpbot.STATE["side"] == "SELL"
     assert ggpbot.STATE["native_sl_status"] == "VERIFIED"
+
+
+
+def test_position_contracts_uses_total_position_not_available_close_quantity():
+    # BingX positionAmt is total position; availableAmt is only closeable quantity.
+    assert ggpbot._position_contracts({
+        "info": {"positionAmt": "0", "availableAmt": "2", "positionSize": "2"}
+    }) == 0.0
+    assert ggpbot._position_contracts({
+        "contracts": 0, "info": {"positionAmt": "0.0", "availableAmt": "1"}
+    }) == 0.0
+    assert ggpbot._position_contracts({
+        "info": {"positionAmt": "-0.25", "availableAmt": "0.25"}
+    }) == pytest.approx(0.25)
+    assert ggpbot._position_contracts({
+        "contracts": 0.5, "info": {"positionAmt": "0.5", "availableAmt": "0.5"}
+    }) == pytest.approx(0.5)
