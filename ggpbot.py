@@ -12283,7 +12283,9 @@ def smart_opportunity_selection():
                 item["rejection_reason"] = "profit_targets_invalid"
                 continue
             evidence = list(item.get("evidence") or [])
-            market_intelligence = item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {}
+            market_intelligence = dict(item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {})
+            market_intelligence["entry_location_status"] = str(item.get("entry_location_status") or "UNKNOWN")
+            market_intelligence["entry_location_checks"] = list(item.get("entry_location_checks") or [])
 
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
@@ -12297,6 +12299,8 @@ def smart_opportunity_selection():
                 "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
                 "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "entry_location_status": str(item.get("entry_location_status") or "UNKNOWN"),
+                "entry_location_checks": list(item.get("entry_location_checks") or []),
                 "support_resistance": dict(item.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
                 "order_block": dict(item.get("order_block") or {}),
                 "fvg": dict(item.get("fvg") or {}),
