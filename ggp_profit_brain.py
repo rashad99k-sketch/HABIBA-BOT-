@@ -339,6 +339,14 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     existing trend-mode TP2 path, not the range-scalp target selector.
     """
     ctx = context if isinstance(context, dict) else {}
+    # Explicit volatility bands keep the single-target full-close policy
+    # explainable: LOW_VOL -> 0.25%, HIGHER_VOL -> 0.50%. They are price-move
+    # percentages, never leveraged ROE, and never create TP1/TP2/splitting.
+    band = str(ctx.get("volatility_band") or "").upper()
+    if band == "LOW_VOL":
+        return RANGE_PROFIT_TARGETS_PCT[0], "low_volatility_range_full_close_0.25pct"
+    if band == "HIGHER_VOL":
+        return RANGE_PROFIT_TARGETS_PCT[1], "higher_volatility_scalp_full_close_0.50pct"
     adx = _number(ctx.get("adx"), 0.0) or 0.0
     continuation = _number(ctx.get("continuation_probability"), 0.0) or 0.0
     volume_ratio = _number(ctx.get("volume_ratio"), 0.0) or 0.0

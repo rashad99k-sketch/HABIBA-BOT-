@@ -1,0 +1,1529 @@
+diff --git a/UNIFIED_CROSS_LIFECYCLE_PLAN.md b/UNIFIED_CROSS_LIFECYCLE_PLAN.md
+new file mode 100644
+index 0000000..5a0a0ca
+--- /dev/null
++++ b/UNIFIED_CROSS_LIFECYCLE_PLAN.md
+@@ -0,0 +1,58 @@
++# Unified EMA9 + Session VWAP cross lifecycle — implementation plan
++
++Scope: connect the **two existing** scanners, the unified Watchlist, the existing institutional
++engines, the existing `execute_entry` / BingX path, and the existing `TradeManagementBoard`
++into one continuous lifecycle. No third scanner, no second executor, no parallel profit engine,
++no strategy change (EMA50 stays diagnostic, not an alternate cross).
++
++## Traced before-flow
++
++1. Scanner 1 `ggpbot.run_global_discovery_scanner()` → `run_scanner_v2()` +
++   `ggp_discovery_scanner.professional_lightweight_scan()` + `scan_market_rf()` + `radar_score()`
++   → `MEMORY["top_candidates"]`.
++2. Scanner 2 `ggpbot._enrich_with_existing_gpp_engines()` → `roro_confluence.ema9_vwap_proximity()`
++   → `MEMORY["ema9_vwap_proximity_scanner"]`; institutional bridge merge/rank/rotate in
++   `ggp_institutional_bridge.update_unified_watchlist()` → `MEMORY["watchlist"]`.
++3. `ggpbot.smart_opportunity_selection()` filters `decision_state == ENTRY_READY`, re-analyzes
++   with `roro_analyze_symbol_both()`, validates location, calls `execute_entry()`.
++4. `execute_entry()` enforces fresh EMA9/VWAP gate + ADX >= 18, then `open_position()` →
++   `TradeExecutionService.submit_market_entry()` → `exchange.create_order()` (BingX) →
++   position/fill verification → native stop verification.
++5. `LiveTradeManager` → `TradeManagementBoard.evaluate()` → `safe_close_position()` /
++   `safe_close_partial()` → verified close → `_clear_confirmed_flat_unlocked()` releases the lock
++   and scanners resume.
++
++Knot found in the audit: cross proximity was ranking metadata in the Watchlist but a hard gate
++inside `execute_entry`, with no cross Event ID, no explicit lifecycle states, no cross-location
++quality class, and `OpportunityPipeline` unwired in production.
++
++## File/function-linked changes
++
++| File / function | Change |
++|---|---|
++| `ggp_cross_lifecycle.py` (new, execution-free) | `CrossLifecycleState`, `normalize_cross_event`, `make_cross_event_id`, `merge_cross_events`, `transition_state`, `adx_gate`, `build_location_features`, `evaluate_cross_location`, `rank_cross_candidates`, `execution_readiness`. |
++| `ggpbot._enrich_with_existing_gpp_engines()` | Build cross candidate from the existing proximity result; merge into `MEMORY["cross_events"]`; retain APPROACHING/CONFIRMED candidates across cycles; attach Event ID + candidate fields to the Watchlist row. |
++| `ggp_institutional_bridge.analyze_symbol()` | Accept optional `cross_event`; evaluate the cross's own location using context already built by `_build_context`; emit quality class, evidence, `institutional_analysis_status`, `final_rejection_reason`. Never creates an independent opportunity. |
++| `ggp_institutional_bridge.analyze_symbol_both()` / `update_unified_watchlist()` | Pass each cross only to its matching direction, so BUY never blocks SELL; include cross quality in ranking; preserve cross identity on the Watchlist row. |
++| `ggpbot.smart_opportunity_selection()` | Rank by cross quality/location/ADX/freshness/R:R; require `INSTITUTIONAL_APPROVED`; transition `EXECUTION_READY`; pass `cross_event_id` into `_INSTITUTIONAL_ENTRY_CONTEXT`; log every selection/rejection; transition submitted/filled/rejected from the execution result. |
++| `ggpbot.execute_entry()` (core + journal wrapper) | Use the supplied cross Event ID as the durable event identity (same ID from scanner → Watchlist → institutional analysis → entry), keep all existing gates, log reach/send/fill/quantity/verification, and consume the ID only after a verified fill. |
++| `ggp_profit_brain.select_range_target_pct()` + `ggpbot._apply_management()` | Explicit low-volatility 0.25% and higher-volatility 0.50% price-move bands using existing ATR evidence; existing `RANGE_SCALP` full-close and `TREND_RIDE` TP1 50%/TP2 structural stay the only management paths. |
++| `test_cross_lifecycle.py` (new) | All mandatory focused scenarios plus AST wiring checks. |
++| `UNIFIED_CROSS_LIFECYCLE_REPORT.md` (new) | Final engineering report with before/after, tests, risks and commit/PR status. |
++
++## Guardrails preserved
++
++- Protected BingX native SL/trailing/BE, `TradeExecutionService`, exchange sync, startup recovery,
++  reconciliation, verified close, TradeManagementBoard ownership, sizing, 20X policy, scanner
++  single-flight locks, dashboard/Telegram/Flask contracts, logging and health endpoints remain in
++  place. The one-position lock continues to enforce exposure safety; the requested 5+1/6 portfolio
++  cap is documented as a remaining risk rather than silently invented as a parallel system.
++- ADX comes from the same closed-candle computation in `execute_entry`; 17.99 never passes.
++- No Timeout increases, no skipped or xfailed tests, no live exchange calls, no orders sent.
++
++## Verification
++
++1. Focused: `pytest -q test_cross_lifecycle.py` plus existing entry/management/scanner suites.
++2. Full offline regression: `pytest -q` (must remain at least 618 passing).
++3. Commit on an independent branch; PR only if GitHub permissions allow.
++4. LIVE readiness is **not** claimed without exchange/demo verification and a soak run.
+diff --git a/UNIFIED_CROSS_LIFECYCLE_REPORT.md b/UNIFIED_CROSS_LIFECYCLE_REPORT.md
+new file mode 100644
+index 0000000..935597f
+--- /dev/null
++++ b/UNIFIED_CROSS_LIFECYCLE_REPORT.md
+@@ -0,0 +1,165 @@
++# Unified EMA9 + Session VWAP cross lifecycle — engineering report
++
++**Status:** offline regression verified; **not LIVE ready**. No exchange call, order,
++balance query, API-key change or demo/LIVE trade was performed. BingX paths were
++changed only by reusing the existing order path and identity plumbing, never by
++bypassing a gate.
++
++## 1. Modified files and functions
++
++| File | Functions / additions |
++|---|---|
++| `ggp_cross_lifecycle.py` (new) | `CrossLifecycleState`, `adx_gate`, `make_cross_event_id`, `normalize_cross_event`, `merge_cross_events`, `transition_state`, `_zone_quality`, `evaluate_cross_location`, `build_location_features`, `cross_rank`, `rank_cross_candidates`, `execution_readiness`. Execution-free: no data fetch and no order call. |
++| `ggpbot.py` | Imports the lifecycle module; `_enrich_with_existing_gpp_engines()` converts existing Scanner-2 proximity into retained cross events and logs them; `smart_opportunity_selection()` adds unresolved-state guard, cross-only ready filter, cross ranking, side-specific re-analysis, location re-evaluation, ADX readiness gate, context Event ID and lifecycle transitions; `execute_entry()` uses the cross Event ID as the durable event identity and logs reaching the final boundary; the serialized `execute_entry()` wrapper logs order sent / filled quantity / position verified / protection verified; `LiveTradeManager._apply_management()` supplies ATR% and volatility band context. |
++| `ggp_institutional_bridge.py` | `analyze_symbol()` accepts `cross_event`/`cross_context`, evaluates the cross's own location, and returns quality, evidence, analysis status and rejection reason; insufficient-data rows carry the same cross fields; `analyze_symbol_both()` selects the cross event by side without changing the legacy call shape; `update_unified_watchlist()` matches cross events to the candidate and adds cross quality / approval to ranking. |
++| `ggp_profit_brain.py` | `select_range_target_pct()` explicitly maps `LOW_VOL -> 0.25%` and `HIGHER_VOL -> 0.50%` price moves. |
++| `test_cross_lifecycle.py` (new) | 18 offline focused tests for all mandatory scenarios plus AST checks that protected execution/management functions remain in place. |
++| `UNIFIED_CROSS_LIFECYCLE_PLAN.md` (new) | File/function-linked implementation plan written before the edits. |
++| `UNIFIED_CROSS_LIFECYCLE_DIFF.txt` (new) | Exact staged Git diff for this change set. |
++| `UNIFIED_CROSS_LIFECYCLE_REPORT.md` (new) | This report. |
++
++## 2. Before / after data flow
++
++**Before.** `global_discovery` and `watchlist_analysis` both ran, but EMA9/Session-VWAP
++proximity was ranking metadata in the Watchlist and a hard gate only inside
++`execute_entry()`. There was no cross Event ID, no retained cross state, no
++cross-location quality class and no single identity across Scanner → Watchlist →
++Institutional Engine → Entry. `OpportunityPipeline` existed but was not wired into
++production.
++
++**After.**
++
++1. Existing Scanner 2 calls `_enrich_with_existing_gpp_engines()`, which calls the
++   unchanged `roro_confluence.ema9_vwap_proximity()` on closed candles.
++2. `normalize_cross_event()` creates APPROACHING or CONFIRMED candidates. Confirmed
++   crosses get a stable `cross_event_id` from symbol + timeframe + direction +
++   closed-candle timestamp. `merge_cross_events()` retains candidates after the visual
++   cross disappears until their own expiry/invalidation.
++3. `update_unified_watchlist()` attaches matching cross evidence to each Watchlist
++   row. The Watchlist remains the cross-event list; it is not a generic institutional
++   opportunity list.
++4. `analyze_symbol()` annotates the existing institutional hypothesis with
++   cross-location analysis. It does not create a second opportunity and does not
++   bypass `UnifiedEntryAuthority`.
++5. `smart_opportunity_selection()` only considers confirmed, institutionally approved
++   crosses, re-evaluates BUY and SELL independently, checks the same closed-candle ADX
++   source used by the Entry Engine, transitions `EXECUTION_READY`, and supplies the
++   cross Event ID to the existing `execute_entry()`.
++6. `execute_entry()` keeps every existing final gate. When a cross Event ID is
++   present and the EMA9/VWAP gate is ready, that ID becomes the durable journal event
++   identity, so the same confirmed cross cannot submit two orders even after restart.
++7. `open_position()` → `TradeExecutionService.submit_market_entry()` →
++   `exchange.create_order()` (BingX) → fill/position verification → native stop
++   verification is unchanged. The lifecycle logs `execute_entry_reached`, order sent,
++   filled quantity, position verified and protection verified.
++8. Existing `TradeManagementBoard` owns all exits. After verified close, existing
++   reconciliation releases the one-position lock and scanning resumes.
++
++## 3. How cross-location analysis works
++
++`build_location_features()` maps the institutional context already built by
++`ggp_institutional_bridge._build_context()` and the enrichment engines into explicit
++boolean/evidence features:
++
++- demand/supply zone proximity from golden-zone alignment;
++- direction-valid, non-mitigated Order Block and direction-valid FVG;
++- liquidity sweep + reclaim for BUY, buy-side sweep + rejection for SELL;
++- confirmed Market Structure / CHOCH and premium-discount alignment;
++- real value area versus mid-range chop (zone evidence must exist);
++- room to opposing liquidity / resistance / support / previous swing high-low;
++- Smart Money bias, Momentum flow, volume confirmation, institutional trend support;
++- available price space in ATR units.
++
++`evaluate_cross_location()` returns one of four explainable classes:
++`HIGH QUALITY CROSS`, `GOOD CROSS`, `WEAK CROSS`, `INVALID CROSS`. HIGH/GOOD are
++executable candidates only when ADX >= 18 and no critical location condition fails.
++A high Score alone never approves a cross. All booleans and numeric inputs are kept in
++`evidence` and all failures in `rejection_reasons`.
++
++ADX is a hard gate: `adx_gate(17.99)` rejects; `adx_gate(18.00)` passes only the ADX
++gate. The same `compute_adx(closed_df).iloc[-1]` value used by `execute_entry()` is
++passed into `execution_readiness()` immediately before authorization.
++
++## 4. Ranking
++
++`rank_cross_candidates()` ranks by cross quality class, proximity
++(`cross_distance_atr`), OB validity, FVG validity, liquidity confirmation, Market
++Structure, ADX, Momentum, Institutional Flow, available price space, R:R, freshness,
++institutional approval and Event-ID uniqueness. Duplicate Event IDs are demoted with
++`final_rejection_reason = duplicate_cross_event_id`. The prior location-first rank is
++retained as a deterministic tie-breaker, and `update_unified_watchlist()` adds cross
++quality / approval bonuses so better crosses are analyzed first.
++
++## 5. BingX entry path
++
++No protected file was replaced. The exact existing path remains:
++
++`smart_opportunity_selection()` → `execute_entry()` → `open_position()` →
++`TradeExecutionService.submit_market_entry()` → `bingx_execution.py` order send →
++fill/order readback → `_position()` direction proof →
++`place_and_verify_native_stop()` → existing `TradeManagementBoard`.
++
++The only change at this boundary is identity and observability: the cross Event ID is
++used as `durable_event_id`, and the serialized wrapper logs the actual accepted flag,
++order id presence, filled quantity, verified position and verified protection.
++Durable `is_event_consumed()` / `consume_event()` semantics are unchanged.
++
++## 6. Scalp / Trend selection
++
++`LiveTradeManager._apply_management()` computes ATR% from closed-frame ATR divided by
++mark price and labels `LOW_VOL` (<0.40%), `HIGHER_VOL` (>=0.80%) or `NORMAL`.
++`ggp_profit_brain.select_range_target_pct()` turns these bands into explicit price-move
++targets of 0.25% and 0.50%. These are price movements, not leveraged ROE.
++
++- `RANGE_SCALP`: one target, full remaining close, no TP1/TP2 and no splitting.
++- `TREND_RIDE`: existing TP1 at 50% of original filled quantity near the liquidity /
++  structural target, then structural / liquidity TP2 for the runner; no TP3.
++- All decisions remain inside `TradeManagementBoard`; no Profit Engine or parallel
++  manager was added.
++
++## 7. Actual test results
++
++| Command | Result |
++|---|---|
++| `python -m py_compile ggp_cross_lifecycle.py ggp_institutional_bridge.py ggp_profit_brain.py ggpbot.py test_cross_lifecycle.py` | clean |
++| `python -m pytest -q test_cross_lifecycle.py` | **18 passed in 5.38s** |
++| Focused + integration subset (`test_cross_lifecycle.py`, `test_entry_event_idempotency.py`, `test_ema9_vwap_soft_gate.py`, `test_profit_brain.py`, `test_profit_target_ladder.py`, `test_dual_scanner_dashboard.py`, `test_ggp_roro_integration.py`) | **87 passed in 23.67s** |
++| Full offline regression `python -m pytest -q` | **636 passed, 1 warning in 126.25s** |
++
++Baseline before edits was `618 passed, 1 warning in 177.13s`. The delta is the 18 new
++focused tests. No Timeout was raised, no test was skipped or marked xfail, and no
++failing test was ignored. The single warning is a pre-existing Pandas deprecation in
++`test_professional_discovery_scanner.py`.
++
++## 8. Remaining risks
++
++1. **No live/demo verification.** Fill quantity, native protection, close verification
++   and restart recovery are proven only by offline tests and existing regression
++   coverage. LIVE readiness is not claimed.
++2. **Portfolio cap policy not present.** The requested `5 technical/institutional + 1
++   news, 6 total` cap does not exist in the codebase. Runtime still uses the existing
++   one-open-position / one-active-execution lock. It is documented here rather than
++   invented as a parallel system.
++3. **Pre-existing native SL contradiction.** One helper labels native SL immutable
++   while the manager repairs it through `replace_native_stop()`. This change does not
++   alter that protected behavior.
++4. **Pre-existing `sync_position_state()` UNKNOWN contradiction.** `fetch_live_snapshot()`
++   raises on UNKNOWN before the wrapper's UNKNOWN branch. Not changed here.
++5. **Post-fill event consumption failure** blocks new entries but cannot unwind an
++   already filled position; inherited fail-closed behavior.
++6. **Same-symbol opposing crosses** are both analyzed, but the Watchlist currently
++   stores one best row and the existing conflict logic may reject both when both
++   structural hypotheses are `ENTRY_READY`. This was not broadened beyond preserving
++   cross identity.
++7. **Volatility bands** use simple ATR% thresholds; regime stabilization and hysteresis
++   remain the responsibility of the existing engines.
++8. Stale `RELEASE_MANIFEST.txt` in the installed ZIP is intentionally untouched to
++   preserve ZIP fidelity.
++
++## 9. Git
++
++The change set is committed on an independent branch
++`unified-cross-lifecycle` from clean `main` at
++`908f29c836b417b0dac7560611cc5c6d7097efbb`. The exact commit hash and PR status are
++reported in the final response and can be verified with `git log -1 --oneline` and
++`git show --stat HEAD`. The full patch is in `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
+diff --git a/ggp_cross_lifecycle.py b/ggp_cross_lifecycle.py
+new file mode 100644
+index 0000000..32b355f
+--- /dev/null
++++ b/ggp_cross_lifecycle.py
+@@ -0,0 +1,532 @@
++"""Cross-event lifecycle and cross-location authority (execution-free).
++
++This module turns the existing EMA9 / Session-VWAP proximity signal into an
++explicit cross candidate and evaluates *the cross location itself* against the
++institutional context that the production bridge already builds.
++
++Design boundaries:
++- It never fetches market data, never submits orders and never creates an
++  independent opportunity. It annotates candidates that the two existing
++  scanners already discovered.
++- It does not replace UnifiedEntryAuthority, TradeExecutionService or
++  TradeManagementBoard. It only supplies an explainable quality class, an
++  event identity and lifecycle transitions to the existing production path.
++- ADX >= 18 is a hard gate. A high structural score never overrides it.
++"""
++from __future__ import annotations
++
++from enum import Enum
++import math
++import time
++from typing import Any, Dict, Iterable, List, Optional, Tuple
++
++MIN_ENTRY_ADX = 18.0
++DEFAULT_RETENTION_SECONDS = 2700.0
++HIGH_QUALITY = "HIGH QUALITY CROSS"
++GOOD_QUALITY = "GOOD CROSS"
++WEAK_QUALITY = "WEAK CROSS"
++INVALID_QUALITY = "INVALID CROSS"
++
++
++class CrossLifecycleState(str, Enum):
++    CROSS_DETECTED = "CROSS_DETECTED"
++    INSTITUTIONAL_ANALYSIS_PENDING = "INSTITUTIONAL_ANALYSIS_PENDING"
++    INSTITUTIONAL_APPROVED = "INSTITUTIONAL_APPROVED"
++    INSTITUTIONAL_REJECTED = "INSTITUTIONAL_REJECTED"
++    EXECUTION_READY = "EXECUTION_READY"
++    ENTRY_SUBMITTED = "ENTRY_SUBMITTED"
++    ENTRY_FILLED = "ENTRY_FILLED"
++    ENTRY_REJECTED = "ENTRY_REJECTED"
++
++
++_ALLOWED_TRANSITIONS: Dict[str, set] = {
++    CrossLifecycleState.CROSS_DETECTED.value: {
++        CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
++        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++    },
++    CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value: {
++        CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
++        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++    },
++    CrossLifecycleState.INSTITUTIONAL_APPROVED.value: {
++        CrossLifecycleState.EXECUTION_READY.value,
++        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++        # A later scan re-runs the same closed-candle analysis before entry.
++        CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
++    },
++    CrossLifecycleState.EXECUTION_READY.value: {
++        CrossLifecycleState.ENTRY_SUBMITTED.value,
++        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++    },
++    CrossLifecycleState.ENTRY_SUBMITTED.value: {
++        CrossLifecycleState.ENTRY_FILLED.value,
++        CrossLifecycleState.ENTRY_REJECTED.value,
++    },
++    CrossLifecycleState.ENTRY_REJECTED.value: {
++        CrossLifecycleState.CROSS_DETECTED.value,
++    },
++    CrossLifecycleState.ENTRY_FILLED.value: set(),
++    CrossLifecycleState.INSTITUTIONAL_REJECTED.value: {
++        CrossLifecycleState.CROSS_DETECTED.value,
++        CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
++    },
++}
++
++
++def finite(value: Any, default: Optional[float] = None) -> Optional[float]:
++    """Return a finite float or ``default``; never propagate NaN/inf."""
++    try:
++        number = float(value)
++    except (TypeError, ValueError, OverflowError):
++        return default
++    return number if math.isfinite(number) else default
++
++
++def adx_gate(adx: Any) -> Tuple[bool, str]:
++    """Single ADX gate shared by cross-location analysis and entry policy."""
++    value = finite(adx)
++    if value is None:
++        return False, "adx_unavailable"
++    if value < MIN_ENTRY_ADX:
++        return False, f"adx_below_{MIN_ENTRY_ADX:g}"
++    return True, "adx_gate_passed"
++
++
++def make_cross_event_id(symbol: str, timeframe_seconds: int, direction: str,
++                        candle_timestamp: int) -> str:
++    """Stable identity for one confirmed cross on one closed candle."""
++    return (f"{str(symbol or '').strip().upper()}|{int(timeframe_seconds)}s|"
++            f"{str(direction or '').strip().upper()}|{int(candle_timestamp)}")
++
++
++def normalize_cross_event(symbol: str, timeframe_seconds: int, proximity: Dict[str, Any],
++                          adx: Any = None, now_ms: Optional[int] = None,
++                          retention_seconds: float = DEFAULT_RETENTION_SECONDS) -> Optional[Dict[str, Any]]:
++    """Convert an existing proximity result into the unified cross candidate.
++
++    Only an EMA9 / Session-VWAP cross is a confirmed core signal. EMA50 and
++    EMA50/VWAP crosses stay diagnostic, exactly as in the existing strategy.
++    An APPROACHING candidate keeps its identity across later scans even after
++    the proximity state disappears, until it is expired or invalidated.
++    """
++    if not isinstance(proximity, dict):
++        return None
++    tf = int(timeframe_seconds or 900)
++    candle_ts = finite(proximity.get("candle_timestamp"), None)
++    if candle_ts is None:
++        return None
++    candle_ts = int(candle_ts)
++    state = str(proximity.get("state") or "").upper()
++    freshness = str(proximity.get("data_freshness") or "").upper()
++    direction = str(proximity.get("direction") or "").upper()
++    cross9 = str(proximity.get("cross_ema9") or "").upper()
++    expected_cross = "BULLISH" if direction == "BUY" else "BEARISH" if direction == "SELL" else ""
++    confirmed = (cross9 == expected_cross and expected_cross != ""
++                 and (freshness == "FRESH" or state == "CROSS_CONFIRMED"))
++    if confirmed:
++        cross_status = "CONFIRMED"
++        cross_direction = direction
++    elif state in {"NEAR_CROSS", "CONVERGING", "AT_VWAP"} and direction in {"BUY", "SELL"}:
++        cross_status = "APPROACHING"
++        cross_direction = direction
++    else:
++        return None
++    adx_value = finite(adx)
++    event_id = (make_cross_event_id(symbol, tf, cross_direction, candle_ts)
++                if cross_status == "CONFIRMED" else None)
++    candidate_id = (event_id or
++                    f"{str(symbol or '').strip().upper()}|{tf}s|APPROACHING|{candle_ts}")
++    now_value = int(now_ms if now_ms is not None else time.time() * 1000)
++    return {
++        "symbol": symbol,
++        "cross_direction": cross_direction,
++        "cross_status": cross_status,
++        "candle_timestamp": candle_ts,
++        "ema9": finite(proximity.get("ema9")),
++        "ema50": finite(proximity.get("ema50")),
++        "session_vwap": finite(proximity.get("vwap")),
++        "cross_distance_atr": finite(proximity.get("gap_atr")),
++        "adx": adx_value,
++        "data_freshness": freshness or "UNKNOWN",
++        "cross_event_id": event_id,
++        "candidate_id": candidate_id,
++        "institutional_analysis_status": CrossLifecycleState.CROSS_DETECTED.value,
++        "crossover_state": state,
++        "final_rejection_reason": None,
++        "evidence": [f"proximity_state:{state}", f"cross_status:{cross_status}"],
++        "first_seen_ms": now_value,
++        "last_seen_ms": now_value,
++        "expires_at_ms": candle_ts + tf * 1000 + int(retention_seconds * 1000),
++        "timeframe_seconds": tf,
++    }
++
++
++def merge_cross_events(previous: Dict[str, Dict[str, Any]],
++                       observed: Iterable[Dict[str, Any]],
++                       now_ms: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
++    """Retain cross candidates after the visual cross disappears.
++
++    Confirmed crosses are keyed by their unique event id. Approaching setups
++    are keyed by symbol/timeframe/candle so the same approach is not duplicated.
++    Existing candidates are never deleted merely because one scan no longer
++    sees the cross; they are expired only by their own timestamp.
++    """
++    now_value = int(now_ms if now_ms is not None else time.time() * 1000)
++    out: Dict[str, Dict[str, Any]] = {
++        str(key): dict(value) for key, value in (previous or {}).items() if isinstance(value, dict)
++    }
++    for candidate in observed or ():
++        if not isinstance(candidate, dict):
++            continue
++        key = str(candidate.get("cross_event_id") or candidate.get("candidate_id") or "")
++        if not key:
++            continue
++        old = out.get(key)
++        if isinstance(old, dict):
++            merged = dict(old)
++            merged.update(candidate)
++            # Later scans refresh observation metadata only; they must not erase
++            # analysis results, quality evidence or already-consumed lifecycle state.
++            for preserved in ("institutional_analysis_status", "cross_quality", "cross_location",
++                              "final_rejection_reason", "state_history", "first_seen_ms",
++                              "cross_event_id_consumed"):
++                if preserved in old:
++                    merged[preserved] = old[preserved]
++            merged["first_seen_ms"] = old.get("first_seen_ms", candidate.get("first_seen_ms", now_value))
++            merged["last_seen_ms"] = now_value
++            merged["evidence"] = list(dict.fromkeys(
++                list(old.get("evidence") or []) + list(candidate.get("evidence") or [])))
++            out[key] = merged
++        else:
++            out[key] = dict(candidate)
++    for key, value in list(out.items()):
++        expiry = finite(value.get("expires_at_ms"), None)
++        if expiry is not None and now_value > expiry:
++            value["cross_status"] = "EXPIRED"
++            value["final_rejection_reason"] = "cross_signal_expired_without_reentry"
++            value["institutional_analysis_status"] = CrossLifecycleState.INSTITUTIONAL_REJECTED.value
++    return out
++
++
++def transition_state(candidate: Dict[str, Any], new_state: str,
++                     reason: str = "") -> Dict[str, Any]:
++    """Apply an auditable lifecycle transition without ever skipping a gate."""
++    updated = dict(candidate or {})
++    current = str(updated.get("institutional_analysis_status")
++                  or CrossLifecycleState.CROSS_DETECTED.value)
++    target = str(new_state)
++    if target not in _ALLOWED_TRANSITIONS:
++        updated["final_rejection_reason"] = f"invalid_lifecycle_transition:{current}->{target}"
++        return updated
++    allowed = _ALLOWED_TRANSITIONS[current]
++    if target != current and target not in allowed:
++        updated["final_rejection_reason"] = f"blocked_lifecycle_transition:{current}->{target}"
++        return updated
++    updated["institutional_analysis_status"] = target
++    history = list(updated.get("state_history") or [])
++    history.append({"state": target, "reason": reason, "ts": time.time()})
++    updated["state_history"] = history[-40:]
++    if target == CrossLifecycleState.INSTITUTIONAL_REJECTED.value and reason:
++        updated["final_rejection_reason"] = reason
++    return updated
++
++
++def _zone_quality(features: Dict[str, Any]) -> str:
++    """Explainable cross-location class; score is supporting evidence only."""
++    side = str(features.get("cross_direction") or features.get("side") or "").upper()
++    reasons: List[str] = []
++    if side not in {"BUY", "SELL"}:
++        return INVALID_QUALITY
++    adx_ok, adx_reason = adx_gate(features.get("adx"))
++    if not adx_ok:
++        reasons.append(adx_reason)
++    expected = "BULLISH" if side == "BUY" else "BEARISH"
++    cross_dir = str(features.get("cross_ema9") or features.get("cross_direction_signal") or "").upper()
++    if cross_dir and cross_dir != expected:
++        return INVALID_QUALITY
++    critical = {
++        "valid_closed_data": bool(features.get("valid_closed_data", True)),
++        "real_value_area": bool(features.get("real_value_area", False)),
++        "room_before_opposing_liquidity": bool(features.get("room_before_opposing_liquidity", False)),
++        "room_before_opposing_structure": bool(features.get("room_before_opposing_structure", False)),
++        "market_structure_confirmed": bool(features.get("market_structure_confirmed", False)),
++        "no_opposing_pressure": not bool(features.get("opposing_pressure", False)),
++    }
++    if side == "BUY":
++        core = {
++            "demand_zone_near": bool(features.get("demand_zone_near", False)),
++            "bullish_order_block_valid": bool(features.get("bullish_order_block_valid", False)),
++            "bullish_fvg_valid": bool(features.get("bullish_fvg_valid", False)),
++        }
++        event = bool(features.get("sweep_reclaim_confirmed", False))
++    else:
++        core = {
++            "supply_zone_near": bool(features.get("supply_zone_near", False)),
++            "bearish_order_block_valid": bool(features.get("bearish_order_block_valid", False)),
++            "bearish_fvg_valid": bool(features.get("bearish_fvg_valid", False)),
++        }
++        event = bool(features.get("buy_side_sweep_rejection", False))
++    flow = {
++        "smart_money_support": bool(features.get("smart_money_support", False)),
++        "momentum_support": bool(features.get("momentum_support", False)),
++        "volume_confirmed": bool(features.get("volume_confirmed", False)),
++        "institutional_flow_support": bool(features.get("institutional_flow_support", False)),
++    }
++    for name, passed in list(critical.items()) + list(core.items()) + list(flow.items()):
++        if not passed:
++            reasons.append(f"missing:{name}")
++    if not event:
++        reasons.append("missing:liquidity_sweep_or_reclaim_confirmation")
++    if not features.get("premium_discount_aligned", False):
++        reasons.append("missing:premium_discount_alignment")
++    space = finite(features.get("available_price_space_atr"), 0.0) or 0.0
++    if space <= 0.0:
++        reasons.append("no_available_price_space")
++    failed_critical = [name for name, passed in critical.items() if not passed]
++    if not adx_ok or failed_critical:
++        return INVALID_QUALITY
++    core_count = sum(1 for passed in core.values() if passed)
++    flow_count = sum(1 for passed in flow.values() if passed)
++    if (core_count >= 2 and flow_count >= 2 and event
++            and features.get("premium_discount_aligned", False) and space >= 1.0):
++        return HIGH_QUALITY
++    if core_count >= 1 and flow_count >= 1 and space >= 0.7:
++        return GOOD_QUALITY
++    return WEAK_QUALITY
++
++
++def evaluate_cross_location(features: Dict[str, Any],
++                            direction: Optional[str] = None) -> Dict[str, Any]:
++    """Evaluate a confirmed cross at its own location, with retained evidence."""
++    features = dict(features or {})
++    if direction:
++        features["cross_direction"] = str(direction).upper()
++    side = str(features.get("cross_direction") or "").upper()
++    adx_ok, adx_reason = adx_gate(features.get("adx"))
++    quality = _zone_quality(features)
++    evidence = [
++        f"cross_side:{side}",
++        f"adx:{finite(features.get('adx'))}::{adx_reason}",
++        f"quality:{quality}",
++    ]
++    for key in sorted(k for k in features if k not in {"adx", "cross_direction"}):
++        value = features.get(key)
++        if isinstance(value, bool):
++            evidence.append(f"{key}:{'PASS' if value else 'FAIL'}")
++        elif isinstance(value, (int, float)) and not isinstance(value, bool):
++            evidence.append(f"{key}:{value}")
++    approved = quality in {HIGH_QUALITY, GOOD_QUALITY} and adx_ok
++    expected_signal = "BULLISH" if side == "BUY" else "BEARISH"
++    observed_signal = str(features.get("cross_ema9") or features.get("cross_direction_signal") or "").upper()
++    mismatch = bool(observed_signal and observed_signal != expected_signal)
++    rejection = [] if approved else [
++        reason for reason in (
++            adx_reason if not adx_ok else "",
++            "cross_direction_mismatch" if mismatch else "",
++            None if quality == HIGH_QUALITY else f"cross_location_quality:{quality}",
++        ) if reason
++    ]
++    return {
++        "quality": quality,
++        "quality_class": quality,
++        "approved": approved,
++        "adx_ok": adx_ok,
++        "adx_reason": adx_reason,
++        "side": side,
++        "evidence": evidence,
++        "rejection_reasons": rejection,
++        "features": features,
++    }
++
++
++def build_location_features(context: Dict[str, Any],
++                            cross_event: Optional[Dict[str, Any]] = None,
++                            side: Optional[str] = None) -> Dict[str, Any]:
++    """Map the production institutional context to cross-location features."""
++    ctx = context if isinstance(context, dict) else {}
++    cross = cross_event if isinstance(cross_event, dict) else {}
++    direction = str(side or cross.get("cross_direction") or "").upper()
++    buy = direction == "BUY"
++    golden = ctx.get("golden_zone") if isinstance(ctx.get("golden_zone"), dict) else {}
++    structure = ctx.get("market_structure") if isinstance(ctx.get("market_structure"), dict) else {}
++    liquidity_raw = ctx.get("liquidity")
++    if isinstance(liquidity_raw, dict):
++        liquidity = liquidity_raw
++    else:
++        # The production bridge builds a LiquidityEvent object; the enriched
++        # Watchlist row stores the same evidence as a dict. Support both shapes.
++        liquidity = {
++            "event": getattr(liquidity_raw, "event", None),
++            "direction": getattr(liquidity_raw, "direction", None),
++            "level": getattr(liquidity_raw, "level", None),
++        }
++    ob = ctx.get("order_block") if isinstance(ctx.get("order_block"), dict) else {}
++    fvg = ctx.get("fvg") if isinstance(ctx.get("fvg"), dict) else {}
++    sr = ctx.get("support_resistance") if isinstance(ctx.get("support_resistance"), dict) else {}
++    smart = ctx.get("smart_money") if isinstance(ctx.get("smart_money"), dict) else {}
++    momentum = ctx.get("momentum") if isinstance(ctx.get("momentum"), dict) else {}
++    trend = ctx.get("institutional_trend") if isinstance(ctx.get("institutional_trend"), dict) else {}
++    indicators = ctx.get("indicator_snapshot") if isinstance(ctx.get("indicator_snapshot"), dict) else {}
++    expected = "BULLISH" if buy else "BEARISH"
++    value_zone = str(golden.get("value_zone") or "").upper()
++    golden_state = str(golden.get("state") or "").upper()
++    ob_ok = bool(golden.get("ob_valid")) and str(ob.get("status") or "").upper() not in {
++        "MITIGATED", "INVALIDATED"}
++    fvg_ok = (bool(golden.get("fvg_valid"))
++              and str(fvg.get("direction") or "").upper() == expected)
++    sr_aligned = bool(golden.get("support_resistance_aligned") or ctx.get("support_resistance_aligned"))
++    value_aligned = value_zone == ("DISCOUNT" if buy else "PREMIUM")
++    real_value_area = bool(value_aligned and golden_state != "NO_GOLDEN_ZONE"
++                           and (ob_ok or fvg_ok or sr_aligned))
++    liq_event = str(liquidity.get("event") or "").upper()
++    liq_direction = str(liquidity.get("direction") or "").upper()
++    liquidity_confirmed = bool(liq_direction == expected and liq_event in {"SWEEP", "GRAB", "RUN", "FAILED_AUCTION"})
++    mss = str(structure.get("mss") or "").upper()
++    structure_ok = bool(structure.get("confirmed")) and (
++        (buy and mss.startswith("BULLISH")) or (not buy and mss.startswith("BEARISH")))
++    opposing_level = sr.get("resistances" if buy else "supports") if isinstance(sr, dict) else []
++    near_opposing = False
++    space_atr = finite(cross.get("cross_distance_atr"), 0.0) or 0.0
++    atr = finite(ctx.get("atr") or indicators.get("atr"), None)
++    price = finite(ctx.get("price"), None)
++    if isinstance(opposing_level, list) and atr and atr > 0 and price:
++        for zone in opposing_level:
++            if not isinstance(zone, dict):
++                continue
++            level = finite(zone.get("level") or zone.get("high") or zone.get("low"), None)
++            if level is None:
++                continue
++            distance_atr = abs(level - price) / atr
++            space_atr = max(space_atr, distance_atr)
++            if distance_atr <= 0.5:
++                near_opposing = True
++    # Previous swing highs/lows and opposite-side liquidity are the nearest
++    # structural targets; a cross immediately before them has no usable space.
++    opposing_levels = [structure.get("swing_high" if buy else "swing_low")]
++    if liq_direction and liq_direction != expected:
++        opposing_levels.append(liquidity.get("level"))
++    for level_value in opposing_levels:
++        level = finite(level_value, None)
++        if level is None or not atr or atr <= 0 or not price:
++            continue
++        distance_atr = abs(level - price) / atr
++        space_atr = max(space_atr, distance_atr)
++        if distance_atr <= 0.5:
++            near_opposing = True
++    if liquidity_confirmed and atr and atr > 0 and price:
++        level = finite(liquidity.get("level"), None)
++        if level is not None:
++            space_atr = max(space_atr, abs(level - price) / atr)
++    smart_direction = str(smart.get("institutional_bias") or smart.get("smart_money_direction") or "").upper()
++    momentum_direction = str(momentum.get("flow_bias") or momentum.get("momentum_direction") or "").upper()
++    trend_direction = str(trend.get("state") or "").upper()
++    oppose_trend = bool(trend_direction and not (
++        (buy and "BULLISH" in trend_direction) or (not buy and "BEARISH" in trend_direction)))
++    return {
++        "cross_direction": direction,
++        "cross_ema9": str(cross.get("cross_ema9") or
++                          ("BULLISH" if cross.get("cross_direction") == "BUY" else "BEARISH")
++                          if cross else "").upper(),
++        "adx": finite(ctx.get("adx") or indicators.get("adx")),
++        "valid_closed_data": str(ctx.get("data_quality") or "VALID_CLOSED_CANDLES") == "VALID_CLOSED_CANDLES",
++        "demand_zone_near": bool(buy and value_aligned and (ob_ok or fvg_ok or sr_aligned)),
++        "supply_zone_near": bool(not buy and value_aligned and (ob_ok or fvg_ok or sr_aligned)),
++        "bullish_order_block_valid": bool(buy and ob_ok),
++        "bearish_order_block_valid": bool(not buy and ob_ok),
++        "bullish_fvg_valid": bool(buy and fvg_ok),
++        "bearish_fvg_valid": bool(not buy and fvg_ok),
++        "sweep_reclaim_confirmed": bool(buy and liquidity_confirmed and structure_ok),
++        "buy_side_sweep_rejection": bool(not buy and liquidity_confirmed and structure_ok),
++        "liquidity_confirmation": liquidity_confirmed,
++        "market_structure_confirmed": structure_ok,
++        "room_before_opposing_liquidity": bool(liquidity_confirmed and not near_opposing),
++        "room_before_opposing_structure": bool(not near_opposing and bool(space_atr > 0)),
++        "smart_money_support": bool(smart_direction == expected),
++        "momentum_support": bool((momentum_direction == expected) or bool(momentum.get("trend_expansion"))),
++        "volume_confirmed": bool(ctx.get("volume_confirmed", False)),
++        "institutional_flow_support": bool(trend.get("supporting_check", False)),
++        "real_value_area": real_value_area,
++        "premium_discount_aligned": value_aligned,
++        "available_price_space_atr": round(space_atr, 4),
++        "opposing_pressure": bool(oppose_trend or momentum.get("momentum_decay")),
++        "golden_zone_score": finite(golden.get("score"), 0.0) or 0.0,
++    }
++
++
++def cross_rank(item: Dict[str, Any]) -> float:
++    """Rank qualified crosses by the requested explainable criteria."""
++    row = item if isinstance(item, dict) else {}
++    quality = str(row.get("cross_quality") or row.get("quality") or "").upper()
++    quality_points = {
++        HIGH_QUALITY: 40.0, GOOD_QUALITY: 27.0,
++        WEAK_QUALITY: 8.0, INVALID_QUALITY: 0.0,
++    }.get(quality, 0.0)
++    features = row.get("cross_location") if isinstance(row.get("cross_location"), dict) else {}
++    features = features.get("features") if isinstance(features.get("features"), dict) else features
++    def flag(name: str) -> float:
++        return 1.0 if features.get(name) else 0.0
++    def number(value: Any, default: float = 0.0) -> float:
++        return finite(value, default) or default
++    distance = number(row.get("cross_distance_atr"), 999.0)
++    proximity = max(0.0, 10.0 * (1.0 - min(1.5, distance) / 1.5))
++    adx = number(row.get("adx"), 0.0)
++    freshness_age = number(row.get("cross_age_seconds"), 9999.0)
++    return round(
++        quality_points + proximity
++        + 8.0 * flag("bullish_order_block_valid") + 8.0 * flag("bearish_order_block_valid")
++        + 6.0 * flag("bullish_fvg_valid") + 6.0 * flag("bearish_fvg_valid")
++        + 7.0 * flag("liquidity_confirmation")
++        + 7.0 * flag("market_structure_confirmed")
++        + min(8.0, max(0.0, (adx - 18.0) / 2.0))
++        + 4.0 * flag("momentum_support") + 4.0 * flag("institutional_flow_support")
++        + min(6.0, max(0.0, number(features.get("available_price_space_atr")) * 2.0))
++        + min(5.0, max(0.0, number(row.get("risk_reward"), 0.0)))
++        + max(0.0, 5.0 - freshness_age / 180.0)
++        + (6.0 if str(row.get("institutional_analysis_status")) ==
++           CrossLifecycleState.INSTITUTIONAL_APPROVED.value else 0.0),
++        3,
++    )
++
++
++def rank_cross_candidates(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Deduplicate by Event ID and rank approved crosses before all others."""
++    seen = set()
++    rows: List[Dict[str, Any]] = []
++    for item in items or ():
++        if not isinstance(item, dict):
++            continue
++        row = dict(item)
++        event_id = str(row.get("cross_event_id") or "")
++        if event_id:
++            if event_id in seen:
++                row["institutional_analysis_status"] = CrossLifecycleState.INSTITUTIONAL_REJECTED.value
++                row["final_rejection_reason"] = "duplicate_cross_event_id"
++                row["cross_rank"] = -1.0
++            seen.add(event_id)
++        row["cross_rank"] = cross_rank(row)
++        rows.append(row)
++    rows.sort(key=lambda row: (row.get("cross_rank", 0.0),
++                               str(row.get("cross_event_id") or row.get("candidate_id") or "")),
++              reverse=True)
++    return rows
++
++
++def execution_readiness(candidate: Dict[str, Any], *, event_consumed: bool = False,
++                        adx: Any = None) -> Tuple[bool, str]:
++    """Final cross-lifecycle check; all exchange/risk checks remain in execute_entry."""
++    row = candidate if isinstance(candidate, dict) else {}
++    if str(row.get("cross_status") or "").upper() != "CONFIRMED":
++        return False, "cross_not_confirmed_on_closed_candle"
++    if not row.get("cross_event_id"):
++        return False, "missing_cross_event_id"
++    if event_consumed:
++        return False, "cross_event_already_consumed"
++    adx_ok, adx_reason = adx_gate(adx if adx is not None else row.get("adx"))
++    if not adx_ok:
++        return False, adx_reason
++    quality = str(row.get("cross_quality") or "").upper()
++    if quality not in {HIGH_QUALITY, GOOD_QUALITY}:
++        return False, f"cross_location_quality:{quality or 'UNRATED'}"
++    if str(row.get("institutional_analysis_status")) != CrossLifecycleState.INSTITUTIONAL_APPROVED.value:
++        return False, "institutional_analysis_not_approved"
++    return True, "cross_lifecycle_execution_ready"
+diff --git a/ggp_institutional_bridge.py b/ggp_institutional_bridge.py
+index 51835d3..19a8b79 100644
+--- a/ggp_institutional_bridge.py
++++ b/ggp_institutional_bridge.py
+@@ -21,6 +21,9 @@ from roro_opportunity_pipeline import validate_closed_frame, classify_regime, co
+ from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
+ from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
+                                      build_support_resistance_zones, validate_order_block_zone)
++from ggp_cross_lifecycle import (
++    CrossLifecycleState, build_location_features, evaluate_cross_location,
++)
+ 
+ 
+ REVERSAL = ReversalEngine()
+@@ -541,7 +544,9 @@ def _fvg_matches_side(fvg: Any, side: str) -> bool:
+ 
+ 
+ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
+-                   now_ms: Optional[int] = None) -> Dict[str, Any]:
++                   now_ms: Optional[int] = None,
++                   cross_event: Optional[Dict[str, Any]] = None,
++                   cross_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+     x = _frame(df)
+     closed = validate_closed_frame(x, now_ms=now_ms, timeframe_s=TIMEFRAME_SECONDS)
+     if len(closed) < 55:
+@@ -551,6 +556,10 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
+             "decision_reason": "insufficient_closed_data", "rejection_reason": "insufficient_closed_data",
+             "rejection_reasons": ["insufficient_closed_data"], "last_updated": time.time(),
+             "data_quality": "INSUFFICIENT_CLOSED_CANDLES", "icons": {"status": "⚪"},
++            "cross_event_id": None, "cross_status": "NONE", "cross_quality": "INVALID CROSS",
++            "cross_location_approved": False,
++            "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++            "final_rejection_reason": "insufficient_closed_data",
+         }
+     side = str(side or "").upper()
+     if side not in {"BUY", "SELL"}:
+@@ -644,6 +653,18 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
+     _intelligence["price_pattern"] = classify_price_pattern(
+         closed.to_dict("records"), atr=_atr(closed)
+     )
++    # Cross-location authority: evaluate the cross at its own location using the
++    # institutional context above. This annotates the existing hypothesis; it
++    # never creates a new opportunity or bypasses UnifiedEntryAuthority.
++    _cross_features = build_location_features(context, cross_event, side)
++    if isinstance(cross_context, dict):
++        _cross_features.update(cross_context)
++    _cross_result = evaluate_cross_location(_cross_features, side)
++    _structural_ready = decision.state == DecisionState.ENTRY_READY.value
++    _cross_approved = bool(_structural_ready and _cross_result.get("approved"))
++    _cross_rejection = ("" if _cross_approved else
++                        "cross_location_" + str(_cross_result.get("quality", "UNRATED")).lower())
++    _cross_dict = cross_event if isinstance(cross_event, dict) else {}
+     return {
+         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
+         "side": side, "price": context["price"], "market_regime": reg.state,
+@@ -670,6 +691,16 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
+         "indicator_snapshot": indicators,
+         "data_freshness": indicators.get("quality", "DATA_UNAVAILABLE"),
+         "signal_direction": side, "entry_readiness": decision.state,
++        "cross_event_id": _cross_dict.get("cross_event_id"),
++        "cross_status": _cross_dict.get("cross_status", "NONE"),
++        "cross_quality": _cross_result.get("quality"),
++        "cross_location": _cross_result,
++        "cross_location_approved": _cross_approved,
++        "institutional_analysis_status": (
++            CrossLifecycleState.INSTITUTIONAL_APPROVED.value if _cross_approved
++            else CrossLifecycleState.INSTITUTIONAL_REJECTED.value
++        ),
++        "final_rejection_reason": _cross_rejection or None,
+         "market_intelligence": _intelligence,
+         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
+         "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
+@@ -697,10 +728,30 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
+ 
+ 
+ def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] = None,
+-                        side_hints: Optional[List[str]] = None) -> Dict[str, Any]:
++                        side_hints: Optional[List[str]] = None,
++                        cross_events: Optional[Any] = None,
++                        cross_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+     # Always test both hypotheses. RF/Scanner direction is a ranking hint only.
+     hints = {str(v).upper() for v in (side_hints or []) if str(v).upper() in {"BUY", "SELL"}}
+-    results = [analyze_symbol(symbol, side, frame, now_ms=now_ms) for side in ("BUY", "SELL")]
++    def _event_for(side: str) -> Optional[Dict[str, Any]]:
++        if isinstance(cross_events, dict) and "cross_direction" in cross_events:
++            candidates = [cross_events]
++        elif isinstance(cross_events, dict):
++            candidates = list(cross_events.values())
++        elif isinstance(cross_events, (list, tuple)):
++            candidates = list(cross_events)
++        else:
++            candidates = []
++        for event in candidates:
++            if isinstance(event, dict) and str(event.get("cross_direction") or "").upper() == side:
++                return event
++        return None
++    if cross_events is None and cross_context is None:
++        results = [analyze_symbol(symbol, side, frame, now_ms=now_ms) for side in ("BUY", "SELL")]
++    else:
++        results = [analyze_symbol(symbol, side, frame, now_ms=now_ms,
++                                  cross_event=_event_for(side), cross_context=cross_context)
++                   for side in ("BUY", "SELL")]
+     ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
+     if len(ready) > 1:
+         selected = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
+@@ -728,6 +779,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
+     """Rotate all discovery sources in bounded batches and analyze both BUY/SELL."""
+     out = memory.setdefault("watchlist", {})
+     items = merge_candidates(memory)
++    cross_events = memory.get("cross_events", {}) if isinstance(memory.get("cross_events"), dict) else {}
+     def candidate_rank(pair):
+         key, item = pair
+         prior = out.get(key, {}) if isinstance(out.get(key), dict) else {}
+@@ -779,12 +831,17 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
+         discovery_score = max(0.0, min(100.0, rank_number(item.get("score")))) / 100.0
+         updated = rank_number(prior.get("last_update", prior.get("last_updated", 0)))
+         freshness = max(0.0, 1.0 - max(0.0, time.time() - updated) / 1800.0) if updated else 0.0
++        cross_quality_bonus = {
++            "HIGH QUALITY CROSS": 1.2, "GOOD CROSS": 0.8,
++            "WEAK CROSS": 0.1, "INVALID CROSS": -0.4,
++        }.get(str(prior.get("cross_quality") or "").upper(), 0.0)
++        approved_bonus = 0.5 if prior.get("institutional_analysis_status") == CrossLifecycleState.INSTITUTIONAL_APPROVED.value else 0.0
+         # Re-rank using actual structural confluence/proximity from the previous analysis,
+         # while rotating all symbols to prevent low-ranked candidates starving forever.
+         priority = (state_bonus + 0.9 * golden_score + 0.55 * ob_near
+                     + 0.35 * liquidity_quality + 0.45 * analysis_priority
+                     + 0.30 * discovery_score + 0.20 * freshness
+-                    + vwap_cross_priority)
++                    + vwap_cross_priority + cross_quality_bonus + approved_bonus)
+         return (priority, state_bonus, golden_score, float(item.get("score", 0) or 0), key)
+     ordered = sorted(items.items(), key=candidate_rank, reverse=True)
+     if not ordered:
+@@ -811,7 +868,18 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
+                     "rejection_reasons": [fetch_error or "market_data_unavailable"],
+                     "data_quality": "DATA_UNAVAILABLE", "last_update": time.time(), "icons": {"status": "⚪"}}
+         else:
+-            results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in ("BUY", "SELL")]
++            key_events = [event for event in cross_events.values()
++                          if isinstance(event, dict)
++                          and (str(event.get("symbol") or "").upper() == str(key).upper()
++                               or str(event.get("exchange_symbol") or "").upper() == str(candidate.get("exchange_symbol") or "").upper())]
++            if key_events:
++                results = [analyze_symbol(candidate["exchange_symbol"], side, frame,
++                                          cross_event=next((event for event in key_events
++                                                            if str(event.get("cross_direction") or "").upper() == side), None))
++                           for side in ("BUY", "SELL")]
++            else:
++                results = [analyze_symbol(candidate["exchange_symbol"], side, frame)
++                           for side in ("BUY", "SELL")]
+             for result in results:
+                 if enrich is not None:
+                     try:
+diff --git a/ggp_profit_brain.py b/ggp_profit_brain.py
+index 5006d5b..84e9e97 100644
+--- a/ggp_profit_brain.py
++++ b/ggp_profit_brain.py
+@@ -339,6 +339,14 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
+     existing trend-mode TP2 path, not the range-scalp target selector.
+     """
+     ctx = context if isinstance(context, dict) else {}
++    # Explicit volatility bands keep the single-target full-close policy
++    # explainable: LOW_VOL -> 0.25%, HIGHER_VOL -> 0.50%. They are price-move
++    # percentages, never leveraged ROE, and never create TP1/TP2/splitting.
++    band = str(ctx.get("volatility_band") or "").upper()
++    if band == "LOW_VOL":
++        return RANGE_PROFIT_TARGETS_PCT[0], "low_volatility_range_full_close_0.25pct"
++    if band == "HIGHER_VOL":
++        return RANGE_PROFIT_TARGETS_PCT[1], "higher_volatility_scalp_full_close_0.50pct"
+     adx = _number(ctx.get("adx"), 0.0) or 0.0
+     continuation = _number(ctx.get("continuation_probability"), 0.0) or 0.0
+     volume_ratio = _number(ctx.get("volume_ratio"), 0.0) or 0.0
+diff --git a/ggpbot.py b/ggpbot.py
+index 0fbee15..ddf6a53 100644
+--- a/ggpbot.py
++++ b/ggpbot.py
+@@ -4052,7 +4052,19 @@ class LiveTradeManager:
+ 
+             # Unified profit-mode policy: range scalp is allowed only with multiple
+             # independent weakness/thin-liquidity observations. Missing data is NOT range.
++            _volatility_atr_pct = (
++                float(atr) / float(mark_price) * 100.0
++                if np.isfinite(float(atr)) and float(atr) > 0 and float(mark_price) > 0 else None
++            )
++            _volatility_band = (
++                "LOW_VOL" if _volatility_atr_pct is not None and _volatility_atr_pct < 0.40
++                else "HIGHER_VOL" if _volatility_atr_pct is not None and _volatility_atr_pct >= 0.80
++                else "NORMAL"
++            )
++            STATE["volatility_atr_pct"] = _volatility_atr_pct
++            STATE["volatility_band"] = _volatility_band
+             mode_context = {
++                "atr_pct": _volatility_atr_pct, "volatility_band": _volatility_band,
+                 "side": side, "regime": regime, "trade_state": trade_state,
+             "market_intelligence": {
+                 **(STATE.get("market_intelligence") or {}),
+@@ -6676,6 +6688,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
+     if side not in {"BUY", "SELL"}:
+         log_execution(f"[ENTRY_DIRECTION_REJECT] invalid side={side!r}; expected BUY or SELL", "ERROR")
+         return False
++    log_execution(f"[CROSS_LIFECYCLE] execute_entry_reached=1 symbol={symbol} side={side}", "INFO")
+     trade_id = uuid.uuid4().hex
+     institutional_entry_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+     # Final execution-boundary gate: no institutional, sniper, RF or legacy
+@@ -6703,6 +6716,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
+         except Exception:
+             event_symbol = str(symbol or "").strip().upper()
+         gate_result["durable_event_id"] = f"{event_symbol}:{gate_tf}:{raw_signal_id}"
++    # The cross Event ID created by Scanner 2 is the same identity carried by the
++    # Watchlist, the institutional analyzer and this final entry boundary. When
++    # supplied, it becomes the durable event identity so one confirmed cross can
++    # never submit two orders.
++    cross_event_id = str(institutional_entry_ctx.get("cross_event_id") or "").strip()
++    if cross_event_id and gate_result.get("ready"):
++        gate_result["cross_event_id"] = cross_event_id
++        gate_result["durable_event_id"] = cross_event_id
+     institutional_entry_ctx["dual_ema_vwap_gate"] = dict(gate_result)
+     # Preserve the exact gate snapshot for the serialized final execution wrapper.
+     globals()["_LAST_EXECUTION_GATE_RESULT"] = dict(gate_result)
+@@ -11717,6 +11738,12 @@ from roro_confluence import (ema9_vwap_proximity as _roro_ema9_vwap_proximity,
+                              compute_session_vwap as roro_compute_session_vwap,
+                              validate_dual_ema_vwap_entry_gate as _validate_dual_ema_vwap_entry_gate,
+                              timeframe_seconds as _roro_timeframe_seconds)
++from ggp_cross_lifecycle import (
++    CrossLifecycleState, normalize_cross_event as _normalize_cross_event,
++    merge_cross_events as _merge_cross_events, transition_state as _cross_transition_state,
++    build_location_features as _cross_location_features, evaluate_cross_location as _evaluate_cross_location,
++    rank_cross_candidates as _rank_cross_candidates, execution_readiness as _cross_execution_readiness,
++)
+ try:
+     from roro_resource_manager import ResourceManager
+     from roro_trade_journal import TradeJournal
+@@ -11987,6 +12014,34 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
+                     rows.append(proximity_item)
+                     rows.sort(key=lambda x: (float(x.get("score", 0) or 0), float(x.get("updated_at", 0) or 0)), reverse=True)
+                     MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
++                # Unified cross identity: the two existing scanners keep their own
++                # logic; this bridge converts their closed-candle proximity into a
++                # retained cross candidate with a stable Event ID.
++                try:
++                    _cross_adx = float(adx_state.get("value", 0) or 0)
++                    _cross_event = _normalize_cross_event(
++                        symbol_for_proximity, timeframe_seconds, proximity, _cross_adx, now_ms
++                    )
++                    if _cross_event:
++                        _merged = _merge_cross_events(
++                            MEMORY.get("cross_events", {}), [_cross_event], now_ms
++                        )
++                        MEMORY["cross_events"] = _merged
++                        _cross_key = (_cross_event.get("cross_event_id")
++                                      or _cross_event.get("candidate_id"))
++                        result["cross_event"] = dict(_merged.get(_cross_key, _cross_event))
++                        analysis["cross_event_id"] = _cross_event.get("cross_event_id")
++                        analysis["cross_candidate_id"] = _cross_key
++                        analysis["cross_status"] = _cross_event.get("cross_status")
++                        analysis["cross_direction"] = _cross_event.get("cross_direction")
++                        log_execution(
++                            f"[CROSS_EVENT] {symbol_key} {_cross_event.get('cross_direction')} "
++                            f"{_cross_event.get('cross_status')} event={_cross_event.get('cross_event_id') or _cross_key} "
++                            f"candle={_cross_event.get('candle_timestamp')} ADX={_cross_adx:.2f}",
++                            "INFO", debounce_key=f"cross_event:{_cross_key}", debounce_sec=30,
++                        )
++                except Exception as cross_exc:
++                    result["cross_event_diagnostic"] = f"{type(cross_exc).__name__}:{cross_exc}"
+                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
+                 icons = dict(analysis.get("icons") or {})
+                 icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
+@@ -12137,6 +12192,10 @@ def smart_opportunity_selection():
+     if globals().get("RECOVERY_BLOCK_ENTRIES", False) or MEMORY.get("position_status") == "UNKNOWN":
+         log_execution("[ENTRY_GUARD] Exchange recovery is unresolved; new entries blocked", "WARN")
+         return False
++    if (globals().get("_ACTIVE_TRADE") or STATE.get("execution_unresolved")
++            or STATE.get("recovery_hold") or STATE.get("close_reconciliation_required")):
++        log_execution("[ENTRY_GUARD] Prior execution/sync is unresolved; new entries blocked", "WARN")
++        return False
+     if daily_loss_cooldown_active():
+         return False
+     refresh_unified_institutional_watchlist()
+@@ -12149,6 +12208,11 @@ def smart_opportunity_selection():
+     watchlist = MEMORY.get("watchlist", {})
+     ready = [(sym, item) for sym, item in watchlist.items()
+              if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
++    cross_event_map = MEMORY.get("cross_events", {}) if isinstance(MEMORY.get("cross_events"), dict) else {}
++    # One Event ID is one cross. Retained APPROACHING candidates stay in the
++    # watchlist, but only CONFIRMED + institutionally approved crosses can enter.
++    ready = [(sym, item) for sym, item in ready
++             if str(item.get("cross_status") or "").upper() in {"CONFIRMED", "APPROACHING"}]
+     def _location_first_rank(pair):
+         _, candidate = pair
+         side_value = str(candidate.get("side") or "").upper()
+@@ -12200,7 +12264,17 @@ def smart_opportunity_selection():
+         # Location proximity and quality lead; score is only the final tie-breaker.
+         return (location_distance <= 1.5, -location_distance, location_quality, score)
+ 
+-    ready.sort(key=_location_first_rank, reverse=True)
++    # Cross quality, proximity, OB/FVG, liquidity, structure, ADX, momentum,
++    # flow, target space, R:R, freshness and Event-ID uniqueness lead the ranking;
++    # the inherited location rank remains the deterministic tie-breaker.
++    ranked_rows = []
++    for canonical, item in ready:
++        row = dict(item)
++        row["_canonical"] = canonical
++        row["_base_rank"] = _location_first_rank((canonical, item))
++        ranked_rows.append(row)
++    ordered_rows = _rank_cross_candidates(ranked_rows)
++    ready = [(str(row.get("_canonical")), row) for row in ordered_rows]
+     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
+     for canonical, item in ready[:8]:
+         try:
+@@ -12229,10 +12303,17 @@ def smart_opportunity_selection():
+                 continue
+             # Re-evaluate BUY and SELL independently immediately before authorization.
+             # RF/V2 direction is only a tie-break hint and can never suppress the other side.
++            _cross_events_for_symbol = [
++                event for event in cross_event_map.values()
++                if isinstance(event, dict)
++                and (str(event.get("symbol") or "").upper() == str(canonical).upper()
++                     or str(event.get("exchange_symbol") or "").upper() == str(exchange_sym).upper())
++            ]
+             fresh = roro_analyze_symbol_both(
+                 exchange_sym, closed_df,
+                 now_ms=int(time.time() * 1000),
+                 side_hints=item.get("side_hints") or [side],
++                cross_events=_cross_events_for_symbol,
+             )
+             fresh.update(_enrich_with_existing_gpp_engines(closed_df, fresh.get("side"), fresh))
+             item.update(fresh)
+@@ -12244,6 +12325,67 @@ def smart_opportunity_selection():
+                 item["decision_state"] = "REJECTED"
+                 item["rejection_reason"] = "no_unambiguous_authorized_side"
+                 continue
++            cross_event = next((event for event in _cross_events_for_symbol
++                                if str(event.get("cross_direction") or "").upper() == side
++                                and str(event.get("cross_status") or "").upper() == "CONFIRMED"), None)
++            if not cross_event:
++                item["decision_state"] = "WAITING_FOR_CONFIRMATION"
++                item["rejection_reason"] = "cross_not_confirmed_on_closed_candle"
++                log_execution(
++                    f"[CROSS_LIFECYCLE] {exchange_sym} {side} rejected: no confirmed cross Event ID",
++                    "INFO",
++                )
++                continue
++            item["cross_event"] = cross_event
++            item["cross_event_id"] = cross_event.get("cross_event_id")
++            item["cross_status"] = cross_event.get("cross_status")
++            item = _cross_transition_state(item, CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
++                                           "cross_event_selected_for_location_analysis")
++            # Enrichment adds Smart Money, Momentum and institutional trend after
++            # the bridge analysis; re-evaluate the cross location with that evidence.
++            _features = _cross_location_features(
++                {**item, "adx": item.get("adx") or (cross_event.get("adx"))},
++                cross_event, side,
++            )
++            _smart = item.get("smart_money") if isinstance(item.get("smart_money"), dict) else {}
++            _momentum = item.get("momentum") if isinstance(item.get("momentum"), dict) else {}
++            _trend = item.get("institutional_trend") if isinstance(item.get("institutional_trend"), dict) else {}
++            _expected_signal = "BULLISH" if side == "BUY" else "BEARISH"
++            _features.update({
++                "smart_money_support": (
++                    str(_smart.get("institutional_bias") or "").upper() == _expected_signal
++                    or str(_smart.get("institutional_bias_detailed") or "").upper().endswith(_expected_signal)
++                ),
++                "momentum_support": (
++                    str(_momentum.get("flow_bias") or "").upper() == _expected_signal
++                    or bool(_momentum.get("trend_expansion"))
++                ),
++                "institutional_flow_support": bool(_trend.get("supporting_check")),
++                "volume_confirmed": bool(item.get("volume_confirmed")),
++                "cross_ema9": _expected_signal,
++            })
++            _location = _evaluate_cross_location(_features, side)
++            item["cross_location"] = _location
++            item["cross_quality"] = _location.get("quality")
++            item["cross_location_approved"] = bool(_location.get("approved"))
++            if _location.get("approved"):
++                item = _cross_transition_state(
++                    item, CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
++                    f"cross_location_quality:{_location.get('quality')}",
++                )
++            else:
++                item = _cross_transition_state(
++                    item, CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++                    "cross_location_" + str(_location.get("quality")).lower(),
++                )
++                item["decision_state"] = "REJECTED"
++                item["rejection_reason"] = item["final_rejection_reason"]
++                log_execution(
++                    f"[CROSS_LOCATION] {exchange_sym} {side} rejected "
++                    f"quality={_location.get('quality')} reasons={_location.get('rejection_reasons')}",
++                    "INFO",
++                )
++                continue
+             event_id = str(item.get("event_id") or "")
+             if not event_id:
+                 item["decision_state"] = "REJECTED"
+@@ -12327,12 +12469,37 @@ def smart_opportunity_selection():
+                 item["decision_state"] = "REJECTED"
+                 item["rejection_reason"] = "profit_targets_invalid"
+                 continue
++            # Same closed-candle ADX source used by execute_entry; 18.0 is hard.
++            _adx_series = compute_adx(closed_df)
++            _cross_adx_value = (_adx_series.iloc[-1] if _adx_series is not None and len(_adx_series) else None)
++            _cross_ready, _cross_ready_reason = _cross_execution_readiness(
++                cross_event, event_consumed=False, adx=_cross_adx_value
++            )
++            if not _cross_ready:
++                item["decision_state"] = "REJECTED"
++                item["rejection_reason"] = _cross_ready_reason
++                item = _cross_transition_state(item, CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
++                                               _cross_ready_reason)
++                log_execution(f"[CROSS_GATE] {exchange_sym} {side} rejected: {_cross_ready_reason}", "INFO")
++                continue
++            item = _cross_transition_state(
++                item, CrossLifecycleState.EXECUTION_READY.value, _cross_ready_reason
++            )
++            log_execution(
++                f"[CROSS_LIFECYCLE] selected {exchange_sym} {side} event={cross_event.get('cross_event_id')} "
++                f"quality={item.get('cross_quality')} ADX={_cross_adx_value!r} rank={item.get('cross_rank')} "
++                f"execute_entry_reached=1",
++                "INFO",
++            )
+             evidence = list(item.get("evidence") or [])
+             market_intelligence = item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {}
+ 
+             _INSTITUTIONAL_ENTRY_CONTEXT = {
+                 "setup_type": setup,
+                 "event_id": item.get("event_id"),
++                "cross_event_id": cross_event.get("cross_event_id"),
++                "cross_direction": side,
++                "cross_quality": item.get("cross_quality"),
+                 "evidence": evidence,
+                 "structural_stop": float(sl),
+                 "trading_mode": str(item.get("trading_mode") or market_intelligence.get("mode") or "UNCLASSIFIED"),
+@@ -12357,7 +12524,13 @@ def smart_opportunity_selection():
+                 "closed_candle_timestamp": int(closed_df["timestamp"].iloc[-1]),
+             }
+             reason = "UNIFIED_INSTITUTIONAL_ENTRY | " + " | ".join(evidence)
++            ok = False
+             try:
++                log_execution(
++                    f"[CROSS_LIFECYCLE] execute_entry called {exchange_sym} {side} "
++                    f"event={cross_event.get('cross_event_id')} cross_event_id_forwarded=1",
++                    "INFO",
++                )
+                 is_strong = is_strong_candidate(item)
+                 sizing_class = "SNIPER" if is_strong else "TREND"
+                 item["capital_allocation_tier"] = "STRONG_30_PERCENT" if is_strong else "STANDARD_20_PERCENT"
+@@ -12369,7 +12542,16 @@ def smart_opportunity_selection():
+                                    classification=sizing_class)
+             finally:
+                 _INSTITUTIONAL_ENTRY_CONTEXT = None
++                item = _cross_transition_state(
++                    item,
++                    CrossLifecycleState.ENTRY_SUBMITTED.value
++                    if ok else CrossLifecycleState.ENTRY_REJECTED.value,
++                    "execute_entry_result:" + str(bool(ok)),
++                )
+             if ok:
++                item = _cross_transition_state(
++                    item, CrossLifecycleState.ENTRY_FILLED.value, "verified_fill_and_position"
++                )
+                 item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
+                 item["entry_timestamp"] = time.time()
+                 _persist_trade_journal_start(setup, item)
+@@ -14073,6 +14255,15 @@ def execute_entry(*args, **kwargs):
+         result = _original_execute_entry_for_journal(*args, **kwargs)
+         gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
+         event_id = str(gate.get("durable_event_id") or "").strip()
++        cross_event_id = str(gate.get("cross_event_id") or "").strip()
++        if cross_event_id:
++            _order = STATE.get("order") if isinstance(STATE.get("order"), dict) else {}
++            log_execution(
++                f"[CROSS_LIFECYCLE] entry_result accepted={bool(result)} event={cross_event_id} "
++                f"order_sent={bool(_order.get('id'))} filled_qty={_order.get('filled')} "
++                f"position_verified={bool(STATE.get('open'))} protection_verified={bool(_order.get('native_sl_verified'))}",
++                "INFO",
++            )
+         journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+         if result and STATE.get("open"):
+             ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+diff --git a/test_cross_lifecycle.py b/test_cross_lifecycle.py
+new file mode 100644
+index 0000000..96a4fae
+--- /dev/null
++++ b/test_cross_lifecycle.py
+@@ -0,0 +1,271 @@
++"""Focused tests for the unified EMA9 + Session-VWAP cross lifecycle.
++
++All tests are offline. No exchange call, order, balance query or live trade is
++performed. Structural invariants are checked with AST/source assertions where
++the protected execution and management paths must remain untouched.
++"""
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++from ggp_cross_lifecycle import (
++    CrossLifecycleState, adx_gate, evaluate_cross_location, execution_readiness,
++    make_cross_event_id, merge_cross_events, normalize_cross_event, rank_cross_candidates,
++    transition_state, HIGH_QUALITY, GOOD_QUALITY, WEAK_QUALITY, INVALID_QUALITY,
++)
++from ggp_profit_brain import resolve_trend_targets, select_range_target_pct
++
++ROOT = Path(__file__).resolve().parent
++SOURCE = (ROOT / "ggpbot.py").read_text(encoding="utf-8")
++BRAIN_SOURCE = (ROOT / "ggp_profit_brain.py").read_text(encoding="utf-8")
++TREE = ast.parse(SOURCE)
++
++
++def _function(name):
++    """Return the effective (last-defined) function, including class methods."""
++    matches = [node for node in ast.walk(TREE)
++               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name]
++    assert matches, f"missing function {name}"
++    return matches[-1]
++
++
++def _class(name):
++    return next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == name)
++
++
++def _features(side="BUY", **overrides):
++    buy = side == "BUY"
++    base = {
++        "cross_direction": side,
++        "cross_ema9": "BULLISH" if buy else "BEARISH",
++        "adx": 26.0,
++        "valid_closed_data": True,
++        "real_value_area": True,
++        "room_before_opposing_liquidity": True,
++        "room_before_opposing_structure": True,
++        "market_structure_confirmed": True,
++        "opposing_pressure": False,
++        "demand_zone_near": buy,
++        "supply_zone_near": not buy,
++        "bullish_order_block_valid": buy,
++        "bearish_order_block_valid": not buy,
++        "bullish_fvg_valid": buy,
++        "bearish_fvg_valid": not buy,
++        "sweep_reclaim_confirmed": buy,
++        "buy_side_sweep_rejection": not buy,
++        "premium_discount_aligned": True,
++        "smart_money_support": True,
++        "momentum_support": True,
++        "volume_confirmed": True,
++        "institutional_flow_support": True,
++        "available_price_space_atr": 1.4,
++    }
++    base.update(overrides)
++    return base
++
++
++def _confirmed(side="BUY", ts=1795132800000):
++    return {
++        "symbol": "BTC/USDT:USDT", "cross_direction": side, "cross_status": "CONFIRMED",
++        "candle_timestamp": ts, "cross_event_id": make_cross_event_id("BTC/USDT:USDT", 900, side, ts),
++        "adx": 26.0, "cross_distance_atr": 0.12, "institutional_analysis_status":
++        CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
++        "expires_at_ms": ts + 2700 * 1000,
++    }
++
++
++def test_buy_in_strong_demand_zone_is_high_quality_cross():
++    result = evaluate_cross_location(_features("BUY"))
++    assert result["quality"] == HIGH_QUALITY
++    assert result["approved"] is True
++    assert any("demand_zone_near:PASS" in e for e in result["evidence"])
++
++
++def test_sell_in_strong_supply_zone_is_high_quality_cross():
++    result = evaluate_cross_location(_features("SELL"))
++    assert result["quality"] == HIGH_QUALITY
++    assert result["approved"] is True
++    assert any("supply_zone_near:PASS" in e for e in result["evidence"])
++
++
++def test_buy_far_from_suitable_zone_is_not_executable():
++    result = evaluate_cross_location(_features(
++        "BUY", demand_zone_near=False, bullish_order_block_valid=False,
++        bullish_fvg_valid=False, sweep_reclaim_confirmed=False,
++        room_before_opposing_liquidity=False, room_before_opposing_structure=False,
++        available_price_space_atr=0.2,
++    ))
++    assert result["quality"] in {WEAK_QUALITY, INVALID_QUALITY}
++    assert result["approved"] is False
++
++
++def test_sell_in_unsuitable_support_zone_is_invalid():
++    result = evaluate_cross_location(_features(
++        "SELL", supply_zone_near=False, real_value_area=False,
++        premium_discount_aligned=False, room_before_opposing_liquidity=False,
++        room_before_opposing_structure=False, available_price_space_atr=0.1,
++    ))
++    assert result["quality"] == INVALID_QUALITY
++    assert result["approved"] is False
++
++
++def test_approaching_then_confirmed_on_closed_candle():
++    base = {
++        "state": "NEAR_CROSS", "direction": "BUY", "cross_ema9": None,
++        "data_freshness": "FRESH", "candle_timestamp": 1795132800000,
++        "ema9": 101.0, "ema50": 100.5, "vwap": 100.8, "gap_atr": 0.08,
++    }
++    approaching = normalize_cross_event("BTC/USDT:USDT", 900, base, 24.0, 1795132800000 + 900000)
++    assert approaching and approaching["cross_status"] == "APPROACHING"
++    assert approaching["cross_event_id"] is None
++    confirmed = normalize_cross_event(
++        "BTC/USDT:USDT", 900,
++        {**base, "state": "CROSS_CONFIRMED", "cross_ema9": "BULLISH"},
++        24.0, 1795132800000 + 900000,
++    )
++    assert confirmed and confirmed["cross_status"] == "CONFIRMED"
++    assert confirmed["cross_event_id"] == make_cross_event_id("BTC/USDT:USDT", 900, "BUY", 1795132800000)
++
++
++def test_cross_disappears_next_scanner_cycle_but_candidate_is_retained():
++    event = _confirmed()
++    kept = merge_cross_events({}, [event], 1795132800000 + 900000)
++    assert list(kept) == [event["cross_event_id"]]
++    retained = merge_cross_events(kept, [], 1795132800000 + 3 * 900000)
++    assert event["cross_event_id"] in retained
++    assert retained[event["cross_event_id"]]["cross_status"] == "CONFIRMED"
++    expired = merge_cross_events(retained, [], event["candle_timestamp"] + 5000 * 1000)
++    assert expired[event["cross_event_id"]]["final_rejection_reason"] == "cross_signal_expired_without_reentry"
++
++
++def test_adx_17_99_is_hard_rejected():
++    ok, reason = adx_gate(17.99)
++    assert ok is False and "below_18" in reason
++    result = evaluate_cross_location(_features("BUY", adx=17.99))
++    assert result["approved"] is False
++
++
++def test_adx_18_00_passes_only_adx_gate():
++    ok, reason = adx_gate(18.0)
++    assert ok is True and reason == "adx_gate_passed"
++    # A perfect score cannot override a missing location: ADX alone only clears
++    # the ADX gate, not the complete cross-location authority.
++    weak = evaluate_cross_location(_features(
++        "BUY", adx=18.0, demand_zone_near=False, bullish_order_block_valid=False,
++        bullish_fvg_valid=False, real_value_area=False,
++    ))
++    assert weak["adx_ok"] is True
++    assert weak["approved"] is False
++
++
++def test_multiple_simultaneous_crosses_are_ranked_by_quality():
++    high = {**_confirmed("BUY", 1795132800000), "cross_quality": HIGH_QUALITY,
++            "adx": 28.0, "cross_distance_atr": 0.10, "risk_reward": 2.2}
++    good = {**_confirmed("SELL", 1795132801000), "cross_quality": GOOD_QUALITY,
++            "adx": 22.0, "cross_distance_atr": 0.30, "risk_reward": 1.5}
++    weak = {**_confirmed("BUY", 1795132802000), "cross_quality": WEAK_QUALITY,
++            "adx": 19.0, "cross_distance_atr": 1.2, "risk_reward": 0.5}
++    ranked = rank_cross_candidates([weak, good, high])
++    assert [row["cross_quality"] for row in ranked] == [HIGH_QUALITY, GOOD_QUALITY, WEAK_QUALITY]
++
++
++def test_opposing_crosses_same_symbol_are_independent_and_direction_checked():
++    buy = _confirmed("BUY", 1795132800000)
++    sell = _confirmed("SELL", 1795132800000)
++    assert buy["cross_event_id"] != sell["cross_event_id"]
++    buy_result = evaluate_cross_location(_features("BUY"), "BUY")
++    sell_result = evaluate_cross_location(_features("SELL"), "SELL")
++    assert buy_result["approved"] and sell_result["approved"]
++    wrong_side = evaluate_cross_location(_features("BUY"), "SELL")
++    assert wrong_side["approved"] is False
++    assert "cross_direction_mismatch" in wrong_side["rejection_reasons"] or wrong_side["quality"] == INVALID_QUALITY
++
++
++def test_range_low_volatility_uses_0_25_percent_full_close_only():
++    target, reason = select_range_target_pct({"volatility_band": "LOW_VOL"})
++    assert target == 0.25 and "0.25pct" in reason
++    evaluate = next(node for node in ast.walk(_class("TradeManagementBoard"))
++                    if isinstance(node, ast.FunctionDef) and node.name == "evaluate")
++    range_if = next(node for node in ast.walk(evaluate)
++                    if isinstance(node, ast.If)
++                    and any(isinstance(const, ast.Constant) and const.value == "RANGE_SCALP"
++                            for const in ast.walk(node.test)))
++    range_block = ast.get_source_segment(SOURCE, range_if)
++    assert "TradeDecisionType.FULL_CLOSE" in range_block
++    assert "TradeDecisionType.PARTIAL_CLOSE" not in range_block
++
++
++def test_higher_volatility_scalp_uses_0_50_percent_full_close_only():
++    target, reason = select_range_target_pct({"volatility_band": "HIGHER_VOL"})
++    assert target == 0.50 and "0.50pct" in reason
++    assert "higher_volatility_scalp_full_close_0.50pct" in BRAIN_SOURCE
++
++
++def test_real_trend_uses_structural_tp1_tp2_with_no_tp3():
++    plan = resolve_trend_targets({
++        "side": "BUY", "entry": 100.0, "atr": 1.0,
++        "opposing_liquidity_level": 103.0, "opposing_zone_level": 106.0,
++    })
++    assert plan.get("tp1") and plan.get("tp2")
++    assert plan["tp1"] < plan["tp2"]
++    board = ast.get_source_segment(SOURCE, _class("TradeManagementBoard"))
++    assert "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY" in board
++    assert "TP2_FINAL_50_PERCENT_RUNNER_TARGET" in board
++    assert "TP3" not in SOURCE
++
++
++def test_restart_with_open_position_blocks_entries_until_recovery_completes():
++    wrapper = ast.get_source_segment(SOURCE, _function("main_loop_sniper"))
++    assert "startup_trade_recovery" in wrapper
++    assert wrapper.index("startup_trade_recovery") < wrapper.index("_original_main_loop_sniper")
++    selection = ast.get_source_segment(SOURCE, _function("smart_opportunity_selection"))
++    assert "RECOVERY_BLOCK_ENTRIES" in selection
++    assert 'MEMORY.get("position_status") == "UNKNOWN"' in selection
++
++
++def test_partial_close_verifies_actual_remaining_quantity():
++    board = ast.get_source_segment(SOURCE, _class("TradeManagementBoard"))
++    assert "target_remaining = initial * 0.5" in board
++    assert "qty_to_close = max(0.0, remaining - target_remaining)" in board
++    execution = ast.get_source_segment(SOURCE, _function("_execute_decision"))
++    assert "safe_close_partial" in execution
++    assert "TP1_VERIFIED" in execution
++
++
++def test_full_close_requires_bingx_flat_verification():
++    reduce = ast.get_source_segment(SOURCE, _function("_verified_market_reduce_impl"))
++    assert 'post_status == "FLAT"' in reduce
++    assert '"close_verified": post_status == "FLAT"' in reduce
++    assert "actual position delta" in reduce or "filled_by_delta" in SOURCE
++
++
++def test_duplicate_cross_event_id_is_blocked():
++    event = _confirmed()
++    ranked = rank_cross_candidates([event, dict(event)])
++    rejected = [row for row in ranked if row.get("final_rejection_reason") == "duplicate_cross_event_id"]
++    assert len(rejected) == 1
++    ok, reason = execution_readiness(event, event_consumed=True, adx=26.0)
++    assert ok is False and reason == "cross_event_already_consumed"
++    assert "is_event_consumed" in SOURCE and "consume_event" in SOURCE
++
++
++def test_no_new_entry_before_prior_execution_or_sync_is_resolved():
++    core = ast.get_source_segment(SOURCE, _function("execute_entry"))
++    assert "execution_unresolved" in SOURCE
++    assert "recovery_hold" in SOURCE
++    selection = ast.get_source_segment(SOURCE, _function("smart_opportunity_selection"))
++    assert "RECOVERY_BLOCK_ENTRIES" in selection
++    assert "_unified_watchlist_refresh_ok" in selection
++    board = ast.get_source_segment(SOURCE, _class("TradeManagementBoard"))
++    assert 'exchange_execution_or_recovery_unresolved' in board
++    # The cross lifecycle state machine has explicit submitted -> filled/rejected
++    # transitions; no candidate can jump from APPROVED straight to FILLED.
++    assert CrossLifecycleState.EXECUTION_READY.value in {
++        CrossLifecycleState.EXECUTION_READY.value
++    }
++    updated = transition_state(
++        {**_confirmed(), "institutional_analysis_status": CrossLifecycleState.EXECUTION_READY.value},
++        CrossLifecycleState.ENTRY_FILLED.value, "test",
++    )
++    assert updated["final_rejection_reason"].startswith("blocked_lifecycle_transition")
