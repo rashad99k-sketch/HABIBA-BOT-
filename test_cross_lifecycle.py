@@ -679,9 +679,9 @@ def test_approaching_ema50_only_and_unrated_crosses_never_authorize():
 def test_buy_and_sell_queues_are_independent_with_explainable_best_picks():
     ts = 1795132800000
     buy = {**_confirmed("BUY", ts), "cross_quality": HIGH_QUALITY, "adx": 28.0,
-           "cross_distance_atr": 0.08}
+           "cross_distance_atr": 0.08, "cross_location_approved": True}
     sell = {**_confirmed("SELL", ts), "cross_quality": GOOD_QUALITY, "adx": 24.0,
-            "cross_distance_atr": 0.10}
+            "cross_distance_atr": 0.10, "cross_location_approved": True}
     weak_buy = {**_confirmed("BUY", ts + 900000), "cross_quality": WEAK_QUALITY,
                 "adx": 26.0,
                 "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value}
@@ -701,7 +701,8 @@ def test_expired_or_duplicate_event_cannot_block_a_newer_valid_event():
     stale = {**_confirmed("BUY", 1795132800000), "cross_quality": HIGH_QUALITY,
              "final_rejection_reason": "cross_signal_expired_without_reentry",
              "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value}
-    fresh = {**_confirmed("BUY", 1795132809000), "cross_quality": HIGH_QUALITY}
+    fresh = {**_confirmed("BUY", 1795132809000), "cross_quality": HIGH_QUALITY,
+             "cross_location_approved": True}
     rejected = rank_cross_candidates_by_side([stale])
     assert rejected["best_buy"] is None
     ranked = rank_cross_candidates_by_side([stale, fresh])
@@ -765,3 +766,55 @@ def test_no_duplicate_cross_event_or_watchlist_stores():
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     assert target.id not in {"CROSS_EVENTS", "WATCHLIST", "CROSS_EVENT_STORE"}
+
+
+def test_best_pick_requires_an_approved_cross_location():
+    row = {**_confirmed(), "cross_quality": HIGH_QUALITY, "adx": 26.0,
+           "cross_location_approved": False}
+    assert rank_cross_candidates_by_side([row])["best_buy"] is None
+
+
+def test_identity_preserves_fresh_zero_geometry_and_adx():
+    row = _confirmed()
+    row.update({
+        "adx": 0.0, "ema9": 0.0, "vwap": 0.0, "cross_distance_atr": 0.0,
+        "cross_event": {"adx": 26.0, "ema9": 101.0, "session_vwap": 100.0,
+                        "cross_distance_atr": 0.5},
+    })
+    identity = cross_lifecycle_identity(row)
+    assert identity["adx"] == 0.0
+    assert identity["ema9"] == 0.0
+    assert identity["session_vwap"] == 0.0
+    assert identity["distance_from_vwap"] == 0.0
+
+
+def test_data_endpoint_publishes_fresh_cross_ranking_and_identity(monkeypatch):
+    import ggpbot
+
+    monkeypatch.setattr(ggpbot, "get_balance_safe", lambda: 1000.0)
+    monkeypatch.setattr(ggpbot, "get_free_balance_safe", lambda: 1000.0)
+    monkeypatch.setattr(ggpbot, "get_dashboard_metrics", lambda: {
+        "total_pnl": 0.0, "total_pnl_usdt": 0.0, "last_trade": None,
+    })
+    monkeypatch.setattr(ggpbot, "naiso_health_snapshot", lambda: {})
+    monkeypatch.setattr(ggpbot, "cleanup_watchlist", lambda: None)
+    monkeypatch.setitem(ggpbot.STATE, "open", False)
+    monkeypatch.setitem(ggpbot.DASHBOARD_STATE, "live_trade_mode", False)
+    row = {**_confirmed(), "cross_quality": HIGH_QUALITY,
+           "cross_location_approved": True}
+    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {"BTC/USDT:USDT": row})
+    monkeypatch.setitem(ggpbot.MEMORY, "cross_opportunity_ranking",
+                        {"best_buy": None, "best_sell": None})
+    monkeypatch.setitem(ggpbot.MEMORY, "health", {})
+    monkeypatch.setitem(ggpbot.MEMORY, "last_scan", 0)
+    monkeypatch.setitem(ggpbot.MEMORY, "regime", "UNKNOWN")
+
+    response = ggpbot.app.test_client().get("/data")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert "error" not in payload
+    ranking = payload["cross_opportunity_ranking"]
+    assert ranking["best_buy"]["cross_event_id"] == row["cross_event_id"]
+    assert ranking["best_buy"]["badge"] == "🟢 ENTRY CANDIDATE"
+    watch_row = payload["watchlist"]["BTC/USDT:USDT"]
+    assert watch_row["cross_lifecycle"]["badge"] == "🟢 ENTRY CANDIDATE"

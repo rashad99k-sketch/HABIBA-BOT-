@@ -333,6 +333,17 @@ def cross_lifecycle_identity(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         zone = "ORDER_BLOCK:" + str(ob.get("status") or "UNKNOWN").upper()
     if not zone and fvg:
         zone = "FVG:" + str(fvg.get("status") or "UNKNOWN").upper()
+
+    def _first_finite(*values: Any) -> Optional[float]:
+        # `or` would discard a legitimate fresh zero and fall back to stale data.
+        for value in values:
+            if value is None:
+                continue
+            number = finite(value)
+            if number is not None:
+                return number
+        return None
+
     return {
         "badge": cross_lifecycle_badge(item),
         "lifecycle_state": str(item.get("institutional_analysis_status") or "UNKNOWN"),
@@ -344,12 +355,13 @@ def cross_lifecycle_identity(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "cross_status": str(item.get("cross_status") or event.get("cross_status") or "NONE").upper(),
         "candle_timestamp": item.get("candle_timestamp") or event.get("candle_timestamp"),
         "cross_event_id": item.get("cross_event_id") or event.get("cross_event_id"),
-        "adx": finite(item.get("adx") or adx_di.get("adx") or event.get("adx")),
-        "ema9": finite(item.get("ema9") or event.get("ema9") or proximity.get("ema9")),
-        "session_vwap": finite(item.get("vwap") or event.get("session_vwap") or proximity.get("vwap")),
-        "distance_from_vwap": finite(item.get("cross_distance_atr")
-                                     or event.get("cross_distance_atr")
-                                     or proximity.get("gap_atr")),
+        "adx": _first_finite(item.get("adx"), adx_di.get("adx"), event.get("adx")),
+        "ema9": _first_finite(item.get("ema9"), event.get("ema9"), proximity.get("ema9")),
+        "session_vwap": _first_finite(item.get("vwap"), event.get("session_vwap"),
+                                      proximity.get("vwap")),
+        "distance_from_vwap": _first_finite(item.get("cross_distance_atr"),
+                                            event.get("cross_distance_atr"),
+                                            proximity.get("gap_atr")),
         "institutional_zone": zone or "UNKNOWN",
         "zone_quality": item.get("cross_quality") or item.get("zone_quality") or "UNRATED",
         "market_structure": str(structure.get("pattern") or structure.get("mss")
@@ -416,6 +428,7 @@ def rank_cross_candidates_by_side(items: Iterable[Dict[str, Any]]) -> Dict[str, 
         return bool(
             status == "CONFIRMED" and row.get("cross_event_id")
             and not reason and quality in APPROVABLE_QUALITIES and adx_ok
+            and bool(row.get("cross_location_approved"))
             and lifecycle in {
                 CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
                 CrossLifecycleState.ENTRY_CANDIDATE.value,

@@ -1,8 +1,15 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..0b133f6
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1 @@
++UNIFIED_CROSS_LIFECYCLE_DIFF.txt -whitespace
 diff --git a/UNIFIED_CROSS_LIFECYCLE_REPORT.md b/UNIFIED_CROSS_LIFECYCLE_REPORT.md
-index 4e53dcd..c495ae9 100644
+index 4e53dcd..2a34592 100644
 --- a/UNIFIED_CROSS_LIFECYCLE_REPORT.md
 +++ b/UNIFIED_CROSS_LIFECYCLE_REPORT.md
-@@ -226,3 +226,135 @@ a pre-existing Pandas `Timestamp.utcnow` deprecation in
+@@ -226,3 +226,152 @@ a pre-existing Pandas `Timestamp.utcnow` deprecation in
  - Exact patch: `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
  
  No commit or PR claims LIVE readiness; they cover offline-verified code only.
@@ -116,8 +123,8 @@ index 4e53dcd..c495ae9 100644
 +| Check | Result |
 +|---|---|
 +| `py_compile` on all changed Python files | clean |
-+| Focused lifecycle/scanner/profit suite | **95 passed** |
-+| Full offline regression with isolated venv | **653 passed, 1 warning in 139.86s** |
++| Focused lifecycle/scanner/profit suite | **98 passed** |
++| Full offline regression with isolated venv | **656 passed, 1 warning in 128.09s** |
 +| Skipped / xfail / weakened timeout tests | none |
 +| Real exchange order, balance query, API setting change | none |
 +| Demo / LIVE verification | **not performed** |
@@ -138,8 +145,25 @@ index 4e53dcd..c495ae9 100644
 +requested 5+1 portfolio redesign or add a News Engine. No 24-hour soak, exchange outage,
 +demo order, LIVE trade, native-stop recovery soak or verified-close exchange test was
 +performed. **The system is not demo-verified, not LIVE-verified and not LIVE-ready.**
++
++### 12.9 Independent review disposition and PR status
++
++An independent read-only architecture/code review returned **no BLOCKER** and four CONCERNs.
++All four were dispositioned before merge:
++
++| Concern | Disposition |
++|---|---|
++| Ranking published before reanalysis could make the UI stale | `/data` now recomputes BEST BUY/SELL from current Watchlist rows on every request; `smart_opportunity_selection()` still publishes its snapshot for non-UI consumers. |
++| Display eligibility broader than final readiness | BEST picks now require `cross_location_approved=True` in addition to confirmed EMA9 cross, approved quality, ADX >= 18 and an approved/candidate/ready lifecycle. |
++| `or` fallbacks could discard legitimate fresh zero geometry/ADX | `cross_lifecycle_identity()`, `_sync_cross_event()` and cross-location feature construction now use explicit `is None` fallbacks. |
++| Several assertions were static source/AST checks | Added a behavioral Flask `/data` test plus best-pick and zero-value behavior tests; AST checks remain as architecture guards only. |
++
++PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/45 .
++The first branch commit `5f8f151a7703042fbca0f0964fd00e4c6446bc9b` had GitHub Actions
++`python-tests: success`. The review-fix commit is rechecked by CI before merge.
++No GitHub review or check reported a blocker.
 diff --git a/ggp_cross_lifecycle.py b/ggp_cross_lifecycle.py
-index 130f71c..cf01d66 100644
+index 130f71c..af955aa 100644
 --- a/ggp_cross_lifecycle.py
 +++ b/ggp_cross_lifecycle.py
 @@ -22,34 +22,62 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -221,7 +245,7 @@ index 130f71c..cf01d66 100644
      CrossLifecycleState.INSTITUTIONAL_REJECTED.value: {
          CrossLifecycleState.CROSS_DETECTED.value,
          CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
-@@ -244,6 +275,166 @@ def transition_state(candidate: Dict[str, Any], new_state: str,
+@@ -244,6 +275,179 @@ def transition_state(candidate: Dict[str, Any], new_state: str,
      return updated
  
  
@@ -283,6 +307,17 @@ index 130f71c..cf01d66 100644
 +        zone = "ORDER_BLOCK:" + str(ob.get("status") or "UNKNOWN").upper()
 +    if not zone and fvg:
 +        zone = "FVG:" + str(fvg.get("status") or "UNKNOWN").upper()
++
++    def _first_finite(*values: Any) -> Optional[float]:
++        # `or` would discard a legitimate fresh zero and fall back to stale data.
++        for value in values:
++            if value is None:
++                continue
++            number = finite(value)
++            if number is not None:
++                return number
++        return None
++
 +    return {
 +        "badge": cross_lifecycle_badge(item),
 +        "lifecycle_state": str(item.get("institutional_analysis_status") or "UNKNOWN"),
@@ -294,12 +329,13 @@ index 130f71c..cf01d66 100644
 +        "cross_status": str(item.get("cross_status") or event.get("cross_status") or "NONE").upper(),
 +        "candle_timestamp": item.get("candle_timestamp") or event.get("candle_timestamp"),
 +        "cross_event_id": item.get("cross_event_id") or event.get("cross_event_id"),
-+        "adx": finite(item.get("adx") or adx_di.get("adx") or event.get("adx")),
-+        "ema9": finite(item.get("ema9") or event.get("ema9") or proximity.get("ema9")),
-+        "session_vwap": finite(item.get("vwap") or event.get("session_vwap") or proximity.get("vwap")),
-+        "distance_from_vwap": finite(item.get("cross_distance_atr")
-+                                     or event.get("cross_distance_atr")
-+                                     or proximity.get("gap_atr")),
++        "adx": _first_finite(item.get("adx"), adx_di.get("adx"), event.get("adx")),
++        "ema9": _first_finite(item.get("ema9"), event.get("ema9"), proximity.get("ema9")),
++        "session_vwap": _first_finite(item.get("vwap"), event.get("session_vwap"),
++                                      proximity.get("vwap")),
++        "distance_from_vwap": _first_finite(item.get("cross_distance_atr"),
++                                            event.get("cross_distance_atr"),
++                                            proximity.get("gap_atr")),
 +        "institutional_zone": zone or "UNKNOWN",
 +        "zone_quality": item.get("cross_quality") or item.get("zone_quality") or "UNRATED",
 +        "market_structure": str(structure.get("pattern") or structure.get("mss")
@@ -366,6 +402,7 @@ index 130f71c..cf01d66 100644
 +        return bool(
 +            status == "CONFIRMED" and row.get("cross_event_id")
 +            and not reason and quality in APPROVABLE_QUALITIES and adx_ok
++            and bool(row.get("cross_location_approved"))
 +            and lifecycle in {
 +                CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
 +                CrossLifecycleState.ENTRY_CANDIDATE.value,
@@ -388,7 +425,7 @@ index 130f71c..cf01d66 100644
  def _zone_quality(features: Dict[str, Any]) -> str:
      """Explainable cross-location class; score is supporting evidence only."""
      side = str(features.get("cross_direction") or features.get("side") or "").upper()
-@@ -257,8 +448,10 @@ def _zone_quality(features: Dict[str, Any]) -> str:
+@@ -257,8 +461,10 @@ def _zone_quality(features: Dict[str, Any]) -> str:
      cross_dir = str(features.get("cross_ema9") or features.get("cross_direction_signal") or "").upper()
      if cross_dir and cross_dir != expected:
          return INVALID_QUALITY
@@ -399,7 +436,7 @@ index 130f71c..cf01d66 100644
          "real_value_area": bool(features.get("real_value_area", False)),
          "room_before_opposing_liquidity": bool(features.get("room_before_opposing_liquidity", False)),
          "room_before_opposing_structure": bool(features.get("room_before_opposing_structure", False)),
-@@ -302,9 +495,11 @@ def _zone_quality(features: Dict[str, Any]) -> str:
+@@ -302,9 +508,11 @@ def _zone_quality(features: Dict[str, Any]) -> str:
      flow_count = sum(1 for passed in flow.values() if passed)
      if (core_count >= 2 and flow_count >= 2 and event
              and features.get("premium_discount_aligned", False) and space >= 1.0):
@@ -412,7 +449,7 @@ index 130f71c..cf01d66 100644
      return WEAK_QUALITY
  
  
-@@ -328,7 +523,11 @@ def evaluate_cross_location(features: Dict[str, Any],
+@@ -328,7 +536,11 @@ def evaluate_cross_location(features: Dict[str, Any],
              evidence.append(f"{key}:{'PASS' if value else 'FAIL'}")
          elif isinstance(value, (int, float)) and not isinstance(value, bool):
              evidence.append(f"{key}:{value}")
@@ -425,7 +462,7 @@ index 130f71c..cf01d66 100644
      expected_signal = "BULLISH" if side == "BUY" else "BEARISH"
      observed_signal = str(features.get("cross_ema9") or features.get("cross_direction_signal") or "").upper()
      mismatch = bool(observed_signal and observed_signal != expected_signal)
-@@ -336,7 +535,7 @@ def evaluate_cross_location(features: Dict[str, Any],
+@@ -336,7 +548,7 @@ def evaluate_cross_location(features: Dict[str, Any],
          reason for reason in (
              adx_reason if not adx_ok else "",
              "cross_direction_mismatch" if mismatch else "",
@@ -434,7 +471,7 @@ index 130f71c..cf01d66 100644
          ) if reason
      ]
      return {
-@@ -445,6 +644,7 @@ def build_location_features(context: Dict[str, Any],
+@@ -445,6 +657,7 @@ def build_location_features(context: Dict[str, Any],
                            ("BULLISH" if cross.get("cross_direction") == "BUY" else "BEARISH")
                            if cross else "").upper(),
          "adx": finite(ctx.get("adx") or indicators.get("adx")),
@@ -442,7 +479,7 @@ index 130f71c..cf01d66 100644
          "valid_closed_data": str(ctx.get("data_quality") or "VALID_CLOSED_CANDLES") == "VALID_CLOSED_CANDLES",
          "demand_zone_near": bool(buy and value_aligned and (ob_ok or fvg_ok or sr_aligned)),
          "supply_zone_near": bool(not buy and value_aligned and (ob_ok or fvg_ok or sr_aligned)),
-@@ -475,7 +675,7 @@ def cross_rank(item: Dict[str, Any]) -> float:
+@@ -475,7 +688,7 @@ def cross_rank(item: Dict[str, Any]) -> float:
      row = item if isinstance(item, dict) else {}
      quality = str(row.get("cross_quality") or row.get("quality") or "").upper()
      quality_points = {
@@ -451,7 +488,7 @@ index 130f71c..cf01d66 100644
          WEAK_QUALITY: 8.0, INVALID_QUALITY: 0.0,
      }.get(quality, 0.0)
      features = row.get("cross_location") if isinstance(row.get("cross_location"), dict) else {}
-@@ -547,7 +747,7 @@ def execution_readiness(candidate: Dict[str, Any], *, event_consumed: bool = Fal
+@@ -547,7 +760,7 @@ def execution_readiness(candidate: Dict[str, Any], *, event_consumed: bool = Fal
      if not adx_ok:
          return False, adx_reason
      quality = str(row.get("cross_quality") or "").upper()
@@ -642,7 +679,7 @@ index 72e920c..6b4aaf9 100644
              and volume_ratio >= 0.85 and di_aligned and not adverse_rejection):
          return RANGE_PROFIT_TARGETS_PCT[1], "moderate_follow_through_0.50pct"
 diff --git a/ggpbot.py b/ggpbot.py
-index ab83655..b8539e7 100644
+index ab83655..8718de8 100644
 --- a/ggpbot.py
 +++ b/ggpbot.py
 @@ -3394,6 +3394,7 @@ def _move_native_stop_verified(symbol, new_trigger_price, *, action="MOVE_SL", r
@@ -707,7 +744,44 @@ index ab83655..b8539e7 100644
                <div style="font-size:17px;letter-spacing:2px;margin:4px 0;">${{iconRow}}</div>
                <small>Price: ${{priceText}} | Regime: ${{w.market_regime || "UNKNOWN"}} | Structure: ${{structure.pattern || structure.direction || "UNKNOWN"}} | Liquidity: ${{liq.event || "UNKNOWN"}} / ${{liq.direction || "UNKNOWN"}}</small>
                <br><small>OB: ${{ob.low ?? "?"}}–${{ob.high ?? "?"}} (${{w.order_block_state || "UNKNOWN"}}) | FVG: ${{fvg.lower ?? "?"}}–${{fvg.upper ?? "?"}} (${{fvg.status || "UNKNOWN"}})</small>
-@@ -10001,7 +10023,15 @@ def data():
+@@ -9952,6 +9974,36 @@ def decision_feed():
+         log_execution(f"/decision error: {type(exc).__name__}: {exc}", "ERROR")
+         return jsonify({"data": [], "error": "decision_feed_unavailable"}), 200
+ 
++
++def _compact_cross_rank_row(row):
++    identity = _cross_lifecycle_identity(row)
++    return {
++        "symbol": identity["symbol"],
++        "cross_event_id": identity["cross_event_id"],
++        "direction": identity["cross_direction"],
++        "cross_rank": row.get("cross_rank"),
++        "cross_quality": row.get("cross_quality"),
++        "adx": identity["adx"],
++        "badge": identity["badge"],
++    }
++
++
++def _publish_fresh_cross_opportunity_ranking():
++    """Recompute BEST BUY/SELL from current Watchlist rows at read time."""
++    rows = [value for value in MEMORY.get("watchlist", {}).values()
++            if isinstance(value, dict)]
++    ranking = _rank_cross_candidates_by_side(rows)
++    published = {
++        "BUY": [_compact_cross_rank_row(row) for row in ranking["BUY"]],
++        "SELL": [_compact_cross_rank_row(row) for row in ranking["SELL"]],
++        "best_buy": ranking["best_buy"],
++        "best_sell": ranking["best_sell"],
++        "updated_at": ranking["updated_at"],
++    }
++    MEMORY["cross_opportunity_ranking"] = published
++    return published
++
++
+ @app.route("/data")
+ def data():
+     try:
+@@ -10001,7 +10053,18 @@ def data():
          health["errors"] = len(DASHBOARD_STATE["errors"])
          top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
          cleanup_watchlist()
@@ -721,10 +795,13 @@ index ab83655..b8539e7 100644
 +            row["cross_lifecycle"] = identity
 +            row.setdefault("icons", {})["cross_lifecycle"] = identity["badge"]
 +            watchlist_data[key] = row
++        # Recompute the ranking here so a scan/entry thread cannot leave the UI
++        # showing a best pick from before the latest reanalysis or transition.
++        _publish_fresh_cross_opportunity_ranking()
          no_entry_feed = MEMORY.get("no_entry_feed", [])[-5:]
          live_data = {}
          supervisor_data = None
-@@ -10085,6 +10115,7 @@ def data():
+@@ -10085,6 +10148,7 @@ def data():
              "ema9_vwap_proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner", [])[:30],
              "ema9_vwap_proximity_scanner_meta": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}),
              "watchlist": watchlist_data,
@@ -732,7 +809,7 @@ index ab83655..b8539e7 100644
              "no_entry_feed": no_entry_feed,
              "entry_rejection_metrics": MEMORY.get("entry_rejection_metrics", {}),
              "last_closed_candle_validation": MEMORY.get("last_closed_candle_validation", {}),
-@@ -11742,7 +11773,11 @@ from ggp_cross_lifecycle import (
+@@ -11742,7 +11806,11 @@ from ggp_cross_lifecycle import (
      CrossLifecycleState, normalize_cross_event as _normalize_cross_event,
      merge_cross_events as _merge_cross_events, transition_state as _cross_transition_state,
      build_location_features as _cross_location_features, evaluate_cross_location as _evaluate_cross_location,
@@ -745,7 +822,7 @@ index ab83655..b8539e7 100644
  )
  try:
      from roro_resource_manager import ResourceManager
-@@ -11985,12 +12020,26 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
+@@ -11985,12 +12053,26 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                  symbol_key = roro_canonical_symbol(symbol_for_proximity)
                  candle_ts = int(closed.timestamp.iloc[-1])
                  last_seen = MEMORY.setdefault("_proximity_last_seen_by_symbol", {})
@@ -773,7 +850,7 @@ index ab83655..b8539e7 100644
                      _proximity_cross_age = (
                          max(0.0, _observed_at - (float(proximity.get("candle_timestamp") or 0) / 1000.0
                                                   + _proximity_frame_seconds))
-@@ -12023,6 +12072,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
+@@ -12023,6 +12105,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                          symbol_for_proximity, timeframe_seconds, proximity, _cross_adx, now_ms
                      )
                      if _cross_event:
@@ -781,7 +858,7 @@ index ab83655..b8539e7 100644
                          _merged = _merge_cross_events(
                              MEMORY.get("cross_events", {}), [_cross_event], now_ms
                          )
-@@ -12030,10 +12080,29 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
+@@ -12030,10 +12113,29 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                          _cross_key = (_cross_event.get("cross_event_id")
                                        or _cross_event.get("candidate_id"))
                          result["cross_event"] = dict(_merged.get(_cross_key, _cross_event))
@@ -815,7 +892,7 @@ index ab83655..b8539e7 100644
                          log_execution(
                              f"[CROSS_EVENT] {symbol_key} {_cross_event.get('cross_direction')} "
                              f"{_cross_event.get('cross_status')} event={_cross_event.get('cross_event_id') or _cross_key} "
-@@ -12044,10 +12113,12 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
+@@ -12044,10 +12146,12 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                      result["cross_event_diagnostic"] = f"{type(cross_exc).__name__}:{cross_exc}"
                  result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                  icons = dict(analysis.get("icons") or {})
@@ -829,7 +906,16 @@ index ab83655..b8539e7 100644
                  analysis["icons"] = icons
          except Exception as proximity_exc:
              result["ema9_vwap_proximity"] = {"state": "UNKNOWN", "reason": f"{type(proximity_exc).__name__}",
-@@ -12285,10 +12356,16 @@ def smart_opportunity_selection():
+@@ -12277,7 +12381,7 @@ def smart_opportunity_selection():
+             "institutional_analysis_status": row.get("institutional_analysis_status")
+             or CrossLifecycleState.CROSS_DETECTED.value,
+             "final_rejection_reason": row.get("final_rejection_reason"),
+-            "adx": row.get("adx") or event.get("adx"),
++            "adx": row.get("adx") if row.get("adx") is not None else event.get("adx"),
+             "last_analyzed_ms": time.time(),
+         })
+         key = str(event.get("cross_event_id") or event.get("candidate_id") or "")
+@@ -12285,10 +12389,16 @@ def smart_opportunity_selection():
              MEMORY.setdefault("cross_events", {})[key] = event
              cross_event_map[key] = event
  
@@ -849,7 +935,7 @@ index ab83655..b8539e7 100644
      def _location_first_rank(pair):
          _, candidate = pair
          side_value = str(candidate.get("side") or "").upper()
-@@ -12341,8 +12418,9 @@ def smart_opportunity_selection():
+@@ -12341,8 +12451,9 @@ def smart_opportunity_selection():
          return (location_distance <= 1.5, -location_distance, location_quality, score)
  
      # Cross quality, proximity, OB/FVG, liquidity, structure, ADX, momentum,
@@ -861,7 +947,7 @@ index ab83655..b8539e7 100644
      original_items = {id(item): (canonical, item) for canonical, item in ready}
      ranked_rows = []
      for canonical, item in ready:
-@@ -12351,7 +12429,30 @@ def smart_opportunity_selection():
+@@ -12351,7 +12462,19 @@ def smart_opportunity_selection():
          row["_source_id"] = id(item)
          row["_base_rank"] = _location_first_rank((canonical, item))
          ranked_rows.append(row)
@@ -869,22 +955,11 @@ index ab83655..b8539e7 100644
 +    side_ranking = _rank_cross_candidates_by_side(ranked_rows)
 +    ordered_rows = side_ranking["queue"]
 +
-+    def _compact_rank_row(row):
-+        identity = _cross_lifecycle_identity(row)
-+        return {
-+            "symbol": identity["symbol"],
-+            "cross_event_id": identity["cross_event_id"],
-+            "direction": identity["cross_direction"],
-+            "cross_rank": row.get("cross_rank"),
-+            "cross_quality": row.get("cross_quality"),
-+            "adx": identity["adx"],
-+            "badge": identity["badge"],
-+        }
-+
-+    # Published for the Dashboard/API; no exchange state or secret is exposed.
++    # Published for non-UI consumers; /data recomputes the same projection from
++    # current Watchlist rows so the Dashboard never shows a stale best pick.
 +    MEMORY["cross_opportunity_ranking"] = {
-+        "BUY": [_compact_rank_row(row) for row in side_ranking["BUY"]],
-+        "SELL": [_compact_rank_row(row) for row in side_ranking["SELL"]],
++        "BUY": [_compact_cross_rank_row(row) for row in side_ranking["BUY"]],
++        "SELL": [_compact_cross_rank_row(row) for row in side_ranking["SELL"]],
 +        "best_buy": side_ranking["best_buy"],
 +        "best_sell": side_ranking["best_sell"],
 +        "updated_at": side_ranking["updated_at"],
@@ -893,7 +968,7 @@ index ab83655..b8539e7 100644
      ready = []
      for row in ordered_rows:
          source = original_items.get(int(row.get("_source_id") or 0))
-@@ -12376,7 +12477,19 @@ def smart_opportunity_selection():
+@@ -12376,7 +12499,19 @@ def smart_opportunity_selection():
          if event_id:
              seen_event_ids.add(event_id)
          unique_ready.append((canonical, item))
@@ -914,7 +989,21 @@ index ab83655..b8539e7 100644
      # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
      for canonical, item in ready[:8]:
          try:
-@@ -12474,10 +12587,15 @@ def smart_opportunity_selection():
+@@ -12449,9 +12584,11 @@ def smart_opportunity_selection():
+             _sync_cross_event(cross_event, item)
+             # Enrichment adds Smart Money, Momentum and institutional trend after
+             # the bridge analysis; re-evaluate the cross location with that evidence.
++            _features_adx = item.get("adx")
++            if _features_adx is None:
++                _features_adx = cross_event.get("adx")
+             _features = _cross_location_features(
+-                {**item, "adx": item.get("adx") or (cross_event.get("adx"))},
+-                cross_event, side,
++                {**item, "adx": _features_adx}, cross_event, side,
+             )
+             _smart = item.get("smart_money") if isinstance(item.get("smart_money"), dict) else {}
+             _momentum = item.get("momentum") if isinstance(item.get("momentum"), dict) else {}
+@@ -12474,10 +12611,15 @@ def smart_opportunity_selection():
              item["cross_location"] = _location
              item["cross_quality"] = _location.get("quality")
              item["cross_location_approved"] = bool(_location.get("approved"))
@@ -932,7 +1021,7 @@ index ab83655..b8539e7 100644
                  )
              else:
                  _apply_cross_transition(
-@@ -12588,6 +12706,13 @@ def smart_opportunity_selection():
+@@ -12588,6 +12730,13 @@ def smart_opportunity_selection():
              _adx_series = compute_adx(closed_df)
              _cross_adx_value = (_adx_series.iloc[-1] if _adx_series is not None and len(_adx_series) else None)
              _cross_consumed = _cross_event_consumed(cross_event)
@@ -946,7 +1035,7 @@ index ab83655..b8539e7 100644
              # Readiness must inspect the ENRICHED candidate. The raw cross-event
              # record is still CROSS_DETECTED at this point; checking it would
              # reject every cross before execute_entry() is reached.
-@@ -12678,7 +12803,15 @@ def smart_opportunity_selection():
+@@ -12678,7 +12827,15 @@ def smart_opportunity_selection():
                  _sync_cross_event(cross_event, item)
                  item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
                  item["entry_timestamp"] = time.time()
@@ -963,7 +1052,7 @@ index ab83655..b8539e7 100644
                  trade_id = str(STATE.get("trade_id") or "")
                  if INSTITUTIONAL_TRADE_JOURNAL and trade_id:
                      INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
-@@ -14396,7 +14529,20 @@ def execute_entry(*args, **kwargs):
+@@ -14396,7 +14553,20 @@ def execute_entry(*args, **kwargs):
          journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
          if result and STATE.get("open"):
              ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
@@ -986,7 +1075,7 @@ index ab83655..b8539e7 100644
                  trade_id = str(STATE.get("trade_id") or "")
                  try:
 diff --git a/test_cross_lifecycle.py b/test_cross_lifecycle.py
-index fa593c5..ba4e32f 100644
+index fa593c5..6de9bfa 100644
 --- a/test_cross_lifecycle.py
 +++ b/test_cross_lifecycle.py
 @@ -13,10 +13,11 @@ import pandas as pd
@@ -1005,7 +1094,7 @@ index fa593c5..ba4e32f 100644
  )
  from ggp_institutional_bridge import _select_cross_event, cross_event_authorization_block
  from ggp_profit_brain import resolve_trend_targets, select_range_target_pct
-@@ -556,3 +557,211 @@ def test_execution_wrapper_logs_authoritative_fill_and_protection_state(monkeypa
+@@ -556,3 +557,264 @@ def test_execution_wrapper_logs_authoritative_fill_and_protection_state(monkeypa
      assert "filled_qty=1.5" in cross_log
      assert "position_verified=True" in cross_log
      assert "protection_verified=True" in cross_log
@@ -1131,9 +1220,9 @@ index fa593c5..ba4e32f 100644
 +def test_buy_and_sell_queues_are_independent_with_explainable_best_picks():
 +    ts = 1795132800000
 +    buy = {**_confirmed("BUY", ts), "cross_quality": HIGH_QUALITY, "adx": 28.0,
-+           "cross_distance_atr": 0.08}
++           "cross_distance_atr": 0.08, "cross_location_approved": True}
 +    sell = {**_confirmed("SELL", ts), "cross_quality": GOOD_QUALITY, "adx": 24.0,
-+            "cross_distance_atr": 0.10}
++            "cross_distance_atr": 0.10, "cross_location_approved": True}
 +    weak_buy = {**_confirmed("BUY", ts + 900000), "cross_quality": WEAK_QUALITY,
 +                "adx": 26.0,
 +                "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value}
@@ -1153,7 +1242,8 @@ index fa593c5..ba4e32f 100644
 +    stale = {**_confirmed("BUY", 1795132800000), "cross_quality": HIGH_QUALITY,
 +             "final_rejection_reason": "cross_signal_expired_without_reentry",
 +             "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value}
-+    fresh = {**_confirmed("BUY", 1795132809000), "cross_quality": HIGH_QUALITY}
++    fresh = {**_confirmed("BUY", 1795132809000), "cross_quality": HIGH_QUALITY,
++             "cross_location_approved": True}
 +    rejected = rank_cross_candidates_by_side([stale])
 +    assert rejected["best_buy"] is None
 +    ranked = rank_cross_candidates_by_side([stale, fresh])
@@ -1217,6 +1307,58 @@ index fa593c5..ba4e32f 100644
 +            for target in node.targets:
 +                if isinstance(target, ast.Name):
 +                    assert target.id not in {"CROSS_EVENTS", "WATCHLIST", "CROSS_EVENT_STORE"}
++
++
++def test_best_pick_requires_an_approved_cross_location():
++    row = {**_confirmed(), "cross_quality": HIGH_QUALITY, "adx": 26.0,
++           "cross_location_approved": False}
++    assert rank_cross_candidates_by_side([row])["best_buy"] is None
++
++
++def test_identity_preserves_fresh_zero_geometry_and_adx():
++    row = _confirmed()
++    row.update({
++        "adx": 0.0, "ema9": 0.0, "vwap": 0.0, "cross_distance_atr": 0.0,
++        "cross_event": {"adx": 26.0, "ema9": 101.0, "session_vwap": 100.0,
++                        "cross_distance_atr": 0.5},
++    })
++    identity = cross_lifecycle_identity(row)
++    assert identity["adx"] == 0.0
++    assert identity["ema9"] == 0.0
++    assert identity["session_vwap"] == 0.0
++    assert identity["distance_from_vwap"] == 0.0
++
++
++def test_data_endpoint_publishes_fresh_cross_ranking_and_identity(monkeypatch):
++    import ggpbot
++
++    monkeypatch.setattr(ggpbot, "get_balance_safe", lambda: 1000.0)
++    monkeypatch.setattr(ggpbot, "get_free_balance_safe", lambda: 1000.0)
++    monkeypatch.setattr(ggpbot, "get_dashboard_metrics", lambda: {
++        "total_pnl": 0.0, "total_pnl_usdt": 0.0, "last_trade": None,
++    })
++    monkeypatch.setattr(ggpbot, "naiso_health_snapshot", lambda: {})
++    monkeypatch.setattr(ggpbot, "cleanup_watchlist", lambda: None)
++    monkeypatch.setitem(ggpbot.STATE, "open", False)
++    monkeypatch.setitem(ggpbot.DASHBOARD_STATE, "live_trade_mode", False)
++    row = {**_confirmed(), "cross_quality": HIGH_QUALITY,
++           "cross_location_approved": True}
++    monkeypatch.setitem(ggpbot.MEMORY, "watchlist", {"BTC/USDT:USDT": row})
++    monkeypatch.setitem(ggpbot.MEMORY, "cross_opportunity_ranking",
++                        {"best_buy": None, "best_sell": None})
++    monkeypatch.setitem(ggpbot.MEMORY, "health", {})
++    monkeypatch.setitem(ggpbot.MEMORY, "last_scan", 0)
++    monkeypatch.setitem(ggpbot.MEMORY, "regime", "UNKNOWN")
++
++    response = ggpbot.app.test_client().get("/data")
++    assert response.status_code == 200
++    payload = response.get_json()
++    assert "error" not in payload
++    ranking = payload["cross_opportunity_ranking"]
++    assert ranking["best_buy"]["cross_event_id"] == row["cross_event_id"]
++    assert ranking["best_buy"]["badge"] == "🟢 ENTRY CANDIDATE"
++    watch_row = payload["watchlist"]["BTC/USDT:USDT"]
++    assert watch_row["cross_lifecycle"]["badge"] == "🟢 ENTRY CANDIDATE"
 diff --git a/test_profit_brain.py b/test_profit_brain.py
 index 5576970..b6b02e3 100644
 --- a/test_profit_brain.py
@@ -1259,10 +1401,3 @@ index b704b42..1a168f5 100644
  
  
  def test_trend_targets_are_one_and_three_percent_for_long():
-diff --git a/.gitattributes b/.gitattributes
-new file mode 100644
-index 0000000..0b133f6
---- /dev/null
-+++ b/.gitattributes
-@@ -0,0 +1 @@
-+UNIFIED_CROSS_LIFECYCLE_DIFF.txt -whitespace

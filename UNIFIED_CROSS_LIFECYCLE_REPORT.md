@@ -336,8 +336,8 @@ existing one-position path.
 | Check | Result |
 |---|---|
 | `py_compile` on all changed Python files | clean |
-| Focused lifecycle/scanner/profit suite | **95 passed** |
-| Full offline regression with isolated venv | **653 passed, 1 warning in 139.86s** |
+| Focused lifecycle/scanner/profit suite | **98 passed** |
+| Full offline regression with isolated venv | **656 passed, 1 warning in 128.09s** |
 | Skipped / xfail / weakened timeout tests | none |
 | Real exchange order, balance query, API setting change | none |
 | Demo / LIVE verification | **not performed** |
@@ -358,3 +358,20 @@ same-symbol conflict behavior remain applicable. This hardening did not attempt 
 requested 5+1 portfolio redesign or add a News Engine. No 24-hour soak, exchange outage,
 demo order, LIVE trade, native-stop recovery soak or verified-close exchange test was
 performed. **The system is not demo-verified, not LIVE-verified and not LIVE-ready.**
+
+### 12.9 Independent review disposition and PR status
+
+An independent read-only architecture/code review returned **no BLOCKER** and four CONCERNs.
+All four were dispositioned before merge:
+
+| Concern | Disposition |
+|---|---|
+| Ranking published before reanalysis could make the UI stale | `/data` now recomputes BEST BUY/SELL from current Watchlist rows on every request; `smart_opportunity_selection()` still publishes its snapshot for non-UI consumers. |
+| Display eligibility broader than final readiness | BEST picks now require `cross_location_approved=True` in addition to confirmed EMA9 cross, approved quality, ADX >= 18 and an approved/candidate/ready lifecycle. |
+| `or` fallbacks could discard legitimate fresh zero geometry/ADX | `cross_lifecycle_identity()`, `_sync_cross_event()` and cross-location feature construction now use explicit `is None` fallbacks. |
+| Several assertions were static source/AST checks | Added a behavioral Flask `/data` test plus best-pick and zero-value behavior tests; AST checks remain as architecture guards only. |
+
+PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/45 .
+The first branch commit `5f8f151a7703042fbca0f0964fd00e4c6446bc9b` had GitHub Actions
+`python-tests: success`. The review-fix commit is rechecked by CI before merge.
+No GitHub review or check reported a blocker.

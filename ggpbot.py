@@ -9974,6 +9974,36 @@ def decision_feed():
         log_execution(f"/decision error: {type(exc).__name__}: {exc}", "ERROR")
         return jsonify({"data": [], "error": "decision_feed_unavailable"}), 200
 
+
+def _compact_cross_rank_row(row):
+    identity = _cross_lifecycle_identity(row)
+    return {
+        "symbol": identity["symbol"],
+        "cross_event_id": identity["cross_event_id"],
+        "direction": identity["cross_direction"],
+        "cross_rank": row.get("cross_rank"),
+        "cross_quality": row.get("cross_quality"),
+        "adx": identity["adx"],
+        "badge": identity["badge"],
+    }
+
+
+def _publish_fresh_cross_opportunity_ranking():
+    """Recompute BEST BUY/SELL from current Watchlist rows at read time."""
+    rows = [value for value in MEMORY.get("watchlist", {}).values()
+            if isinstance(value, dict)]
+    ranking = _rank_cross_candidates_by_side(rows)
+    published = {
+        "BUY": [_compact_cross_rank_row(row) for row in ranking["BUY"]],
+        "SELL": [_compact_cross_rank_row(row) for row in ranking["SELL"]],
+        "best_buy": ranking["best_buy"],
+        "best_sell": ranking["best_sell"],
+        "updated_at": ranking["updated_at"],
+    }
+    MEMORY["cross_opportunity_ranking"] = published
+    return published
+
+
 @app.route("/data")
 def data():
     try:
@@ -10032,6 +10062,9 @@ def data():
             row["cross_lifecycle"] = identity
             row.setdefault("icons", {})["cross_lifecycle"] = identity["badge"]
             watchlist_data[key] = row
+        # Recompute the ranking here so a scan/entry thread cannot leave the UI
+        # showing a best pick from before the latest reanalysis or transition.
+        _publish_fresh_cross_opportunity_ranking()
         no_entry_feed = MEMORY.get("no_entry_feed", [])[-5:]
         live_data = {}
         supervisor_data = None
@@ -12348,7 +12381,7 @@ def smart_opportunity_selection():
             "institutional_analysis_status": row.get("institutional_analysis_status")
             or CrossLifecycleState.CROSS_DETECTED.value,
             "final_rejection_reason": row.get("final_rejection_reason"),
-            "adx": row.get("adx") or event.get("adx"),
+            "adx": row.get("adx") if row.get("adx") is not None else event.get("adx"),
             "last_analyzed_ms": time.time(),
         })
         key = str(event.get("cross_event_id") or event.get("candidate_id") or "")
@@ -12432,22 +12465,11 @@ def smart_opportunity_selection():
     side_ranking = _rank_cross_candidates_by_side(ranked_rows)
     ordered_rows = side_ranking["queue"]
 
-    def _compact_rank_row(row):
-        identity = _cross_lifecycle_identity(row)
-        return {
-            "symbol": identity["symbol"],
-            "cross_event_id": identity["cross_event_id"],
-            "direction": identity["cross_direction"],
-            "cross_rank": row.get("cross_rank"),
-            "cross_quality": row.get("cross_quality"),
-            "adx": identity["adx"],
-            "badge": identity["badge"],
-        }
-
-    # Published for the Dashboard/API; no exchange state or secret is exposed.
+    # Published for non-UI consumers; /data recomputes the same projection from
+    # current Watchlist rows so the Dashboard never shows a stale best pick.
     MEMORY["cross_opportunity_ranking"] = {
-        "BUY": [_compact_rank_row(row) for row in side_ranking["BUY"]],
-        "SELL": [_compact_rank_row(row) for row in side_ranking["SELL"]],
+        "BUY": [_compact_cross_rank_row(row) for row in side_ranking["BUY"]],
+        "SELL": [_compact_cross_rank_row(row) for row in side_ranking["SELL"]],
         "best_buy": side_ranking["best_buy"],
         "best_sell": side_ranking["best_sell"],
         "updated_at": side_ranking["updated_at"],
@@ -12562,9 +12584,11 @@ def smart_opportunity_selection():
             _sync_cross_event(cross_event, item)
             # Enrichment adds Smart Money, Momentum and institutional trend after
             # the bridge analysis; re-evaluate the cross location with that evidence.
+            _features_adx = item.get("adx")
+            if _features_adx is None:
+                _features_adx = cross_event.get("adx")
             _features = _cross_location_features(
-                {**item, "adx": item.get("adx") or (cross_event.get("adx"))},
-                cross_event, side,
+                {**item, "adx": _features_adx}, cross_event, side,
             )
             _smart = item.get("smart_money") if isinstance(item.get("smart_money"), dict) else {}
             _momentum = item.get("momentum") if isinstance(item.get("momentum"), dict) else {}
