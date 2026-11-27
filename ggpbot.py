@@ -12390,12 +12390,20 @@ def smart_opportunity_selection():
             market_intelligence["entry_location_status"] = str(item.get("entry_location_status") or "UNKNOWN")
             market_intelligence["entry_location_checks"] = list(item.get("entry_location_checks") or [])
 
+            cross_authorization = item.get("cross_entry_authorization")
+            cross_authorization = cross_authorization if isinstance(cross_authorization, dict) else {}
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "decision_state": item.get("decision_state"),
-                "cross_timestamp": item.get("cross_timestamp") or item.get("crossover_ts"),
+                # The bridge's immediate-cross result exposes origin_timestamp;
+                # carry it into the final execution boundary instead of silently
+                # dropping the cross identity between Watchlist and execute_entry.
+                "cross_timestamp": (
+                    item.get("cross_timestamp") or item.get("crossover_ts")
+                    or item.get("origin_timestamp") or cross_authorization.get("cross_timestamp")
+                ),
+                "event_id": item.get("event_id") or cross_authorization.get("event_id"),
                 "rejection_reason": item.get("rejection_reason"),
-                "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
                 "atr_comparison_stop": float(atr_comparison_stop),
