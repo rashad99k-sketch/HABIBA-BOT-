@@ -10945,15 +10945,19 @@ def update_institutional_flow_scanner():
         log_execution(f"[SCANNER] Error updating institutional flow: {e}", "ERROR")
 
 # ========== LIVE INSTITUTIONAL UPDATER THREAD (PAUSED DURING TRADE) ==========
-def live_institutional_updater():
-    while True:
+def live_institutional_updater(stop_event=None):
+    """Refresh institutional flow until an optional orderly-stop event is set."""
+    while stop_event is None or not stop_event.is_set():
         try:
             watchdog = globals().get("NAISO_WATCHDOG")
             if watchdog is not None:
                 watchdog.beat("institutional_updater", paused=bool(STATE.get("open")))
             # Do not run during open trade to avoid duplicate API calls and thread contention
             if STATE.get("open"):
-                time.sleep(5)
+                if stop_event is None:
+                    time.sleep(5)
+                else:
+                    stop_event.wait(5)
                 continue
             symbol = DEFAULT_SYMBOL
             df = get_ohlcv_safe(symbol, 100)
@@ -10981,7 +10985,10 @@ def live_institutional_updater():
                 update_institutional_flow_scanner()
         except Exception as e:
             log_execution(f"[LIVE_UPDATER] Error: {e}", "ERROR")
-        time.sleep(5)
+        if stop_event is None:
+            time.sleep(5)
+        else:
+            stop_event.wait(5)
 
 # ========== MAIN LOOP ==========
 MEMORY = {
@@ -11137,8 +11144,15 @@ def sync_all_states():
         PERF["total_pnl_usdt"] = real_pnl
         PERF["total_pnl_pct"] = real_pnl_pct / 100
 
-def main_loop_sniper():
+def main_loop_sniper(stop_event=None):
+    """Run the production loop; an optional event enables orderly test shutdown."""
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, RECOVERY_BLOCK_ENTRIES
+    def _wait(seconds):
+        if stop_event is None:
+            time.sleep(seconds)
+        else:
+            stop_event.wait(seconds)
+
     last_scan = 0
     last_candidate_scan = 0
     last_flow_update = 0
@@ -11156,14 +11170,15 @@ def main_loop_sniper():
         log_execution("[SCANNER_1] Initial bounded global discovery dispatched", "INFO")
     else:
         log_execution("[SCANNER_1] Initial discovery dispatch refused; next due unchanged", "WARN")
+    updater_thread = None
     try:
-        updater_thread = threading.Thread(target=live_institutional_updater, daemon=True,
-                                          name="live_institutional_updater")
+        updater_thread = threading.Thread(target=live_institutional_updater, args=(stop_event,),
+                                          daemon=True, name="live_institutional_updater")
         updater_thread.start()
     except Exception as exc:
         log_execution(f"[THREAD_START] live_institutional_updater failed: {type(exc).__name__}: {exc}",
                       "ERROR")
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             now = time.time()
             _main_loop_progress("iteration_start",
@@ -11176,7 +11191,7 @@ def main_loop_sniper():
                 # Keep the normal bounded TTL/resource cleanup alive while entry scanning is paused.
                 # Do not force full GC on every one-second cooldown poll.
                 hourly_cleanup()
-                time.sleep(1)
+                _wait(1)
                 continue
 
             if now - last_flow_update > 60:
@@ -11191,11 +11206,11 @@ def main_loop_sniper():
                     continue
             if TRADE_STATE["in_position"] or STATE["open"]:
                 if not _main_loop_manage_open_position():
-                    time.sleep(BASE_SLEEP)
+                    _wait(BASE_SLEEP)
                     continue
             else:
                 if INSUFFICIENT_MARGIN_COOLDOWN_UNTIL and time.time() < INSUFFICIENT_MARGIN_COOLDOWN_UNTIL:
-                    time.sleep(1)
+                    _wait(1)
                     continue
                 if now - last_scan >= GLOBAL_SCAN_INTERVAL:
                     if dispatch_scanner_task("global_discovery", _run_global_discovery_scanner_with_heartbeat):
@@ -11216,9 +11231,9 @@ def main_loop_sniper():
                     _main_loop_progress("sniper_scan_start")
                     _run_sniper_scan_if_due()
                     _main_loop_progress("sniper_scan_complete")
-                    time.sleep(1)
+                    _wait(1)
                 else:
-                    time.sleep(1)
+                    _wait(1)
                 continue
             if STATE["open"] and STATE.get("current_symbol"):
                 sym = STATE["current_symbol"]
@@ -11239,10 +11254,15 @@ def main_loop_sniper():
             _main_loop_progress("cleanup")
             hourly_cleanup()
             _main_loop_progress("iteration_complete")
-            time.sleep(BASE_SLEEP)
+            _wait(BASE_SLEEP)
         except Exception as e:
             log_execution(f"Main loop error: {traceback.format_exc()}", "ERROR")
-            time.sleep(BASE_SLEEP)
+            _wait(BASE_SLEEP)
+
+    if stop_event is not None:
+        stop_event.set()
+        if updater_thread is not None:
+            updater_thread.join(timeout=6.0)
 
 main_loop = main_loop_sniper
 
@@ -11937,7 +11957,11 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     rows = [x for x in rows if x.get("symbol") != symbol_key]
                     rows.append(proximity_item)
                     rows.sort(key=lambda x: (float(x.get("score", 0) or 0), float(x.get("updated_at", 0) or 0)), reverse=True)
-                    MEMORY["ema9_vwap_proximity_scanner"] = rows[:30]
+                    # Preserve more recent observations and keep confirmed fresh crosses
+                    # ahead of proximity-only rows so they can enter the unified Watchlist.
+                    rows.sort(key=lambda x: (bool(x.get("cross_fresh")), float(x.get("score", 0) or 0),
+                                             float(x.get("updated_at", 0) or 0)), reverse=True)
+                    MEMORY["ema9_vwap_proximity_scanner"] = rows[:80]
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
                 icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
@@ -12240,18 +12264,23 @@ def smart_opportunity_selection():
                 for zone in location_candidates
             ]
             actionable_locations = [check for check in location_checks if check.get("valid")]
+            setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
+            cross_entry = setup == "EMA9_VWAP_CROSS"
+            item["entry_location_status"] = "VALID" if actionable_locations else "LATE_OR_UNZONED_ENTRY"
+            item["entry_location_checks"] = location_checks
             _record_entry_path_diag(
-                exchange_sym, "LOCATION_GATE", side=side,
-                decision_state="PASSED" if actionable_locations else "REJECTED",
-                rejection_reason=None if actionable_locations else "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE",
-                cross_timestamp=item.get("crossover_ts"),
+                exchange_sym, "LOCATION_DIAGNOSTICS", side=side,
+                decision_state="PASSED" if actionable_locations else ("OBSERVED_NOT_VETOED" if cross_entry else "REJECTED"),
+                rejection_reason=None if actionable_locations or cross_entry else "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE",
+                cross_timestamp=item.get("cross_timestamp") or item.get("crossover_ts"),
                 details={"candidate_zone_count": len(location_candidates),
-                         "valid_zone_count": len(actionable_locations),
-                         "checks": location_checks,
-                         "decision_state": item.get("decision_state"),
+                         "valid_zone_count": len(actionable_locations), "checks": location_checks,
+                         "cross_entry": cross_entry, "decision_state": item.get("decision_state"),
                          "event_id": item.get("event_id")},
-                logger=lambda message: log_execution(message, "INFO" if actionable_locations else "WARN"))
-            if not actionable_locations:
+                logger=lambda message: log_execution(message, "INFO" if actionable_locations or cross_entry else "WARN"))
+            # Cross-entry location quality is recorded for management after fill;
+            # it does not delay or veto a valid closed-candle cross.
+            if not actionable_locations and not cross_entry:
                 item["decision_state"] = "NO_CHASE"
                 item["rejection_reason"] = "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE"
                 log_execution(
@@ -12260,8 +12289,7 @@ def smart_opportunity_selection():
                 )
                 continue
 
-            setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
-            if not ("REVERSAL" in setup or "CONTINUATION" in setup):
+            if not ("REVERSAL" in setup or "CONTINUATION" in setup or cross_entry):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "unsupported_setup_type"
                 continue
@@ -12279,12 +12307,14 @@ def smart_opportunity_selection():
                 item["rejection_reason"] = "profit_targets_invalid"
                 continue
             evidence = list(item.get("evidence") or [])
-            market_intelligence = item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {}
+            market_intelligence = dict(item.get("market_intelligence") if isinstance(item.get("market_intelligence"), dict) else {})
+            market_intelligence["entry_location_status"] = str(item.get("entry_location_status") or "UNKNOWN")
+            market_intelligence["entry_location_checks"] = list(item.get("entry_location_checks") or [])
 
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "decision_state": item.get("decision_state"),
-                "cross_timestamp": item.get("crossover_ts"),
+                "cross_timestamp": item.get("cross_timestamp") or item.get("crossover_ts"),
                 "rejection_reason": item.get("rejection_reason"),
                 "event_id": item.get("event_id"),
                 "evidence": evidence,
@@ -12293,6 +12323,8 @@ def smart_opportunity_selection():
                 "entry_behavior": str(item.get("entry_behavior") or market_intelligence.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_zone_low": safe_float(item.get("entry_zone_low", market_intelligence.get("reference_low")), 0.0),
                 "entry_zone_high": safe_float(item.get("entry_zone_high", market_intelligence.get("reference_high")), 0.0),
+                "entry_location_status": str(item.get("entry_location_status") or "UNKNOWN"),
+                "entry_location_checks": list(item.get("entry_location_checks") or []),
                 "support_resistance": dict(item.get("support_resistance") or {"status": "UNKNOWN", "supports": [], "resistances": []}),
                 "order_block": dict(item.get("order_block") or {}),
                 "fvg": dict(item.get("fvg") or {}),
@@ -14083,7 +14115,8 @@ LiveTradeManager.manage_live_trade = _manage_live_trade_with_journal
 
 # Start-up recovery must complete before Scanner can authorize a new order.
 _original_main_loop_sniper = main_loop_sniper
-def main_loop_sniper():
+def main_loop_sniper(stop_event=None):
+    """Run startup recovery, then the supervisor; optional event is for orderly shutdown."""
     try:
         if not PAPER_MODE:
             try:
@@ -14104,7 +14137,7 @@ def main_loop_sniper():
         log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
     _main_loop_progress("startup_recovery_complete",
                         recovery_hold=bool(STATE.get("recovery_hold")))
-    return _original_main_loop_sniper()
+    return _original_main_loop_sniper(stop_event=stop_event)
 
 
 # safe_main_loop resolves this alias dynamically; point it at the recovery wrapper.

@@ -147,3 +147,79 @@ def test_decision_serializer_flattens_tuple_evidence():
     assert result["evidence"] == ["sweep", "reclaim", "closed_mss"]
     assert result["rejection_reasons"] == ["trigger_pending"]
     assert all(isinstance(value, str) for value in result["evidence"] + result["rejection_reasons"])
+
+
+
+def test_fresh_ema9_vwap_cross_authorizes_immediate_entry_without_retest(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    from types import SimpleNamespace
+
+    df = frame()
+    monkeypatch.setattr(bridge, "validate_dual_ema_vwap_entry_gate", lambda *a, **k: {
+        "ready": True, "signal_candle_id": "BUY:1700071100000",
+        "ema9_cross_timestamp": 1700071100000, "ema9_cross": "BULLISH",
+    })
+    monkeypatch.setattr(bridge, "_adx", lambda _df: 22.0)
+    monkeypatch.setattr(bridge, "_atr", lambda _df: 1.0)
+    result = bridge._cross_entry_authorization(
+        "BTC/USDT:USDT", "BUY", df, {}, SimpleNamespace(structural_stop=None),
+        now_ms=1700072000000,
+    )
+    assert result is not None
+    assert result["decision_state"] == "ENTRY_READY"
+    assert result["decision_setup_type"] == "EMA9_VWAP_CROSS"
+    assert result["structural_stop"] < float(df.close.iloc[-1])
+    assert result["event_id"].endswith("BUY:1700071100000")
+    assert "post_entry_management_owns_retest_pullback_and_liquidity_decisions" in result["evidence"]
+
+
+def test_ema9_vwap_cross_does_not_authorize_when_adx_below_18(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    from types import SimpleNamespace
+
+    df = frame()
+    monkeypatch.setattr(bridge, "validate_dual_ema_vwap_entry_gate", lambda *a, **k: {
+        "ready": True, "signal_candle_id": "BUY:1700071100000",
+        "ema9_cross_timestamp": 1700071100000, "ema9_cross": "BULLISH",
+    })
+    monkeypatch.setattr(bridge, "_adx", lambda _df: 17.99)
+    monkeypatch.setattr(bridge, "_atr", lambda _df: 1.0)
+    assert bridge._cross_entry_authorization(
+        "BTC/USDT:USDT", "BUY", df, {}, SimpleNamespace(structural_stop=None),
+        now_ms=1700072000000,
+    ) is None
+
+
+def test_ema9_vwap_cross_does_not_authorize_without_fresh_cross(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    from types import SimpleNamespace
+
+    df = frame()
+    monkeypatch.setattr(bridge, "validate_dual_ema_vwap_entry_gate", lambda *a, **k: {
+        "ready": False, "reason": "missing_fresh_directional_ema9_vwap_cross",
+    })
+    monkeypatch.setattr(bridge, "_adx", lambda _df: 30.0)
+    assert bridge._cross_entry_authorization(
+        "BTC/USDT:USDT", "BUY", df, {}, SimpleNamespace(structural_stop=None),
+        now_ms=1700072000000,
+    ) is None
+
+
+
+def test_proximity_scanner_crosses_are_merged_into_unified_watchlist_candidates():
+    merged = merge_candidates({
+        "ema9_vwap_proximity_scanner": [
+            {"symbol": "SOL", "exchange_symbol": "SOL/USDT:USDT",
+             "cross_ema9": "BULLISH", "cross_fresh": True, "score": 91},
+            {"symbol": "XRP", "exchange_symbol": "XRP/USDT:USDT",
+             "cross_ema9": "BEARISH", "cross_fresh": True, "score": 88},
+            {"symbol": "OLD", "exchange_symbol": "OLD/USDT:USDT",
+             "cross_ema9": "BULLISH", "cross_fresh": False, "score": 99},
+            {"symbol": "NEAR", "exchange_symbol": "NEAR/USDT:USDT",
+             "cross_ema9": None, "cross_fresh": True, "score": 98},
+        ],
+    })
+    assert set(merged) == {"SOL", "XRP"}
+    assert merged["SOL"]["sides"] == ["BUY"]
+    assert merged["XRP"]["sides"] == ["SELL"]
+    assert "ema9_vwap_proximity_scanner" in merged["SOL"]["sources"]
