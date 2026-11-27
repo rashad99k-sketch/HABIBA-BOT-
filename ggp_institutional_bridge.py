@@ -665,6 +665,24 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _cross_rejection = ("" if _cross_approved else
                         "cross_location_" + str(_cross_result.get("quality", "UNRATED")).lower())
     _cross_dict = cross_event if isinstance(cross_event, dict) else {}
+    _lifecycle_status = (CrossLifecycleState.INSTITUTIONAL_APPROVED.value if _cross_approved
+                         else CrossLifecycleState.INSTITUTIONAL_REJECTED.value)
+    _lifecycle_rejection = _cross_rejection or None
+    # Keep the supplied cross event itself in sync with the analysis row. The
+    # production caller also persists this into MEMORY["cross_events"] so the
+    # final readiness gate cannot inspect a stale CROSS_DETECTED object.
+    if isinstance(cross_event, dict):
+        cross_event.update({
+            "cross_event_id": _cross_dict.get("cross_event_id"),
+            "cross_status": _cross_dict.get("cross_status", "NONE"),
+            "cross_quality": _cross_result.get("quality"),
+            "cross_location": _cross_result,
+            "cross_location_approved": bool(_cross_approved),
+            "institutional_analysis_status": _lifecycle_status,
+            "final_rejection_reason": _lifecycle_rejection,
+            "last_analyzed_ms": time.time(),
+            "adx": float(_adx_value) if np.isfinite(_adx_value) else _cross_dict.get("adx"),
+        })
     return {
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
@@ -696,11 +714,8 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "cross_quality": _cross_result.get("quality"),
         "cross_location": _cross_result,
         "cross_location_approved": _cross_approved,
-        "institutional_analysis_status": (
-            CrossLifecycleState.INSTITUTIONAL_APPROVED.value if _cross_approved
-            else CrossLifecycleState.INSTITUTIONAL_REJECTED.value
-        ),
-        "final_rejection_reason": _cross_rejection or None,
+        "institutional_analysis_status": _lifecycle_status,
+        "final_rejection_reason": _lifecycle_rejection,
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
         "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
@@ -727,6 +742,41 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     }
 
 
+def _select_cross_event(cross_events: Optional[Any], side: str,
+                        preferred_event_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Pick the exact cross event for a side, otherwise the newest confirmed one."""
+    if isinstance(cross_events, dict) and "cross_direction" in cross_events:
+        candidates: List[Any] = [cross_events]
+    elif isinstance(cross_events, dict):
+        candidates = list(cross_events.values())
+    elif isinstance(cross_events, (list, tuple)):
+        candidates = list(cross_events)
+    else:
+        candidates = []
+    wanted_side = str(side or "").upper()
+    matches = [event for event in candidates
+               if isinstance(event, dict)
+               and str(event.get("cross_direction") or "").upper() == wanted_side]
+    preferred = str(preferred_event_id or "")
+    if preferred:
+        exact = next((event for event in matches
+                      if str(event.get("cross_event_id") or "") == preferred
+                      and not event.get("cross_event_id_consumed")), None)
+        if exact is not None:
+            return exact
+    confirmed = [event for event in matches
+                 if str(event.get("cross_status") or "").upper() == "CONFIRMED"]
+    confirmed.sort(key=lambda event: (
+        int(event.get("candle_timestamp") or 0),
+        int(event.get("last_seen_ms") or 0),
+        int(event.get("first_seen_ms") or 0),
+    ), reverse=True)
+    for event in confirmed:
+        if not event.get("cross_event_id_consumed"):
+            return event
+    return confirmed[0] if confirmed else next((event for event in matches), None)
+
+
 def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] = None,
                         side_hints: Optional[List[str]] = None,
                         cross_events: Optional[Any] = None,
@@ -734,18 +784,8 @@ def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] 
     # Always test both hypotheses. RF/Scanner direction is a ranking hint only.
     hints = {str(v).upper() for v in (side_hints or []) if str(v).upper() in {"BUY", "SELL"}}
     def _event_for(side: str) -> Optional[Dict[str, Any]]:
-        if isinstance(cross_events, dict) and "cross_direction" in cross_events:
-            candidates = [cross_events]
-        elif isinstance(cross_events, dict):
-            candidates = list(cross_events.values())
-        elif isinstance(cross_events, (list, tuple)):
-            candidates = list(cross_events)
-        else:
-            candidates = []
-        for event in candidates:
-            if isinstance(event, dict) and str(event.get("cross_direction") or "").upper() == side:
-                return event
-        return None
+        preferred = (cross_context or {}).get("cross_event_id") if isinstance(cross_context, dict) else None
+        return _select_cross_event(cross_events, side, preferred)
     if cross_events is None and cross_context is None:
         results = [analyze_symbol(symbol, side, frame, now_ms=now_ms) for side in ("BUY", "SELL")]
     else:
@@ -870,12 +910,13 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         else:
             key_events = [event for event in cross_events.values()
                           if isinstance(event, dict)
-                          and (str(event.get("symbol") or "").upper() == str(key).upper()
+                          and (canonical_symbol(event.get("symbol")) == canonical_symbol(key)
+                               or str(event.get("symbol") or "").upper() == str(candidate.get("exchange_symbol") or "").upper()
                                or str(event.get("exchange_symbol") or "").upper() == str(candidate.get("exchange_symbol") or "").upper())]
             if key_events:
+                preferred = str(candidate.get("cross_event_id") or "")
                 results = [analyze_symbol(candidate["exchange_symbol"], side, frame,
-                                          cross_event=next((event for event in key_events
-                                                            if str(event.get("cross_direction") or "").upper() == side), None))
+                                          cross_event=_select_cross_event(key_events, side, preferred))
                            for side in ("BUY", "SELL")]
             else:
                 results = [analyze_symbol(candidate["exchange_symbol"], side, frame)

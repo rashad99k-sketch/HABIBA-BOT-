@@ -12209,6 +12209,78 @@ def smart_opportunity_selection():
     ready = [(sym, item) for sym, item in watchlist.items()
              if isinstance(item, dict) and item.get("decision_state") == "ENTRY_READY"]
     cross_event_map = MEMORY.get("cross_events", {}) if isinstance(MEMORY.get("cross_events"), dict) else {}
+
+    def _cross_event_consumed(event):
+        if not isinstance(event, dict) or event.get("cross_event_id_consumed"):
+            return True
+        event_id = str(event.get("cross_event_id") or "").strip()
+        if not event_id:
+            return False
+        journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        if journal is None:
+            return False
+        try:
+            return bool(journal.is_event_consumed(event_id))
+        except Exception:
+            return True
+
+    def _select_cross_event_for_item(sym, exchange_sym_value, side, preferred_id):
+        canonical = roro_canonical_symbol(sym)
+        events = [
+            event for event in cross_event_map.values()
+            if isinstance(event, dict)
+            and (roro_canonical_symbol(event.get("symbol")) == canonical
+                 or str(event.get("symbol") or "").upper() == str(exchange_sym_value).upper()
+                 or str(event.get("exchange_symbol") or "").upper() == str(exchange_sym_value).upper())
+            and str(event.get("cross_direction") or "").upper() == side
+        ]
+        preferred_id = str(preferred_id or "")
+        if preferred_id:
+            exact = next((event for event in events
+                          if str(event.get("cross_event_id") or "") == preferred_id), None)
+            if exact is not None and not _cross_event_consumed(exact):
+                return exact
+        confirmed = [
+            event for event in events
+            if str(event.get("cross_status") or "").upper() == "CONFIRMED"
+            and str(event.get("final_rejection_reason") or "") not in {
+                "duplicate_cross_event_id", "cross_signal_expired_without_reentry"
+            }
+        ]
+        confirmed.sort(key=lambda event: (
+            int(event.get("candle_timestamp") or 0),
+            int(event.get("last_seen_ms") or 0),
+            int(event.get("first_seen_ms") or 0),
+        ), reverse=True)
+        # Never let an older, already-consumed cross block a newer valid cross.
+        return next((event for event in confirmed if not _cross_event_consumed(event)), None)
+
+    def _apply_cross_transition(target, state, reason):
+        updated = _cross_transition_state(target, state, reason)
+        target.clear()
+        target.update(updated)
+        return target
+
+    def _sync_cross_event(event, row):
+        if not isinstance(event, dict) or not isinstance(row, dict):
+            return
+        event.update({
+            "cross_event_id": event.get("cross_event_id") or row.get("cross_event_id"),
+            "cross_status": event.get("cross_status") or row.get("cross_status"),
+            "cross_quality": row.get("cross_quality"),
+            "cross_location": row.get("cross_location"),
+            "cross_location_approved": bool(row.get("cross_location_approved", False)),
+            "institutional_analysis_status": row.get("institutional_analysis_status")
+            or CrossLifecycleState.CROSS_DETECTED.value,
+            "final_rejection_reason": row.get("final_rejection_reason"),
+            "adx": row.get("adx") or event.get("adx"),
+            "last_analyzed_ms": time.time(),
+        })
+        key = str(event.get("cross_event_id") or event.get("candidate_id") or "")
+        if key:
+            MEMORY.setdefault("cross_events", {})[key] = event
+            cross_event_map[key] = event
+
     # One Event ID is one cross. Retained APPROACHING candidates stay in the
     # watchlist, but only CONFIRMED + institutionally approved crosses can enter.
     ready = [(sym, item) for sym, item in ready
@@ -12267,14 +12339,40 @@ def smart_opportunity_selection():
     # Cross quality, proximity, OB/FVG, liquidity, structure, ADX, momentum,
     # flow, target space, R:R, freshness and Event-ID uniqueness lead the ranking;
     # the inherited location rank remains the deterministic tie-breaker.
+    original_items = {id(item): (canonical, item) for canonical, item in ready}
     ranked_rows = []
     for canonical, item in ready:
         row = dict(item)
         row["_canonical"] = canonical
+        row["_source_id"] = id(item)
         row["_base_rank"] = _location_first_rank((canonical, item))
         ranked_rows.append(row)
     ordered_rows = _rank_cross_candidates(ranked_rows)
-    ready = [(str(row.get("_canonical")), row) for row in ordered_rows]
+    ready = []
+    for row in ordered_rows:
+        source = original_items.get(int(row.get("_source_id") or 0))
+        if source is None:
+            continue
+        canonical, item = source
+        # Mutate the original Watchlist entry so rejected / WAITING / ranked
+        # state is visible to rotation, dashboard and the next scanner cycle.
+        item.update({key: value for key, value in row.items()
+                     if not key.startswith("_")})
+        ready.append((canonical, item))
+    # Event-ID uniqueness is enforced before any re-analysis or entry call.
+    seen_event_ids = set()
+    unique_ready = []
+    for canonical, item in ready:
+        event_id = str(item.get("cross_event_id") or "").strip()
+        if event_id and event_id in seen_event_ids:
+            item["decision_state"] = "REJECTED"
+            item["rejection_reason"] = "duplicate_cross_event_id"
+            item["institutional_analysis_status"] = CrossLifecycleState.INSTITUTIONAL_REJECTED.value
+            continue
+        if event_id:
+            seen_event_ids.add(event_id)
+        unique_ready.append((canonical, item))
+    ready = unique_ready
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
@@ -12325,9 +12423,9 @@ def smart_opportunity_selection():
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "no_unambiguous_authorized_side"
                 continue
-            cross_event = next((event for event in _cross_events_for_symbol
-                                if str(event.get("cross_direction") or "").upper() == side
-                                and str(event.get("cross_status") or "").upper() == "CONFIRMED"), None)
+            cross_event = _select_cross_event_for_item(
+                canonical, exchange_sym, side, item.get("cross_event_id")
+            )
             if not cross_event:
                 item["decision_state"] = "WAITING_FOR_CONFIRMATION"
                 item["rejection_reason"] = "cross_not_confirmed_on_closed_candle"
@@ -12339,8 +12437,10 @@ def smart_opportunity_selection():
             item["cross_event"] = cross_event
             item["cross_event_id"] = cross_event.get("cross_event_id")
             item["cross_status"] = cross_event.get("cross_status")
-            item = _cross_transition_state(item, CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
-                                           "cross_event_selected_for_location_analysis")
+            _sync_cross_event(cross_event, item)
+            _apply_cross_transition(item, CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
+                                    "cross_event_selected_for_location_analysis")
+            _sync_cross_event(cross_event, item)
             # Enrichment adds Smart Money, Momentum and institutional trend after
             # the bridge analysis; re-evaluate the cross location with that evidence.
             _features = _cross_location_features(
@@ -12369,31 +12469,40 @@ def smart_opportunity_selection():
             item["cross_quality"] = _location.get("quality")
             item["cross_location_approved"] = bool(_location.get("approved"))
             if _location.get("approved"):
-                item = _cross_transition_state(
+                _apply_cross_transition(
                     item, CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
                     f"cross_location_quality:{_location.get('quality')}",
                 )
             else:
-                item = _cross_transition_state(
+                _apply_cross_transition(
                     item, CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
                     "cross_location_" + str(_location.get("quality")).lower(),
                 )
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = item["final_rejection_reason"]
+                _sync_cross_event(cross_event, item)
                 log_execution(
                     f"[CROSS_LOCATION] {exchange_sym} {side} rejected "
                     f"quality={_location.get('quality')} reasons={_location.get('rejection_reasons')}",
                     "INFO",
                 )
                 continue
+            _sync_cross_event(cross_event, item)
             event_id = str(item.get("event_id") or "")
             if not event_id:
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "missing_event_id"
                 continue
-            if INSTITUTIONAL_TRADE_JOURNAL and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(event_id):
+            cross_event_id = str(item.get("cross_event_id") or "").strip()
+            duplicate_ids = [value for value in (event_id, cross_event_id)
+                             if value and INSTITUTIONAL_TRADE_JOURNAL
+                             and INSTITUTIONAL_TRADE_JOURNAL.is_event_consumed(value)]
+            if duplicate_ids:
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "duplicate_event_persisted"
+                item["institutional_analysis_status"] = CrossLifecycleState.INSTITUTIONAL_REJECTED.value
+                item["final_rejection_reason"] = "duplicate_event_persisted"
+                _sync_cross_event(cross_event, item)
                 continue
             atr_value = compute_atr(closed_df).iloc[-1]
             if not np.isfinite(atr_value) or atr_value <= 0:
@@ -12472,19 +12581,25 @@ def smart_opportunity_selection():
             # Same closed-candle ADX source used by execute_entry; 18.0 is hard.
             _adx_series = compute_adx(closed_df)
             _cross_adx_value = (_adx_series.iloc[-1] if _adx_series is not None and len(_adx_series) else None)
+            _cross_consumed = _cross_event_consumed(cross_event)
+            # Readiness must inspect the ENRICHED candidate. The raw cross-event
+            # record is still CROSS_DETECTED at this point; checking it would
+            # reject every cross before execute_entry() is reached.
             _cross_ready, _cross_ready_reason = _cross_execution_readiness(
-                cross_event, event_consumed=False, adx=_cross_adx_value
+                item, event_consumed=_cross_consumed, adx=_cross_adx_value
             )
             if not _cross_ready:
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = _cross_ready_reason
-                item = _cross_transition_state(item, CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
-                                               _cross_ready_reason)
+                _apply_cross_transition(item, CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
+                                        _cross_ready_reason)
+                _sync_cross_event(cross_event, item)
                 log_execution(f"[CROSS_GATE] {exchange_sym} {side} rejected: {_cross_ready_reason}", "INFO")
                 continue
-            item = _cross_transition_state(
+            _apply_cross_transition(
                 item, CrossLifecycleState.EXECUTION_READY.value, _cross_ready_reason
             )
+            _sync_cross_event(cross_event, item)
             log_execution(
                 f"[CROSS_LIFECYCLE] selected {exchange_sym} {side} event={cross_event.get('cross_event_id')} "
                 f"quality={item.get('cross_quality')} ADX={_cross_adx_value!r} rank={item.get('cross_rank')} "
@@ -12542,16 +12657,19 @@ def smart_opportunity_selection():
                                    classification=sizing_class)
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
-                item = _cross_transition_state(
+                _apply_cross_transition(
                     item,
                     CrossLifecycleState.ENTRY_SUBMITTED.value
                     if ok else CrossLifecycleState.ENTRY_REJECTED.value,
                     "execute_entry_result:" + str(bool(ok)),
                 )
+                _sync_cross_event(cross_event, item)
             if ok:
-                item = _cross_transition_state(
+                _apply_cross_transition(
                     item, CrossLifecycleState.ENTRY_FILLED.value, "verified_fill_and_position"
                 )
+                cross_event["cross_event_id_consumed"] = True
+                _sync_cross_event(cross_event, item)
                 item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
                 item["entry_timestamp"] = time.time()
                 _persist_trade_journal_start(setup, item)
@@ -14257,11 +14375,16 @@ def execute_entry(*args, **kwargs):
         event_id = str(gate.get("durable_event_id") or "").strip()
         cross_event_id = str(gate.get("cross_event_id") or "").strip()
         if cross_event_id:
-            _order = STATE.get("order") if isinstance(STATE.get("order"), dict) else {}
+            order_id = str(STATE.get("entry_exchange_order_id") or gate.get("exchange_order_id") or "")
+            filled_qty = STATE.get("actual_filled_qty") or STATE.get("qty") or STATE.get("initial_qty")
+            position_verified = bool(STATE.get("open")) and str(
+                STATE.get("entry_execution_state") or ""
+            ).upper() == "FILLED"
+            protection_verified = bool(STATE.get("native_sl_verified"))
             log_execution(
                 f"[CROSS_LIFECYCLE] entry_result accepted={bool(result)} event={cross_event_id} "
-                f"order_sent={bool(_order.get('id'))} filled_qty={_order.get('filled')} "
-                f"position_verified={bool(STATE.get('open'))} protection_verified={bool(_order.get('native_sl_verified'))}",
+                f"order_sent={bool(order_id)} order_id={order_id or None} filled_qty={filled_qty} "
+                f"position_verified={position_verified} protection_verified={protection_verified}",
                 "INFO",
             )
         journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")

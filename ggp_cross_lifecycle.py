@@ -215,6 +215,14 @@ def transition_state(candidate: Dict[str, Any], new_state: str,
     current = str(updated.get("institutional_analysis_status")
                   or CrossLifecycleState.CROSS_DETECTED.value)
     target = str(new_state)
+    prior_reason = str(updated.get("final_rejection_reason") or "")
+    # A duplicate or expired identity can never be re-approved by a later scan.
+    if (current == CrossLifecycleState.INSTITUTIONAL_REJECTED.value
+            and prior_reason in {"duplicate_cross_event_id",
+                                 "cross_signal_expired_without_reentry"}
+            and target != current):
+        updated["final_rejection_reason"] = prior_reason
+        return updated
     if target not in _ALLOWED_TRANSITIONS:
         updated["final_rejection_reason"] = f"invalid_lifecycle_transition:{current}->{target}"
         return updated
@@ -226,7 +234,12 @@ def transition_state(candidate: Dict[str, Any], new_state: str,
     history = list(updated.get("state_history") or [])
     history.append({"state": target, "reason": reason, "ts": time.time()})
     updated["state_history"] = history[-40:]
-    if target == CrossLifecycleState.INSTITUTIONAL_REJECTED.value and reason:
+    if target in {CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+                  CrossLifecycleState.EXECUTION_READY.value,
+                  CrossLifecycleState.ENTRY_SUBMITTED.value,
+                  CrossLifecycleState.ENTRY_FILLED.value}:
+        updated["final_rejection_reason"] = None
+    elif target == CrossLifecycleState.INSTITUTIONAL_REJECTED.value and reason:
         updated["final_rejection_reason"] = reason
     return updated
 
@@ -385,38 +398,42 @@ def build_location_features(context: Dict[str, Any],
     structure_ok = bool(structure.get("confirmed")) and (
         (buy and mss.startswith("BULLISH")) or (not buy and mss.startswith("BEARISH")))
     opposing_level = sr.get("resistances" if buy else "supports") if isinstance(sr, dict) else []
-    near_opposing = False
-    space_atr = finite(cross.get("cross_distance_atr"), 0.0) or 0.0
+    # Available price space is the distance to the NEAREST opposing boundary,
+    # never the EMA9/VWAP gap and never a farther structural level that happens
+    # to be large. For BUY the nearest resistance boundary is its low; for SELL
+    # the nearest support boundary is its high.
     atr = finite(ctx.get("atr") or indicators.get("atr"), None)
     price = finite(ctx.get("price"), None)
-    if isinstance(opposing_level, list) and atr and atr > 0 and price:
-        for zone in opposing_level:
-            if not isinstance(zone, dict):
-                continue
-            level = finite(zone.get("level") or zone.get("high") or zone.get("low"), None)
+    space_distances: List[float] = []
+    near_opposing = False
+    if atr and atr > 0 and price:
+        def _add_opposing_level(level_value: Any) -> None:
+            level = finite(level_value, None)
             if level is None:
-                continue
-            distance_atr = abs(level - price) / atr
-            space_atr = max(space_atr, distance_atr)
+                return
+            forward = (level - price) if buy else (price - level)
+            distance_atr = max(0.0, forward) / atr
+            space_distances.append(distance_atr)
             if distance_atr <= 0.5:
+                nonlocal near_opposing
                 near_opposing = True
-    # Previous swing highs/lows and opposite-side liquidity are the nearest
-    # structural targets; a cross immediately before them has no usable space.
-    opposing_levels = [structure.get("swing_high" if buy else "swing_low")]
-    if liq_direction and liq_direction != expected:
-        opposing_levels.append(liquidity.get("level"))
-    for level_value in opposing_levels:
-        level = finite(level_value, None)
-        if level is None or not atr or atr <= 0 or not price:
-            continue
-        distance_atr = abs(level - price) / atr
-        space_atr = max(space_atr, distance_atr)
-        if distance_atr <= 0.5:
-            near_opposing = True
-    if liquidity_confirmed and atr and atr > 0 and price:
-        level = finite(liquidity.get("level"), None)
-        if level is not None:
-            space_atr = max(space_atr, abs(level - price) / atr)
+
+        if isinstance(opposing_level, list):
+            boundary_keys = ("low", "level", "high") if buy else ("high", "level", "low")
+            for zone in opposing_level:
+                if not isinstance(zone, dict):
+                    continue
+                for key in boundary_keys:
+                    level = finite(zone.get(key), None)
+                    if level is not None:
+                        _add_opposing_level(level)
+                        break
+        # Previous swing highs/lows and opposite-side liquidity are structural
+        # boundaries; a cross immediately before them has no usable space.
+        _add_opposing_level(structure.get("swing_high" if buy else "swing_low"))
+        if liq_direction and liq_direction != expected:
+            _add_opposing_level(liquidity.get("level"))
+    space_atr = min(space_distances) if space_distances else 0.0
     smart_direction = str(smart.get("institutional_bias") or smart.get("smart_money_direction") or "").upper()
     momentum_direction = str(momentum.get("flow_bias") or momentum.get("momentum_direction") or "").upper()
     trend_direction = str(trend.get("state") or "").upper()
@@ -497,13 +514,15 @@ def rank_cross_candidates(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
             continue
         row = dict(item)
         event_id = str(row.get("cross_event_id") or "")
+        duplicate = bool(event_id and event_id in seen)
         if event_id:
-            if event_id in seen:
-                row["institutional_analysis_status"] = CrossLifecycleState.INSTITUTIONAL_REJECTED.value
-                row["final_rejection_reason"] = "duplicate_cross_event_id"
-                row["cross_rank"] = -1.0
             seen.add(event_id)
         row["cross_rank"] = cross_rank(row)
+        if duplicate:
+            row["institutional_analysis_status"] = CrossLifecycleState.INSTITUTIONAL_REJECTED.value
+            row["final_rejection_reason"] = "duplicate_cross_event_id"
+            row["cross_location_approved"] = False
+            row["cross_rank"] = -1.0
         rows.append(row)
     rows.sort(key=lambda row: (row.get("cross_rank", 0.0),
                                str(row.get("cross_event_id") or row.get("candidate_id") or "")),
@@ -521,6 +540,9 @@ def execution_readiness(candidate: Dict[str, Any], *, event_consumed: bool = Fal
         return False, "missing_cross_event_id"
     if event_consumed:
         return False, "cross_event_already_consumed"
+    rejected_reason = str(row.get("final_rejection_reason") or "")
+    if rejected_reason in {"duplicate_cross_event_id", "cross_signal_expired_without_reentry"}:
+        return False, rejected_reason
     adx_ok, adx_reason = adx_gate(adx if adx is not None else row.get("adx"))
     if not adx_ok:
         return False, adx_reason
