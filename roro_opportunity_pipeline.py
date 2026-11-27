@@ -147,18 +147,37 @@ def _session_vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def confirmed_swings(df: pd.DataFrame, left_right: int = 2) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
-    """Return pivots only after right-side candles have closed; no lookahead leak."""
+    """Return confirmed pivots with vectorized windows; right-side candles must exist.
+
+    The previous implementation repeatedly sliced pandas Series inside a Python
+    loop. Liquidity analysis invokes this for several historical prefixes per
+    symbol, multiplying that overhead on the foreground scan loop.
+    """
     highs: List[Tuple[int, float]] = []
     lows: List[Tuple[int, float]] = []
     n = int(left_right)
-    if len(df) < 2 * n + 1:
+    if n < 1 or len(df) < 2 * n + 1:
         return highs, lows
-    for i in range(n, len(df) - n):
-        h = float(df.high.iloc[i]); lo = float(df.low.iloc[i])
-        if h > float(df.high.iloc[i-n:i].max()) and h >= float(df.high.iloc[i+1:i+n+1].max()):
-            highs.append((int(df.timestamp.iloc[i]), h))
-        if lo < float(df.low.iloc[i-n:i].min()) and lo <= float(df.low.iloc[i+1:i+n+1].min()):
-            lows.append((int(df.timestamp.iloc[i]), lo))
+
+    high_values = pd.to_numeric(df["high"], errors="raise").to_numpy(dtype=float)
+    low_values = pd.to_numeric(df["low"], errors="raise").to_numpy(dtype=float)
+    timestamps = pd.to_numeric(df["timestamp"], errors="raise").to_numpy(dtype=np.int64)
+
+    high_windows = np.lib.stride_tricks.sliding_window_view(high_values, 2 * n + 1)
+    low_windows = np.lib.stride_tricks.sliding_window_view(low_values, 2 * n + 1)
+    high_centers = high_windows[:, n]
+    low_centers = low_windows[:, n]
+    high_mask = (
+        (high_centers > np.max(high_windows[:, :n], axis=1))
+        & (high_centers >= np.max(high_windows[:, n + 1:], axis=1))
+    )
+    low_mask = (
+        (low_centers < np.min(low_windows[:, :n], axis=1))
+        & (low_centers <= np.min(low_windows[:, n + 1:], axis=1))
+    )
+    indices = np.arange(n, len(df) - n)
+    highs = [(int(timestamps[i]), float(high_values[i])) for i in indices[high_mask]]
+    lows = [(int(timestamps[i]), float(low_values[i])) for i in indices[low_mask]]
     return highs, lows
 
 

@@ -73,6 +73,7 @@ from ggp_position_sizing import (
     validate_execution_stop,
     validate_trade_geometry,
 )
+from ggp_entry_authorization import validate_ema9_vwap_cross_authorization
 from bingx_execution import (TradeExecutionService, BingXPositionModeAdapter,
                               ExecutionState, PositionMode, build_position_order_params,
                               leverage_params)
@@ -6609,8 +6610,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     _record_entry_path_diag(symbol, "EXECUTE_ENTRY_ENTERED", side=side,
                              decision_state=institutional_entry_ctx.get("decision_state", "ENTRY_READY"),
                              cross_timestamp=_entry_cross_ts,
-                             details={"trade_id": trade_id, "entry_type": entry_type,
-                                      "trade_type": trade_type},
+                             details={
+                                 "trade_id": trade_id, "entry_type": entry_type,
+                                 "trade_type": trade_type,
+                                 "setup_type": institutional_entry_ctx.get("setup_type"),
+                                 "event_id": institutional_entry_ctx.get("event_id"),
+                                 "closed_candle_source": institutional_entry_ctx.get("closed_candle_source"),
+                             },
                              logger=lambda message: log_execution(message, "INFO"))
     # Final execution-boundary gate: no institutional, sniper, RF or legacy
     # setup can bypass the mandatory EMA9-to-session-VWAP closed-candle cross.
@@ -6720,6 +6726,84 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         )
         return False
     log_execution(f"[ADX_ENTRY_FILTER] PASSED {symbol} {side}: ADX={float(adx_val):.2f} >= 18.0", "INFO")
+    # Complete LIVE authorization before balance snapshots or position sizing.
+    if not PAPER_MODE and MODE_LIVE:
+        if institutional_entry_ctx:
+            setup = str(institutional_entry_ctx.get("setup_type", "")).upper()
+            evidence = [str(x).lower() for x in institutional_entry_ctx.get("evidence", [])]
+            authorization_reason = "unsupported_institutional_setup"
+            if setup == "EMA9_VWAP_CROSS":
+                valid, authorization_reason = validate_ema9_vwap_cross_authorization(
+                    side=side,
+                    setup_type=setup,
+                    decision_state=institutional_entry_ctx.get("decision_state"),
+                    event_id=institutional_entry_ctx.get("event_id"),
+                    evidence=evidence,
+                    adx=adx_val,
+                    gate=institutional_entry_ctx.get("dual_ema_vwap_gate") or {},
+                    candle_source=institutional_entry_ctx.get("closed_candle_source"),
+                    cross_timestamp=institutional_entry_ctx.get("cross_timestamp"),
+                )
+            elif setup in ("REVERSAL_ENGINE", "LIQUIDITY_SWEEP_REVERSAL"):
+                required = ("prior_liquidity_pool", "sweep", "reclaim", "closed_mss", "directional_trigger")
+                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
+                authorization_reason = "reversal_evidence_complete" if valid else "reversal_evidence_or_retest_missing"
+            elif setup == "FAILED_AUCTION_REVERSAL":
+                required = ("failed_auction", "outside_acceptance_failed", "reclaim", "closed_mss", "directional_trigger")
+                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
+                authorization_reason = "failed_auction_evidence_or_retest_missing"
+            elif setup in ("TREND_CONTINUATION_ENGINE", "TREND_CONTINUATION_RETEST"):
+                has_bos = any("bos" in ev for ev in evidence)
+                has_displacement = any("displacement" in ev for ev in evidence)
+                has_retest = any(token in ev for ev in evidence for token in ("retest:", "pullback:", "micro_pullback:"))
+                has_trigger = any("post_retest_trigger" in ev for ev in evidence)
+                valid = has_bos and has_displacement and has_retest and has_trigger
+                authorization_reason = "continuation_evidence_complete" if valid else "continuation_evidence_or_retest_missing"
+            else:
+                valid = False
+            if not valid:
+                _record_entry_path_diag(
+                    symbol, "FINAL_ENTRY_AUTHORIZATION", side=side,
+                    decision_state="REJECTED", rejection_reason=authorization_reason,
+                    cross_timestamp=_entry_cross_ts,
+                    details={"setup_type": setup,
+                             "event_id": institutional_entry_ctx.get("event_id"),
+                             "closed_candle_source": institutional_entry_ctx.get("closed_candle_source"),
+                             "adx": safe_float(adx_val, None)},
+                    logger=lambda message: log_execution(message, "ERROR"),
+                )
+                log_execution(
+                    f"[ENTRY] Institutional authorization incomplete for {setup}; "
+                    f"reason={authorization_reason}; LIVE blocked", "ERROR",
+                )
+                return False
+            _record_entry_path_diag(
+                symbol, "FINAL_ENTRY_AUTHORIZATION", side=side,
+                decision_state="AUTHORIZED", cross_timestamp=_entry_cross_ts,
+                details={"setup_type": setup,
+                         "event_id": institutional_entry_ctx.get("event_id"),
+                         "closed_candle_source": institutional_entry_ctx.get("closed_candle_source"),
+                         "authorization_reason": authorization_reason,
+                         "adx": safe_float(adx_val, None)},
+                logger=lambda message: log_execution(message, "INFO"),
+            )
+            log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f}", "INFO")
+        else:
+            # Legacy/manual entry path keeps its existing stricter safeguards.
+            if not (25 <= adx_val <= 38):
+                log_execution(f"[ENTRY] Legacy path ADX {adx_val:.1f} not in [25,38] – skipping", "WARN")
+                return False
+            if df is not None:
+                liquidity_ctx = detect_liquidity_context(df, lookback=10)
+                if side == "BUY" and liquidity_ctx != "sell_side_taken":
+                    log_execution(f"[ENTRY] Legacy BUY requires sell-side liquidity sweep, got {liquidity_ctx}", "WARN")
+                    return False
+                if side == "SELL" and liquidity_ctx != "buy_side_taken":
+                    log_execution(f"[ENTRY] Legacy SELL requires buy-side liquidity sweep, got {liquidity_ctx}", "WARN")
+                    return False
+            else:
+                log_execution("[ENTRY] No DF for legacy liquidity check, skipping", "WARN")
+                return False
     entry_spread_pct = safe_float(institutional_entry_ctx.get("spread_pct"), 0.0) or 0.0
     entry_liquidity_quality = str(institutional_entry_ctx.get("liquidity_quality") or "UNKNOWN")
     entry_orderbook_depth = safe_float(institutional_entry_ctx.get("orderbook_depth_usdt"), 0.0) or 0.0
@@ -6897,46 +6981,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     except Exception as sizing_exc:
         log_execution(f"[SIZING_REJECT] {symbol}: {type(sizing_exc).__name__}: {sizing_exc}", "ERROR")
         return False
-    if not PAPER_MODE and MODE_LIVE:
-        institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
-        if institutional_ctx:
-            setup = str(institutional_ctx.get("setup_type", "")).upper()
-            evidence = [str(x).lower() for x in institutional_ctx.get("evidence", [])]
-            if setup in ("REVERSAL_ENGINE", "LIQUIDITY_SWEEP_REVERSAL"):
-                required = ("prior_liquidity_pool", "sweep", "reclaim", "closed_mss", "directional_trigger")
-                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
-            elif setup == "FAILED_AUCTION_REVERSAL":
-                required = ("failed_auction", "outside_acceptance_failed", "reclaim", "closed_mss", "directional_trigger")
-                valid = all(any(token in ev for ev in evidence) for token in required) and any(ev.startswith("post_mss_retest:") for ev in evidence)
-            elif setup in ("TREND_CONTINUATION_ENGINE", "TREND_CONTINUATION_RETEST"):
-                has_bos = any("bos" in ev for ev in evidence)
-                has_displacement = any("displacement" in ev for ev in evidence)
-                has_retest = any(token in ev for ev in evidence for token in ("retest:", "pullback:", "micro_pullback:"))
-                has_trigger = any("post_retest_trigger" in ev for ev in evidence)
-                valid = has_bos and has_displacement and has_retest and has_trigger
-            else:
-                valid = False
-            if not valid:
-                log_execution(f"[ENTRY] Institutional authorization incomplete for {setup}; LIVE blocked", "ERROR")
-                return False
-            # ADX, EMA and VWAP remain contextual evidence. They are not universal entry gates.
-            log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} treated as context, not a hard cross gate", "INFO")
-        else:
-            # Legacy/manual entry path keeps its existing stricter safeguards.
-            if not (25 <= adx_val <= 38):
-                log_execution(f"[ENTRY] Legacy path ADX {adx_val:.1f} not in [25,38] – skipping", "WARN")
-                return False
-            if df is not None:
-                liquidity_ctx = detect_liquidity_context(df, lookback=10)
-                if side == "BUY" and liquidity_ctx != "sell_side_taken":
-                    log_execution(f"[ENTRY] Legacy BUY requires sell-side liquidity sweep, got {liquidity_ctx}", "WARN")
-                    return False
-                if side == "SELL" and liquidity_ctx != "buy_side_taken":
-                    log_execution(f"[ENTRY] Legacy SELL requires buy-side liquidity sweep, got {liquidity_ctx}", "WARN")
-                    return False
-            else:
-                log_execution("[ENTRY] No DF for legacy liquidity check, skipping", "WARN")
-                return False
+
 
     plus_di, minus_di, _, _ = get_di_components(df) if df is not None else (None, None, None, None)
     di_dominance = False
@@ -12370,12 +12415,20 @@ def smart_opportunity_selection():
             market_intelligence["entry_location_status"] = str(item.get("entry_location_status") or "UNKNOWN")
             market_intelligence["entry_location_checks"] = list(item.get("entry_location_checks") or [])
 
+            cross_authorization = item.get("cross_entry_authorization")
+            cross_authorization = cross_authorization if isinstance(cross_authorization, dict) else {}
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "decision_state": item.get("decision_state"),
-                "cross_timestamp": item.get("cross_timestamp") or item.get("crossover_ts"),
+                # The bridge's immediate-cross result exposes origin_timestamp;
+                # carry it into the final execution boundary instead of silently
+                # dropping the cross identity between Watchlist and execute_entry.
+                "cross_timestamp": (
+                    item.get("cross_timestamp") or item.get("crossover_ts")
+                    or item.get("origin_timestamp") or cross_authorization.get("cross_timestamp")
+                ),
+                "event_id": item.get("event_id") or cross_authorization.get("event_id"),
                 "rejection_reason": item.get("rejection_reason"),
-                "event_id": item.get("event_id"),
                 "evidence": evidence,
                 "structural_stop": float(sl),
                 "atr_comparison_stop": float(atr_comparison_stop),

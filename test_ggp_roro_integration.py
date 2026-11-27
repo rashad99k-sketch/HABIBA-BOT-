@@ -223,3 +223,57 @@ def test_proximity_scanner_crosses_are_merged_into_unified_watchlist_candidates(
     assert merged["SOL"]["sides"] == ["BUY"]
     assert merged["XRP"]["sides"] == ["SELL"]
     assert "ema9_vwap_proximity_scanner" in merged["SOL"]["sources"]
+
+
+def test_confirmed_swings_vectorized_matches_reference_for_ties_and_random_frames():
+    from roro_opportunity_pipeline import confirmed_swings
+
+    rng = np.random.default_rng(731)
+    for size in (5, 12, 80, 257):
+        high = rng.uniform(10.0, 20.0, size=size)
+        low = high - rng.uniform(0.1, 2.0, size=size)
+        if size > 12:
+            high[12] = high[11]
+            low[12] = low[11]
+        ts = np.arange(size, dtype=np.int64) * 900_000 + 1_700_000_000_000
+        df = pd.DataFrame({"timestamp": ts, "high": high, "low": low})
+        for width in (1, 2, 3):
+            expected_highs, expected_lows = [], []
+            for i in range(width, size - width):
+                h, lo = float(high[i]), float(low[i])
+                if h > float(np.max(high[i-width:i])) and h >= float(np.max(high[i+1:i+width+1])):
+                    expected_highs.append((int(ts[i]), h))
+                if lo < float(np.min(low[i-width:i])) and lo <= float(np.min(low[i+1:i+width+1])):
+                    expected_lows.append((int(ts[i]), lo))
+            assert confirmed_swings(df, left_right=width) == (expected_highs, expected_lows)
+
+
+def test_bridge_cross_event_handoff_satisfies_final_live_authorization(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    from types import SimpleNamespace
+    from ggp_entry_authorization import validate_ema9_vwap_cross_authorization
+
+    df = frame()
+    cross_ts = 1700071100000
+    monkeypatch.setattr(bridge, "validate_dual_ema_vwap_entry_gate", lambda *a, **k: {
+        "ready": True, "signal_candle_id": f"BUY:{cross_ts}",
+        "ema9_cross_timestamp": cross_ts, "ema9_cross": "BULLISH",
+    })
+    monkeypatch.setattr(bridge, "_adx", lambda _df: 22.0)
+    monkeypatch.setattr(bridge, "_atr", lambda _df: 1.0)
+    handoff = bridge._cross_entry_authorization(
+        "BTC/USDT:USDT", "BUY", df, {}, SimpleNamespace(structural_stop=None),
+        now_ms=1700072000000,
+    )
+    assert handoff is not None
+    final_gate = dict(handoff["cross_gate"])
+    final_gate["frame_source"] = "UNIFIED_WATCHLIST_AUTHORIZED_FRAME"
+    ok, reason = validate_ema9_vwap_cross_authorization(
+        side="BUY", setup_type=handoff["decision_setup_type"],
+        decision_state=handoff["decision_state"], event_id=handoff["event_id"],
+        evidence=handoff["evidence"], adx=handoff["adx"], gate=final_gate,
+        candle_source="UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+        cross_timestamp=handoff["cross_timestamp"],
+    )
+    assert ok is True
+    assert reason == "authorized_closed_ema9_session_vwap_cross"
