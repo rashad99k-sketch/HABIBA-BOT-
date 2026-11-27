@@ -1049,26 +1049,9 @@ def get_orderbook_cached(symbol, limit=20):
 
 # ========== EXCHANGE POSITION SYNC ==========
 def fetch_position(symbol):
-    if PAPER_MODE:
-        return None
-    try:
-        sym = normalize_symbol(symbol)
-        if hasattr(ex, 'fetch_positions'):
-            positions = safe_api_call(ex.fetch_positions, [sym])
-        elif hasattr(ex, 'fetch_open_positions'):
-            positions = safe_api_call(ex.fetch_open_positions, [sym])
-        else:
-            return None
-        if not positions:
-            return None
-        for pos in positions:
-            pos_sym = pos.get('symbol', '')
-            if normalize_symbol(symbol) in pos_sym and float(pos.get('contracts', 0)) > 0:
-                return pos
-        return None
-    except Exception as e:
-        log_execution(f"[POS_SYNC] fetch_position error: {e}", "ERROR")
-        return None
+    """Return a raw position only when the tri-state exchange read is OPEN."""
+    status, pos = fetch_position_tri_state(symbol)
+    return pos if status == "OPEN" else None
 
 def get_mark_price(symbol):
     if PAPER_MODE:
@@ -1955,21 +1938,29 @@ class ExchangeSyncService:
         self._reconcile_count = 0
         self._last_reconcile = 0
         self._reconcile_lock = threading.Lock()
+        self.last_fetch_status = "UNKNOWN"
 
     def fetch_live_snapshot(self, symbol):
-        """Return a snapshot, None only for exchange-confirmed FLAT; raise on UNKNOWN."""
+        """Return a snapshot only for OPEN; UNKNOWN fail-closes without treating it as FLAT."""
         if PAPER_MODE:
+            self.last_fetch_status = "OPEN" if STATE.get("open") else "FLAT"
             return self._paper_snapshot(symbol)
         status, pos = fetch_position_tri_state(symbol)
+        self.last_fetch_status = status
         if status == "UNKNOWN":
-            raise RuntimeError(f"exchange position state UNKNOWN for {symbol}")
+            log_execution(f"[SYNC] exchange position state UNKNOWN for {symbol}; local state retained", "ERROR")
+            return None
         if status == "FLAT":
             return None
-        if not isinstance(pos, dict):
-            raise RuntimeError(f"exchange OPEN response malformed for {symbol}")
-        snapshot = _snapshot_from_position(symbol, pos)
-        self._last_snapshot = snapshot
-        return snapshot
+        try:
+            snap = _snapshot_from_position(symbol, pos)
+            snap.raw_position = pos
+        except Exception as exc:
+            self.last_fetch_status = "UNKNOWN"
+            log_execution(f"[SYNC] invalid exchange position snapshot: {exc}", "ERROR")
+            return None
+        self._last_snapshot = snap
+        return snap
 
     def _paper_snapshot(self, symbol):
         if not STATE.get("open") or STATE.get("current_symbol") != symbol:
@@ -1991,61 +1982,67 @@ class ExchangeSyncService:
         return snap
 
     def reconcile(self, symbol, local_state, *, force=False):
+        """Tri-state reconciliation; force bypasses throttle, never bypasses safety."""
         global RECOVERY_BLOCK_ENTRIES
         now = time.time()
+        lock = getattr(self, "_reconcile_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._reconcile_lock = lock
         if not self._reconcile_lock.acquire(blocking=False):
             return "BUSY"
         try:
             if not force and now - self._last_reconcile < 10:
                 return "THROTTLED"
             self._last_reconcile = now
-            log_execution(f"[RECONCILIATION] Starting for {symbol}", "INFO")
-            self._reconcile_count += 1
             try:
                 snap = self.fetch_live_snapshot(symbol)
             except Exception as exc:
-                # UNKNOWN is never treated as FLAT. Keep exposure/state and block entries.
+                status = "UNKNOWN"
+                log_execution(
+                    f"[RECONCILIATION] {symbol} snapshot error; state UNKNOWN: {type(exc).__name__}: {exc}",
+                    "ERROR", debounce_key=f"exchange_reconcile_error_{symbol}", debounce_sec=30
+                )
+                snap = None
+            else:
+                status = getattr(self, "last_fetch_status", "UNKNOWN")
+
+            if status == "UNKNOWN":
+                MEMORY["position_status"] = "UNKNOWN"
+                MEMORY["recovery_status"] = "EXCHANGE_STATE_UNKNOWN"
                 if local_state.get("open"):
                     STATE["recovery_hold"] = True
                     STATE["recovery_reason"] = "EXCHANGE_POSITION_STATE_UNKNOWN"
                     RECOVERY_BLOCK_ENTRIES = True
-                log_execution(f"[RECONCILIATION] UNKNOWN for {symbol}; local exposure preserved: {type(exc).__name__}: {exc}", "ERROR",
-                              debounce_key=f"reconcile_unknown_{symbol}", debounce_sec=30)
+                log_execution(
+                    f"[RECONCILIATION] {symbol} state UNKNOWN; preserving local exposure; no close/finalize action",
+                    "ERROR", debounce_key=f"exchange_reconcile_unknown_{symbol}", debounce_sec=30
+                )
                 return "UNKNOWN"
-            if snap is None:
+
+            if status == "FLAT":
                 if local_state.get("open"):
-                    log_execution(f"[RECONCILIATION] BingX confirmed FLAT for {symbol}; reconciling external close", "WARN")
-                    _clear_confirmed_flat(symbol, reason="EXCHANGE_FLAT_CONFIRMED")
+                    _clear_confirmed_flat(symbol)
+                MEMORY["position_status"] = "FLAT"
                 return "FLAT"
-            with _TRADE_LOCK:
-                STATE["entry"] = snap.entry_price
-                STATE["qty"] = snap.qty
-                STATE["remaining_qty"] = snap.qty
-                STATE["side"] = snap.side
-                STATE["mark_price"] = snap.mark_price
-                STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
-                STATE["roe_pct"] = snap.roe_pct
-                STATE["exchange_reported_roe_pct"] = getattr(snap, "reported_roe_pct", None)
-                STATE["fees_usdt"] = safe_float(getattr(snap, "fees_usdt", 0.0), 0.0)
-                STATE["funding_usdt"] = safe_float(getattr(snap, "funding_usdt", 0.0), 0.0)
-                STATE["margin"] = snap.margin
-                STATE["liquidation_price"] = snap.liquidation_price
-                TRADE_STATE.update({
-                    "symbol": symbol,
-                    "side": snap.side,
-                    "entry": snap.entry_price,
-                    "qty": snap.qty,
-                    "last_update_ts": time.time()
-                })
-                if not STATE.get("open"):
-                    STATE["open"] = True
-                    STATE["current_symbol"] = symbol
-                    STATE["entry_time"] = time.time()
-            log_execution(f"[RECONCILIATION] Completed: ROE={snap.roe_pct:.2f}%, Qty={snap.qty}", "SUCCESS")
+
+            if status != "OPEN" or snap is None:
+                MEMORY["position_status"] = "UNKNOWN"
+                if local_state.get("open"):
+                    STATE["recovery_hold"] = True
+                    STATE["recovery_reason"] = "INVALID_EXCHANGE_SNAPSHOT"
+                    RECOVERY_BLOCK_ENTRIES = True
+                return "UNKNOWN"
+
+            if STATE.get("pending_close_order_id"):
+                _resolve_pending_close_from_snapshot(symbol, snap)
+            if _apply_open_snapshot(symbol, snap) is None:
+                return "UNKNOWN"
+            self._last_snapshot = snap
             self.event_bus.emit("reconciled", snap)
             return "OPEN"
         finally:
-            self._reconcile_lock.release()
+            lock.release()
 
 class RecoveryGuard:
     def __init__(self, event_bus, exchange_sync):
@@ -2356,12 +2353,13 @@ from ggp_profit_brain import (classify_profit_mode, range_target_price, target_r
                               select_range_target_pct, tp2_reassessment, thesis_failure_action,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE,
-                              SCALP_STATE, TREND_STATE, EXIT_REQUIRED_STATE, CLOSED_STATE,
+                              SCALP_STATE, TREND_STATE, STANDARD_STATE,
+                              EXIT_REQUIRED_STATE, CLOSED_STATE,
                               SCALP_ROE_TARGETS_PCT, TREND_ROE_TARGETS_PCT,
                               BEHAVIOR_DISTRIBUTION, BEHAVIOR_INSTITUTIONAL_EXIT,
                               verify_roe_inputs, roe_target_price, select_scalp_roe_target,
                               analyze_post_entry_behavior, map_profit_mode_to_regime,
-                              transition_trade_regime)
+                              transition_trade_regime, regime_plan_consistency)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2404,6 +2402,12 @@ class TradeManagementBoard:
         continuation = safe_float(ctx.get("continuation_probability"), 0.5)
         trade_state = str(ctx.get("trade_state") or "UNKNOWN").upper()
         profit_mode = str(ctx.get("profit_mode") or "TWO_STAGE_50_50").upper()
+        # trade_regime_state is the single routing authority. profit_mode is kept
+        # only as a compatibility diagnostic; it never selects a decision path.
+        regime_state = str(ctx.get("trade_regime_state") or "").upper()
+        if regime_state not in {SCALP_STATE, TREND_STATE, STANDARD_STATE,
+                                EXIT_REQUIRED_STATE, CLOSED_STATE}:
+            regime_state = STANDARD_STATE
 
         def decision(action, reason, **params):
             result = TradeDecision(action, params=params, reason=reason)
@@ -2415,7 +2419,9 @@ class TradeManagementBoard:
                 "action": action.value, "reason": str(reason), "symbol": symbol,
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
-                "profit_mode": profit_mode, "tp1_hit": bool(ctx.get("tp1_hit")),
+                "trade_regime_state": regime_state, "profit_mode": profit_mode,
+                "regime_plan_consistent": bool(ctx.get("regime_plan_consistent", True)),
+                "tp1_hit": bool(ctx.get("tp1_hit")),
                 "tp2_hit": bool(ctx.get("tp2_hit")),
                 "tp1_price": safe_float(ctx.get("tp1_price")),
                 "tp2_price": safe_float(ctx.get("tp2_price")),
@@ -2434,14 +2440,15 @@ class TradeManagementBoard:
                 self._last_visible_ts = self._last_decision_time
             return result
 
-        if ctx.get("execution_unresolved") or ctx.get("close_reconciliation_required") or ctx.get("recovery_hold"):
+        # 1) Exchange/position safety and unresolved execution are first. A
+        # pending reduce order or unfinished recovery must never be doubled.
+        if (ctx.get("execution_unresolved") or ctx.get("close_reconciliation_required")
+                or ctx.get("recovery_hold") or ctx.get("position_safety_hold")):
             return decision(TradeDecisionType.HOLD, "exchange_execution_or_recovery_unresolved")
+        # 2) Emergency exit remains independent of indicators and board routing.
         if ctx.get("emergency_exit"):
             return decision(TradeDecisionType.EMERGENCY_EXIT, str(ctx.get("emergency_reason") or "emergency_exit"))
-        if str(ctx.get("trade_regime_state") or "").upper() == EXIT_REQUIRED_STATE:
-            return decision(TradeDecisionType.FULL_CLOSE, "institutional_exit_required_by_regime",
-                            close_reason="EXIT_REQUIRED")
-
+        # 3) Thesis failure / structural invalidation overrides regime hysteresis.
         thesis_score = safe_float(ctx.get("thesis_failure_score"), 0.0)
         thesis_action, thesis_reason = thesis_failure_action(
             side, roe, thesis_score, ctx.get("thesis_failure_reasons") or [],
@@ -2451,6 +2458,11 @@ class TradeManagementBoard:
                             str(ctx.get("thesis_failure_reason") or thesis_reason))
         if thesis_action == "PROTECT" and not ctx.get("be_done"):
             return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
+        # 4) Institutional exit from the confirmed regime state.
+        if regime_state == EXIT_REQUIRED_STATE:
+            return decision(TradeDecisionType.FULL_CLOSE, "institutional_exit_required_by_regime",
+                            close_reason="EXIT_REQUIRED")
+        # 5) Hard exit states from the existing trade state machine.
         if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
             return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
 
@@ -2470,9 +2482,15 @@ class TradeManagementBoard:
             return decision(TradeDecisionType.HOLD,
                             f"roe_target_blocked_{str(ctx.get('roe_diagnostic') or 'unverified_basis')}")
 
+        # A conflict between the explicit regime and the legacy diagnostic plan
+        # must never be resolved by guessing. Safety exits above stay active.
+        if ctx.get("regime_plan_consistent") is False:
+            return decision(TradeDecisionType.HOLD,
+                            f"regime_plan_inconsistent_{str(ctx.get('regime_plan_consistency_reason') or 'unknown')}")
+
         # SCALP uses exactly one ROE target and closes the whole remaining
         # exposure. It is never split into TP1/TP2.
-        if profit_mode == RANGE_MODE:
+        if regime_state == SCALP_STATE:
             scalp_target = safe_float(ctx.get("scalp_target_roe_pct"), 0.0)
             if scalp_target > 0 and roe >= scalp_target:
                 return decision(TradeDecisionType.FULL_CLOSE,
@@ -2480,21 +2498,29 @@ class TradeManagementBoard:
                                 close_reason="SCALP_TARGET")
             return decision(TradeDecisionType.HOLD, "scalp_waiting_for_selected_roe_target")
 
-        # Canonical TP1: reduce the original filled quantity to exactly 50%.
-        # This compensates for any previously confirmed partial fill and never
-        # changes the policy to 30%/60% based on a score.
+        # STANDARD retains the original price-based 50/50 plan from the entry
+        # TP/TP2 levels. TREND uses verified 40%/60% net ROE. Both share the same
+        # quantity accounting, execution service and verification pipeline.
+        price_targets = regime_state == STANDARD_STATE
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
         if not tp1_hit and remaining > 0 and initial > 0:
-            tp1_roe = safe_float(ctx.get("tp1_target_roe_pct"), 0.0)
-            if tp1_roe > 0 and roe >= tp1_roe:
+            if price_targets:
+                tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
+                tp1_ready = tp1_price > 0 and target_reached(side, current, tp1_price)
+                tp1_reason = "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY"
+            else:
+                tp1_roe = safe_float(ctx.get("tp1_target_roe_pct"), 0.0)
+                tp1_ready = tp1_roe > 0 and roe >= tp1_roe
+                tp1_reason = f"TP1_FIXED_50_PERCENT_AT_{tp1_roe:.0f}pct_ROE"
+            if tp1_ready:
                 target_remaining = initial * 0.5
                 tolerance = max(initial * 0.002, 1e-10)
                 qty_to_close = max(0.0, remaining - target_remaining)
                 if qty_to_close <= tolerance:
                     return decision(TradeDecisionType.HOLD, "tp1_quantity_already_at_50pct_wait_for_reconciliation")
                 ratio = min(1.0, qty_to_close / remaining)
-                return decision(TradeDecisionType.PARTIAL_CLOSE, f"TP1_FIXED_50_PERCENT_AT_{tp1_roe:.0f}pct_ROE",
+                return decision(TradeDecisionType.PARTIAL_CLOSE, tp1_reason,
                                 ratio=ratio, target_remaining_qty=target_remaining,
                                 close_reason="TP1")
 
@@ -2505,10 +2531,16 @@ class TradeManagementBoard:
                 return decision(TradeDecisionType.FULL_CLOSE,
                                 str(ctx.get("tp2_decision_reason") or "tp2_remote_and_continuation_weak"),
                                 close_reason="TP2_ADAPTIVE_STRICT_EXIT")
-            tp2_roe = safe_float(ctx.get("tp2_target_roe_pct"), 0.0)
-            if tp2_roe > 0 and roe >= tp2_roe:
-                return decision(TradeDecisionType.FULL_CLOSE, f"TP2_FINAL_50_PERCENT_AT_{tp2_roe:.0f}pct_ROE",
-                                close_reason="TP2")
+            if price_targets:
+                tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
+                if tp2_price > 0 and target_reached(side, current, tp2_price):
+                    return decision(TradeDecisionType.FULL_CLOSE, "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+                                    close_reason="TP2")
+            else:
+                tp2_roe = safe_float(ctx.get("tp2_target_roe_pct"), 0.0)
+                if tp2_roe > 0 and roe >= tp2_roe:
+                    return decision(TradeDecisionType.FULL_CLOSE, f"TP2_FINAL_50_PERCENT_AT_{tp2_roe:.0f}pct_ROE",
+                                    close_reason="TP2")
 
         # BE+ and trailing apply to the verified remaining runner only.
         if tp1_hit and not ctx.get("be_done"):
@@ -3019,8 +3051,12 @@ class LiveTradeManager:
         # so wiping them here made TP2 targets disappear between TP1 and TP2.
         if not preserve_management_state:
             STATE["trade_regime_state"] = None
-            STATE["trade_regime_reason"] = ""
-            STATE["profit_mode"] = None
+            STATE["trade_regime_reason"] = "awaiting_first_closed_candle"
+            # Until the first completed candle classifies the trade, the legacy
+            # plan remains the original STANDARD 50/50. This prevents the absent
+            # regime from silently becoming SCALP through the diagnostic mirror.
+            STATE["profit_mode"] = STANDARD_MODE
+            STATE["profit_mode_reason"] = "awaiting_first_closed_candle"
             STATE["profit_mode_candidate"] = None
             STATE["profit_mode_candidate_count"] = 0
             STATE["profit_mode_last_candle_ts"] = 0.0
@@ -3033,6 +3069,10 @@ class LiveTradeManager:
             STATE["tp1_target_roe_pct"] = 0.0
             STATE["tp2_target_roe_pct"] = 0.0
             STATE["exit_required_reason"] = ""
+            # Immutable server-side TP levels from entry; STANDARD mode reuses
+            # them instead of the adaptive ROE targets.
+            STATE["original_tp1_price"] = safe_float(tp1, 0.0)
+            STATE["original_tp2_price"] = safe_float(tp2, 0.0)
             # A fresh trade must not inherit the previous trade's ROE basis.
             STATE.update({
                 "roe_pct": 0.0, "computed_roe_pct": 0.0, "net_roe_pct": 0.0,
@@ -3051,10 +3091,12 @@ class LiveTradeManager:
         log_execution(f"[LIFECYCLE] Trade open requested for {symbol} {side}", "INFO")
 
     def manage_live_trade(self):
+        emergency_closed = False
         if not (STATE.get("open") and STATE.get("current_symbol")):
             if self.lifecycle_state not in (TradeLifecycleState.IDLE, TradeLifecycleState.CLOSED):
                 self.lifecycle_state = TradeLifecycleState.IDLE
                 DASHBOARD_STATE["live_trade_mode"] = False
+            _persist_trade_journal_snapshot()
             return
         now = time.time()
         roe = STATE.get("roe_pct", 0.0)
@@ -3063,6 +3105,7 @@ class LiveTradeManager:
         calm_conditions = abs(roe) < 1.5 and 18 < adx < 30
         target_interval = 5 if calm_conditions else 2
         if now - self.last_management_ts < target_interval:
+            _persist_trade_journal_snapshot()
             return
         self.last_management_ts = now
         symbol = STATE["current_symbol"]
@@ -3073,17 +3116,22 @@ class LiveTradeManager:
             with _TRADE_LOCK:
                 if self._emergency_exit_if_valid(symbol, now):
                     self._log_live_status()
-                    return
+                    emergency_closed = True
+            if emergency_closed:
+                _persist_trade_journal_snapshot()
+                return
         if STATE.get("execution_unresolved"):
             if now - self.last_position_sync_ts >= 2:
                 self.exchange_sync.reconcile(symbol, STATE)
                 self.last_position_sync_ts = now
             log_execution(f"[EXECUTION_UNRESOLVED] {symbol}: management actions paused until exchange order outcome is reconciled", "ERROR",
                           debounce_key=f"execution_unresolved_{symbol}", debounce_sec=30)
+            _persist_trade_journal_snapshot()
             return
         if not PAPER_MODE and (STATE.get("recovery_hold") or not STATE.get("native_sl_verified")):
             log_execution(f"[MANAGEMENT_BLOCKED] {symbol}: Recovery Hold / Native SL verification is not complete; no TP or synthetic close actions", "CRITICAL",
                           debounce_key=f"management_protection_gate_{symbol}", debounce_sec=30)
+            _persist_trade_journal_snapshot()
             return
         with _TRADE_LOCK:
             # Position reconciliation every 10 seconds
@@ -3093,6 +3141,7 @@ class LiveTradeManager:
             # Execute management decision
             self._apply_management(symbol, now)
         self._log_live_status()
+        _persist_trade_journal_snapshot()
 
     def _log_live_status(self):
         now = time.time()
@@ -3385,7 +3434,8 @@ class LiveTradeManager:
                 "trend_expansion": bool(momentum.get("trend_expansion", False)),
             }
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
-            current_mode = str(STATE.get("profit_mode") or RANGE_MODE)
+            # A missing legacy diagnostic must never imply a SCALP plan.
+            current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
 
             # Opposing swing liquidity is used only as contextual evidence for
             # target selection; the executed target itself is ROE-based.
@@ -3439,21 +3489,24 @@ class LiveTradeManager:
             last_mode_ts = safe_float(STATE.get("profit_mode_last_candle_ts"), 0.0)
             if closed_candle_ts > last_mode_ts:
                 STATE["profit_mode_last_candle_ts"] = closed_candle_ts
-                if current_regime not in {SCALP_STATE, TREND_STATE}:
-                    new_regime, transition_reason, confirmations = candidate_regime, f"initial_classification_{candidate_regime.lower()}", 0
-                else:
-                    prior_candidate = str(STATE.get("profit_mode_candidate") or "").upper()
-                    prior_count = int(safe_float(STATE.get("profit_mode_candidate_count"), 0))
-                    confirmations = prior_count + 1 if prior_candidate == candidate_regime else 1
-                    new_regime, transition_reason, confirmations = transition_trade_regime(
-                        current_regime, candidate_regime, behavior, confirmations, behavior_evidence)
+                prior_candidate = str(STATE.get("profit_mode_candidate") or "").upper()
+                prior_count = int(safe_float(STATE.get("profit_mode_candidate_count"), 0))
+                confirmations = prior_count + 1 if prior_candidate == candidate_regime else 1
+                new_regime, transition_reason, confirmations = transition_trade_regime(
+                    current_regime, candidate_regime, behavior, confirmations, behavior_evidence)
                 STATE["profit_mode_candidate"] = candidate_regime
                 STATE["profit_mode_candidate_count"] = confirmations
                 STATE["trade_regime_state"] = new_regime
                 STATE["trade_regime_reason"] = transition_reason
                 if new_regime == EXIT_REQUIRED_STATE:
                     STATE["exit_required_reason"] = behavior_reason
-                current_mode = TREND_MODE if new_regime == TREND_STATE else RANGE_MODE
+                # profit_mode is a diagnostic mirror of the explicit regime only.
+                if new_regime == TREND_STATE:
+                    current_mode = TREND_MODE
+                elif new_regime == SCALP_STATE:
+                    current_mode = RANGE_MODE
+                else:
+                    current_mode = STANDARD_MODE
                 STATE["profit_mode"] = current_mode
                 STATE["profit_mode_reason"] = f"{candidate_reason}|{transition_reason}|{behavior_reason}"
                 STATE["profit_mode_evidence"] = list(candidate_evidence) + [behavior]
@@ -3461,7 +3514,7 @@ class LiveTradeManager:
                 STATE["range_target_move_pct"] = distance_to_opposing if current_mode == RANGE_MODE else 0.0
                 STATE["range_target_reason"] = target_reason if current_mode == RANGE_MODE else ""
 
-                if current_mode == RANGE_MODE:
+                if new_regime == SCALP_STATE:
                     target_context = {
                         "adx": adx_now, "adx_slope": adx_slope,
                         "continuation_probability": continuation_eval.continuation_probability,
@@ -3472,6 +3525,10 @@ class LiveTradeManager:
                         "adverse_rejection": adverse_rejection,
                         "distribution_risk": safe_float(smart_money.get("distribution_risk"), 0.0),
                         "post_entry_behavior": behavior,
+                        # Liquidity narrowing is only applied with a verified
+                        # leverage basis; no silent 20x assumption here.
+                        "actual_leverage": roe_check.get("leverage") if roe_check.get("ok") else 0.0,
+                        "opposing_liquidity_strong": bool(target_reason == "nearest_opposing_swing_liquidity_pool"),
                     }
                     scalp_target, scalp_reason = select_scalp_roe_target(target_context)
                     STATE["scalp_target_roe_pct"] = scalp_target
@@ -3479,7 +3536,7 @@ class LiveTradeManager:
                     STATE["scalp_target_price"] = roe_target_price(roe_check, scalp_target) if roe_check.get("ok") else 0.0
                     STATE["tp1_target_roe_pct"] = 0.0
                     STATE["tp2_target_roe_pct"] = 0.0
-                else:
+                elif new_regime == TREND_STATE:
                     STATE["scalp_target_roe_pct"] = 0.0
                     STATE["scalp_target_price"] = 0.0
                     STATE["scalp_target_reason"] = ""
@@ -3491,6 +3548,19 @@ class LiveTradeManager:
                     else:
                         STATE["tp1_target_roe_pct"] = 0.0
                         STATE["tp2_target_roe_pct"] = 0.0
+                else:
+                    # STANDARD and EXIT_REQUIRED retain the original price plan
+                    # (server-side TP1/TP2 at entry) and no adaptive ROE targets.
+                    STATE["scalp_target_roe_pct"] = 0.0
+                    STATE["scalp_target_price"] = 0.0
+                    STATE["scalp_target_reason"] = ""
+                    STATE["tp1_target_roe_pct"] = 0.0
+                    STATE["tp2_target_roe_pct"] = 0.0
+                    if new_regime == STANDARD_STATE:
+                        STATE["tp1_price"] = safe_float(
+                            STATE.get("original_tp1_price"), safe_float(STATE.get("synthetic_tp1"), 0.0))
+                        STATE["tp2_price"] = safe_float(
+                            STATE.get("original_tp2_price"), safe_float(STATE.get("tp2_price"), 0.0))
                 log_execution(
                     f"[PROFIT_MODE] {symbol} regime={new_regime} mode={current_mode} "
                     f"behavior={behavior}/{behavior_reason} candidate={candidate_mode} "
@@ -3634,6 +3704,22 @@ class LiveTradeManager:
                 safe_float(STATE.get("adx_slope"), 0.0), structure_aligned,
                 max_atr_distance=safe_float(os.getenv("TP2_MAX_ATR_DISTANCE", "3.0"), 3.0),
                 min_continuation=safe_float(os.getenv("TP2_MIN_CONTINUATION", "0.45"), 0.45))
+        consistency_ok, consistency_reason = regime_plan_consistency(
+            STATE.get("trade_regime_state"), STATE.get("profit_mode"),
+            tp1_hit=bool(STATE.get("tp1_hit")), tp2_hit=bool(STATE.get("tp2_hit")),
+            remaining_qty=safe_float(STATE.get("remaining_qty"), STATE.get("qty", 0.0)),
+            initial_qty=safe_float(STATE.get("initial_qty"), STATE.get("qty", 0.0)),
+            scalp_target_roe_pct=safe_float(STATE.get("scalp_target_roe_pct"), 0.0),
+            tp1_target_roe_pct=safe_float(STATE.get("tp1_target_roe_pct"), 0.0),
+            tp2_target_roe_pct=safe_float(STATE.get("tp2_target_roe_pct"), 0.0))
+        STATE["regime_plan_consistent"] = bool(consistency_ok)
+        STATE["regime_plan_consistency_reason"] = consistency_reason
+        if not consistency_ok:
+            log_execution(
+                f"[REGIME_PLAN_CONFLICT] {symbol}: regime={STATE.get('trade_regime_state')} "
+                f"mode={STATE.get('profit_mode')} {consistency_reason}; profit targets held",
+                "ERROR", debounce_key=f"regime_plan_conflict_{symbol}", debounce_sec=30)
+
         context = {
             "symbol": symbol, "side": side, "entry": entry, "current_price": mark_price,
             "atr": atr, "roe": roe,
@@ -3660,9 +3746,13 @@ class LiveTradeManager:
             "synthetic_tp1": STATE.get("synthetic_tp1", 0), "tp2_price": STATE.get("tp2_price", 0),
             "range_target_price": STATE.get("range_target_price", 0),
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
-            "profit_mode": STATE.get("profit_mode", RANGE_MODE),
+            # Before the first classification the original 50/50 plan is the
+            # only legal default; RANGE_SCALP must be earned by evidence.
+            "profit_mode": STATE.get("profit_mode") or STANDARD_MODE,
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
             "trade_regime_state": STATE.get("trade_regime_state"),
+            "regime_plan_consistent": bool(consistency_ok),
+            "regime_plan_consistency_reason": consistency_reason,
             "post_entry_behavior": STATE.get("post_entry_behavior"),
             "behavior_reason": STATE.get("post_entry_behavior_reason", ""),
             "roe_ready": bool(STATE.get("roe_verified", False)),
@@ -3677,6 +3767,7 @@ class LiveTradeManager:
             "execution_unresolved": STATE.get("execution_unresolved", False),
             "close_reconciliation_required": STATE.get("close_reconciliation_required", False),
             "recovery_hold": STATE.get("recovery_hold", False),
+            "position_safety_hold": bool(STATE.get("position_safety_hold", False)),
             "smart_trail_mult": self.brain.get_trail_multiplier(),
             "peak_roe": safe_float(STATE.get("peak_roe"), 0.0),
             "peak_drawdown_roe": safe_float(STATE.get("peak_drawdown_roe"), 0.0),
@@ -3937,64 +4028,34 @@ def sync_position_state(symbol=None):
                 return price, 0.0, 0.0, roe_pct
         return None, None, None, None
 
-    if not symbol and STATE.get("open"):
-        symbol = STATE["current_symbol"]
+    if not symbol:
+        symbol = STATE.get("current_symbol") if STATE.get("open") else TRADE_STATE.get("symbol")
     if not symbol:
         return None, None, None, None
-
     snap = _exchange_sync.fetch_live_snapshot(symbol)
-    if snap is None:
-        if STATE.get("open"):
-            log_execution(f"[POS_SYNC] Position closed externally on {symbol}, cleaning state", "WARN")
-            with _TRADE_LOCK:
-                STATE["open"] = False
-                TRADE_STATE["in_position"] = False
-                _live_manager.lifecycle_state = TradeLifecycleState.CLOSED
-                DASHBOARD_STATE["live_trade_mode"] = False
+    status = getattr(_exchange_sync, "last_fetch_status", "UNKNOWN")
+    if status == "UNKNOWN":
+        MEMORY["position_status"] = "UNKNOWN"
+        log_execution(f"[POS_SYNC] {symbol} status UNKNOWN; local state retained", "WARN")
         return None, None, None, None
-
-    with _TRADE_LOCK:
-        if not STATE.get("open"):
-            STATE["open"] = True
-            STATE["side"] = snap.side
-            STATE["entry"] = snap.entry_price
-            STATE["qty"] = snap.qty
-            STATE["remaining_qty"] = snap.qty
-            STATE["current_symbol"] = symbol
-            STATE["entry_time"] = time.time()
-            TRADE_STATE.update({
-                "in_position": True,
-                "symbol": symbol,
-                "side": snap.side,
-                "entry": snap.entry_price,
-                "qty": snap.qty,
-                "last_update_ts": time.time()
-            })
-            _live_manager.start_trade(symbol, snap.side, snap.entry_price, snap.qty, 0.0, 0.0, 0.0)
+    if status == "FLAT":
+        if STATE.get("open"):
+            _clear_confirmed_flat(symbol)
         else:
-            STATE["entry"] = snap.entry_price
-            STATE["qty"] = snap.qty
-            STATE["remaining_qty"] = snap.qty
-            STATE["side"] = snap.side
-            TRADE_STATE.update({
-                "entry": snap.entry_price,
-                "qty": snap.qty,
-                "side": snap.side
-            })
-
-        STATE["margin"] = snap.margin
-        STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
-        STATE["roe_pct"] = snap.roe_pct
-        STATE["exchange_reported_roe_pct"] = getattr(snap, "reported_roe_pct", None)
-        STATE["fees_usdt"] = safe_float(getattr(snap, "fees_usdt", 0.0), 0.0)
-        STATE["funding_usdt"] = safe_float(getattr(snap, "funding_usdt", 0.0), 0.0)
-        STATE["leverage"] = snap.leverage
-        STATE["leverage_verified"] = bool(getattr(snap, "leverage_verified", False))
-        STATE["leverage_source"] = "exchange_snapshot" if STATE["leverage_verified"] else "unverified_config_default"
-        STATE["contract_size"] = safe_float(getattr(snap, "contract_size", 0.0), 0.0)
-        STATE["mark_price"] = snap.mark_price
-        STATE["liquidation_price"] = snap.liquidation_price
-
+            MEMORY["position_status"] = "FLAT"
+            MEMORY["current_position"] = None
+        return None, None, None, None
+    if snap is None:
+        MEMORY["position_status"] = "UNKNOWN"
+        return None, None, None, None
+    if STATE.get("pending_close_order_id"):
+        _resolve_pending_close_from_snapshot(symbol, snap)
+    if _apply_open_snapshot(symbol, snap) is None:
+        return None, None, None, None
+    if STATE.get("recovery_hold") or not STATE.get("trade_id"):
+        _attempt_runtime_trade_recovery(symbol, position=None, force=False)
+    if not STATE.get("recovery_hold") and not STATE.get("execution_unresolved"):
+        _persist_trade_journal_snapshot()
     return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
 
 def get_realized_pnl_for_symbol(symbol, lookback_seconds=30):
@@ -5360,8 +5421,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             if df is None:
                 log_execution("[ENTRY] No closed-candle data for authorized institutional setup; LIVE blocked", "ERROR")
                 return False
-            # ADX, EMA and VWAP remain contextual evidence. They are not universal entry gates.
-            log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} treated as context, not a hard cross gate", "INFO")
+            # The ADX >= 18 hard gate is enforced on the closed-candle authority
+            # path before this point; EMA9/Session VWAP stay ranking-only context.
+            log_execution(f"[ENTRY] Institutional setup authorized: {setup}; ADX={adx_val:.1f} already passed authority hard gate", "INFO")
         else:
             # Legacy/manual entry path keeps its existing stricter safeguards.
             if not (25 <= adx_val <= 38):
@@ -5484,7 +5546,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "orderbook_depth_usdt": entry_orderbook_depth,
             "synthetic_tp1": tp1,
             "trade_id": trade_id,
-            "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
+            "original_tp1_price": safe_float(tp1, 0.0),
+            "original_tp2_price": safe_float(tp2, 0.0),
+            "profit_mode": STANDARD_MODE, "profit_mode_reason": "awaiting_first_closed_candle",
+            "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
@@ -5522,6 +5587,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "trade_id": trade_id, "current_symbol": symbol, "side": side,
         "synthetic_sl": sl, "sl": sl, "native_sl_original_price": sl,
         "tp1_price": tp1, "tp2_price": tp2, "synthetic_tp1": tp1,
+        "original_tp1_price": safe_float(tp1, 0.0),
+        "original_tp2_price": safe_float(tp2, 0.0),
+        "profit_mode": STANDARD_MODE, "trade_regime_state": None,
         "initial_qty": qty, "qty": qty, "remaining_qty": qty,
         "trade_type": trade_type, "entry_type": entry_type,
         "margin_allocation_pct": margin_percent, "position_leverage": LEVERAGE,
@@ -5579,6 +5647,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "orderbook_depth_usdt": entry_orderbook_depth,
             "synthetic_tp1": tp1,
             "trade_id": trade_id,
+            "original_tp1_price": safe_float(tp1, 0.0),
+            "original_tp2_price": safe_float(tp2, 0.0),
             "position_mode": order.get("positionMode", "PAPER"),
             "position_side": order.get("positionSide"),
             "entry_client_order_id": order.get("clientOrderId"),
@@ -5589,7 +5659,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "recovery_hold": bool(order.get("protection_unverified", False)),
             "native_sl_status": "VERIFIED" if order.get("native_sl_verified") else ("PAPER_SIMULATED" if PAPER_MODE else "UNVERIFIED"),
             "execution_unresolved": bool(order.get("protection_unverified", False)),
-            "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
+            "profit_mode": STANDARD_MODE, "profit_mode_reason": "awaiting_first_closed_candle",
+            "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
@@ -5648,6 +5719,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
         time.sleep(1)
         sync_position_state(symbol)
+        # The journal start is tied to this existing lifecycle, never a second manager.
+        if STATE.get("open"):
+            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+            _persist_trade_journal_start(ctx.get("setup_type"))
         return True
     else:
         return False
@@ -8911,50 +8986,64 @@ def validate_position_state(local_pos, symbol):
     return local_pos
 
 def sync_all_states():
+    global RECOVERY_BLOCK_ENTRIES
     if PAPER_MODE:
-        MEMORY["position_status"] = "OPEN" if STATE.get("open") else "CLOSED"
+        MEMORY["position_status"] = "OPEN" if STATE.get("open") else "FLAT"
         MEMORY["total_pnl"] = PERF.get("total_pnl_usdt", 0.0)
         MEMORY["total_pnl_pct"] = PERF.get("total_pnl_pct", 0.0) * 100
+        RECOVERY_BLOCK_ENTRIES = False
         return
-    symbol = STATE.get("current_symbol") if STATE.get("open") else (TRADE_STATE.get("symbol") if TRADE_STATE.get("in_position") else None)
-    if not symbol:
-        real_pos = sync_position_with_exchange(DEFAULT_SYMBOL)
-        if real_pos is None:
-            MEMORY["position_status"] = "CLOSED"
+    symbol = STATE.get("current_symbol") if STATE.get("open") else None
+    if symbol:
+        sync_position_state(symbol)
+    else:
+        status, positions = fetch_position_tri_state(None)
+        if status == "UNKNOWN":
+            MEMORY["position_status"] = "UNKNOWN"
             MEMORY["current_position"] = None
-        else:
-            MEMORY["position_status"] = "OPEN"
-            MEMORY["current_position"] = real_pos
-        real_pnl, real_pnl_pct = get_realized_pnl(DEFAULT_SYMBOL)
+            RECOVERY_BLOCK_ENTRIES = True
+        elif status == "FLAT":
+            MEMORY["position_status"] = "FLAT"
+            MEMORY["current_position"] = None
+            # Confirmed flat resolves an ambiguous order write without fabricating a fill.
+            STATE["execution_unresolved"] = False
+            STATE["recovery_hold"] = False
+            RECOVERY_BLOCK_ENTRIES = False
+        elif status == "OPEN" and positions:
+            if len(positions) == 1:
+                _attempt_runtime_trade_recovery(_position_symbol(positions[0]),
+                                                position=positions[0], force=False)
+            else:
+                MEMORY["position_status"] = "MULTIPLE_OPEN"
+                RECOVERY_BLOCK_ENTRIES = True
+    symbol_for_pnl = symbol or DEFAULT_SYMBOL
+    try:
+        real_pnl, real_pnl_pct = get_realized_pnl(symbol_for_pnl)
         MEMORY["total_pnl"] = real_pnl
         MEMORY["total_pnl_pct"] = real_pnl_pct
-        return
-    valid = validate_position_state(STATE, symbol)
-    if valid is None:
-        log_execution(f"[SYNC] Position on {symbol} closed externally – cleaning local state.", "WARN")
-        with _TRADE_LOCK:
-            STATE["open"] = False
-            TRADE_STATE["in_position"] = False
-        MEMORY["position_status"] = "CLOSED"
-        MEMORY["current_position"] = None
-        MEMORY["entry"] = None
-        MEMORY["sl"] = None
-        MEMORY["tp"] = None
-    else:
-        MEMORY["position_status"] = "OPEN"
-        MEMORY["current_position"] = valid
-    real_pnl, real_pnl_pct = get_realized_pnl(symbol)
-    MEMORY["total_pnl"] = real_pnl
-    MEMORY["total_pnl_pct"] = real_pnl_pct
-    if "total_pnl_usdt" in PERF:
-        PERF["total_pnl_usdt"] = real_pnl
-        PERF["total_pnl_pct"] = real_pnl_pct / 100
+    except Exception:
+        pass
 
 def main_loop_sniper():
     global INSUFFICIENT_MARGIN_COOLDOWN_UNTIL, RECOVERY_BLOCK_ENTRIES
     last_scan = 0
     last_candidate_scan = 0
     last_flow_update = 0
+    # Start-up recovery must complete before Scanner can authorize a new order.
+    try:
+        if not PAPER_MODE:
+            try:
+                ex.load_markets()
+            except Exception as exc:
+                MEMORY["position_status"] = "UNKNOWN"
+                MEMORY["recovery_status"] = "MARKETS_UNAVAILABLE"
+                log_execution(f"[RECOVERY] Cannot load BingX markets before startup recovery: {exc}", "ERROR")
+        startup_trade_recovery()
+    except Exception as exc:
+        RECOVERY_BLOCK_ENTRIES = True
+        MEMORY["position_status"] = "UNKNOWN"
+        MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
+        log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
     try:
         ex.load_markets()
         log_execution(f"Markets loaded", "INFO")
@@ -9243,6 +9332,12 @@ _INSTITUTIONAL_ENTRY_CONTEXT = None
 RECOVERY_BLOCK_ENTRIES = False
 
 
+def entry_adx_gate_passed(adx_value):
+    """ADX >= 18 is a hard actuation gate; missing/NaN ADX fails closed."""
+    value = safe_float(adx_value, float("nan"))
+    return bool(np.isfinite(value) and value >= 18.0)
+
+
 def smart_opportunity_selection():
     """Unified Watchlist -> institutional engines -> one existing GGP execution path."""
     global _INSTITUTIONAL_ENTRY_CONTEXT
@@ -9287,6 +9382,15 @@ def smart_opportunity_selection():
             item.update(fresh)
             item["source"] = item.get("source") or "unified_watchlist"
             if item.get("decision_state") != "ENTRY_READY":
+                continue
+            # ADX >= 18 remains a hard gate on the actuation path. It is derived
+            # from the freshly validated closed-candle frame, never from the
+            # forming candle or from configured leverage.
+            adx_di = item.get("adx_di") if isinstance(item.get("adx_di"), dict) else {}
+            fresh_adx = adx_di.get("adx")
+            if not entry_adx_gate_passed(fresh_adx):
+                item["decision_state"] = "REJECTED"
+                item["rejection_reason"] = "adx_below_18_hard_gate"
                 continue
             side = str(item.get("side", "")).upper()
             if side not in ("BUY", "SELL"):
@@ -10759,217 +10863,6 @@ def startup_trade_recovery():
     log_execution("[RECOVERY] Open BingX position has no matching journal. Tracking exposure only; entries blocked pending manual review.", "ERROR")
     return False
 
-
-# Replace ambiguous legacy position reads with an explicit tri-state status.
-def fetch_position(symbol):
-    status, pos = fetch_position_tri_state(symbol)
-    return pos if status == "OPEN" else None
-
-
-def _exchange_fetch_live_snapshot(self, symbol):
-    if PAPER_MODE:
-        self.last_fetch_status = "OPEN" if STATE.get("open") else "FLAT"
-        return self._paper_snapshot(symbol)
-    status, pos = fetch_position_tri_state(symbol)
-    self.last_fetch_status = status
-    if status != "OPEN":
-        return None
-    try:
-        snap = _snapshot_from_position(symbol, pos)
-        snap.raw_position = pos
-        self._last_snapshot = snap
-        return snap
-    except Exception as exc:
-        self.last_fetch_status = "UNKNOWN"
-        log_execution(f"[SYNC] invalid exchange position snapshot: {exc}", "ERROR")
-        return None
-
-
-def _exchange_reconcile(self, symbol, local_state, *, force=False):
-    """Tri-state reconciliation; force bypasses throttle, never bypasses safety."""
-    global RECOVERY_BLOCK_ENTRIES
-    now = time.time()
-    lock = getattr(self, "_reconcile_lock", None)
-    if lock is None:
-        lock = threading.Lock()
-        self._reconcile_lock = lock
-    if not lock.acquire(blocking=False):
-        return "BUSY"
-    try:
-        if not force and now - self._last_reconcile < 10:
-            return "THROTTLED"
-        self._last_reconcile = now
-        try:
-            snap = self.fetch_live_snapshot(symbol)
-        except Exception as exc:
-            status = "UNKNOWN"
-            log_execution(
-                f"[RECONCILIATION] {symbol} snapshot error; state UNKNOWN: {type(exc).__name__}: {exc}",
-                "ERROR", debounce_key=f"exchange_reconcile_error_{symbol}", debounce_sec=30
-            )
-            snap = None
-        else:
-            status = getattr(self, "last_fetch_status", "UNKNOWN")
-
-        if status == "UNKNOWN":
-            MEMORY["position_status"] = "UNKNOWN"
-            MEMORY["recovery_status"] = "EXCHANGE_STATE_UNKNOWN"
-            if local_state.get("open"):
-                STATE["recovery_hold"] = True
-                STATE["recovery_reason"] = "EXCHANGE_POSITION_STATE_UNKNOWN"
-                RECOVERY_BLOCK_ENTRIES = True
-            log_execution(
-                f"[RECONCILIATION] {symbol} state UNKNOWN; preserving local exposure; no close/finalize action",
-                "ERROR", debounce_key=f"exchange_reconcile_unknown_{symbol}", debounce_sec=30
-            )
-            return "UNKNOWN"
-
-        if status == "FLAT":
-            if local_state.get("open"):
-                _clear_confirmed_flat(symbol)
-            MEMORY["position_status"] = "FLAT"
-            return "FLAT"
-
-        if status != "OPEN" or snap is None:
-            MEMORY["position_status"] = "UNKNOWN"
-            if local_state.get("open"):
-                STATE["recovery_hold"] = True
-                STATE["recovery_reason"] = "INVALID_EXCHANGE_SNAPSHOT"
-                RECOVERY_BLOCK_ENTRIES = True
-            return "UNKNOWN"
-
-        if STATE.get("pending_close_order_id"):
-            _resolve_pending_close_from_snapshot(symbol, snap)
-        if _apply_open_snapshot(symbol, snap) is None:
-            return "UNKNOWN"
-        self._last_snapshot = snap
-        self.event_bus.emit("reconciled", snap)
-        return "OPEN"
-    finally:
-        lock.release()
-
-
-ExchangeSyncService.fetch_live_snapshot = _exchange_fetch_live_snapshot
-ExchangeSyncService.reconcile = _exchange_reconcile
-
-
-_original_sync_position_state = sync_position_state
-def sync_position_state(symbol=None):
-    if PAPER_MODE:
-        return _original_sync_position_state(symbol)
-    if not symbol:
-        symbol = STATE.get("current_symbol") if STATE.get("open") else TRADE_STATE.get("symbol")
-    if not symbol:
-        return None, None, None, None
-    snap = _exchange_sync.fetch_live_snapshot(symbol)
-    status = getattr(_exchange_sync, "last_fetch_status", "UNKNOWN")
-    if status == "UNKNOWN":
-        MEMORY["position_status"] = "UNKNOWN"
-        log_execution(f"[POS_SYNC] {symbol} status UNKNOWN; local state retained", "WARN")
-        return None, None, None, None
-    if status == "FLAT":
-        if STATE.get("open"):
-            _clear_confirmed_flat(symbol)
-        else:
-            MEMORY["position_status"] = "FLAT"
-            MEMORY["current_position"] = None
-        return None, None, None, None
-    if snap is None:
-        MEMORY["position_status"] = "UNKNOWN"
-        return None, None, None, None
-    if STATE.get("pending_close_order_id"):
-        _resolve_pending_close_from_snapshot(symbol, snap)
-    if _apply_open_snapshot(symbol, snap) is None:
-        return None, None, None, None
-    if STATE.get("recovery_hold") or not STATE.get("trade_id"):
-        _attempt_runtime_trade_recovery(symbol, position=None, force=False)
-    if not STATE.get("recovery_hold") and not STATE.get("execution_unresolved"):
-        _persist_trade_journal_snapshot()
-    return snap.mark_price, snap.unrealized_pnl, snap.margin, snap.roe_pct
-
-
-def sync_all_states():
-    global RECOVERY_BLOCK_ENTRIES
-    if PAPER_MODE:
-        MEMORY["position_status"] = "OPEN" if STATE.get("open") else "FLAT"
-        MEMORY["total_pnl"] = PERF.get("total_pnl_usdt", 0.0)
-        MEMORY["total_pnl_pct"] = PERF.get("total_pnl_pct", 0.0) * 100
-        RECOVERY_BLOCK_ENTRIES = False
-        return
-    symbol = STATE.get("current_symbol") if STATE.get("open") else None
-    if symbol:
-        sync_position_state(symbol)
-    else:
-        status, positions = fetch_position_tri_state(None)
-        if status == "UNKNOWN":
-            MEMORY["position_status"] = "UNKNOWN"
-            MEMORY["current_position"] = None
-            RECOVERY_BLOCK_ENTRIES = True
-        elif status == "FLAT":
-            MEMORY["position_status"] = "FLAT"
-            MEMORY["current_position"] = None
-            # Confirmed flat resolves an ambiguous order write without fabricating a fill.
-            STATE["execution_unresolved"] = False
-            STATE["recovery_hold"] = False
-            RECOVERY_BLOCK_ENTRIES = False
-        elif status == "OPEN" and positions:
-            if len(positions) == 1:
-                position = positions[0]
-                key = roro_canonical_symbol(_position_symbol(position))
-                _attempt_runtime_trade_recovery(_position_symbol(position), position=position, force=False)
-            else:
-                MEMORY["position_status"] = "MULTIPLE_OPEN"
-                RECOVERY_BLOCK_ENTRIES = True
-    symbol_for_pnl = symbol or DEFAULT_SYMBOL
-    try:
-        real_pnl, real_pnl_pct = get_realized_pnl(symbol_for_pnl)
-        MEMORY["total_pnl"] = real_pnl
-        MEMORY["total_pnl_pct"] = real_pnl_pct
-    except Exception:
-        pass
-
-
-# Journal start/snapshot is tied to the existing GGP trade lifecycle, not a second manager.
-_original_execute_entry_for_journal = execute_entry
-def execute_entry(*args, **kwargs):
-    result = _original_execute_entry_for_journal(*args, **kwargs)
-    if result and STATE.get("open"):
-        ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-        _persist_trade_journal_start(ctx.get("setup_type"))
-    return result
-
-_original_manage_live_trade_for_journal = LiveTradeManager.manage_live_trade
-def _manage_live_trade_with_journal(self):
-    result = _original_manage_live_trade_for_journal(self)
-    _persist_trade_journal_snapshot()
-    return result
-LiveTradeManager.manage_live_trade = _manage_live_trade_with_journal
-
-# Start-up recovery must complete before Scanner can authorize a new order.
-_original_main_loop_sniper = main_loop_sniper
-def main_loop_sniper():
-    try:
-        if not PAPER_MODE:
-            try:
-                ex.load_markets()
-            except Exception as exc:
-                MEMORY["position_status"] = "UNKNOWN"
-                MEMORY["recovery_status"] = "MARKETS_UNAVAILABLE"
-                log_execution(f"[RECOVERY] Cannot load BingX markets before startup recovery: {exc}", "ERROR")
-            startup_trade_recovery()
-        else:
-            startup_trade_recovery()
-    except Exception as exc:
-        global RECOVERY_BLOCK_ENTRIES
-        RECOVERY_BLOCK_ENTRIES = True
-        MEMORY["position_status"] = "UNKNOWN"
-        MEMORY["recovery_status"] = "STARTUP_RECOVERY_ERROR"
-        log_execution(f"[RECOVERY] Startup recovery failed closed: {exc}", "ERROR")
-    return _original_main_loop_sniper()
-
-
-# safe_main_loop resolves this alias dynamically; point it at the recovery wrapper.
-main_loop = main_loop_sniper
 
 DASHBOARD_SERVERS = []
 DASHBOARD_ACTIVE_PORTS = []
