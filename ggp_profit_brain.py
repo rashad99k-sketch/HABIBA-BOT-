@@ -12,9 +12,10 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 # Price-move percentages (not leveraged ROE percentages).
-# At 20x these correspond approximately to 5%, 10%, 20% and 60% ROE,
-# before fees, funding and slippage.
-RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
+# At 20x these correspond approximately to 5% and 10% ROE before fees,
+# funding and slippage. SCALP is closed 100% at one target; there is no
+# 1.00% scalp tier and no TP1/TP2 split.
+RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50)
 TREND_TP1_MOVE_PCT = 2.00
 TREND_TP2_MOVE_PCT = 3.00
 RANGE_MODE = "RANGE_SCALP"
@@ -331,12 +332,11 @@ def target_reached(side: str, current_price: float, target_price: float) -> bool
 
 
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
-    """Select a 0.25/0.50/1.00% PRICE move from simple, observable evidence.
+    """Select the SCALP 0.25% or 0.50% PRICE move from observable evidence.
 
     Targets are price movement percentages, not leveraged ROE. Weak/thin
-    conditions stay at 0.25%; moderate follow-through earns 0.50%; strong
-    directional evidence earns 1.00%. Larger directional moves belong to the
-    existing trend-mode TP2 path, not the range-scalp target selector.
+    conditions stay at 0.25%; moderate and strong follow-through are both
+    capped at 0.50%. Stronger directional moves belong to TREND mode only.
     """
     ctx = context if isinstance(context, dict) else {}
     adx = _number(ctx.get("adx"), 0.0) or 0.0
@@ -366,7 +366,9 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     adverse_rejection = bool(ctx.get("adverse_rejection", False))
     if (aligned_count >= 2 and continuation >= 0.72 and adx >= 22.0
             and volume_ratio >= 1.20 and di_aligned and not adverse_rejection):
-        return RANGE_PROFIT_TARGETS_PCT[2], "strong_closed_candle_follow_through_1.00pct"
+        # The directive caps every SCALP target at 0.50%; strong follow-through
+        # must not create a third tier or a trend-style runner.
+        return RANGE_PROFIT_TARGETS_PCT[1], "strong_follow_through_capped_at_0.50pct"
     if (aligned_count >= 2 and continuation >= 0.55 and adx >= 18.0
             and volume_ratio >= 0.85 and di_aligned and not adverse_rejection):
         return RANGE_PROFIT_TARGETS_PCT[1], "moderate_follow_through_0.50pct"

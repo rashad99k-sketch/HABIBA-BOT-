@@ -22,34 +22,62 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 MIN_ENTRY_ADX = 18.0
 DEFAULT_RETENTION_SECONDS = 2700.0
-HIGH_QUALITY = "HIGH QUALITY CROSS"
-GOOD_QUALITY = "GOOD CROSS"
-WEAK_QUALITY = "WEAK CROSS"
-INVALID_QUALITY = "INVALID CROSS"
+EXCELLENT_QUALITY = "EXCELLENT"
+GOOD_QUALITY = "GOOD"
+MODERATE_QUALITY = "MODERATE"
+WEAK_QUALITY = "WEAK"
+INVALID_QUALITY = "INVALID"
+# Backwards-compatible constant names for existing callers and tests.
+HIGH_QUALITY = EXCELLENT_QUALITY
+
+APPROVABLE_QUALITIES = {EXCELLENT_QUALITY, GOOD_QUALITY}
 
 
 class CrossLifecycleState(str, Enum):
     CROSS_DETECTED = "CROSS_DETECTED"
+    WAITING_FOR_INSTITUTIONAL_ANALYSIS = "WAITING_FOR_INSTITUTIONAL_ANALYSIS"
     INSTITUTIONAL_ANALYSIS_PENDING = "INSTITUTIONAL_ANALYSIS_PENDING"
+    ZONE_ANALYSIS_COMPLETE = "ZONE_ANALYSIS_COMPLETE"
+    ENTRY_CANDIDATE = "ENTRY_CANDIDATE"
     INSTITUTIONAL_APPROVED = "INSTITUTIONAL_APPROVED"
     INSTITUTIONAL_REJECTED = "INSTITUTIONAL_REJECTED"
     EXECUTION_READY = "EXECUTION_READY"
     ENTRY_SUBMITTED = "ENTRY_SUBMITTED"
     ENTRY_FILLED = "ENTRY_FILLED"
     ENTRY_REJECTED = "ENTRY_REJECTED"
+    CONSUMED = "CONSUMED"
 
 
 _ALLOWED_TRANSITIONS: Dict[str, set] = {
     CrossLifecycleState.CROSS_DETECTED.value: {
+        CrossLifecycleState.WAITING_FOR_INSTITUTIONAL_ANALYSIS.value,
+        CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
+        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
+    },
+    CrossLifecycleState.WAITING_FOR_INSTITUTIONAL_ANALYSIS.value: {
         CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
         CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
     },
     CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value: {
+        CrossLifecycleState.ZONE_ANALYSIS_COMPLETE.value,
         CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
+    },
+    CrossLifecycleState.ZONE_ANALYSIS_COMPLETE.value: {
+        CrossLifecycleState.ENTRY_CANDIDATE.value,
+        CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+        CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
+    },
+    CrossLifecycleState.ENTRY_CANDIDATE.value: {
+        # Execution-side gates can re-confirm the institutional approval before
+        # the final single-flight cross readiness check.
+        CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+        CrossLifecycleState.EXECUTION_READY.value,
         CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
     },
     CrossLifecycleState.INSTITUTIONAL_APPROVED.value: {
         CrossLifecycleState.EXECUTION_READY.value,
+        CrossLifecycleState.ENTRY_CANDIDATE.value,
         CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
         # A later scan re-runs the same closed-candle analysis before entry.
         CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
@@ -65,7 +93,10 @@ _ALLOWED_TRANSITIONS: Dict[str, set] = {
     CrossLifecycleState.ENTRY_REJECTED.value: {
         CrossLifecycleState.CROSS_DETECTED.value,
     },
-    CrossLifecycleState.ENTRY_FILLED.value: set(),
+    CrossLifecycleState.ENTRY_FILLED.value: {
+        CrossLifecycleState.CONSUMED.value,
+    },
+    CrossLifecycleState.CONSUMED.value: set(),
     CrossLifecycleState.INSTITUTIONAL_REJECTED.value: {
         CrossLifecycleState.CROSS_DETECTED.value,
         CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
@@ -244,6 +275,179 @@ def transition_state(candidate: Dict[str, Any], new_state: str,
     return updated
 
 
+_PERMANENT_REJECTIONS = {"duplicate_cross_event_id", "cross_signal_expired_without_reentry"}
+
+
+def cross_lifecycle_badge(row: Optional[Dict[str, Any]]) -> str:
+    """Return the Watchlist badge driven by the real event state, never a label."""
+    item = row if isinstance(row, dict) else {}
+    state = str(item.get("institutional_analysis_status") or item.get("lifecycle_state") or "").upper()
+    status = str(item.get("cross_status") or "").upper()
+    decision_state = str(item.get("decision_state") or "").upper()
+    reason = str(item.get("final_rejection_reason") or "")
+    consumed = bool(item.get("cross_event_id_consumed") or item.get("consumed"))
+    if (status == "EXPIRED" or consumed
+            or state in {CrossLifecycleState.CONSUMED.value,
+                         CrossLifecycleState.WAITING_FOR_INSTITUTIONAL_ANALYSIS.value}):
+        return "⚪ EXPIRED / WAITING"
+    if (state == CrossLifecycleState.INSTITUTIONAL_REJECTED.value
+            or status == "REJECTED" or decision_state == "REJECTED"
+            or reason in _PERMANENT_REJECTIONS):
+        return "🔴 REJECTED"
+    if state == CrossLifecycleState.EXECUTION_READY.value:
+        return "🚀 EXECUTION READY"
+    if state in {CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+                 CrossLifecycleState.ENTRY_CANDIDATE.value}:
+        return "🟢 ENTRY CANDIDATE"
+    if state in {CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value,
+                 CrossLifecycleState.ZONE_ANALYSIS_COMPLETE.value}:
+        return "🟣 INSTITUTIONAL ZONE ANALYSIS"
+    if status == "CONFIRMED":
+        return "🟡 CROSS CONFIRMED — ANALYZING"
+    if status == "APPROACHING":
+        return "🔵 APPROACHING CROSS"
+    return "⚪ EXPIRED / WAITING"
+
+
+def cross_lifecycle_identity(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Flatten the required Watchlist identity fields from the retained event."""
+    item = row if isinstance(row, dict) else {}
+    event = item.get("cross_event") if isinstance(item.get("cross_event"), dict) else {}
+    proximity = (item.get("ema9_vwap_proximity")
+                 if isinstance(item.get("ema9_vwap_proximity"), dict) else {})
+    icons = item.get("icons") if isinstance(item.get("icons"), dict) else {}
+    adx_di = item.get("adx_di") if isinstance(item.get("adx_di"), dict) else {}
+    golden = item.get("golden_zone") if isinstance(item.get("golden_zone"), dict) else {}
+    ob = item.get("order_block") if isinstance(item.get("order_block"), dict) else {}
+    fvg = item.get("fvg") if isinstance(item.get("fvg"), dict) else {}
+    structure = (item.get("market_structure")
+                 if isinstance(item.get("market_structure"), dict) else {})
+    liquidity = item.get("liquidity") if isinstance(item.get("liquidity"), dict) else {}
+    evidence = [str(value) for value in (item.get("evidence") or [])]
+    retest = next((value for value in evidence
+                   if any(token in value.lower() for token in ("retest", "pullback"))), None)
+    if retest is None and str(icons.get("pullback") or "") == "🔄":
+        retest = "retest_observed"
+    zone = str(golden.get("state") or "").upper()
+    if not zone and ob:
+        zone = "ORDER_BLOCK:" + str(ob.get("status") or "UNKNOWN").upper()
+    if not zone and fvg:
+        zone = "FVG:" + str(fvg.get("status") or "UNKNOWN").upper()
+
+    def _first_finite(*values: Any) -> Optional[float]:
+        # `or` would discard a legitimate fresh zero and fall back to stale data.
+        for value in values:
+            if value is None:
+                continue
+            number = finite(value)
+            if number is not None:
+                return number
+        return None
+
+    return {
+        "badge": cross_lifecycle_badge(item),
+        "lifecycle_state": str(item.get("institutional_analysis_status") or "UNKNOWN"),
+        "symbol": item.get("symbol") or event.get("symbol") or "UNKNOWN",
+        "cross_direction": str(
+            item.get("cross_direction") or event.get("cross_direction")
+            or item.get("side") or item.get("signal_direction") or "UNKNOWN"
+        ).upper(),
+        "cross_status": str(item.get("cross_status") or event.get("cross_status") or "NONE").upper(),
+        "candle_timestamp": item.get("candle_timestamp") or event.get("candle_timestamp"),
+        "cross_event_id": item.get("cross_event_id") or event.get("cross_event_id"),
+        "adx": _first_finite(item.get("adx"), adx_di.get("adx"), event.get("adx")),
+        "ema9": _first_finite(item.get("ema9"), event.get("ema9"), proximity.get("ema9")),
+        "session_vwap": _first_finite(item.get("vwap"), event.get("session_vwap"),
+                                      proximity.get("vwap")),
+        "distance_from_vwap": _first_finite(item.get("cross_distance_atr"),
+                                            event.get("cross_distance_atr"),
+                                            proximity.get("gap_atr")),
+        "institutional_zone": zone or "UNKNOWN",
+        "zone_quality": item.get("cross_quality") or item.get("zone_quality") or "UNRATED",
+        "market_structure": str(structure.get("pattern") or structure.get("mss")
+                                or item.get("market_regime") or "UNKNOWN").upper(),
+        "liquidity_condition": str(liquidity.get("event") or item.get("liquidity_condition")
+                                   or "UNKNOWN").upper(),
+        "retest_status": retest or "NOT_CONFIRMED",
+        "volume_condition": str(item.get("volume_condition")
+                                or ("CONFIRMED" if item.get("volume_confirmed") else "NOT_CONFIRMED")),
+        "opportunity_classification": str(item.get("trading_mode")
+                                          or item.get("opportunity_classification")
+                                          or item.get("decision_setup_type") or "UNCLASSIFIED"),
+        "waiting_or_rejection_reason": (item.get("final_rejection_reason")
+                                        or item.get("rejection_reason")
+                                        or item.get("waiting_reason") or ""),
+    }
+
+
+def opportunity_summary(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Explainable BEST BUY / BEST SELL summary without invented probabilities."""
+    item = row if isinstance(row, dict) else {}
+    identity = cross_lifecycle_identity(item)
+    location = item.get("cross_location") if isinstance(item.get("cross_location"), dict) else {}
+    reasons: List[str] = []
+    if identity["zone_quality"] and identity["zone_quality"] != "UNRATED":
+        reasons.append(f"zone_quality:{identity['zone_quality']}")
+    if identity["adx"] is not None:
+        reasons.append(f"adx:{identity['adx']:g}")
+    reasons.extend(str(value) for value in (location.get("evidence") or [])[:6])
+    if item.get("cross_rank") is not None:
+        reasons.append(f"cross_rank:{item.get('cross_rank')}")
+    return {
+        "symbol": identity["symbol"],
+        "cross_event_id": identity["cross_event_id"],
+        "direction": identity["cross_direction"],
+        "cross_timestamp": identity["candle_timestamp"],
+        "adx": identity["adx"],
+        "best_institutional_zone": identity["institutional_zone"],
+        "zone_quality": identity["zone_quality"],
+        "entry_area": {"low": item.get("entry_zone_low"), "high": item.get("entry_zone_high")},
+        "stop_loss_reference": item.get("structural_stop"),
+        "opportunity_type": identity["opportunity_classification"],
+        "selection_reasons": reasons,
+        "badge": identity["badge"],
+        "cross_rank": item.get("cross_rank"),
+    }
+
+
+def rank_cross_candidates_by_side(items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Rank BUY and SELL queues independently and publish explainable best picks."""
+    ranked = rank_cross_candidates(items)
+    queues: Dict[str, List[Dict[str, Any]]] = {"BUY": [], "SELL": []}
+    for row in ranked:
+        side = str(row.get("side") or row.get("cross_direction") or "").upper()
+        if side in queues:
+            queues[side].append(row)
+
+    def _eligible(row: Dict[str, Any]) -> bool:
+        status = str(row.get("cross_status") or "").upper()
+        quality = str(row.get("cross_quality") or row.get("quality") or "").upper()
+        reason = str(row.get("final_rejection_reason") or "")
+        lifecycle = str(row.get("institutional_analysis_status") or "").upper()
+        adx_ok, _ = adx_gate(row.get("adx"))
+        return bool(
+            status == "CONFIRMED" and row.get("cross_event_id")
+            and not reason and quality in APPROVABLE_QUALITIES and adx_ok
+            and bool(row.get("cross_location_approved"))
+            and lifecycle in {
+                CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+                CrossLifecycleState.ENTRY_CANDIDATE.value,
+                CrossLifecycleState.EXECUTION_READY.value,
+            }
+        )
+
+    best_buy = next((opportunity_summary(row) for row in queues["BUY"] if _eligible(row)), None)
+    best_sell = next((opportunity_summary(row) for row in queues["SELL"] if _eligible(row)), None)
+    return {
+        "BUY": queues["BUY"],
+        "SELL": queues["SELL"],
+        "queue": ranked,
+        "best_buy": best_buy,
+        "best_sell": best_sell,
+        "updated_at": time.time(),
+    }
+
+
 def _zone_quality(features: Dict[str, Any]) -> str:
     """Explainable cross-location class; score is supporting evidence only."""
     side = str(features.get("cross_direction") or features.get("side") or "").upper()
@@ -257,8 +461,10 @@ def _zone_quality(features: Dict[str, Any]) -> str:
     cross_dir = str(features.get("cross_ema9") or features.get("cross_direction_signal") or "").upper()
     if cross_dir and cross_dir != expected:
         return INVALID_QUALITY
+    indicator_quality = str(features.get("indicator_quality", "")).upper()
     critical = {
         "valid_closed_data": bool(features.get("valid_closed_data", True)),
+        "fresh_indicators": indicator_quality not in {"STALE_DATA", "DATA_UNAVAILABLE"},
         "real_value_area": bool(features.get("real_value_area", False)),
         "room_before_opposing_liquidity": bool(features.get("room_before_opposing_liquidity", False)),
         "room_before_opposing_structure": bool(features.get("room_before_opposing_structure", False)),
@@ -302,9 +508,11 @@ def _zone_quality(features: Dict[str, Any]) -> str:
     flow_count = sum(1 for passed in flow.values() if passed)
     if (core_count >= 2 and flow_count >= 2 and event
             and features.get("premium_discount_aligned", False) and space >= 1.0):
-        return HIGH_QUALITY
+        return EXCELLENT_QUALITY
     if core_count >= 1 and flow_count >= 1 and space >= 0.7:
         return GOOD_QUALITY
+    if (core_count + flow_count) >= 2 and space >= 0.5:
+        return MODERATE_QUALITY
     return WEAK_QUALITY
 
 
@@ -328,7 +536,11 @@ def evaluate_cross_location(features: Dict[str, Any],
             evidence.append(f"{key}:{'PASS' if value else 'FAIL'}")
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             evidence.append(f"{key}:{value}")
-    approved = quality in {HIGH_QUALITY, GOOD_QUALITY} and adx_ok
+        elif value is not None:
+            # Keep categorical evidence (indicator freshness, cross direction,
+            # zone state) auditable in the same stream as boolean/numeric checks.
+            evidence.append(f"{key}:{str(value)[:80]}")
+    approved = quality in APPROVABLE_QUALITIES and adx_ok
     expected_signal = "BULLISH" if side == "BUY" else "BEARISH"
     observed_signal = str(features.get("cross_ema9") or features.get("cross_direction_signal") or "").upper()
     mismatch = bool(observed_signal and observed_signal != expected_signal)
@@ -336,7 +548,7 @@ def evaluate_cross_location(features: Dict[str, Any],
         reason for reason in (
             adx_reason if not adx_ok else "",
             "cross_direction_mismatch" if mismatch else "",
-            None if quality == HIGH_QUALITY else f"cross_location_quality:{quality}",
+            None if quality in APPROVABLE_QUALITIES else f"cross_location_quality:{quality}",
         ) if reason
     ]
     return {
@@ -445,6 +657,7 @@ def build_location_features(context: Dict[str, Any],
                           ("BULLISH" if cross.get("cross_direction") == "BUY" else "BEARISH")
                           if cross else "").upper(),
         "adx": finite(ctx.get("adx") or indicators.get("adx")),
+        "indicator_quality": str(indicators.get("quality") or ctx.get("indicator_quality") or "FRESH").upper(),
         "valid_closed_data": str(ctx.get("data_quality") or "VALID_CLOSED_CANDLES") == "VALID_CLOSED_CANDLES",
         "demand_zone_near": bool(buy and value_aligned and (ob_ok or fvg_ok or sr_aligned)),
         "supply_zone_near": bool(not buy and value_aligned and (ob_ok or fvg_ok or sr_aligned)),
@@ -475,7 +688,7 @@ def cross_rank(item: Dict[str, Any]) -> float:
     row = item if isinstance(item, dict) else {}
     quality = str(row.get("cross_quality") or row.get("quality") or "").upper()
     quality_points = {
-        HIGH_QUALITY: 40.0, GOOD_QUALITY: 27.0,
+        EXCELLENT_QUALITY: 40.0, GOOD_QUALITY: 27.0, MODERATE_QUALITY: 14.0,
         WEAK_QUALITY: 8.0, INVALID_QUALITY: 0.0,
     }.get(quality, 0.0)
     features = row.get("cross_location") if isinstance(row.get("cross_location"), dict) else {}
@@ -547,7 +760,7 @@ def execution_readiness(candidate: Dict[str, Any], *, event_consumed: bool = Fal
     if not adx_ok:
         return False, adx_reason
     quality = str(row.get("cross_quality") or "").upper()
-    if quality not in {HIGH_QUALITY, GOOD_QUALITY}:
+    if quality not in APPROVABLE_QUALITIES:
         return False, f"cross_location_quality:{quality or 'UNRATED'}"
     if str(row.get("institutional_analysis_status")) != CrossLifecycleState.INSTITUTIONAL_APPROVED.value:
         return False, "institutional_analysis_not_approved"
