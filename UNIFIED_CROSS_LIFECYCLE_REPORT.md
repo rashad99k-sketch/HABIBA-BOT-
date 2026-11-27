@@ -220,7 +220,8 @@ a pre-existing Pandas `Timestamp.utcnow` deprecation in
 
 - PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44
 - Merge method: standard GitHub merge commit; no force push, rebase or history rewrite.
-- GitHub API confirmed `merged: true` and `main` HEAD equals the merge commit above.
+- GitHub API confirmed `merged: true` with the merge commit above; subsequent report-only
+  documentation commits advanced `main` without changing implementation code.
 - GitHub Actions `python-tests`: success on `f9be4e9`.
 - Exact patch: `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
 
