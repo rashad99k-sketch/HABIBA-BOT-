@@ -1,6 +1,7 @@
 # Unified EMA9 + Session VWAP cross lifecycle — final engineering report
 
-**Status:** offline regression verified on the integrated branch; **not LIVE ready**.
+**Status:** merged into `main` after offline regression verification and independent review;
+**not LIVE ready**.
 No exchange call, order, balance query, API-key change, demo order or LIVE trade was
 performed. BingX execution paths were only reused through the existing order path and
 identity plumbing; no gate was bypassed.
@@ -18,6 +19,9 @@ identity plumbing; no gate was bypassed.
 | Clean base before work | `908f29c836b417b0dac7560611cc5c6d7097efbb` |
 | Remote `main` after owner commit | `59eeffd09ac7ea0d81ea3bb800c0633547acf0d6` |
 | Merge base PR → main | `908f29c836b417b0dac7560611cc5c6d7097efbb` |
+| Final PR head | `f9be4e91172f875958dbb71c45eb010aa324625a` |
+| Merge commit on `main` | `1f342414dbba45e4edb3a94eac067d260ea93270` (GitHub-verified) |
+| PR result | merged, not closed unmerged |
 | PR | https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44 |
 
 The owner's newer `main` commit changed only `.env.example`. It was preserved by a
@@ -162,6 +166,9 @@ ROE.
 | Full offline regression before merging `origin/main` | **642 passed, 1 warning in 124.51s** |
 | Full offline regression after merging owner commit `59eeffd` | **642 passed, 1 warning in 126.45s** |
 | Final full offline regression after independent re-review fixes | **643 passed, 1 warning in 130.83s** |
+| GitHub Actions `python-tests` on final PR head `f9be4e9` | **success** (run 46064388234) |
+| Independent initial re-review | Prior blockers fixed; safe as offline-verified code, not LIVE-ready |
+| Independent targeted re-review of follow-up fixes | **no actionable findings**; safe as offline-verified code, not LIVE-ready |
 
 Baseline before edits was `618 passed, 1 warning in 177.13s`. No Timeout was raised, no
 test was skipped or marked xfail, and no failing test was ignored. The single warning is
@@ -193,17 +200,28 @@ a pre-existing Pandas `Timestamp.utcnow` deprecation in
    `ENTRY_READY`.
 8. **Volatility bands** use simple ATR% thresholds; regime stabilization/hysteresis stay
    with existing engines.
-9. No 24-hour soak, no exchange outage simulation under LIVE credentials and no GitHub
-   Actions status checks were available on the PR head.
+9. No 24-hour soak and no exchange outage simulation under LIVE credentials. GitHub
+   Actions `python-tests` did run and passed on the final PR head; it is not a substitute
+   for demo/LIVE verification.
 
 ## 11. Git history and PR
 
-- Implementation: `1f80d691ff74ebe71a728e82b27ac014c6145899`
-- Report metadata: `0a66ddcb3233a5149db77edc1ad83e421b1307e5`
-- Review fixes: `6270c5a3faaf212e963e14389a93672600b01df3`
-- Integration merge of `origin/main` into branch: `877b0e6a737a5b94e4858e4d1451a8b022303671`
-- PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44
-- Exact patch: `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`
+| Event | Commit / result |
+|---|---|
+| Clean base before edits | `908f29c836b417b0dac7560611cc5c6d7097efbb` |
+| Owner `.env.example` commit on `main` (preserved) | `59eeffd09ac7ea0d81ea3bb800c0633547acf0d6` |
+| Implementation | `1f80d691ff74ebe71a728e82b27ac014c6145899` |
+| Initial report metadata | `0a66ddcb3233a5149db77edc1ad83e421b1307e5` |
+| First independent-review fixes | `6270c5a3faaf212e963e14389a93672600b01df3` |
+| Integration of `origin/main` into branch | `877b0e6a737a5b94e4858e4d1451a8b022303671` |
+| Final documentation / generated diff | `12b0dd7d4346e700a2eecef0bff2ad66884728bb` |
+| Final PR head (follow-up validity/canonical fixes) | `f9be4e91172f875958dbb71c45eb010aa324625a` |
+| PR #44 merge into `main` | `1f342414dbba45e4edb3a94eac067d260ea93270` |
 
-Full hashes are recorded in the final response and in Git after the main integration
-commit. No commit or PR claims LIVE readiness; they cover offline-verified code only.
+- PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44
+- Merge method: standard GitHub merge commit; no force push, rebase or history rewrite.
+- GitHub API confirmed `merged: true` and `main` HEAD equals the merge commit above.
+- GitHub Actions `python-tests`: success on `f9be4e9`.
+- Exact patch: `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
+
+No commit or PR claims LIVE readiness; they cover offline-verified code only.
