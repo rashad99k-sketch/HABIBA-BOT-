@@ -246,3 +246,34 @@ def test_confirmed_swings_vectorized_matches_reference_for_ties_and_random_frame
                 if lo < float(np.min(low[i-width:i])) and lo <= float(np.min(low[i+1:i+width+1])):
                     expected_lows.append((int(ts[i]), lo))
             assert confirmed_swings(df, left_right=width) == (expected_highs, expected_lows)
+
+
+def test_bridge_cross_event_handoff_satisfies_final_live_authorization(monkeypatch):
+    import ggp_institutional_bridge as bridge
+    from types import SimpleNamespace
+    from ggp_entry_authorization import validate_ema9_vwap_cross_authorization
+
+    df = frame()
+    cross_ts = 1700071100000
+    monkeypatch.setattr(bridge, "validate_dual_ema_vwap_entry_gate", lambda *a, **k: {
+        "ready": True, "signal_candle_id": f"BUY:{cross_ts}",
+        "ema9_cross_timestamp": cross_ts, "ema9_cross": "BULLISH",
+    })
+    monkeypatch.setattr(bridge, "_adx", lambda _df: 22.0)
+    monkeypatch.setattr(bridge, "_atr", lambda _df: 1.0)
+    handoff = bridge._cross_entry_authorization(
+        "BTC/USDT:USDT", "BUY", df, {}, SimpleNamespace(structural_stop=None),
+        now_ms=1700072000000,
+    )
+    assert handoff is not None
+    final_gate = dict(handoff["cross_gate"])
+    final_gate["frame_source"] = "UNIFIED_WATCHLIST_AUTHORIZED_FRAME"
+    ok, reason = validate_ema9_vwap_cross_authorization(
+        side="BUY", setup_type=handoff["decision_setup_type"],
+        decision_state=handoff["decision_state"], event_id=handoff["event_id"],
+        evidence=handoff["evidence"], adx=handoff["adx"], gate=final_gate,
+        candle_source="UNIFIED_WATCHLIST_AUTHORIZED_FRAME",
+        cross_timestamp=handoff["cross_timestamp"],
+    )
+    assert ok is True
+    assert reason == "authorized_closed_ema9_session_vwap_cross"
