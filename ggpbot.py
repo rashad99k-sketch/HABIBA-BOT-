@@ -12824,11 +12824,17 @@ _journal_last_snapshot_ts = 0.0
 
 
 def _position_contracts(pos):
+    """Read only authoritative total-position quantity, never closeable capacity.
+
+    BingX documents positionAmt as the total position and availableAmt as the
+    amount available to close. availableAmt and the undocumented positionSize
+    alias must not invent an open position when total-position data is absent.
+    """
     info = pos.get("info") if isinstance(pos, dict) else {}
     info = info if isinstance(info, dict) else {}
     raw = pos.get("contracts")
     if raw in (None, ""):
-        raw = info.get("positionAmt", info.get("positionSize", info.get("availableAmt", 0)))
+        raw = info.get("positionAmt", 0)
     try:
         return abs(float(raw or 0))
     except (TypeError, ValueError):
@@ -12869,6 +12875,26 @@ def fetch_position_tri_state(symbol=None):
             LAST_POSITION_FETCH_STATUS = "UNKNOWN"
             return "UNKNOWN", None
         open_positions = [p for p in result if isinstance(p, dict) and _position_contracts(p) > 0]
+        if not symbol:
+            # Keep account-wide recovery explainable: record only position identity
+            # and quantity fields, never credentials or full exchange payloads.
+            audit_rows = []
+            for row in result[:20]:
+                if not isinstance(row, dict):
+                    continue
+                info = row.get("info") if isinstance(row.get("info"), dict) else {}
+                audit_rows.append({
+                    "symbol": _position_symbol(row),
+                    "side": row.get("side") or info.get("positionSide") or info.get("side"),
+                    "contracts": row.get("contracts"),
+                    "positionAmt": info.get("positionAmt"),
+                    "availableAmt": info.get("availableAmt"),
+                    "counted_qty": _position_contracts(row),
+                })
+            log_execution(
+                f"[POS_SYNC_AUDIT] scope=ALL_MARKETS rows={len(result)} "
+                f"counted_open={len(open_positions)} samples={audit_rows}",
+                "INFO", debounce_key="position_sync_account_audit", debounce_sec=30)
         if symbol:
             target = roro_canonical_symbol(symbol)
             matches = [p for p in open_positions if roro_canonical_symbol(_position_symbol(p)) == target]
