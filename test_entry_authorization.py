@@ -80,3 +80,16 @@ def test_ema9_vwap_cross_authorization_rejects_wrong_direction_or_missing_eviden
         candle_source=ctx["candle_source"], cross_timestamp=ctx["cross_timestamp"],
     )
     assert not ok and reason == "closed_cross_evidence_missing"
+
+
+def test_ema9_vwap_cross_authorization_rejects_timestamp_mismatch_inside_signal_identity():
+    ctx = valid_context("BUY")
+    ctx["gate"]["signal_candle_id"] = "BUY:1795744800001"
+    ok, reason = validate_ema9_vwap_cross_authorization(
+        side=ctx["side"], setup_type=ctx["setup_type"],
+        decision_state=ctx["decision_state"], event_id=ctx["event_id"],
+        evidence=ctx["evidence"], adx=ctx["adx"], gate=ctx["gate"],
+        candle_source=ctx["candle_source"], cross_timestamp=ctx["cross_timestamp"],
+    )
+    assert ok is False
+    assert reason == "signal_candle_timestamp_mismatch"
