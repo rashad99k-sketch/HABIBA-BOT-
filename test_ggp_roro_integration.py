@@ -223,3 +223,26 @@ def test_proximity_scanner_crosses_are_merged_into_unified_watchlist_candidates(
     assert merged["SOL"]["sides"] == ["BUY"]
     assert merged["XRP"]["sides"] == ["SELL"]
     assert "ema9_vwap_proximity_scanner" in merged["SOL"]["sources"]
+
+
+def test_confirmed_swings_vectorized_matches_reference_for_ties_and_random_frames():
+    from roro_opportunity_pipeline import confirmed_swings
+
+    rng = np.random.default_rng(731)
+    for size in (5, 12, 80, 257):
+        high = rng.uniform(10.0, 20.0, size=size)
+        low = high - rng.uniform(0.1, 2.0, size=size)
+        if size > 12:
+            high[12] = high[11]
+            low[12] = low[11]
+        ts = np.arange(size, dtype=np.int64) * 900_000 + 1_700_000_000_000
+        df = pd.DataFrame({"timestamp": ts, "high": high, "low": low})
+        for width in (1, 2, 3):
+            expected_highs, expected_lows = [], []
+            for i in range(width, size - width):
+                h, lo = float(high[i]), float(low[i])
+                if h > float(np.max(high[i-width:i])) and h >= float(np.max(high[i+1:i+width+1])):
+                    expected_highs.append((int(ts[i]), h))
+                if lo < float(np.min(low[i-width:i])) and lo <= float(np.min(low[i+1:i+width+1])):
+                    expected_lows.append((int(ts[i]), lo))
+            assert confirmed_swings(df, left_right=width) == (expected_highs, expected_lows)
