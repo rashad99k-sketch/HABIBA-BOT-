@@ -6149,6 +6149,9 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             return None
         _ACTIVE_TRADE = True
     order = None
+    # Once the exchange submission service is invoked, a local exception cannot
+    # prove that BingX is flat. Preserve the single-trade lock until reconciliation.
+    entry_submission_attempted = False
     try:
         market = ex.market(sym)
         contract_size = safe_float(market.get("contractSize"), 0.0)
@@ -6198,6 +6201,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                                      decision_state="SUBMITTING",
                                      details={"quantity": amount, "leverage": LEVERAGE},
                                      logger=lambda message: log_execution(message, "INFO"))
+            entry_submission_attempted = True
             result = service.submit_market_entry(
                 symbol=sym, side=side, quantity=amount, leverage=LEVERAGE,
                 structural_stop=stop_value, trade_id=str(trade_id or STATE.get("trade_id") or uuid.uuid4().hex),
@@ -6212,7 +6216,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
                          "requested_qty": result.requested_qty,
                          "filled_qty": result.filled_qty,
                          "remaining_qty": result.remaining_qty,
-                         "average_price": result.average_price,
+                         "average_fill_price": result.average_fill_price,
                          "reason": result.reason},
                 logger=lambda message: log_execution(message, "INFO" if result.state is ExecutionState.FILLED else "WARN"))
             if result.state not in {ExecutionState.FILLED}:
@@ -6254,6 +6258,16 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             )
             return order
     except Exception as e:
+        if entry_submission_attempted:
+            STATE.update({"execution_unresolved": True, "recovery_hold": True,
+                          "entry_execution_state": ExecutionState.EXECUTION_UNCERTAIN.value})
+            MEMORY["recovery_status"] = "ORDER_SUBMISSION_UNCERTAIN"
+            if "RECOVERY_BLOCK_ENTRIES" in globals():
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+            log_execution(
+                "[LIVE_SAFETY] Exception after entry submission attempt; preserving "
+                "entry lock until BingX reconciliation: "
+                f"{type(e).__name__}: {e}", "CRITICAL")
         log_execution(f"Open position error: {type(e).__name__}: {e}", "ERROR")
     finally:
         # Keep the entry lock held after a returned order; execute_entry adopts the

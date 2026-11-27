@@ -837,6 +837,51 @@ def test_open_position_reports_held_trade_lock_without_releasing_it(monkeypatch)
 # --------------------------------------------------------------------------- #
 # 16: no new entries while Recovery Hold is active
 # --------------------------------------------------------------------------- #
+
+def test_post_submission_exception_keeps_lock_and_requires_reconciliation(monkeypatch):
+    _fresh_state()
+    exchange = MockExchange(balance=1000.0, position=_long_position(qty=1.0, entry=100.0, mark=100.0))
+    monkeypatch.setattr(ggpbot, "ex", exchange)
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "dynamic_spread_tolerance", lambda _symbol: 1000.0)
+    monkeypatch.setattr(ggpbot, "get_spread_bps", lambda _symbol: 0.0)
+    monkeypatch.setattr(ggpbot, "log_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ggpbot, "_ACTIVE_TRADE", False)
+
+    class FilledThenStopFailure:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def submit_market_entry(self, **_kwargs):
+            return SimpleNamespace(
+                state=ExecutionState.FILLED,
+                filled_qty=1.0,
+                remaining_qty=0.0,
+                average_fill_price=100.0,
+                exchange_order_id="entry-1",
+                client_order_id="client-1",
+                position_mode=PositionMode.HEDGE.value,
+                position_side="LONG",
+                trade_id="trade-1",
+                raw_order={"id": "entry-1"},
+                reason="",
+            )
+
+        def place_and_verify_native_stop(self, **_kwargs):
+            raise RuntimeError("simulated stop verification failure")
+
+    monkeypatch.setattr(ggpbot, "TradeExecutionService", FilledThenStopFailure)
+    try:
+        assert ggpbot.open_position("BUY", 1.0, "BTC/USDT:USDT", stop_loss=95.0) is None
+        assert ggpbot.STATE["execution_unresolved"] is True
+        assert ggpbot.STATE["recovery_hold"] is True
+        assert ggpbot.STATE["entry_execution_state"] == ExecutionState.EXECUTION_UNCERTAIN.value
+        assert ggpbot._ACTIVE_TRADE is True
+    finally:
+        ggpbot._ACTIVE_TRADE = False
+        ggpbot.RECOVERY_BLOCK_ENTRIES = False
+
 def test_no_new_entry_during_recovery_hold(monkeypatch):
     monkeypatch.setattr(ggpbot, "refresh_unified_institutional_watchlist", lambda: None)
     ggpbot.RECOVERY_BLOCK_ENTRIES = True
