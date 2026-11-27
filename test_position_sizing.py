@@ -200,3 +200,35 @@ def test_medium_and_strong_targets_are_exact_margin_spend():
     assert strong.margin_required == pytest.approx(3.0)
     assert medium.final_notional == pytest.approx(40.0)
     assert strong.final_notional == pytest.approx(60.0)
+
+
+@pytest.mark.parametrize("side,entry,stop", [
+    ("BUY", 100.0, 99.0),
+    ("SELL", 100.0, 101.0),
+])
+def test_execution_stop_accepts_uninvalidated_structural_level(side, entry, stop):
+    from ggp_position_sizing import validate_execution_stop
+    assert validate_execution_stop(side=side, entry_price=entry, stop_price=stop) is None
+
+
+@pytest.mark.parametrize("side,entry,stop", [
+    ("BUY", 100.0, 100.0),
+    ("BUY", 99.0, 100.0),
+    ("SELL", 100.0, 100.0),
+    ("SELL", 101.0, 100.0),
+])
+def test_execution_stop_rejects_level_crossed_by_execution_price(side, entry, stop):
+    from ggp_position_sizing import validate_execution_stop
+    with pytest.raises(ValueError, match="invalidated at execution price"):
+        validate_execution_stop(side=side, entry_price=entry, stop_price=stop)
+
+
+@pytest.mark.parametrize("side,entry,stop", [
+    ("BUY", float("nan"), 99.0),
+    ("SELL", 100.0, float("inf")),
+    ("BUY", 0.0, 0.0),
+])
+def test_execution_stop_rejects_non_finite_or_non_positive_prices(side, entry, stop):
+    from ggp_position_sizing import validate_execution_stop
+    with pytest.raises(ValueError):
+        validate_execution_stop(side=side, entry_price=entry, stop_price=stop)

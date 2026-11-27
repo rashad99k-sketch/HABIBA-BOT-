@@ -66,22 +66,48 @@ def entry_adx_allowed(adx: Any, minimum: float = MIN_ENTRY_ADX) -> bool:
 
 
 
+def validate_execution_stop(*, side: str, entry_price: float, stop_price: float) -> None:
+    """Validate a structural stop against the actual execution reference price.
+
+    A stop is an invalidation boundary, not a value that may be re-anchored
+    after price has crossed it. Callers must reject the setup when this fails.
+    """
+    direction = str(side or "").strip().upper()
+    if direction not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    try:
+        entry = float(entry_price)
+        stop = float(stop_price)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("entry and structural stop must be numeric") from exc
+    if not isfinite(entry) or entry <= 0 or not isfinite(stop) or stop <= 0:
+        raise ValueError("entry and structural stop must be finite and positive")
+    if direction == "BUY" and stop >= entry:
+        raise ValueError(
+            f"BUY structural stop invalidated at execution price: stop={stop:.12g} entry={entry:.12g}"
+        )
+    if direction == "SELL" and stop <= entry:
+        raise ValueError(
+            f"SELL structural stop invalidated at execution price: stop={stop:.12g} entry={entry:.12g}"
+        )
+
+
 def validate_trade_geometry(*, side: str, entry_price: float, stop_price: float,
                             tp1_price: float, tp2_price: float) -> None:
     """Fail closed when SL/TP levels are inverted for the requested direction."""
     direction = str(side or "").strip().upper()
     if direction not in {"BUY", "SELL"}:
         raise ValueError("side must be BUY or SELL")
-    values = (entry_price, stop_price, tp1_price, tp2_price)
     try:
-        entry, stop, tp1, tp2 = (float(value) for value in values)
+        entry, tp1, tp2 = (float(value) for value in (entry_price, tp1_price, tp2_price))
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("entry/SL/TP prices must be numeric") from exc
-    if not all(isfinite(value) and value > 0 for value in (entry, stop, tp1, tp2)):
-        raise ValueError("entry/SL/TP prices must be finite and positive")
-    if direction == "BUY" and not (stop < entry < tp1 < tp2):
+        raise ValueError("entry/TP prices must be numeric") from exc
+    if not all(isfinite(value) and value > 0 for value in (entry, tp1, tp2)):
+        raise ValueError("entry/TP prices must be finite and positive")
+    validate_execution_stop(side=direction, entry_price=entry, stop_price=stop_price)
+    if direction == "BUY" and not (entry < tp1 < tp2):
         raise ValueError("BUY geometry requires SL < Entry < TP1 < TP2")
-    if direction == "SELL" and not (tp2 < tp1 < entry < stop):
+    if direction == "SELL" and not (tp2 < tp1 < entry):
         raise ValueError("SELL geometry requires TP2 < TP1 < Entry < SL")
 
 def effective_sizing_classification(requested: str, *, strong_tier_authorized: bool) -> str:
