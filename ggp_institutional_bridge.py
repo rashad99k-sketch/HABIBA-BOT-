@@ -716,12 +716,13 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         data_quality="VALID_CLOSED_CANDLES",
     ).to_dict()
     if cross_entry:
-        _intelligence["mode"] = "CROSS_ENTRY_MANAGED"
+        # Keep the market-mode/confidence output produced by the existing
+        # intelligence engine; a cross is an entry trigger, not a fabricated
+        # trend/scalp classification or confidence boost.
         _intelligence["entry_behavior"] = "IMMEDIATE_CROSS_ENTRY"
         _intelligence["reason_codes"] = list(_intelligence.get("reason_codes") or []) + [
             "ema9_vwap_cross_authorized", "retest_pullback_are_post_entry_management_inputs"
         ]
-        _intelligence["confidence"] = max(float(_intelligence.get("confidence", 0.0) or 0.0), 0.80)
     # Chart-pattern recognition is observational metadata based exclusively on
     # the validated closed-candle frame; it cannot authorize or submit orders.
     _intelligence["price_pattern"] = classify_price_pattern(
@@ -757,7 +758,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
         "entry_behavior": "IMMEDIATE_CROSS_ENTRY" if cross_entry else _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
-        "entry_behavior_confidence": 1.0 if cross_entry else float(_intelligence.get("confidence", 0.0) or 0.0),
+        "entry_behavior_confidence": float(_intelligence.get("confidence", 0.0) or 0.0),
         "entry_behavior_reasons": (list(_intelligence.get("reason_codes") or []) + ["ema9_vwap_cross_entry; management_after_fill"]) if cross_entry else list(_intelligence.get("reason_codes") or []),
         "entry_zone_low": _intelligence.get("reference_low"),
         "entry_zone_high": _intelligence.get("reference_high"),
