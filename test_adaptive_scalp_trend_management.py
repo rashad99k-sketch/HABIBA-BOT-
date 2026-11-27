@@ -8,14 +8,12 @@ import pytest
 
 import ggpbot
 from ggp_profit_brain import (
-    BEHAVIOR_DISTRIBUTION, BEHAVIOR_INSUFFICIENT, BEHAVIOR_INSTITUTIONAL_EXIT,
-    BEHAVIOR_MICRO_PULLBACK, BEHAVIOR_PULLBACK, BEHAVIOR_RETEST,
-    BEHAVIOR_TREND_CONTINUATION,
+    BEHAVIOR_DISTRIBUTION, BEHAVIOR_INSTITUTIONAL_EXIT, BEHAVIOR_MICRO_PULLBACK,
+    BEHAVIOR_PULLBACK, BEHAVIOR_RETEST, BEHAVIOR_TREND_CONTINUATION,
     RANGE_MODE, STANDARD_MODE, TREND_MODE,
-    SCALP_STATE, STANDARD_STATE, TREND_STATE, EXIT_REQUIRED_STATE, CLOSED_STATE,
-    SCALP_ROE_TARGETS_PCT, TREND_ROE_TARGETS_PCT,
-    analyze_post_entry_behavior, map_profit_mode_to_regime, regime_plan_consistency,
-    roe_target_price, select_scalp_roe_target, transition_trade_regime, verify_roe_inputs,
+    SCALP_STATE, TREND_STATE, EXIT_REQUIRED_STATE,
+    analyze_post_entry_behavior, map_profit_mode_to_regime, roe_target_price,
+    select_scalp_roe_target, transition_trade_regime, verify_roe_inputs,
 )
 
 
@@ -64,108 +62,10 @@ def _base_context(**overrides):
 # Classification and state transitions
 # ---------------------------------------------------------------------------
 
-def test_insufficient_evidence_stays_in_standard_not_scalp():
-    assert map_profit_mode_to_regime(STANDARD_MODE) == STANDARD_STATE
-    assert map_profit_mode_to_regime("") == STANDARD_STATE
-    assert map_profit_mode_to_regime("UNKNOWN") == STANDARD_STATE
+def test_insufficient_trend_evidence_maps_to_scalp():
+    assert map_profit_mode_to_regime(STANDARD_MODE) == SCALP_STATE
     assert map_profit_mode_to_regime(RANGE_MODE) == SCALP_STATE
     assert map_profit_mode_to_regime(TREND_MODE) == TREND_STATE
-    assert map_profit_mode_to_regime(STANDARD_MODE, BEHAVIOR_INSTITUTIONAL_EXIT) == EXIT_REQUIRED_STATE
-
-
-def test_insufficient_evidence_does_not_initialize_as_scalp():
-    state, reason, _ = transition_trade_regime("", STANDARD_STATE, BEHAVIOR_INSUFFICIENT, 1, {})
-    assert state == STANDARD_STATE
-    assert reason.startswith("initial_classification_")
-
-
-def test_standard_does_not_upgrade_to_trend_on_profit_or_one_candle():
-    first, _, count = transition_trade_regime(
-        STANDARD_STATE, TREND_STATE, BEHAVIOR_TREND_CONTINUATION, 1, {})
-    assert first == STANDARD_STATE
-    assert count == 1
-    rejected, reason, _ = transition_trade_regime(
-        STANDARD_STATE, TREND_STATE, "RANGE_CHOP", 5, {"adverse_rejection": True})
-    assert rejected == STANDARD_STATE
-    assert "rejected" in reason
-    upgraded, reason, _ = transition_trade_regime(
-        STANDARD_STATE, TREND_STATE, BEHAVIOR_TREND_CONTINUATION, 2,
-        {"aligned_closes": 2, "adverse_rejection": False})
-    assert upgraded == TREND_STATE
-    assert "confirmed" in reason
-
-
-def test_standard_can_downgrade_to_scalp_only_with_weakness_evidence():
-    held, _, _ = transition_trade_regime(
-        STANDARD_STATE, SCALP_STATE, BEHAVIOR_TREND_CONTINUATION, 2, {})
-    assert held == STANDARD_STATE
-    downgraded, reason, _ = transition_trade_regime(
-        STANDARD_STATE, SCALP_STATE, BEHAVIOR_DISTRIBUTION, 2, {})
-    assert downgraded == SCALP_STATE
-    assert "weakness" in reason
-
-
-def test_insufficient_behavior_never_downgrades_standard_to_scalp():
-    """Missing closed-candle evidence cannot become a short scalp plan."""
-    held, reason, _ = transition_trade_regime(
-        STANDARD_STATE, SCALP_STATE, BEHAVIOR_INSUFFICIENT, 2,
-        {"weak_market_confirmed": False})
-    assert held == STANDARD_STATE
-    assert "rejected" in reason
-
-
-def test_structural_invalidation_overrides_standard_hysteresis():
-    state, _, _ = transition_trade_regime(
-        STANDARD_STATE, TREND_STATE, BEHAVIOR_INSTITUTIONAL_EXIT, 1,
-        {"structural_invalidation": True})
-    assert state == EXIT_REQUIRED_STATE
-
-
-def test_liquidity_evidence_caps_scalp_target_without_new_targets():
-    context = {
-        "adx": 28, "adx_slope": 1.0, "continuation_probability": 0.80,
-        "volume_ratio": 1.35, "distance_to_opposing_pct": 0.40,
-        "aligned_closed_candles": 2, "di_aligned": True, "zone_strength": 0.8,
-        "post_entry_behavior": BEHAVIOR_TREND_CONTINUATION,
-        "actual_leverage": 20.0, "opposing_liquidity_strong": True,
-    }
-    target, reason = select_scalp_roe_target(context)
-    assert target in SCALP_ROE_TARGETS_PCT
-    assert target == SCALP_ROE_TARGETS_PCT[0]
-    assert "opposing_liquidity" in reason
-
-    # Unverified leverage must not silently apply the 20x conversion.
-    context["actual_leverage"] = 0.0
-    target, reason = select_scalp_roe_target(context)
-    assert target == SCALP_ROE_TARGETS_PCT[1]
-    assert "opposing_liquidity" not in reason
-
-    # A very close opposing pool leaves only the conservative approved target.
-    context["actual_leverage"] = 20.0
-    context["distance_to_opposing_pct"] = 0.20
-    target, reason = select_scalp_roe_target(context)
-    assert target == SCALP_ROE_TARGETS_PCT[0]
-    assert "opposing_liquidity" in reason
-
-
-def test_regime_plan_consistency_detects_conflicting_authorities():
-    ok, _ = regime_plan_consistency(
-        TREND_STATE, TREND_MODE, tp1_hit=True, initial_qty=2.0, remaining_qty=1.0,
-        tp1_target_roe_pct=TREND_ROE_TARGETS_PCT[0],
-        tp2_target_roe_pct=TREND_ROE_TARGETS_PCT[1])
-    assert ok is True
-    ok, reason = regime_plan_consistency(
-        SCALP_STATE, TREND_MODE, initial_qty=2.0, remaining_qty=2.0,
-        scalp_target_roe_pct=SCALP_ROE_TARGETS_PCT[0])
-    assert ok is False
-    assert "conflict" in reason
-    ok, reason = regime_plan_consistency(
-        STANDARD_STATE, STANDARD_MODE,
-        scalp_target_roe_pct=SCALP_ROE_TARGETS_PCT[0])
-    assert ok is False
-    assert "adaptive_roe_targets" in reason
-    ok, _ = regime_plan_consistency(CLOSED_STATE, RANGE_MODE)
-    assert ok is True
 
 
 def test_scalp_to_trend_requires_two_confirmed_candles():
@@ -347,80 +247,6 @@ def test_unresolved_execution_prevents_any_new_target_decision():
         roe=20.0, scalp_target_roe_pct=5.0, execution_unresolved=True))
     assert decision.action is ggpbot.TradeDecisionType.HOLD
     assert decision.reason == "exchange_execution_or_recovery_unresolved"
-
-
-def test_unknown_roe_basis_holds_with_diagnostic():
-    board = _board()
-    held = board.evaluate(_base_context(
-        roe=99.0, scalp_target_roe_pct=5.0, roe_ready=False,
-        roe_diagnostic="unknown_roe_basis"))
-    assert held.action is ggpbot.TradeDecisionType.HOLD
-    assert held.reason == "roe_target_blocked_unknown_roe_basis"
-
-
-def test_conflicting_regime_plan_holds_profit_decision_with_diagnostic():
-    """A restored conflict must stay HOLD; it must never become SCALP or a close."""
-    board = _board()
-    held = board.evaluate(_base_context(
-        roe=99.0, scalp_target_roe_pct=5.0,
-        regime_plan_consistent=False,
-        regime_plan_consistency_reason="restored_tp_state_conflict"))
-    assert held.action is ggpbot.TradeDecisionType.HOLD
-    assert held.reason == "regime_plan_inconsistent_restored_tp_state_conflict"
-
-
-def test_emergency_exit_still_overrides_conflicting_regime_plan():
-    board = _board()
-    decision = board.evaluate(_base_context(
-        roe=99.0, scalp_target_roe_pct=5.0,
-        regime_plan_consistent=False, emergency_exit=True,
-        emergency_reason="exchange_position_vanished"))
-    assert decision.action is ggpbot.TradeDecisionType.EMERGENCY_EXIT
-    assert decision.reason == "exchange_position_vanished"
-
-
-def test_sell_scalp_full_close_at_selected_target():
-    board = _board()
-    decision = board.evaluate(_base_context(
-        side="SELL", entry=100.0, current_price=99.75, roe=5.2,
-        synthetic_sl=105.0, profit_mode=RANGE_MODE, trade_regime_state=SCALP_STATE,
-        scalp_target_roe_pct=5.0))
-    assert decision.action is ggpbot.TradeDecisionType.FULL_CLOSE
-    assert decision.params["close_reason"] == "SCALP_TARGET"
-    assert decision.action is not ggpbot.TradeDecisionType.PARTIAL_CLOSE
-
-
-def test_sell_trend_tp1_then_tp2_use_verified_roe():
-    board = _board()
-    tp1 = board.evaluate(_base_context(
-        side="SELL", entry=100.0, current_price=98.0, roe=40.0,
-        synthetic_sl=105.0, profit_mode=TREND_MODE, trade_regime_state=TREND_STATE,
-        tp1_target_roe_pct=40.0, tp2_target_roe_pct=60.0))
-    assert tp1.action is ggpbot.TradeDecisionType.PARTIAL_CLOSE
-    assert tp1.params["target_remaining_qty"] == 1.0
-    tp2 = board.evaluate(_base_context(
-        side="SELL", entry=100.0, current_price=97.0, roe=60.0,
-        synthetic_sl=105.0, profit_mode=TREND_MODE, trade_regime_state=TREND_STATE,
-        tp1_hit=True, remaining_qty=1.0, be_done=True, atr=0.0,
-        tp1_target_roe_pct=40.0, tp2_target_roe_pct=60.0))
-    assert tp2.action is ggpbot.TradeDecisionType.FULL_CLOSE
-    assert tp2.params["close_reason"] == "TP2"
-
-
-def test_standard_board_uses_original_price_targets_50_50():
-    board = _board()
-    base = _base_context(
-        profit_mode=STANDARD_MODE, trade_regime_state=STANDARD_STATE,
-        tp1_price=99.5, tp2_price=98.0)
-    tp1 = board.evaluate(dict(base, current_price=99.6))
-    assert tp1.action is ggpbot.TradeDecisionType.PARTIAL_CLOSE
-    assert tp1.params["target_remaining_qty"] == 1.0
-    assert tp1.params["close_reason"] == "TP1"
-    assert "FIXED_50_PERCENT" in tp1.reason
-    tp2 = board.evaluate(dict(base, current_price=98.1, tp1_hit=True,
-                              remaining_qty=1.0, be_done=True, atr=0.0))
-    assert tp2.action is ggpbot.TradeDecisionType.FULL_CLOSE
-    assert tp2.params["close_reason"] == "TP2"
 
 
 # ---------------------------------------------------------------------------

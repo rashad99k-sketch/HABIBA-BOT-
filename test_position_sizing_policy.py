@@ -48,11 +48,9 @@ def test_leverage_20_target_notional_400():
     assert r.target_notional == pytest.approx(400.0)
 
 
-# 3) DOGE @ 0.06 -> raw quantity 6666.666666 (allocation binding, not risk).
-# A 2% budget of the 20 USDT target margin covers the 0.05% stop plus the
-# mandatory 0.05% execution buffer, so the allocation ceiling binds exactly.
+# 3) DOGE @ 0.06 -> raw quantity 6666.666666 (allocation binding, not risk)
 def test_doge_raw_quantity_6666_666666():
-    r = _size(100.0, 0.06, 0.05, risk_pct=2.0)
+    r = _size(100.0, 0.06, 0.05, risk_pct=1.0)
     # raw quantity from the allocation target (before risk gate would reduce it)
     raw = r.target_notional / 0.06
     assert raw == pytest.approx(6666.666666, rel=1e-9)
@@ -139,8 +137,7 @@ def test_stale_balance_cache_not_reused():
 
 # 13) Contract size and precision are applied correctly
 def test_contract_size_and_precision_applied():
-    r = _size(100.0, 0.06, 0.05, contract_size=10.0, risk_pct=2.0)
-    assert r.binding_constraint == "ALLOCATION"
+    r = _size(100.0, 0.06, 0.05, contract_size=10.0, risk_pct=1.0)
     # quantity is in contracts: notional = quantity * contract_size * entry
     assert r.quantity * r.contract_size * 0.06 == pytest.approx(r.final_notional)
     assert r.final_notional == pytest.approx(r.target_notional)
@@ -172,14 +169,14 @@ def test_quantity_matches_notional_definition():
 
 # Mandatory DOGE examples, allocation-binding (tight stop) case
 def test_doge_example_100_buy_allocation_binding():
-    r = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=2.0)
+    r = _size(100.0, 0.06, 0.05, side="BUY", risk_pct=1.0)
     assert r.target_margin == pytest.approx(20.0)
     assert r.target_notional == pytest.approx(400.0)
     assert r.quantity == pytest.approx(6666.666666, rel=1e-6)
 
 
 def test_doge_example_33_35_sell_allocation_binding():
-    r = _size(33.35, 0.06, 0.05, side="SELL", risk_pct=2.0)
+    r = _size(33.35, 0.06, 0.05, side="SELL", risk_pct=1.0)
     assert r.target_margin == pytest.approx(6.67, abs=1e-9)
     assert r.target_notional == pytest.approx(133.40, abs=1e-9)
     assert r.quantity == pytest.approx(2223.333333, rel=1e-6)

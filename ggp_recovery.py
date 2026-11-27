@@ -202,27 +202,6 @@ def build_restored_management_state(
     tp1 = _positive(saved.get("tp1_price"), saved.get("synthetic_tp1"), row.get("tp1_price"))
     tp2 = _positive(saved.get("tp2_price"), row.get("tp2_price"))
 
-    # trade_regime_state is the routing authority and must survive a restart.
-    # Older rows may only have the diagnostic profit_mode; map it without ever
-    # turning missing evidence into SCALP.
-    regime = str(saved.get("trade_regime_state") or row.get("trade_regime_state") or "").upper()
-    if regime not in {"SCALP", "TREND", "STANDARD", "EXIT_REQUIRED", "CLOSED"}:
-        remembered_mode = str(saved.get("profit_mode") or row.get("profit_mode") or "").upper()
-        if remembered_mode in {"RANGE", "RANGE_SCALP"}:
-            regime = "SCALP"
-        elif remembered_mode in {"TREND", "TREND_RIDE"}:
-            regime = "TREND"
-        else:
-            regime = "STANDARD"
-    if regime == "SCALP":
-        mode = "RANGE_SCALP"
-    elif regime == "TREND":
-        mode = "TREND_RIDE"
-    elif regime == "EXIT_REQUIRED":
-        mode = str(saved.get("profit_mode") or "TWO_STAGE_50_50").upper() or "TWO_STAGE_50_50"
-    else:
-        mode = "TWO_STAGE_50_50"
-
     missing = []
     partial_close_reconciled = False
     tp1_reconciled = False
@@ -335,32 +314,7 @@ def build_restored_management_state(
         "be_done": bool(saved.get("be_done", trailing.get("be_done", False))),
         "max_price": _number(saved.get("max_price"), row.get("highest_favorable")) or entry or 0.0,
         "min_price": _number(saved.get("min_price"), row.get("lowest_favorable")) or entry or 0.0,
-        # The explicit regime is primary; profit_mode is rebuilt as its mirror
-        # so a restart cannot create a conflicting target plan.
-        "trade_regime_state": regime,
-        "trade_regime_reason": str(saved.get("trade_regime_reason")
-                                   or row.get("trade_regime_reason")
-                                   or "restored_from_persisted_evidence"),
-        "profit_mode": mode,
-        "profit_mode_reason": str(saved.get("profit_mode_reason") or "restored_from_persisted_evidence"),
-        "profit_mode_candidate": saved.get("profit_mode_candidate"),
-        "profit_mode_candidate_count": _number(saved.get("profit_mode_candidate_count")) or 0,
-        "profit_mode_last_candle_ts": _number(saved.get("profit_mode_last_candle_ts")) or 0.0,
-        "original_tp1_price": tp1 or 0.0,
-        "original_tp2_price": tp2 or 0.0,
-        "scalp_target_roe_pct": _number(saved.get("scalp_target_roe_pct")) or 0.0,
-        "scalp_target_price": _number(saved.get("scalp_target_price")) or 0.0,
-        "scalp_target_reason": str(saved.get("scalp_target_reason") or ""),
-        "tp1_target_roe_pct": _number(saved.get("tp1_target_roe_pct")) or 0.0,
-        "tp2_target_roe_pct": _number(saved.get("tp2_target_roe_pct")) or 0.0,
-        "post_entry_behavior": str(saved.get("post_entry_behavior") or "INSUFFICIENT_DATA"),
-        "roe_verified": bool(saved.get("roe_verified") or row.get("roe_verified")),
-        "roe_diagnostic": str(saved.get("roe_diagnostic") or ""),
-        "computed_roe_pct": _number(saved.get("computed_roe_pct")) or 0.0,
-        "net_roe_pct": _number(saved.get("net_roe_pct")) or 0.0,
-        "exchange_reported_roe_pct": _number(saved.get("exchange_reported_roe_pct")),
-        "fees_usdt": _number(saved.get("fees_usdt")) or 0.0,
-        "funding_usdt": _number(saved.get("funding_usdt")) or 0.0,
+        "profit_mode": saved.get("profit_mode") or row.get("profit_mode"),
         "position_mode": position_mode,
         "position_side": position_side,
         "native_sl_order_id": row.get("native_sl_order_id") or saved.get("native_sl_order_id"),

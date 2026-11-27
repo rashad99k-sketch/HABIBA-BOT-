@@ -336,7 +336,6 @@ def adaptive_range_target_price(side: str, entry_price: float, atr: float,
 
 SCALP_STATE = "SCALP"
 TREND_STATE = "TREND"
-STANDARD_STATE = "STANDARD"
 EXIT_REQUIRED_STATE = "EXIT_REQUIRED"
 CLOSED_STATE = "CLOSED"
 
@@ -453,13 +452,7 @@ def roe_target_price(context: Dict[str, Any], target_roe_pct: float) -> float:
 
 
 def select_scalp_roe_target(context: Dict[str, Any]) -> Tuple[float, str]:
-    """Pick exactly one 5/10/20% ROE exit from measurable post-entry evidence.
-
-    Opposing-liquidity evidence from ``adaptive_range_target_price()`` can only
-    narrow the approved ROE target set; it never introduces a new target and
-    never widens one. A verified leverage basis is required for that conversion,
-    so an unverified leverage never silently defaults to 20x here either.
-    """
+    """Pick exactly one 5/10/20% ROE exit from measurable post-entry evidence."""
     ctx = context if isinstance(context, dict) else {}
     adx = _number(ctx.get("adx"), 0.0) or 0.0
     adx_slope = _number(ctx.get("adx_slope"), 0.0) or 0.0
@@ -477,41 +470,23 @@ def select_scalp_roe_target(context: Dict[str, Any]) -> Tuple[float, str]:
         or volume_ratio < 0.75 or distance < 0.25
         or behavior in {BEHAVIOR_DISTRIBUTION, BEHAVIOR_PULLBACK, BEHAVIOR_MICRO_PULLBACK}
     )
+    if weak:
+        return SCALP_ROE_TARGETS_PCT[0], "weak_momentum_near_liquidity_or_rejection_conservative_5pct_roe"
     strong = (
         adx >= 24 and adx_slope >= 0 and continuation >= 0.72 and volume_ratio >= 1.20
         and aligned >= 2 and di_aligned and not adverse_rejection and distribution_risk < 35
         and distance >= 0.80 and zone_strength >= 0.60
         and behavior in {BEHAVIOR_TREND_CONTINUATION, BEHAVIOR_RETEST}
     )
+    if strong:
+        return SCALP_ROE_TARGETS_PCT[2], "strong_zone_closed_candle_and_volume_follow_through_20pct_roe"
     moderate = (
         adx >= 20 and continuation >= 0.58 and volume_ratio >= 0.90
         and aligned >= 1 and distance >= 0.35 and not adverse_rejection
     )
-    if weak:
-        target, reason = SCALP_ROE_TARGETS_PCT[0], "weak_momentum_near_liquidity_or_rejection_conservative_5pct_roe"
-    elif strong:
-        target, reason = SCALP_ROE_TARGETS_PCT[2], "strong_zone_closed_candle_and_volume_follow_through_20pct_roe"
-    elif moderate:
-        target, reason = SCALP_ROE_TARGETS_PCT[1], "moderate_follow_through_10pct_roe"
-    else:
-        target, reason = SCALP_ROE_TARGETS_PCT[0], "insufficient_continuation_evidence_conservative_5pct_roe"
-
-    # Convert the selected ROE to its approximate price move using the VERIFIED
-    # leverage only. If a credible opposing pool sits inside that move, keep the
-    # largest approved target whose implied move fits before the pool.
-    leverage = _number(ctx.get("actual_leverage"), 0.0) or 0.0
-    if bool(ctx.get("opposing_liquidity_strong", False)) and leverage > 0 and distance > 0:
-        implied_move = target / leverage
-        if distance < implied_move:
-            capped = min((pct for pct in SCALP_ROE_TARGETS_PCT if pct / leverage <= distance),
-                         default=SCALP_ROE_TARGETS_PCT[0])
-            if capped < target:
-                target = capped
-            # Record the liquidity evidence even when 5% is already the only
-            # approved target that can fit before the opposing pool.
-            reason += (f"|opposing_liquidity_at_{distance:.2f}pct_"
-                       f"capped_to_{capped:.0f}pct_roe")
-    return target, reason
+    if moderate:
+        return SCALP_ROE_TARGETS_PCT[1], "moderate_follow_through_10pct_roe"
+    return SCALP_ROE_TARGETS_PCT[0], "insufficient_continuation_evidence_conservative_5pct_roe"
 
 
 def analyze_post_entry_behavior(df_closed: Any, side: str, entry_price: float, atr: float,
@@ -608,31 +583,21 @@ def analyze_post_entry_behavior(df_closed: Any, side: str, entry_price: float, a
 
 
 def map_profit_mode_to_regime(profit_mode: str, behavior: str = "") -> str:
-    """Map observed evidence onto the explicit state machine.
-
-    STANDARD is a first-class regime. Missing or conflicting evidence must never
-    be reinterpreted as SCALP: only RANGE_MODE (proven weakness/thin liquidity)
-    maps to SCALP, and only TREND_MODE (proven continuation) maps to TREND.
-    """
+    """Map the existing profit-mode vocabulary onto the explicit state machine."""
     mode = str(profit_mode or "").upper()
-    if str(behavior or "").upper() == BEHAVIOR_INSTITUTIONAL_EXIT:
+    active_behavior = str(behavior or "").upper()
+    if active_behavior == BEHAVIOR_INSTITUTIONAL_EXIT:
         return EXIT_REQUIRED_STATE
     if mode == TREND_MODE:
         return TREND_STATE
-    if mode == RANGE_MODE:
-        return SCALP_STATE
-    return STANDARD_STATE
+    # SCALP is the safe default when trend evidence is absent, matching the
+    # strategic requirement that insufficient trend proof must not ride a trend.
+    return SCALP_STATE
 
 
 def transition_trade_regime(current: str, candidate: str, behavior: str,
                             confirmations: int, evidence: Optional[Dict[str, Any]] = None) -> Tuple[str, str, int]:
-    """Apply two-candle hysteresis across SCALP/TREND/STANDARD.
-
-    Structural invalidation or an institutional-exit behaviour overrides the
-    hysteresis immediately. Profit alone is not evidence: a TREND upgrade still
-    needs closed-candle continuation, and a SCALP downgrade needs confirmed
-    weakness. Insufficient evidence stays in / returns to STANDARD (50/50).
-    """
+    """Apply hysteresis to SCALP/TREND switches; structural failure exits at once."""
     current_state = str(current or "").upper()
     candidate_state = str(candidate or "").upper()
     active_behavior = str(behavior or "").upper()
@@ -643,102 +608,21 @@ def transition_trade_regime(current: str, candidate: str, behavior: str,
         return EXIT_REQUIRED_STATE, "institutional_exit_confirmed", 0
     if current_state == EXIT_REQUIRED_STATE:
         return EXIT_REQUIRED_STATE, "exit_already_required", 0
-
-    valid_states = {SCALP_STATE, TREND_STATE, STANDARD_STATE}
-    if candidate_state not in valid_states:
-        candidate_state = STANDARD_STATE
-    count = max(0, int(confirmations or 0))
-    if not current_state or current_state not in valid_states:
-        return candidate_state, f"initial_classification_{candidate_state.lower()}", count
+    if candidate_state not in {SCALP_STATE, TREND_STATE}:
+        candidate_state = SCALP_STATE
+    if not current_state or current_state not in {SCALP_STATE, TREND_STATE}:
+        return candidate_state, f"initial_classification_{candidate_state.lower()}", 0
     if candidate_state == current_state:
         return current_state, "candidate_matches_current_regime", 0
+    count = max(0, int(confirmations or 0))
     if count < 2:
         return current_state, f"waiting_second_confirmed_candle_for_{candidate_state.lower()}", count
-
-    if candidate_state == TREND_STATE:
-        if (active_behavior in {BEHAVIOR_TREND_CONTINUATION, BEHAVIOR_RETEST}
-                and not bool(evidence.get("adverse_rejection", False))
-                and not bool(evidence.get("structural_invalidation", False))):
-            return TREND_STATE, ("scalp_to_trend_upgrade_confirmed"
-                                 if current_state == SCALP_STATE
-                                 else "standard_to_trend_upgrade_confirmed"), 0
-        return current_state, "trend_upgrade_rejected_no_fresh_continuation_evidence", count
-
-    if candidate_state == SCALP_STATE:
-        # Insufficient evidence is never a reason to shorten into SCALP. The
-        # candidate must carry observed weakness on closed candles, not merely
-        # absent data.
-        weakness_confirmed = (
-            active_behavior in {BEHAVIOR_DISTRIBUTION, BEHAVIOR_PULLBACK,
-                                BEHAVIOR_MICRO_PULLBACK, "RANGE_CHOP"}
-            or bool(evidence.get("weak_market_confirmed", False))
-        )
-        if weakness_confirmed:
-            reason = ("trend_downgraded_after_confirmed_structure_weakening"
-                      if current_state == TREND_STATE
-                      else "standard_to_scalp_confirmed_by_weakness_evidence")
-            return SCALP_STATE, reason, 0
-        return current_state, "scalp_downgrade_rejected_no_weakness_evidence", count
-
-    # STANDARD candidate: two consecutive candles failed to prove either plan.
-    return STANDARD_STATE, "standard_plan_retained_on_insufficient_evidence", 0
-
-
-def regime_plan_consistency(regime_state: str, profit_mode: str, *,
-                            tp1_hit: bool = False, tp2_hit: bool = False,
-                            remaining_qty: float = 0.0, initial_qty: float = 0.0,
-                            scalp_target_roe_pct: float = 0.0,
-                            tp1_target_roe_pct: float = 0.0,
-                            tp2_target_roe_pct: float = 0.0) -> Tuple[bool, str]:
-    """Prove the explicit regime and the legacy diagnostic plan do not conflict.
-
-    ``profit_mode`` is retained only for compatibility and diagnostics. Board
-    decisions route on ``trade_regime_state``; this helper exposes any drift
-    between the two so target management can fail closed instead of guessing.
-    """
-    regime = str(regime_state or "").upper()
-    mode = str(profit_mode or "").upper()
-    if regime not in {SCALP_STATE, TREND_STATE, STANDARD_STATE, EXIT_REQUIRED_STATE, CLOSED_STATE}:
-        return False, "unknown_regime_state"
-    if regime == CLOSED_STATE:
-        return True, "closed_terminal_state"
-    initial = _number(initial_qty, 0.0) or 0.0
-    remaining = _number(remaining_qty, 0.0) or 0.0
-    half = initial * 0.5
-    tolerance = max(initial * 0.002, 1e-10)
-    scalp_target = _number(scalp_target_roe_pct, 0.0) or 0.0
-    tp1_target = _number(tp1_target_roe_pct, 0.0) or 0.0
-    tp2_target = _number(tp2_target_roe_pct, 0.0) or 0.0
-
-    if regime == SCALP_STATE:
-        if mode != RANGE_MODE:
-            return False, "scalp_profit_mode_conflict"
-        if scalp_target not in SCALP_ROE_TARGETS_PCT:
-            return False, "scalp_target_outside_approved_set"
-        if tp1_hit or tp2_hit:
-            return False, "scalp_must_not_have_partial_close"
-        if initial > 0 and abs(remaining - initial) > tolerance:
-            return False, "scalp_quantity_was_split"
-        return True, "scalp_plan_consistent"
-    if regime == TREND_STATE:
-        if mode != TREND_MODE:
-            return False, "trend_profit_mode_conflict"
-        if abs(tp1_target - TREND_ROE_TARGETS_PCT[0]) > 1e-9 or abs(tp2_target - TREND_ROE_TARGETS_PCT[1]) > 1e-9:
-            return False, "trend_roe_targets_missing"
-        if tp2_hit and remaining > tolerance:
-            return False, "trend_tp2_hit_with_remaining_quantity"
-        if tp1_hit and initial > 0 and remaining > half + tolerance:
-            return False, "trend_tp1_quantity_above_half"
-        return True, "trend_plan_consistent"
-    if regime == STANDARD_STATE:
-        if mode != STANDARD_MODE:
-            return False, "standard_profit_mode_conflict"
-        if scalp_target > 0 or tp1_target > 0 or tp2_target > 0:
-            return False, "standard_must_not_use_adaptive_roe_targets"
-        if tp1_hit and initial > 0 and remaining > half + tolerance:
-            return False, "standard_tp1_quantity_above_half"
-        return True, "standard_plan_consistent"
-    # EXIT_REQUIRED: no profit-target plan may survive an invalidated thesis.
-    if scalp_target > 0 or tp1_target > 0 or tp2_target > 0:
-        return False, "exit_required_must_not_retain_profit_targets"
-    return True, "exit_required_plan_consistent"
+    if current_state == SCALP_STATE and candidate_state == TREND_STATE:
+        if active_behavior in {BEHAVIOR_TREND_CONTINUATION, BEHAVIOR_RETEST, BEHAVIOR_PULLBACK} and not bool(evidence.get("adverse_rejection", False)):
+            return TREND_STATE, "scalp_to_trend_upgrade_confirmed", 0
+        return SCALP_STATE, "trend_upgrade_rejected_no_fresh_continuation_evidence", count
+    if current_state == TREND_STATE and candidate_state == SCALP_STATE:
+        if active_behavior in {BEHAVIOR_DISTRIBUTION, BEHAVIOR_PULLBACK, BEHAVIOR_MICRO_PULLBACK, "RANGE_CHOP"}:
+            return SCALP_STATE, "trend_downgraded_after_confirmed_structure_weakening", 0
+        return TREND_STATE, "trend_downgrade_rejected_no_weakening_evidence", count
+    return candidate_state, f"regime_changed_to_{candidate_state.lower()}", 0
