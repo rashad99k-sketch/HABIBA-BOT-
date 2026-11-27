@@ -1,171 +1,205 @@
-# Unified EMA9 + Session VWAP cross lifecycle — engineering report
+# Unified EMA9 + Session VWAP cross lifecycle — final engineering report
 
-**Status:** offline regression verified; **not LIVE ready**. No exchange call, order,
-balance query, API-key change or demo/LIVE trade was performed. BingX paths were
-changed only by reusing the existing order path and identity plumbing, never by
-bypassing a gate.
+**Status:** offline regression verified on the integrated branch; **not LIVE ready**.
+No exchange call, order, balance query, API-key change, demo order or LIVE trade was
+performed. BingX execution paths were only reused through the existing order path and
+identity plumbing; no gate was bypassed.
 
-## 1. Modified files and functions
+## 1. Target repository verification
+
+| Check | Result |
+|---|---|
+| Repository URL | `https://github.com/rashad99k-sketch/HABIBA-BOT-.git` |
+| GitHub full name | `rashad99k-sketch/HABIBA-BOT-` (GitHub API) |
+| Local workdir | `C:\Users\rasha\AppData\Local\Temp\opencode\habiba-adaptive-management` |
+| `origin` URL | `https://github.com/rashad99k-sketch/HABIBA-BOT-.git` |
+| Branch before merge work | `unified-cross-lifecycle` |
+| HEAD before fix commits | `0a66ddcb3233a5149db77edc1ad83e421b1307e5` |
+| Clean base before work | `908f29c836b417b0dac7560611cc5c6d7097efbb` |
+| Remote `main` after owner commit | `59eeffd09ac7ea0d81ea3bb800c0633547acf0d6` |
+| Merge base PR → main | `908f29c836b417b0dac7560611cc5c6d7097efbb` |
+| PR | https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44 |
+
+The owner's newer `main` commit changed only `.env.example`. It was preserved by a
+clean merge; this change set does not modify that file. The current template now has
+`PAPER_MODE=false` and `ENABLE_LIVE_TRADING=true` with empty credentials, which is a
+deployment risk documented below and is not a claim that LIVE trading was tested.
+
+## 2. Architecture audit result
+
+Three independent read-only audits were run: full call-path architecture trace, Git
+diff code review, and remaining-risk assessment. They confirmed:
+
+- Both existing Scanners remain: `global_discovery` and `watchlist_analysis`.
+- No third Scanner, second Profit Engine, second executor or parallel trade manager was
+  added. `TradeManagementBoard`, `LiveTradeManager`, `TradeExecutionService`, BingX
+  execution, native protection, recovery, sync, reconciliation, verified close, sizing,
+  20X policy, dashboard/Telegram/Flask/API/health and single-flight controls remain the
+  existing implementations.
+- EMA9 + Session VWAP remains the core cross. EMA50 stays diagnostic only in
+  `roro_confluence`; it was never substituted as a cross signal.
+- The first review found a merge-blocking defect: the final readiness gate inspected
+  the raw cross-event object, which never received institutional approval, so the
+  unified path could not reach `execute_entry()`. It also found stale Event-ID
+  selection, shallow Watchlist copies, overstated price space, a weak-market target
+  override and inaccurate verification logs. All were fixed and covered by tests.
+
+## 3. Proven issues and fixes
+
+| Issue | Fix |
+|---|---|
+| `execution_readiness()` received a stale `CROSS_DETECTED` event while approval was written to a local copy | `smart_opportunity_selection()` now passes the enriched candidate to the gate; `analyze_symbol()` and `_sync_cross_event()` write quality/status/evidence back into `MEMORY["cross_events"]`. |
+| Event selection could pick the first retained cross for a symbol/side and reuse a consumed ID | Selection prefers the Watchlist row's own `cross_event_id`, otherwise the newest unconsumed confirmed event. Canonical symbol matching handles `BTCUSDT` vs `BTC/USDT:USDT`. Bridge selection follows the same rule. |
+| Duplicate Event IDs were annotated but not excluded and could be re-approved | Duplicates are removed before analysis; `cross_rank` stays `-1.0`; permanent rejection reasons block re-approval; both structural and cross Event IDs are checked against the journal. |
+| Ranking worked on shallow copies, leaving stale Watchlist state | The original Watchlist dicts are now mutated with rank, decision state and rejection reason. |
+| Available price space used the EMA9/VWAP gap and `max()` over distant levels | It now uses the nearest opposing boundary: resistance `low` for BUY, support `high` for SELL, plus opposing swing/liquidity levels. |
+| `HIGHER_VOL` bypassed the inherited weak/thin/ADX guard | Volatility bands are applied only after the mandatory weak-market guard. |
+| Verification log read a non-existent `STATE["order"]` key | The wrapper logs `entry_exchange_order_id`, actual filled quantity (`actual_filled_qty`/`qty`), `entry_execution_state` and `native_sl_verified`. |
+| Focused tests did not exercise the production authorization path | A production-shaped offline test drives `smart_opportunity_selection()` through frame validation, cross selection, location analysis, readiness and a monkeypatched `execute_entry()`. |
+
+## 4. Modified files and functions
 
 | File | Functions / additions |
 |---|---|
-| `ggp_cross_lifecycle.py` (new) | `CrossLifecycleState`, `adx_gate`, `make_cross_event_id`, `normalize_cross_event`, `merge_cross_events`, `transition_state`, `_zone_quality`, `evaluate_cross_location`, `build_location_features`, `cross_rank`, `rank_cross_candidates`, `execution_readiness`. Execution-free: no data fetch and no order call. |
-| `ggpbot.py` | Imports the lifecycle module; `_enrich_with_existing_gpp_engines()` converts existing Scanner-2 proximity into retained cross events and logs them; `smart_opportunity_selection()` adds unresolved-state guard, cross-only ready filter, cross ranking, side-specific re-analysis, location re-evaluation, ADX readiness gate, context Event ID and lifecycle transitions; `execute_entry()` uses the cross Event ID as the durable event identity and logs reaching the final boundary; the serialized `execute_entry()` wrapper logs order sent / filled quantity / position verified / protection verified; `LiveTradeManager._apply_management()` supplies ATR% and volatility band context. |
-| `ggp_institutional_bridge.py` | `analyze_symbol()` accepts `cross_event`/`cross_context`, evaluates the cross's own location, and returns quality, evidence, analysis status and rejection reason; insufficient-data rows carry the same cross fields; `analyze_symbol_both()` selects the cross event by side without changing the legacy call shape; `update_unified_watchlist()` matches cross events to the candidate and adds cross quality / approval to ranking. |
-| `ggp_profit_brain.py` | `select_range_target_pct()` explicitly maps `LOW_VOL -> 0.25%` and `HIGHER_VOL -> 0.50%` price moves. |
-| `test_cross_lifecycle.py` (new) | 18 offline focused tests for all mandatory scenarios plus AST checks that protected execution/management functions remain in place. |
-| `UNIFIED_CROSS_LIFECYCLE_PLAN.md` (new) | File/function-linked implementation plan written before the edits. |
-| `UNIFIED_CROSS_LIFECYCLE_DIFF.txt` (new) | Exact staged Git diff for this change set. |
+| `ggp_cross_lifecycle.py` (new) | `CrossLifecycleState`, `adx_gate`, `make_cross_event_id`, `normalize_cross_event`, `merge_cross_events`, `transition_state`, `_zone_quality`, `evaluate_cross_location`, `build_location_features`, `cross_rank`, `rank_cross_candidates`, `execution_readiness`. Execution-free: no data fetch and no order call. Fixed permanent-rejection handling, duplicate rank and nearest-boundary price space. |
+| `ggpbot.py` | Imports the lifecycle module; `_enrich_with_existing_gpp_engines()` converts existing Scanner-2 proximity into retained cross events; `smart_opportunity_selection()` adds unresolved-state guard, cross ranking, duplicate exclusion, canonical event selection, state write-back, side re-analysis, enriched readiness and ADX gate; `execute_entry()` uses the cross Event ID as durable identity; the serialized wrapper logs authoritative fill/protection state; `LiveTradeManager._apply_management()` supplies ATR% and volatility band context. |
+| `ggp_institutional_bridge.py` | `analyze_symbol()` evaluates the cross's own location and mutates the supplied cross event with the result; `_select_cross_event()` chooses the exact/newest unconsumed confirmed event; `analyze_symbol_both()` and `update_unified_watchlist()` use canonical symbol matching and the same selection rule. |
+| `ggp_profit_brain.py` | `select_range_target_pct()` maps `LOW_VOL -> 0.25%` and `HIGHER_VOL -> 0.50%` after the weak-market guard. |
+| `test_cross_lifecycle.py` (new) | 24 offline tests: mandatory scenarios, AST protected-area checks, enriched-readiness proof, duplicate blocking, bridge Event-ID selection, nearest-boundary space, production-shaped authorization path and verification-log fields. |
+| `UNIFIED_CROSS_LIFECYCLE_PLAN.md` (new) | File/function-linked implementation plan written before edits. |
+| `UNIFIED_CROSS_LIFECYCLE_DIFF.txt` (new) | Exact Git diff for the change set. |
 | `UNIFIED_CROSS_LIFECYCLE_REPORT.md` (new) | This report. |
 
-## 2. Before / after data flow
+## 5. Before / after data flow
 
-**Before.** `global_discovery` and `watchlist_analysis` both ran, but EMA9/Session-VWAP
-proximity was ranking metadata in the Watchlist and a hard gate only inside
-`execute_entry()`. There was no cross Event ID, no retained cross state, no
-cross-location quality class and no single identity across Scanner → Watchlist →
-Institutional Engine → Entry. `OpportunityPipeline` existed but was not wired into
-production.
+**Before.** Both Scanners ran, but EMA9/Session-VWAP proximity was ranking metadata and
+an `execute_entry()` hard gate. There was no cross Event ID, retained cross state,
+cross-location quality class or single identity across Scanner → Watchlist →
+Institutional Engine → Entry.
 
 **After.**
 
-1. Existing Scanner 2 calls `_enrich_with_existing_gpp_engines()`, which calls the
-   unchanged `roro_confluence.ema9_vwap_proximity()` on closed candles.
-2. `normalize_cross_event()` creates APPROACHING or CONFIRMED candidates. Confirmed
-   crosses get a stable `cross_event_id` from symbol + timeframe + direction +
-   closed-candle timestamp. `merge_cross_events()` retains candidates after the visual
-   cross disappears until their own expiry/invalidation.
-3. `update_unified_watchlist()` attaches matching cross evidence to each Watchlist
-   row. The Watchlist remains the cross-event list; it is not a generic institutional
-   opportunity list.
-4. `analyze_symbol()` annotates the existing institutional hypothesis with
-   cross-location analysis. It does not create a second opportunity and does not
-   bypass `UnifiedEntryAuthority`.
-5. `smart_opportunity_selection()` only considers confirmed, institutionally approved
-   crosses, re-evaluates BUY and SELL independently, checks the same closed-candle ADX
-   source used by the Entry Engine, transitions `EXECUTION_READY`, and supplies the
+1. Existing Scanner 2 calls `_enrich_with_existing_gpp_engines()`, which uses unchanged
+   `roro_confluence.ema9_vwap_proximity()` on closed candles.
+2. `normalize_cross_event()` creates APPROACHING/CONFIRMED candidates. Confirmed crosses
+   get a stable ID from symbol + timeframe + direction + closed-candle timestamp.
+   `merge_cross_events()` retains them after the visual cross disappears until expiry.
+3. `update_unified_watchlist()` attaches matching cross evidence to Watchlist rows using
+   canonical symbol matching. The Watchlist remains the cross-event list.
+4. `analyze_symbol()` annotates the existing institutional hypothesis with cross-location
+   analysis and writes the analysis result back to the supplied cross event. It does not
+   create another opportunity or bypass `UnifiedEntryAuthority`.
+5. `smart_opportunity_selection()` ranks confirmed/approved crosses, excludes duplicate
+   IDs, re-evaluates BUY/SELL independently, re-evaluates location with Smart Money /
+   Momentum / trend evidence, syncs state into `MEMORY["cross_events"]`, checks the same
+   closed-candle ADX used by Entry Engine, transitions `EXECUTION_READY`, and forwards the
    cross Event ID to the existing `execute_entry()`.
-6. `execute_entry()` keeps every existing final gate. When a cross Event ID is
-   present and the EMA9/VWAP gate is ready, that ID becomes the durable journal event
-   identity, so the same confirmed cross cannot submit two orders even after restart.
+6. `execute_entry()` keeps every existing final gate. When the EMA9/VWAP gate is ready,
+   the cross Event ID becomes the durable journal identity.
 7. `open_position()` → `TradeExecutionService.submit_market_entry()` →
-   `exchange.create_order()` (BingX) → fill/position verification → native stop
-   verification is unchanged. The lifecycle logs `execute_entry_reached`, order sent,
-   filled quantity, position verified and protection verified.
-8. Existing `TradeManagementBoard` owns all exits. After verified close, existing
-   reconciliation releases the one-position lock and scanning resumes.
+   `bingx_execution.py` order send → fill/position readback → native stop verification is
+   unchanged. The wrapper logs reaching the final boundary, order acceptance, actual
+   filled quantity, position verification and protection verification.
+8. `TradeManagementBoard` owns all exits. After verified close, existing reconciliation
+   releases the one-position lock and scanning resumes.
 
-## 3. How cross-location analysis works
+## 6. Cross-location analysis and ranking
 
-`build_location_features()` maps the institutional context already built by
-`ggp_institutional_bridge._build_context()` and the enrichment engines into explicit
-boolean/evidence features:
+`build_location_features()` maps the existing institutional context into explicit
+evidence: demand/supply zone proximity, direction-valid non-mitigated Order Block and
+FVG, sweep + reclaim or buy-side sweep + rejection, Market Structure / CHOCH, premium/
+discount alignment, real value area vs mid-range chop, nearest opposing liquidity /
+resistance / support / swing level, Smart Money bias, Momentum, volume, institutional
+trend and available price space in ATR. Available space is the **minimum** distance to
+the nearest opposing boundary; it is never inflated by the EMA9/VWAP gap.
 
-- demand/supply zone proximity from golden-zone alignment;
-- direction-valid, non-mitigated Order Block and direction-valid FVG;
-- liquidity sweep + reclaim for BUY, buy-side sweep + rejection for SELL;
-- confirmed Market Structure / CHOCH and premium-discount alignment;
-- real value area versus mid-range chop (zone evidence must exist);
-- room to opposing liquidity / resistance / support / previous swing high-low;
-- Smart Money bias, Momentum flow, volume confirmation, institutional trend support;
-- available price space in ATR units.
+`evaluate_cross_location()` returns `HIGH QUALITY CROSS`, `GOOD CROSS`, `WEAK CROSS` or
+`INVALID CROSS`, with all booleans and numeric inputs retained in `evidence` and all
+failures in `rejection_reasons`. HIGH/GOOD are executable candidates only when ADX >= 18
+and no critical condition fails; a high Score alone never approves a cross.
 
-`evaluate_cross_location()` returns one of four explainable classes:
-`HIGH QUALITY CROSS`, `GOOD CROSS`, `WEAK CROSS`, `INVALID CROSS`. HIGH/GOOD are
-executable candidates only when ADX >= 18 and no critical location condition fails.
-A high Score alone never approves a cross. All booleans and numeric inputs are kept in
-`evidence` and all failures in `rejection_reasons`.
+`rank_cross_candidates()` ranks by quality class, cross proximity, OB/FVG validity,
+liquidity confirmation, Market Structure, ADX, Momentum, Institutional Flow, available
+space, R:R, freshness, approval and Event-ID uniqueness. Duplicate IDs are permanently
+rejected with `cross_rank = -1.0`.
 
-ADX is a hard gate: `adx_gate(17.99)` rejects; `adx_gate(18.00)` passes only the ADX
-gate. The same `compute_adx(closed_df).iloc[-1]` value used by `execute_entry()` is
-passed into `execution_readiness()` immediately before authorization.
+## 7. BingX entry path
 
-## 4. Ranking
-
-`rank_cross_candidates()` ranks by cross quality class, proximity
-(`cross_distance_atr`), OB validity, FVG validity, liquidity confirmation, Market
-Structure, ADX, Momentum, Institutional Flow, available price space, R:R, freshness,
-institutional approval and Event-ID uniqueness. Duplicate Event IDs are demoted with
-`final_rejection_reason = duplicate_cross_event_id`. The prior location-first rank is
-retained as a deterministic tie-breaker, and `update_unified_watchlist()` adds cross
-quality / approval bonuses so better crosses are analyzed first.
-
-## 5. BingX entry path
-
-No protected file was replaced. The exact existing path remains:
+No protected file was replaced. The exact path remains:
 
 `smart_opportunity_selection()` → `execute_entry()` → `open_position()` →
 `TradeExecutionService.submit_market_entry()` → `bingx_execution.py` order send →
-fill/order readback → `_position()` direction proof →
-`place_and_verify_native_stop()` → existing `TradeManagementBoard`.
+fill/order readback → `_position()` direction proof → `place_and_verify_native_stop()` →
+existing `TradeManagementBoard`.
 
-The only change at this boundary is identity and observability: the cross Event ID is
-used as `durable_event_id`, and the serialized wrapper logs the actual accepted flag,
-order id presence, filled quantity, verified position and verified protection.
-Durable `is_event_consumed()` / `consume_event()` semantics are unchanged.
+The only changes are identity and observability: the cross Event ID becomes the durable
+event identity when the existing gate is ready, and the wrapper logs authoritative
+execution state. Durable `is_event_consumed()` / `consume_event()` semantics are unchanged.
 
-## 6. Scalp / Trend selection
+## 8. Scalp / Trend selection
 
-`LiveTradeManager._apply_management()` computes ATR% from closed-frame ATR divided by
-mark price and labels `LOW_VOL` (<0.40%), `HIGHER_VOL` (>=0.80%) or `NORMAL`.
-`ggp_profit_brain.select_range_target_pct()` turns these bands into explicit price-move
-targets of 0.25% and 0.50%. These are price movements, not leveraged ROE.
+`LiveTradeManager._apply_management()` computes ATR% from closed-frame ATR / mark price
+and labels `LOW_VOL` (<0.40%), `HIGHER_VOL` (>=0.80%) or `NORMAL`.
+`ggp_profit_brain.select_range_target_pct()` applies the weak-market guard first, then
+maps the bands to 0.25% and 0.50% price moves. These are price movements, not leveraged
+ROE.
 
 - `RANGE_SCALP`: one target, full remaining close, no TP1/TP2 and no splitting.
 - `TREND_RIDE`: existing TP1 at 50% of original filled quantity near the liquidity /
   structural target, then structural / liquidity TP2 for the runner; no TP3.
-- All decisions remain inside `TradeManagementBoard`; no Profit Engine or parallel
-  manager was added.
+- All exits remain inside `TradeManagementBoard`; no Profit Engine was added.
 
-## 7. Actual test results
+## 9. Actual test results
 
 | Command | Result |
 |---|---|
 | `python -m py_compile ggp_cross_lifecycle.py ggp_institutional_bridge.py ggp_profit_brain.py ggpbot.py test_cross_lifecycle.py` | clean |
-| `python -m pytest -q test_cross_lifecycle.py` | **18 passed in 5.38s** |
-| Focused + integration subset (`test_cross_lifecycle.py`, `test_entry_event_idempotency.py`, `test_ema9_vwap_soft_gate.py`, `test_profit_brain.py`, `test_profit_target_ladder.py`, `test_dual_scanner_dashboard.py`, `test_ggp_roro_integration.py`) | **87 passed in 23.67s** |
-| Full offline regression `python -m pytest -q` | **636 passed, 1 warning in 126.25s** |
+| `python -m pytest -q test_cross_lifecycle.py` | **24 passed in 11.15s** |
+| Focused + integration subset (`test_cross_lifecycle.py`, `test_entry_event_idempotency.py`, `test_ema9_vwap_soft_gate.py`, `test_profit_brain.py`, `test_profit_target_ladder.py`, `test_dual_scanner_dashboard.py`, `test_ggp_roro_integration.py`) | **93 passed in 26.80s** |
+| Full offline regression before merging `origin/main` | **642 passed, 1 warning in 124.51s** |
+| Full offline regression after merging owner commit `59eeffd` | **642 passed, 1 warning in 126.45s** |
 
-Baseline before edits was `618 passed, 1 warning in 177.13s`. The delta is the 18 new
-focused tests. No Timeout was raised, no test was skipped or marked xfail, and no
-failing test was ignored. The single warning is a pre-existing Pandas deprecation in
+Baseline before edits was `618 passed, 1 warning in 177.13s`. No Timeout was raised, no
+test was skipped or marked xfail, and no failing test was ignored. The single warning is
+a pre-existing Pandas `Timestamp.utcnow` deprecation in
 `test_professional_discovery_scanner.py`.
 
-## 8. Remaining risks
+## 10. Remaining risks and explicit non-coverage
 
-1. **No live/demo verification.** Fill quantity, native protection, close verification
-   and restart recovery are proven only by offline tests and existing regression
-   coverage. LIVE readiness is not claimed.
-2. **Portfolio cap policy not present.** The requested `5 technical/institutional + 1
-   news, 6 total` cap does not exist in the codebase. Runtime still uses the existing
-   one-open-position / one-active-execution lock. It is documented here rather than
-   invented as a parallel system.
-3. **Pre-existing native SL contradiction.** One helper labels native SL immutable
-   while the manager repairs it through `replace_native_stop()`. This change does not
-   alter that protected behavior.
-4. **Pre-existing `sync_position_state()` UNKNOWN contradiction.** `fetch_live_snapshot()`
-   raises on UNKNOWN before the wrapper's UNKNOWN branch. Not changed here.
-5. **Post-fill event consumption failure** blocks new entries but cannot unwind an
+1. **No live/demo verification.** No order submission, actual fill, position readback,
+   native SL verification, TradeManagementBoard exit, verified close or restart recovery
+   was tested against BingX Demo or LIVE. LIVE readiness is not claimed.
+2. **Owner `.env.example` defaults are LIVE-shaped.** Remote `main` commit `59eeffd`
+   sets `PAPER_MODE=false` and `ENABLE_LIVE_TRADING=true`. Credentials are empty, and no
+   environment or API setting was changed by this work. This must be reviewed before
+   deployment.
+3. **Portfolio cap not implemented.** The requested `5 technical/institutional + 1 news,
+   6 total` cap does not exist. There is no real News Engine or NEWS category. Runtime is
+   structurally single-position across global state, sync, recovery, reconciliation and
+   management; enabling 5+1 safely would require a redesign. It was not faked.
+4. **Pre-existing native SL contradiction.** One helper labels native SL immutable while
+   the manager repairs it through `replace_native_stop()`. This change does not alter it.
+5. **Pre-existing UNKNOWN contradiction.** The original class method appears to raise on
+   UNKNOWN before the wrapper branch, but the effective runtime monkey-patch preserves
+   UNKNOWN and blocks entries. Duplicate implementations remain an audit hazard.
+6. **Post-fill event consumption failure** blocks new entries but cannot unwind an
    already filled position; inherited fail-closed behavior.
-6. **Same-symbol opposing crosses** are both analyzed, but the Watchlist currently
-   stores one best row and the existing conflict logic may reject both when both
-   structural hypotheses are `ENTRY_READY`. This was not broadened beyond preserving
-   cross identity.
-7. **Volatility bands** use simple ATR% thresholds; regime stabilization and hysteresis
-   remain the responsibility of the existing engines.
-8. Stale `RELEASE_MANIFEST.txt` in the installed ZIP is intentionally untouched to
-   preserve ZIP fidelity.
+7. **Same-symbol opposing crosses** are both analyzed, but the Watchlist stores one best
+   row and existing conflict logic may reject both when both hypotheses are
+   `ENTRY_READY`.
+8. **Volatility bands** use simple ATR% thresholds; regime stabilization/hysteresis stay
+   with existing engines.
+9. No 24-hour soak, no exchange outage simulation under LIVE credentials and no GitHub
+   Actions status checks were available on the PR head.
 
-## 9. Git
+## 11. Git history and PR
 
-The implementation is committed independently on branch
-`unified-cross-lifecycle` from clean `main` at
-`908f29c836b417b0dac7560611cc5c6d7097efbb`:
+- Implementation: `1f80d691ff74ebe71a728e82b27ac014c6145899`
+- Report metadata: `0a66ddcb3233a5149db77edc1ad83e421b1307e5`
+- Review fixes: `6270c5a3faaf212e963e14389a93672600b01df3`
+- Integration merge of `origin/main` into branch: `877b0e6a737a5b94e4858e4d1451a8b022303671`
+- PR: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44
+- Exact patch: `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`
 
-- Implementation commit: `1f80d691ff74ebe71a728e82b27ac014c6145899`
-  (`Unify EMA9/VWAP cross lifecycle from scanner to verified close`).
-- Pull request: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44
-- The exact implementation patch is in `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
-- This report's final metadata is a small follow-up commit on the same branch.
-
-No commit or PR claims LIVE readiness; both are for offline-verified code only.
+Full hashes are recorded in the final response and in Git after the main integration
+commit. No commit or PR claims LIVE readiness; they cover offline-verified code only.
