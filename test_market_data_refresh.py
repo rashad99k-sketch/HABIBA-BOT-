@@ -7,6 +7,7 @@ and that a data problem never touches Native SL / TP1 / TP2.
 """
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -752,3 +753,21 @@ def test_force_close_event_is_independent_of_market_data(monkeypatch):
     mgr.lifecycle_state = ggpbot.TradeLifecycleState.LIVE
     mgr._force_close({"reason": "POSITION_VANISHED"})
     assert closed["n"] == 1, "force_close must run regardless of market data freshness"
+
+
+def test_entry_adx_hard_gate_fails_closed_on_missing_or_weak_adx():
+    assert ggpbot.entry_adx_gate_passed(18.0) is True
+    assert ggpbot.entry_adx_gate_passed(28.5) is True
+    assert ggpbot.entry_adx_gate_passed(17.999) is False
+    assert ggpbot.entry_adx_gate_passed(0.0) is False
+    assert ggpbot.entry_adx_gate_passed(None) is False
+    assert ggpbot.entry_adx_gate_passed("not-a-number") is False
+
+
+def test_entry_adx_gate_is_wired_to_closed_candle_authority():
+    source = Path(ggpbot.__file__).read_text(encoding="utf-8")
+    assert "def entry_adx_gate_passed(adx_value):" in source
+    assert "adx_below_18_hard_gate" in source
+    assert "if not entry_adx_gate_passed(fresh_adx):" in source
+    # EMA9/Session VWAP must remain ranking-only, never an independent entry gate.
+    assert "RANKING_ONLY_NOT_ENTRY_GATE" in source
