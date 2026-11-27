@@ -346,8 +346,19 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     minus = _number(ctx.get("di_minus"))
     side = str(ctx.get("side") or "").upper()
     low_liquidity = bool(ctx.get("thin_liquidity", False)) or volume_ratio <= 0.75
+    # The inherited weak/thin guard is mandatory. Volatility bands choose the
+    # full-close target only AFTER that guard, so HIGHER_VOL cannot extend a
+    # trade under conditions the original policy treated as weak.
     if low_liquidity or adx < 18.0 or continuation < 0.45:
         return RANGE_PROFIT_TARGETS_PCT[0], "weak_or_thin_market_conservative_0.25pct"
+    # Explicit volatility bands keep the single-target full-close policy
+    # explainable: LOW_VOL -> 0.25%, HIGHER_VOL -> 0.50%. They are price-move
+    # percentages, never leveraged ROE, and never create TP1/TP2/splitting.
+    band = str(ctx.get("volatility_band") or "").upper()
+    if band == "LOW_VOL":
+        return RANGE_PROFIT_TARGETS_PCT[0], "low_volatility_range_full_close_0.25pct"
+    if band == "HIGHER_VOL":
+        return RANGE_PROFIT_TARGETS_PCT[1], "higher_volatility_scalp_full_close_0.50pct"
 
     di_known = plus is not None and minus is not None
     di_aligned = ((plus > minus) if side == "BUY" else (minus > plus)) if di_known and side in {"BUY", "SELL"} else False

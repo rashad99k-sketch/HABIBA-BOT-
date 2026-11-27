@@ -21,6 +21,9 @@ from roro_opportunity_pipeline import validate_closed_frame, classify_regime, co
 from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
                                      build_support_resistance_zones, validate_order_block_zone)
+from ggp_cross_lifecycle import (
+    CrossLifecycleState, build_location_features, evaluate_cross_location,
+)
 
 
 REVERSAL = ReversalEngine()
@@ -28,6 +31,23 @@ CONTINUATION = ContinuationEngine()
 AUTHORITY = UnifiedEntryAuthority()
 
 TIMEFRAME_SECONDS = 900
+PERMANENT_CROSS_REJECTIONS = {
+    "duplicate_cross_event_id", "cross_signal_expired_without_reentry",
+}
+
+
+def cross_event_authorization_block(event: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the reason a cross event cannot be used for authorization."""
+    if not isinstance(event, dict):
+        return "cross_event_missing"
+    if event.get("cross_event_id_consumed"):
+        return "cross_event_already_consumed"
+    reason = str(event.get("final_rejection_reason") or "")
+    if reason in PERMANENT_CROSS_REJECTIONS:
+        return reason
+    if str(event.get("cross_status") or "").upper() != "CONFIRMED":
+        return "cross_event_not_confirmed"
+    return None
 
 
 def canonical_symbol(symbol: Any) -> str:
@@ -541,7 +561,9 @@ def _fvg_matches_side(fvg: Any, side: str) -> bool:
 
 
 def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
-                   now_ms: Optional[int] = None) -> Dict[str, Any]:
+                   now_ms: Optional[int] = None,
+                   cross_event: Optional[Dict[str, Any]] = None,
+                   cross_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     x = _frame(df)
     closed = validate_closed_frame(x, now_ms=now_ms, timeframe_s=TIMEFRAME_SECONDS)
     if len(closed) < 55:
@@ -551,6 +573,10 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             "decision_reason": "insufficient_closed_data", "rejection_reason": "insufficient_closed_data",
             "rejection_reasons": ["insufficient_closed_data"], "last_updated": time.time(),
             "data_quality": "INSUFFICIENT_CLOSED_CANDLES", "icons": {"status": "⚪"},
+            "cross_event_id": None, "cross_status": "NONE", "cross_quality": "INVALID CROSS",
+            "cross_location_approved": False,
+            "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
+            "final_rejection_reason": "insufficient_closed_data",
         }
     side = str(side or "").upper()
     if side not in {"BUY", "SELL"}:
@@ -644,6 +670,39 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _intelligence["price_pattern"] = classify_price_pattern(
         closed.to_dict("records"), atr=_atr(closed)
     )
+    # Cross-location authority: evaluate the cross at its own location using the
+    # institutional context above. This annotates the existing hypothesis; it
+    # never creates a new opportunity or bypasses UnifiedEntryAuthority.
+    _cross_features = build_location_features(context, cross_event, side)
+    if isinstance(cross_context, dict):
+        _cross_features.update(cross_context)
+    _cross_result = evaluate_cross_location(_cross_features, side)
+    _cross_dict = cross_event if isinstance(cross_event, dict) else {}
+    _cross_block = cross_event_authorization_block(cross_event) if isinstance(cross_event, dict) else None
+    _structural_ready = decision.state == DecisionState.ENTRY_READY.value
+    _cross_approved = bool(
+        _cross_block is None and _structural_ready and _cross_result.get("approved")
+    )
+    _cross_rejection = ("" if _cross_approved else
+                        (_cross_block or "cross_location_" + str(_cross_result.get("quality", "UNRATED")).lower()))
+    _lifecycle_status = (CrossLifecycleState.INSTITUTIONAL_APPROVED.value if _cross_approved
+                         else CrossLifecycleState.INSTITUTIONAL_REJECTED.value)
+    _lifecycle_rejection = _cross_rejection or None
+    # Keep the supplied cross event itself in sync with the analysis row. The
+    # production caller also persists this into MEMORY["cross_events"] so the
+    # final readiness gate cannot inspect a stale CROSS_DETECTED object.
+    if isinstance(cross_event, dict):
+        cross_event.update({
+            "cross_event_id": _cross_dict.get("cross_event_id"),
+            "cross_status": _cross_dict.get("cross_status", "NONE"),
+            "cross_quality": _cross_result.get("quality"),
+            "cross_location": _cross_result,
+            "cross_location_approved": bool(_cross_approved),
+            "institutional_analysis_status": _lifecycle_status,
+            "final_rejection_reason": _lifecycle_rejection,
+            "last_analyzed_ms": time.time(),
+            "adx": float(_adx_value) if np.isfinite(_adx_value) else _cross_dict.get("adx"),
+        })
     return {
         "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
         "side": side, "price": context["price"], "market_regime": reg.state,
@@ -670,6 +729,13 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "indicator_snapshot": indicators,
         "data_freshness": indicators.get("quality", "DATA_UNAVAILABLE"),
         "signal_direction": side, "entry_readiness": decision.state,
+        "cross_event_id": _cross_dict.get("cross_event_id"),
+        "cross_status": _cross_dict.get("cross_status", "NONE"),
+        "cross_quality": _cross_result.get("quality"),
+        "cross_location": _cross_result,
+        "cross_location_approved": _cross_approved,
+        "institutional_analysis_status": _lifecycle_status,
+        "final_rejection_reason": _lifecycle_rejection,
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
         "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
@@ -696,11 +762,53 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     }
 
 
+def _select_cross_event(cross_events: Optional[Any], side: str,
+                        preferred_event_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Pick the exact cross event for a side, otherwise the newest confirmed one."""
+    if isinstance(cross_events, dict) and "cross_direction" in cross_events:
+        candidates: List[Any] = [cross_events]
+    elif isinstance(cross_events, dict):
+        candidates = list(cross_events.values())
+    elif isinstance(cross_events, (list, tuple)):
+        candidates = list(cross_events)
+    else:
+        candidates = []
+    wanted_side = str(side or "").upper()
+    matches = [event for event in candidates
+               if isinstance(event, dict)
+               and str(event.get("cross_direction") or "").upper() == wanted_side]
+    usable = [event for event in matches if cross_event_authorization_block(event) is None]
+    preferred = str(preferred_event_id or "")
+    if preferred:
+        exact = next((event for event in usable
+                      if str(event.get("cross_event_id") or "") == preferred), None)
+        if exact is not None:
+            return exact
+    confirmed = [event for event in usable
+                 if str(event.get("cross_status") or "").upper() == "CONFIRMED"]
+    confirmed.sort(key=lambda event: (
+        int(event.get("candle_timestamp") or 0),
+        int(event.get("last_seen_ms") or 0),
+        int(event.get("first_seen_ms") or 0),
+    ), reverse=True)
+    return confirmed[0] if confirmed else None
+
+
 def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] = None,
-                        side_hints: Optional[List[str]] = None) -> Dict[str, Any]:
+                        side_hints: Optional[List[str]] = None,
+                        cross_events: Optional[Any] = None,
+                        cross_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     # Always test both hypotheses. RF/Scanner direction is a ranking hint only.
     hints = {str(v).upper() for v in (side_hints or []) if str(v).upper() in {"BUY", "SELL"}}
-    results = [analyze_symbol(symbol, side, frame, now_ms=now_ms) for side in ("BUY", "SELL")]
+    def _event_for(side: str) -> Optional[Dict[str, Any]]:
+        preferred = (cross_context or {}).get("cross_event_id") if isinstance(cross_context, dict) else None
+        return _select_cross_event(cross_events, side, preferred)
+    if cross_events is None and cross_context is None:
+        results = [analyze_symbol(symbol, side, frame, now_ms=now_ms) for side in ("BUY", "SELL")]
+    else:
+        results = [analyze_symbol(symbol, side, frame, now_ms=now_ms,
+                                  cross_event=_event_for(side), cross_context=cross_context)
+                   for side in ("BUY", "SELL")]
     ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
     if len(ready) > 1:
         selected = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
@@ -728,6 +836,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
     """Rotate all discovery sources in bounded batches and analyze both BUY/SELL."""
     out = memory.setdefault("watchlist", {})
     items = merge_candidates(memory)
+    cross_events = memory.get("cross_events", {}) if isinstance(memory.get("cross_events"), dict) else {}
     def candidate_rank(pair):
         key, item = pair
         prior = out.get(key, {}) if isinstance(out.get(key), dict) else {}
@@ -779,12 +888,17 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         discovery_score = max(0.0, min(100.0, rank_number(item.get("score")))) / 100.0
         updated = rank_number(prior.get("last_update", prior.get("last_updated", 0)))
         freshness = max(0.0, 1.0 - max(0.0, time.time() - updated) / 1800.0) if updated else 0.0
+        cross_quality_bonus = {
+            "HIGH QUALITY CROSS": 1.2, "GOOD CROSS": 0.8,
+            "WEAK CROSS": 0.1, "INVALID CROSS": -0.4,
+        }.get(str(prior.get("cross_quality") or "").upper(), 0.0)
+        approved_bonus = 0.5 if prior.get("institutional_analysis_status") == CrossLifecycleState.INSTITUTIONAL_APPROVED.value else 0.0
         # Re-rank using actual structural confluence/proximity from the previous analysis,
         # while rotating all symbols to prevent low-ranked candidates starving forever.
         priority = (state_bonus + 0.9 * golden_score + 0.55 * ob_near
                     + 0.35 * liquidity_quality + 0.45 * analysis_priority
                     + 0.30 * discovery_score + 0.20 * freshness
-                    + vwap_cross_priority)
+                    + vwap_cross_priority + cross_quality_bonus + approved_bonus)
         return (priority, state_bonus, golden_score, float(item.get("score", 0) or 0), key)
     ordered = sorted(items.items(), key=candidate_rank, reverse=True)
     if not ordered:
@@ -811,7 +925,19 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                     "rejection_reasons": [fetch_error or "market_data_unavailable"],
                     "data_quality": "DATA_UNAVAILABLE", "last_update": time.time(), "icons": {"status": "⚪"}}
         else:
-            results = [analyze_symbol(candidate["exchange_symbol"], side, frame) for side in ("BUY", "SELL")]
+            key_events = [event for event in cross_events.values()
+                          if isinstance(event, dict)
+                          and (canonical_symbol(event.get("symbol")) == canonical_symbol(key)
+                               or str(event.get("symbol") or "").upper() == str(candidate.get("exchange_symbol") or "").upper()
+                               or str(event.get("exchange_symbol") or "").upper() == str(candidate.get("exchange_symbol") or "").upper())]
+            if key_events:
+                preferred = str(candidate.get("cross_event_id") or "")
+                results = [analyze_symbol(candidate["exchange_symbol"], side, frame,
+                                          cross_event=_select_cross_event(key_events, side, preferred))
+                           for side in ("BUY", "SELL")]
+            else:
+                results = [analyze_symbol(candidate["exchange_symbol"], side, frame)
+                           for side in ("BUY", "SELL")]
             for result in results:
                 if enrich is not None:
                     try:
