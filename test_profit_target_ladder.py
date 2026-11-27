@@ -9,7 +9,7 @@ from ggp_profit_brain import (
 
 
 def test_range_targets_are_requested_price_moves():
-    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50, 1.00)
+    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50)
 
 
 def test_trend_targets_are_one_and_three_percent_for_long():

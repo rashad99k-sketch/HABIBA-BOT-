@@ -13,10 +13,11 @@ import pandas as pd
 import pytest
 
 from ggp_cross_lifecycle import (
-    CrossLifecycleState, adx_gate, build_location_features, evaluate_cross_location,
-    execution_readiness, make_cross_event_id, merge_cross_events, normalize_cross_event,
-    rank_cross_candidates, transition_state, HIGH_QUALITY, GOOD_QUALITY, WEAK_QUALITY,
-    INVALID_QUALITY,
+    CrossLifecycleState, adx_gate, build_location_features, cross_lifecycle_badge,
+    cross_lifecycle_identity, evaluate_cross_location, execution_readiness,
+    make_cross_event_id, merge_cross_events, normalize_cross_event, opportunity_summary,
+    rank_cross_candidates, rank_cross_candidates_by_side, transition_state, HIGH_QUALITY,
+    GOOD_QUALITY, WEAK_QUALITY, INVALID_QUALITY,
 )
 from ggp_institutional_bridge import _select_cross_event, cross_event_authorization_block
 from ggp_profit_brain import resolve_trend_targets, select_range_target_pct
@@ -556,3 +557,211 @@ def test_execution_wrapper_logs_authoritative_fill_and_protection_state(monkeypa
     assert "filled_qty=1.5" in cross_log
     assert "position_verified=True" in cross_log
     assert "protection_verified=True" in cross_log
+
+
+def test_lifecycle_badges_are_state_driven():
+    base = _confirmed()
+    cases = [
+        ({"cross_status": "APPROACHING", "institutional_analysis_status": ""},
+         "🔵 APPROACHING CROSS"),
+        ({"cross_status": "CONFIRMED", "institutional_analysis_status": ""},
+         "🟡 CROSS CONFIRMED — ANALYZING"),
+        ({"cross_status": "CONFIRMED",
+          "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_ANALYSIS_PENDING.value},
+         "🟣 INSTITUTIONAL ZONE ANALYSIS"),
+        ({"cross_status": "CONFIRMED",
+          "institutional_analysis_status": CrossLifecycleState.ZONE_ANALYSIS_COMPLETE.value},
+         "🟣 INSTITUTIONAL ZONE ANALYSIS"),
+        ({"cross_status": "CONFIRMED",
+          "institutional_analysis_status": CrossLifecycleState.ENTRY_CANDIDATE.value},
+         "🟢 ENTRY CANDIDATE"),
+        ({"cross_status": "CONFIRMED",
+          "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_APPROVED.value},
+         "🟢 ENTRY CANDIDATE"),
+        ({"cross_status": "CONFIRMED",
+          "institutional_analysis_status": CrossLifecycleState.EXECUTION_READY.value},
+         "🚀 EXECUTION READY"),
+        ({"institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value},
+         "🔴 REJECTED"),
+        ({"decision_state": "REJECTED"}, "🔴 REJECTED"),
+        ({"cross_status": "EXPIRED"}, "⚪ EXPIRED / WAITING"),
+        ({"cross_event_id_consumed": True}, "⚪ EXPIRED / WAITING"),
+    ]
+    for overrides, expected in cases:
+        assert cross_lifecycle_badge({**base, **overrides}) == expected
+
+
+def test_lifecycle_identity_fields_survive_reanalysis_and_merge():
+    event = _confirmed()
+    first_seen = event["candle_timestamp"] + 900000
+    event.update({
+        "cross_quality": HIGH_QUALITY,
+        "cross_location": {"evidence": ["retest_confirmed"]},
+        "state_history": [{"state": CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+                           "reason": "test", "ts": 1.0}],
+        "golden_zone": {"state": "GOLDEN_CONFLUENCE", "value_zone": "DISCOUNT",
+                        "ob_valid": True, "fvg_valid": True, "support_resistance_aligned": True},
+        "market_structure": {"confirmed": True, "mss": "BULLISH_CHOCH"},
+        "liquidity": {"event": "SWEEP", "direction": "BULLISH"},
+        "volume_confirmed": True,
+        "trading_mode": "RANGE_SCALP",
+    })
+    retained = merge_cross_events({}, [event], first_seen)
+    # A later scan re-emits the same closed candle as raw CROSS_DETECTED. It must
+    # not erase the analysis result, quality, history or consumed state.
+    reobserved = {**event, "institutional_analysis_status":
+                  CrossLifecycleState.CROSS_DETECTED.value, "cross_quality": None,
+                  "cross_location": None}
+    retained = merge_cross_events(retained, [reobserved], first_seen + 900000)
+    row = retained[event["cross_event_id"]]
+    identity = cross_lifecycle_identity(row)
+    required = {
+        "badge", "lifecycle_state", "symbol", "cross_direction", "cross_status",
+        "candle_timestamp", "cross_event_id", "adx", "ema9", "session_vwap",
+        "distance_from_vwap", "institutional_zone", "zone_quality", "market_structure",
+        "liquidity_condition", "retest_status", "volume_condition",
+        "opportunity_classification", "waiting_or_rejection_reason",
+    }
+    assert required.issubset(identity)
+    assert row["cross_quality"] == HIGH_QUALITY
+    assert row["state_history"] and row["institutional_analysis_status"] == \
+        CrossLifecycleState.INSTITUTIONAL_APPROVED.value
+    assert identity["badge"] == "🟢 ENTRY CANDIDATE"
+    assert identity["institutional_zone"] == "GOLDEN_CONFLUENCE"
+    assert identity["opportunity_classification"] == "RANGE_SCALP"
+    side_only = {**row, "cross_direction": None, "side": "BUY"}
+    assert cross_lifecycle_identity(side_only)["cross_direction"] == "BUY"
+
+
+def test_adx_boundaries_stale_indicators_and_missing_adx_are_rejected():
+    assert adx_gate(17.99) == (False, "adx_below_18")
+    assert adx_gate(18.0) == (True, "adx_gate_passed")
+    assert adx_gate(None) == (False, "adx_unavailable")
+    for quality in ("STALE_DATA", "DATA_UNAVAILABLE"):
+        result = evaluate_cross_location(_features("BUY", indicator_quality=quality))
+        assert result["quality"] == INVALID_QUALITY
+        assert result["approved"] is False
+        assert f"indicator_quality:{quality}" in " | ".join(result["evidence"])
+        assert result["features"]["indicator_quality"] == quality
+    missing = _confirmed()
+    missing.pop("adx")
+    missing["cross_quality"] = HIGH_QUALITY
+    ok, reason = execution_readiness(missing)
+    assert ok is False and reason == "adx_unavailable"
+
+
+def test_approaching_ema50_only_and_unrated_crosses_never_authorize():
+    ts = 1795132800000
+    approaching = normalize_cross_event(
+        "BTC/USDT:USDT", 900,
+        {"state": "NEAR_CROSS", "direction": "BUY", "cross_ema9": None,
+         "data_freshness": "FRESH", "candle_timestamp": ts, "ema9": 101.0,
+         "vwap": 100.8, "gap_atr": 0.08}, 24.0, ts + 900000,
+    )
+    assert approaching["cross_status"] == "APPROACHING"
+    assert approaching["cross_event_id"] is None
+    assert execution_readiness(approaching, adx=26.0)[0] is False
+    assert rank_cross_candidates_by_side([approaching])["best_buy"] is None
+
+    ema50_only = normalize_cross_event(
+        "BTC/USDT:USDT", 900,
+        {"state": "CROSS_CONFIRMED", "direction": "BUY", "cross_ema9": None,
+         "cross_ema50": "BULLISH", "cross_any": "BULLISH",
+         "data_freshness": "FRESH", "candle_timestamp": ts, "ema9": 99.0,
+         "ema50": 101.0, "vwap": 100.0, "gap_atr": 0.10}, 24.0, ts + 900000,
+    )
+    assert ema50_only is None
+
+    unrated = _confirmed()
+    assert execution_readiness(unrated, adx=26.0)[0] is False
+
+
+def test_buy_and_sell_queues_are_independent_with_explainable_best_picks():
+    ts = 1795132800000
+    buy = {**_confirmed("BUY", ts), "cross_quality": HIGH_QUALITY, "adx": 28.0,
+           "cross_distance_atr": 0.08}
+    sell = {**_confirmed("SELL", ts), "cross_quality": GOOD_QUALITY, "adx": 24.0,
+            "cross_distance_atr": 0.10}
+    weak_buy = {**_confirmed("BUY", ts + 900000), "cross_quality": WEAK_QUALITY,
+                "adx": 26.0,
+                "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value}
+    result = rank_cross_candidates_by_side([weak_buy, sell, buy])
+    assert all(row["cross_direction"] == "BUY" for row in result["BUY"])
+    assert all(row["cross_direction"] == "SELL" for row in result["SELL"])
+    assert result["best_buy"]["direction"] == "BUY"
+    assert result["best_buy"]["cross_event_id"] == buy["cross_event_id"]
+    assert result["best_sell"]["direction"] == "SELL"
+    assert result["best_sell"]["cross_event_id"] == sell["cross_event_id"]
+    assert result["best_buy"]["badge"] == "🟢 ENTRY CANDIDATE"
+    assert any("zone_quality:" in reason for reason in result["best_sell"]["selection_reasons"])
+    assert set(opportunity_summary(sell)) == set(result["best_sell"])
+
+
+def test_expired_or_duplicate_event_cannot_block_a_newer_valid_event():
+    stale = {**_confirmed("BUY", 1795132800000), "cross_quality": HIGH_QUALITY,
+             "final_rejection_reason": "cross_signal_expired_without_reentry",
+             "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value}
+    fresh = {**_confirmed("BUY", 1795132809000), "cross_quality": HIGH_QUALITY}
+    rejected = rank_cross_candidates_by_side([stale])
+    assert rejected["best_buy"] is None
+    ranked = rank_cross_candidates_by_side([stale, fresh])
+    assert ranked["best_buy"]["cross_event_id"] == fresh["cross_event_id"]
+    assert execution_readiness(stale, adx=26.0) == (
+        False, "cross_signal_expired_without_reentry")
+
+
+def test_scalp_targets_are_only_025_and_050_price_moves():
+    from ggp_profit_brain import RANGE_PROFIT_TARGETS_PCT
+    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50)
+    strong, reason = select_range_target_pct({
+        "side": "SELL", "adx": 25, "continuation_probability": 0.78,
+        "volume_ratio": 1.30, "di_plus": 12, "di_minus": 31,
+        "aligned_closed_candles": 2,
+    })
+    assert strong == 0.50
+    assert reason == "strong_follow_through_capped_at_0.50pct"
+    assert "strong_closed_candle_follow_through_1.00pct" not in BRAIN_SOURCE
+    assert "RANGE_PROFIT_TARGETS_PCT[2]" not in BRAIN_SOURCE
+
+
+def test_runtime_trade_execution_services_all_inject_the_api_governor():
+    calls = [
+        node for node in ast.walk(TREE)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "TradeExecutionService"
+    ]
+    assert len(calls) == 3
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "api_caller" in keywords
+        assert isinstance(keywords["api_caller"], ast.Name)
+        assert keywords["api_caller"].id == "safe_api_call"
+
+
+def test_best_opportunities_and_cross_identity_reach_payload_and_watchlist_ui():
+    data_source = ast.get_source_segment(SOURCE, _function("data"))
+    assert '"cross_opportunity_ranking": MEMORY.get("cross_opportunity_ranking", {})' in data_source
+    assert "_cross_lifecycle_identity(row)" in data_source
+    for token in ("BEST BUY OPPORTUNITY", "BEST SELL OPPORTUNITY",
+                  "lifecycle.badge", "cross_event_id", "candle_timestamp",
+                  "institutional_zone", "zone_quality", "market_structure",
+                  "liquidity_condition", "retest_status", "volume_condition",
+                  "opportunity_classification", "waiting_or_rejection_reason"):
+        assert token in SOURCE
+
+
+def test_no_duplicate_cross_event_or_watchlist_stores():
+    memory_node = next(
+        node for node in TREE.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "MEMORY" for target in node.targets)
+    )
+    memory_source = ast.get_source_segment(SOURCE, memory_node)
+    assert memory_source.count('"watchlist": {}') == 1
+    assert '"cross_events": {}' not in memory_source
+    assert SOURCE.count('MEMORY["cross_events"] =') == 1
+    for node in TREE.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assert target.id not in {"CROSS_EVENTS", "WATCHLIST", "CROSS_EVENT_STORE"}

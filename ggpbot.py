@@ -3394,6 +3394,7 @@ def _move_native_stop_verified(symbol, new_trigger_price, *, action="MOVE_SL", r
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[NATIVE_SL_MOVE] {message}", "INFO"),
+                api_caller=safe_api_call,
             )
             result = service.replace_native_stop(
                 symbol=normalize_symbol(symbol), side=side, quantity=qty,
@@ -4265,7 +4266,7 @@ class LiveTradeManager:
                         swing_levels = []
                     adaptive_target, target_reason = adaptive_range_target_price(
                         side, entry, atr, swing_levels)
-                    # Percentage objective is a PRICE move (0.25/0.50/1.00%), not leveraged ROE.
+                    # Percentage objective is a SCALP PRICE move (0.25/0.50%), not leveraged ROE.
                     # Use the last three completed candles as follow-through evidence.
                     _aligned_closed = 0
                     for _candle_idx in range(max(0, len(df_live) - 4), len(df_live) - 1):
@@ -6280,6 +6281,7 @@ def open_position(side, amount, symbol, stop_loss=None, trade_id=None, managemen
             service = TradeExecutionService(
                 ex, journal=globals().get("INSTITUTIONAL_TRADE_JOURNAL"),
                 logger=lambda message: log_execution(f"[EXECUTION] {message}", "INFO"),
+                api_caller=safe_api_call,
             )
             entry_submission_attempted = True
             result = service.submit_market_entry(
@@ -9784,9 +9786,24 @@ function updateUI(d) {{
     }}
     if(d.watchlist) {{
         let wHtml = "";
+        let ranking = d.cross_opportunity_ranking || {{}};
+        const bestOpportunityHtml = (best, label) => {{
+            if(!best) return `<div style="margin-bottom:8px;border:1px solid #26364a;border-radius:8px;padding:8px;background:#0f1724;"><b>${{label}}</b> | None qualified</div>`;
+            let ts = best.cross_timestamp ? new Date(Number(best.cross_timestamp)).toLocaleTimeString() : "UNKNOWN";
+            let reasons = (best.selection_reasons || []).join(", ");
+            return `<div style="margin-bottom:8px;border:1px solid #2c6e49;border-radius:8px;padding:8px;background:#0f1724;">
+              <b>${{label}}</b> | ${{best.badge || "⚪"}} | ${{best.symbol || "UNKNOWN"}} ${{best.direction || ""}} | Rank: ${{best.cross_rank ?? "-"}} | ADX: ${{best.adx ?? "-"}}
+              <br><small>Event: ${{best.cross_event_id || "NONE"}} | Candle: ${{ts}} | Zone: ${{best.best_institutional_zone || "UNKNOWN"}} (${{best.zone_quality || "UNRATED"}})</small>
+              <br><small>Entry: ${{best.entry_area?.low ?? "?"}}–${{best.entry_area?.high ?? "?"}} | Stop: ${{best.stop_loss_reference ?? "?"}} | Type: ${{best.opportunity_type || "UNCLASSIFIED"}} | Reasons: ${{reasons || "None"}}</small>
+            </div>`;
+        }};
+        wHtml += bestOpportunityHtml(ranking.best_buy, "BEST BUY OPPORTUNITY");
+        wHtml += bestOpportunityHtml(ranking.best_sell, "BEST SELL OPPORTUNITY");
         for (let sym in d.watchlist) {{
             let w = d.watchlist[sym];
             let sideIcon = w.side === "BUY" ? "🟢" : (w.side === "SELL" ? "🔴" : "⚪");
+            let lifecycle = w.cross_lifecycle || {{}};
+            let crossTs = lifecycle.candle_timestamp ? new Date(Number(lifecycle.candle_timestamp)).toLocaleTimeString() : "UNKNOWN";
             let state = w.decision_state || w.state || "UNKNOWN";
             let stateColor = state === "ENTRY_READY" || state === "CONFIRMED" ? "#2ecc71" :
                 (String(state).startsWith("WAITING") || state === "NO_CHASE" ? "#f1c40f" :
@@ -9814,6 +9831,11 @@ function updateUI(d) {{
             let quality = w.data_quality || "UNKNOWN";
             wHtml += `<div style="margin-bottom:10px;border:1px solid #26364a;border-radius:8px;padding:8px;background:#101a29;">
               <div><b>${{sideIcon}} ${{w.symbol || sym}}</b> | ${{w.decision_setup_type || w.setup_type || w.trade_type || "UNCLASSIFIED"}} | Score: ${{w.score ?? w.discovery_score ?? "-"}} | <span style="color:${{stateColor}}">${{state}}</span></div>
+              <div><b>${{lifecycle.badge || ic.cross_lifecycle || "⚪ EXPIRED / WAITING"}}</b> | Cross: ${{lifecycle.cross_status || w.cross_status || "NONE"}} ${{lifecycle.cross_direction || w.cross_direction || ""}} | Event: ${{lifecycle.cross_event_id || w.cross_event_id || "NONE"}} | Candle: ${{crossTs}} | Rank: ${{w.cross_rank ?? "-"}}</div>
+              <small>Lifecycle: ${{lifecycle.lifecycle_state || "UNKNOWN"}} | Zone: ${{lifecycle.institutional_zone || "UNKNOWN"}} | Quality: ${{lifecycle.zone_quality || "UNRATED"}} | Type: ${{lifecycle.opportunity_classification || "UNCLASSIFIED"}}</small>
+              <br><small>EMA9: ${{lifecycle.ema9 ?? w.ema9 ?? "-"}} | Session VWAP: ${{lifecycle.session_vwap ?? w.vwap ?? "-"}} | Gap ATR: ${{lifecycle.distance_from_vwap ?? w.cross_distance_atr ?? "-"}} | ADX: ${{lifecycle.adx ?? w.adx ?? "-"}}</small>
+              <br><small>Structure: ${{lifecycle.market_structure || "UNKNOWN"}} | Liquidity: ${{lifecycle.liquidity_condition || "UNKNOWN"}} | Retest: ${{lifecycle.retest_status || "NOT_CONFIRMED"}} | Volume: ${{lifecycle.volume_condition || "NOT_CONFIRMED"}}</small>
+              <br><small>Wait/Reject: ${{lifecycle.waiting_or_rejection_reason || rejectStr || "None"}}</small>
               <div style="font-size:17px;letter-spacing:2px;margin:4px 0;">${{iconRow}}</div>
               <small>Price: ${{priceText}} | Regime: ${{w.market_regime || "UNKNOWN"}} | Structure: ${{structure.pattern || structure.direction || "UNKNOWN"}} | Liquidity: ${{liq.event || "UNKNOWN"}} / ${{liq.direction || "UNKNOWN"}}</small>
               <br><small>OB: ${{ob.low ?? "?"}}–${{ob.high ?? "?"}} (${{w.order_block_state || "UNKNOWN"}}) | FVG: ${{fvg.lower ?? "?"}}–${{fvg.upper ?? "?"}} (${{fvg.status || "UNKNOWN"}})</small>
@@ -10001,7 +10023,15 @@ def data():
         health["errors"] = len(DASHBOARD_STATE["errors"])
         top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
         cleanup_watchlist()
-        watchlist_data = MEMORY.get("watchlist", {})
+        # Publish fresh lifecycle identity on every read; scanner and entry
+        # threads mutate the underlying rows asynchronously.
+        watchlist_data = {}
+        for key, value in MEMORY.get("watchlist", {}).items():
+            row = dict(value) if isinstance(value, dict) else {}
+            identity = _cross_lifecycle_identity(row)
+            row["cross_lifecycle"] = identity
+            row.setdefault("icons", {})["cross_lifecycle"] = identity["badge"]
+            watchlist_data[key] = row
         no_entry_feed = MEMORY.get("no_entry_feed", [])[-5:]
         live_data = {}
         supervisor_data = None
@@ -10085,6 +10115,7 @@ def data():
             "ema9_vwap_proximity_scanner": MEMORY.get("ema9_vwap_proximity_scanner", [])[:30],
             "ema9_vwap_proximity_scanner_meta": MEMORY.get("ema9_vwap_proximity_scanner_meta", {}),
             "watchlist": watchlist_data,
+            "cross_opportunity_ranking": MEMORY.get("cross_opportunity_ranking", {}),
             "no_entry_feed": no_entry_feed,
             "entry_rejection_metrics": MEMORY.get("entry_rejection_metrics", {}),
             "last_closed_candle_validation": MEMORY.get("last_closed_candle_validation", {}),
@@ -11742,7 +11773,11 @@ from ggp_cross_lifecycle import (
     CrossLifecycleState, normalize_cross_event as _normalize_cross_event,
     merge_cross_events as _merge_cross_events, transition_state as _cross_transition_state,
     build_location_features as _cross_location_features, evaluate_cross_location as _evaluate_cross_location,
-    rank_cross_candidates as _rank_cross_candidates, execution_readiness as _cross_execution_readiness,
+    rank_cross_candidates as _rank_cross_candidates,
+    rank_cross_candidates_by_side as _rank_cross_candidates_by_side,
+    cross_lifecycle_identity as _cross_lifecycle_identity,
+    finite as _finite_cross_number,
+    execution_readiness as _cross_execution_readiness,
 )
 try:
     from roro_resource_manager import ResourceManager
@@ -11985,12 +12020,26 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                 symbol_key = roro_canonical_symbol(symbol_for_proximity)
                 candle_ts = int(closed.timestamp.iloc[-1])
                 last_seen = MEMORY.setdefault("_proximity_last_seen_by_symbol", {})
+                _analysis_side = str(analysis.get("side") or "").upper()
+                _expected_cross = ("BULLISH" if _analysis_side == "BUY"
+                                   else "BEARISH" if _analysis_side == "SELL" else "")
+                _ema9_cross = str(proximity.get("cross_ema9") or "").upper()
+                # EMA50/VWAP crosses stay diagnostic and never create cross age,
+                # ranking priority or Watchlist lifecycle identity.
+                _proximity_cross_event = bool(_ema9_cross and _expected_cross
+                                              and _ema9_cross == _expected_cross)
+                _proximity_frame_seconds = float(timeframe_seconds)
+                _proximity_cross_max_age = 2.0 * _proximity_frame_seconds
+                _proximity_cross_age = (
+                    max(0.0, time.time() - (float(proximity.get("candle_timestamp") or 0) / 1000.0
+                                           + _proximity_frame_seconds))
+                    if _proximity_cross_event else None
+                )
                 if last_seen.get(symbol_key) != candle_ts:
                     MEMORY["_proximity_batch_updates"] = int(MEMORY.get("_proximity_batch_updates", 0)) + 1
                     last_seen[symbol_key] = candle_ts
                     _observed_at = time.time()
                     _proximity_frame_seconds = float(timeframe_seconds)
-                    _proximity_cross_event = bool(proximity.get("cross_ema9") or proximity.get("cross_ema50"))
                     _proximity_cross_age = (
                         max(0.0, _observed_at - (float(proximity.get("candle_timestamp") or 0) / 1000.0
                                                  + _proximity_frame_seconds))
@@ -12023,6 +12072,7 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                         symbol_for_proximity, timeframe_seconds, proximity, _cross_adx, now_ms
                     )
                     if _cross_event:
+                        _cross_side = str(_cross_event.get("cross_direction") or "").upper()
                         _merged = _merge_cross_events(
                             MEMORY.get("cross_events", {}), [_cross_event], now_ms
                         )
@@ -12030,10 +12080,29 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                         _cross_key = (_cross_event.get("cross_event_id")
                                       or _cross_event.get("candidate_id"))
                         result["cross_event"] = dict(_merged.get(_cross_key, _cross_event))
-                        analysis["cross_event_id"] = _cross_event.get("cross_event_id")
-                        analysis["cross_candidate_id"] = _cross_key
-                        analysis["cross_status"] = _cross_event.get("cross_status")
-                        analysis["cross_direction"] = _cross_event.get("cross_direction")
+                        # Top-level inputs consumed by cross_rank(); no fabricated R:R.
+                        result["cross_distance_atr"] = _finite_cross_number(proximity.get("gap_atr"), 0.0)
+                        result["cross_age_seconds"] = (_proximity_cross_age
+                                                       if _proximity_cross_event else 9999.0)
+                        result["risk_reward"] = 0.0
+                        if not _analysis_side or _analysis_side == _cross_side:
+                            analysis["cross_event_id"] = _cross_event.get("cross_event_id")
+                            analysis["cross_candidate_id"] = _cross_key
+                            analysis["cross_status"] = _cross_event.get("cross_status")
+                            analysis["cross_direction"] = _cross_event.get("cross_direction")
+                            _identity_source = {
+                                **analysis,
+                                "cross_event": result["cross_event"],
+                                "cross_direction": _cross_side,
+                                "adx": _cross_adx,
+                                "ema9": proximity.get("ema9"),
+                                "vwap": proximity.get("vwap"),
+                                "cross_distance_atr": result["cross_distance_atr"],
+                            }
+                            _identity = _cross_lifecycle_identity(_identity_source)
+                            analysis["cross_lifecycle"] = _identity
+                            analysis.setdefault("icons", {})["cross_lifecycle"] = _identity["badge"]
+                            result["cross_lifecycle"] = _identity
                         log_execution(
                             f"[CROSS_EVENT] {symbol_key} {_cross_event.get('cross_direction')} "
                             f"{_cross_event.get('cross_status')} event={_cross_event.get('cross_event_id') or _cross_key} "
@@ -12044,10 +12113,12 @@ def _enrich_with_existing_gpp_engines(frame, side, analysis):
                     result["cross_event_diagnostic"] = f"{type(cross_exc).__name__}:{cross_exc}"
                 result["ema9_vwap_proximity"] = {**proximity, "role": "RANKING_ONLY_NOT_ENTRY_GATE"}
                 icons = dict(analysis.get("icons") or {})
-                icons["ema_vwap_proximity"] = ("⚡" if proximity.get("cross_any") else
+                icons["ema_vwap_proximity"] = ("⚡" if _proximity_cross_event else
                                                 "🟡" if proximity.get("state") in ("NEAR_CROSS", "CONVERGING") else
                                                 "📈" if proximity.get("direction") == "BUY" else
                                                 "📉" if proximity.get("direction") == "SELL" else "⚪")
+                if analysis.get("cross_lifecycle"):
+                    icons["cross_lifecycle"] = analysis["cross_lifecycle"]["badge"]
                 analysis["icons"] = icons
         except Exception as proximity_exc:
             result["ema9_vwap_proximity"] = {"state": "UNKNOWN", "reason": f"{type(proximity_exc).__name__}",
@@ -12285,10 +12356,16 @@ def smart_opportunity_selection():
             MEMORY.setdefault("cross_events", {})[key] = event
             cross_event_map[key] = event
 
-    # One Event ID is one cross. Retained APPROACHING candidates stay in the
-    # watchlist, but only CONFIRMED + institutionally approved crosses can enter.
+    # One Event ID is one cross. APPROACHING is visible in the Watchlist only;
+    # it can never enter the authorization revalidation queue. Rejected, expired
+    # and consumed identities are also removed so they cannot block newer ones.
     ready = [(sym, item) for sym, item in ready
-             if str(item.get("cross_status") or "").upper() in {"CONFIRMED", "APPROACHING"}]
+             if str(item.get("cross_status") or "").upper() == "CONFIRMED"
+             and item.get("cross_event_id")
+             and not item.get("cross_event_id_consumed")
+             and str(item.get("final_rejection_reason") or "") not in {
+                 "duplicate_cross_event_id", "cross_signal_expired_without_reentry",
+             }]
     def _location_first_rank(pair):
         _, candidate = pair
         side_value = str(candidate.get("side") or "").upper()
@@ -12341,8 +12418,9 @@ def smart_opportunity_selection():
         return (location_distance <= 1.5, -location_distance, location_quality, score)
 
     # Cross quality, proximity, OB/FVG, liquidity, structure, ADX, momentum,
-    # flow, target space, R:R, freshness and Event-ID uniqueness lead the ranking;
-    # the inherited location rank remains the deterministic tie-breaker.
+    # flow, target space, R:R, freshness and Event-ID uniqueness lead the ranking.
+    # BUY and SELL are ranked in separate queues so one side cannot starve the
+    # other; the inherited location rank remains only a deterministic tie-breaker.
     original_items = {id(item): (canonical, item) for canonical, item in ready}
     ranked_rows = []
     for canonical, item in ready:
@@ -12351,7 +12429,30 @@ def smart_opportunity_selection():
         row["_source_id"] = id(item)
         row["_base_rank"] = _location_first_rank((canonical, item))
         ranked_rows.append(row)
-    ordered_rows = _rank_cross_candidates(ranked_rows)
+    side_ranking = _rank_cross_candidates_by_side(ranked_rows)
+    ordered_rows = side_ranking["queue"]
+
+    def _compact_rank_row(row):
+        identity = _cross_lifecycle_identity(row)
+        return {
+            "symbol": identity["symbol"],
+            "cross_event_id": identity["cross_event_id"],
+            "direction": identity["cross_direction"],
+            "cross_rank": row.get("cross_rank"),
+            "cross_quality": row.get("cross_quality"),
+            "adx": identity["adx"],
+            "badge": identity["badge"],
+        }
+
+    # Published for the Dashboard/API; no exchange state or secret is exposed.
+    MEMORY["cross_opportunity_ranking"] = {
+        "BUY": [_compact_rank_row(row) for row in side_ranking["BUY"]],
+        "SELL": [_compact_rank_row(row) for row in side_ranking["SELL"]],
+        "best_buy": side_ranking["best_buy"],
+        "best_sell": side_ranking["best_sell"],
+        "updated_at": side_ranking["updated_at"],
+    }
+
     ready = []
     for row in ordered_rows:
         source = original_items.get(int(row.get("_source_id") or 0))
@@ -12376,7 +12477,19 @@ def smart_opportunity_selection():
         if event_id:
             seen_event_ids.add(event_id)
         unique_ready.append((canonical, item))
-    ready = unique_ready
+    # Interleave independent side queues so BUY never monopolizes the bounded
+    # revalidation slots and a later valid SELL event cannot be blocked.
+    side_queues = {"BUY": [], "SELL": []}
+    for canonical, item in unique_ready:
+        side_value = str(item.get("side") or item.get("cross_direction") or "").upper()
+        if side_value in side_queues:
+            side_queues[side_value].append((canonical, item))
+    ready = []
+    for index in range(max(len(side_queues["BUY"]), len(side_queues["SELL"]))):
+        if index < len(side_queues["BUY"]):
+            ready.append(side_queues["BUY"][index])
+        if index < len(side_queues["SELL"]):
+            ready.append(side_queues["SELL"][index])
     # Bound entry revalidation work per loop; the rotating Watchlist analyzes the rest.
     for canonical, item in ready[:8]:
         try:
@@ -12474,10 +12587,15 @@ def smart_opportunity_selection():
             item["cross_location"] = _location
             item["cross_quality"] = _location.get("quality")
             item["cross_location_approved"] = bool(_location.get("approved"))
+            _apply_cross_transition(
+                item, CrossLifecycleState.ZONE_ANALYSIS_COMPLETE.value,
+                f"cross_location_analysis_written_back:{_location.get('quality')}",
+            )
+            _sync_cross_event(cross_event, item)
             if _location.get("approved"):
                 _apply_cross_transition(
-                    item, CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
-                    f"cross_location_quality:{_location.get('quality')}",
+                    item, CrossLifecycleState.ENTRY_CANDIDATE.value,
+                    f"entry_candidate_after_zone_analysis:{_location.get('quality')}",
                 )
             else:
                 _apply_cross_transition(
@@ -12588,6 +12706,13 @@ def smart_opportunity_selection():
             _adx_series = compute_adx(closed_df)
             _cross_adx_value = (_adx_series.iloc[-1] if _adx_series is not None and len(_adx_series) else None)
             _cross_consumed = _cross_event_consumed(cross_event)
+            # All execution-side gates have passed. Promote ENTRY_CANDIDATE to
+            # the approved lifecycle state before the single final cross gate.
+            _apply_cross_transition(
+                item, CrossLifecycleState.INSTITUTIONAL_APPROVED.value,
+                "all_execution_gates_passed_before_final_cross_readiness",
+            )
+            _sync_cross_event(cross_event, item)
             # Readiness must inspect the ENRICHED candidate. The raw cross-event
             # record is still CROSS_DETECTED at this point; checking it would
             # reject every cross before execute_entry() is reached.
@@ -12678,7 +12803,15 @@ def smart_opportunity_selection():
                 _sync_cross_event(cross_event, item)
                 item["entry_status"] = "EXECUTED_VIA_GGP_EXECUTE_ENTRY"
                 item["entry_timestamp"] = time.time()
-                _persist_trade_journal_start(setup, item)
+                # execute_entry's journal wrapper is authoritative; a failed
+                # durable start must keep the bot in recovery hold.
+                if not _persist_trade_journal_start(setup, item):
+                    STATE["entry_event_persistence_failed"] = True
+                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                    log_execution(
+                        f"[ENTRY_EVENT_GUARD] CRITICAL: {exchange_sym} entry journal start failed; new entries blocked",
+                        "ERROR",
+                    )
                 trade_id = str(STATE.get("trade_id") or "")
                 if INSTITUTIONAL_TRADE_JOURNAL and trade_id:
                     INSTITUTIONAL_TRADE_JOURNAL.consume_event(event_id, trade_id)
@@ -14396,7 +14529,20 @@ def execute_entry(*args, **kwargs):
         journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
         if result and STATE.get("open"):
             ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-            _persist_trade_journal_start(ctx.get("setup_type"))
+            # A verified exchange position without a durable journal start is a
+            # recovery hazard, never a silently accepted entry.
+            try:
+                journal_started = bool(_persist_trade_journal_start(ctx.get("setup_type")))
+            except Exception as exc:
+                journal_started = False
+                log_execution(f"[JOURNAL] entry persistence raised {type(exc).__name__}: {exc}", "ERROR")
+            if not journal_started:
+                STATE["entry_event_persistence_failed"] = True
+                globals()["RECOVERY_BLOCK_ENTRIES"] = True
+                log_execution(
+                    "[ENTRY_EVENT_GUARD] CRITICAL: verified entry has no durable journal start; new entries blocked",
+                    "ERROR",
+                )
             if event_id and journal is not None:
                 trade_id = str(STATE.get("trade_id") or "")
                 try:

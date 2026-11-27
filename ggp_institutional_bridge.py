@@ -22,7 +22,9 @@ from roro_confluence import classify_liquidity, find_causal_order_block, Liquidi
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
                                      build_support_resistance_zones, validate_order_block_zone)
 from ggp_cross_lifecycle import (
-    CrossLifecycleState, build_location_features, evaluate_cross_location,
+    CrossLifecycleState, EXCELLENT_QUALITY, GOOD_QUALITY, INVALID_QUALITY,
+    MODERATE_QUALITY, WEAK_QUALITY, build_location_features, cross_lifecycle_identity,
+    evaluate_cross_location,
 )
 
 
@@ -116,6 +118,7 @@ def _indicator_snapshot(closed: pd.DataFrame, *, now_ms: Optional[int] = None) -
     losses = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
     rsi = 100.0 - (100.0 / (1.0 + gains / losses.replace(0, np.nan)))
     atr_value = _atr(closed)
+    adx_value = _adx(closed)
     price = float(close.iloc[-1])
     ema_value = float(ema9.iloc[-1]) if np.isfinite(ema9.iloc[-1]) else None
     vwap_value = float(vwap.iloc[-1]) if np.isfinite(vwap.iloc[-1]) else None
@@ -132,6 +135,7 @@ def _indicator_snapshot(closed: pd.DataFrame, *, now_ms: Optional[int] = None) -
     return {
         "ema9": ema_value, "vwap": vwap_value, "rsi": rsi_value,
         "atr": float(atr_value) if np.isfinite(atr_value) else None,
+        "adx": float(adx_value) if np.isfinite(adx_value) else None,
         "ema9_slope_atr": slope,
         "vwap_position": ("ABOVE" if price > vwap_value else "BELOW" if price < vwap_value else "AT_VWAP") if vwap_value is not None else "UNKNOWN",
         "volume_ratio": volume_ratio, "latest_closed_timestamp": latest_ts,
@@ -531,7 +535,7 @@ def _build_context(df: pd.DataFrame, side: str, *, now_ms: Optional[int] = None)
     }
     indicators = _indicator_snapshot(df, now_ms=now_ms)
     return {
-        "atr": atr, "price": price, "regime": regime, "structure": structure,
+        "atr": atr, "adx": _adx(df), "price": price, "regime": regime, "structure": structure,
         "liquidity": liquidity, "order_block": ob, "fvg": fvg,
         "support_resistance": support_resistance, "support_resistance_aligned": sr_aligned,
         "volume_ratio": volume_ratio,
@@ -573,7 +577,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             "decision_reason": "insufficient_closed_data", "rejection_reason": "insufficient_closed_data",
             "rejection_reasons": ["insufficient_closed_data"], "last_updated": time.time(),
             "data_quality": "INSUFFICIENT_CLOSED_CANDLES", "icons": {"status": "⚪"},
-            "cross_event_id": None, "cross_status": "NONE", "cross_quality": "INVALID CROSS",
+            "cross_event_id": None, "cross_status": "NONE", "cross_quality": INVALID_QUALITY,
             "cross_location_approved": False,
             "institutional_analysis_status": CrossLifecycleState.INSTITUTIONAL_REJECTED.value,
             "final_rejection_reason": "insufficient_closed_data",
@@ -688,6 +692,24 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     _lifecycle_status = (CrossLifecycleState.INSTITUTIONAL_APPROVED.value if _cross_approved
                          else CrossLifecycleState.INSTITUTIONAL_REJECTED.value)
     _lifecycle_rejection = _cross_rejection or None
+    _cross_identity = cross_lifecycle_identity({
+        "symbol": canonical_symbol(symbol),
+        "side": side,
+        "cross_event": _cross_dict,
+        "cross_status": _cross_dict.get("cross_status", "NONE"),
+        "cross_direction": side,
+        "adx": float(_adx_value) if np.isfinite(_adx_value) else _cross_dict.get("adx"),
+        "ema9": indicators.get("ema9"),
+        "vwap": indicators.get("vwap"),
+        "cross_quality": _cross_result.get("quality"),
+        "market_structure": context["structure"],
+        "liquidity": {"event": liq_name, "direction": liq_direction},
+        "volume_confirmed": context["volume_confirmed"],
+        "trading_mode": _intelligence.get("mode"),
+        "decision_setup_type": decision.setup_type,
+        "institutional_analysis_status": _lifecycle_status,
+        "final_rejection_reason": _lifecycle_rejection,
+    })
     # Keep the supplied cross event itself in sync with the analysis row. The
     # production caller also persists this into MEMORY["cross_events"] so the
     # final readiness gate cannot inspect a stale CROSS_DETECTED object.
@@ -736,6 +758,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "cross_location_approved": _cross_approved,
         "institutional_analysis_status": _lifecycle_status,
         "final_rejection_reason": _lifecycle_rejection,
+        "cross_lifecycle": _cross_identity,
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
         "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
@@ -758,6 +781,7 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             "pullback": "🔄" if any(any(token in str(ev).lower() for token in ("retest", "pullback", "micro_pullback")) for ev in decision.evidence) else "⚪",
             "stop": "🛑" if decision.structural_stop else "⚪",
             "status": "✅" if decision.state == DecisionState.ENTRY_READY.value else "🟡" if decision.state.startswith("WAITING") or decision.state == "NO_CHASE" else "⚪",
+            "cross_lifecycle": _cross_identity["badge"],
         },
     }
 
@@ -862,7 +886,13 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         proximity_observed_at = rank_number(proximity.get("updated_at"), 0.0)
         proximity_observation_age = max(0.0, time.time() - proximity_observed_at) if proximity_observed_at else float("inf")
         proximity["observation_age_seconds"] = proximity_observation_age
-        cross_direction = str(proximity.get("cross_any") or "").upper()
+        # Only the retained EMA9/VWAP event may drive cross priority. EMA50 stays
+        # diagnostic and must never make a cross look confirmed for ranking.
+        raw_cross_direction = str(prior.get("cross_direction") or proximity.get("cross_ema9") or "").upper()
+        cross_direction = {
+            "BUY": "BULLISH", "BULLISH": "BULLISH",
+            "SELL": "BEARISH", "BEARISH": "BEARISH",
+        }.get(raw_cross_direction, "")
         selected_side = str(prior.get("side") or "").upper()
         expected_cross = "BULLISH" if selected_side == "BUY" else "BEARISH" if selected_side == "SELL" else ""
         # A previously observed cross is rankable only while its candle age is
@@ -889,8 +919,8 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         updated = rank_number(prior.get("last_update", prior.get("last_updated", 0)))
         freshness = max(0.0, 1.0 - max(0.0, time.time() - updated) / 1800.0) if updated else 0.0
         cross_quality_bonus = {
-            "HIGH QUALITY CROSS": 1.2, "GOOD CROSS": 0.8,
-            "WEAK CROSS": 0.1, "INVALID CROSS": -0.4,
+            EXCELLENT_QUALITY: 1.2, GOOD_QUALITY: 0.8, MODERATE_QUALITY: 0.3,
+            WEAK_QUALITY: 0.1, INVALID_QUALITY: -0.4,
         }.get(str(prior.get("cross_quality") or "").upper(), 0.0)
         approved_bonus = 0.5 if prior.get("institutional_analysis_status") == CrossLifecycleState.INSTITUTIONAL_APPROVED.value else 0.0
         # Re-rank using actual structural confluence/proximity from the previous analysis,
@@ -949,6 +979,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 result["sources"] = list(candidate.get("sources", []))
                 result["discovery_score"] = candidate.get("score", 0)
                 result["side_hints"] = list(candidate.get("sides", []))
+                identity = cross_lifecycle_identity(result)
+                result["cross_lifecycle"] = identity
+                result.setdefault("icons", {})["cross_lifecycle"] = identity["badge"]
             ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
             if len(ready) > 1:
                 best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
@@ -970,6 +1003,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                                   "trend_support": (row.get("institutional_trend") or {}).get("supporting_check")}
                 for row in results
             }
+        best_identity = cross_lifecycle_identity(best)
+        best["cross_lifecycle"] = best_identity
+        best.setdefault("icons", {})["cross_lifecycle"] = best_identity["badge"]
         previous = out.get(key, {})
         best["first_seen"] = previous.get("first_seen", time.time())
         best["discovery_sources"] = list(candidate.get("sources", []))

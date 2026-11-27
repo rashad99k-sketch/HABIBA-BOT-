@@ -226,3 +226,135 @@ a pre-existing Pandas `Timestamp.utcnow` deprecation in
 - Exact patch: `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
 
 No commit or PR claims LIVE readiness; they cover offline-verified code only.
+
+## 12. Follow-up hardening round — `institutional-cross-lifecycle-hardening`
+
+This section supersedes the earlier status only for this follow-up branch. Work started from
+the latest verified `origin/main` at `a7d72f225523e3fdb3026ade30f710e3b3dab569` on
+`institutional-cross-lifecycle-hardening`. No history rewrite, force push or rebase was used.
+
+### 12.1 Root causes found by the follow-up audits
+
+1. **Taxonomy and badges were not state-driven.** The lifecycle module still used
+   `HIGH/GOOD/WEAK/INVALID CROSS` labels; the required taxonomy is
+   `EXCELLENT / GOOD / MODERATE / WEAK / INVALID`, and Watchlist icons were not derived
+   from the retained lifecycle state.
+2. **ADX and cross direction were lost in ranking.** The bridge's institutional context
+   did not expose ADX for cross-location evaluation, and the watchlist ranker compared a
+   BUY/SELL cross direction against BULLISH/BEARISH expected signals, so a valid same-side
+   EMA9 cross could not earn its cross priority.
+3. **Cross age was scoped incorrectly.** `_proximity_cross_age` was assigned only inside
+   the first-observation branch but read on every scan, making freshness/rank inputs
+   depend on scan order.
+4. **One mixed queue and no best picks.** The Watchlist had a single BUY/SELL ordering,
+   APPROACHING/unapproved/expired rows could occupy the bounded `ready[:8]` revalidation
+   slots, and there were no `BEST BUY OPPORTUNITY` / `BEST SELL OPPORTUNITY` outputs.
+5. **SCALP still had a third target.** `RANGE_PROFIT_TARGETS_PCT` was `(0.25, 0.50, 1.00)`
+   and a strong-follow-through branch returned 1.00%.
+6. **API governor was not universal.** Only the journal-repair `TradeExecutionService`
+   constructor injected `api_caller=safe_api_call`; the main entry and native-stop-move
+   constructors did not.
+7. **Entry journal persistence failure was ignored.** A verified entry could continue
+   without a durable journal start, creating a recovery hazard.
+8. **Categorical evidence was dropped.** `evaluate_cross_location()` retained booleans
+   and numbers but discarded strings such as `indicator_quality`, hiding stale/missing
+   indicator evidence.
+
+### 12.2 Fixes and exact file/function map
+
+| File | Function / area | Fix |
+|---|---|---|
+| `ggp_cross_lifecycle.py` | constants, `CrossLifecycleState`, transitions | Required EXCELLENT/GOOD/MODERATE/WEAK/INVALID taxonomy, `APPROVABLE_QUALITIES`, explicit `ENTRY_CANDIDATE → INSTITUTIONAL_APPROVED` transition, consumed/expired/waiting badges. |
+| `ggp_cross_lifecycle.py` | `cross_lifecycle_badge()`, `cross_lifecycle_identity()`, `opportunity_summary()` | State-driven six-icon identity and explainable best-pick payload fields. |
+| `ggp_cross_lifecycle.py` | `rank_cross_candidates_by_side()._eligible()` | Best picks require CONFIRMED event, non-permanent-rejection state, event ID, approved quality, ADX >= 18 and an approved/candidate/ready lifecycle state. |
+| `ggp_cross_lifecycle.py` | `evaluate_cross_location()` | Stale/unavailable indicators fail the location; string evidence is retained. |
+| `ggp_institutional_bridge.py` | `_indicator_snapshot()`, `_build_context()`, `analyze_symbol()` | ADX is exposed from the closed-candle frame and written into the cross lifecycle identity. |
+| `ggp_institutional_bridge.py` | `update_unified_watchlist()` | BUY/SELL directions are normalized before comparison; only EMA9 cross direction earns cross priority; identity is written back to rows and best selection. |
+| `ggpbot.py` | `_enrich_with_existing_gpp_engines()` | Cross age initialized unconditionally; side-matched EMA9-only cross event, distance, age and R:R ranking inputs; lifecycle identity/badge written back. |
+| `ggpbot.py` | `smart_opportunity_selection()` | Filtering, side-independent ranking, interleaved bounded queues, strict final readiness, full state progression through SUBMITTED/FILLED/CONSUMED, journal-start failure guard. |
+| `ggpbot.py` | `data()` / dashboard renderer | Publishes `cross_opportunity_ranking` and BEST BUY/SELL blocks; renders Event ID, candle, EMA9/VWAP, ADX, zone, quality, structure, liquidity, retest, volume, classification, rank and rejection reason. |
+| `ggpbot.py` | `open_position()`, `_move_native_stop_verified()`, `_repair_native_sl_from_journal()` | All three `TradeExecutionService` constructors inject `safe_api_call`. |
+| `ggp_profit_brain.py` | `RANGE_PROFIT_TARGETS_PCT`, `select_range_target_pct()` | SCALP is exactly 0.25% / 0.50%; strong follow-through is capped at 0.50%. |
+| `.gitattributes`, `UNIFIED_CROSS_LIFECYCLE_REPORT.md`, `UNIFIED_CROSS_LIFECYCLE_DIFF.txt` | Reporting artifacts | Regenerated the exact follow-up patch and marked only the embedded-diff artifact whitespace-exempt. |
+
+### 12.3 One integrated workflow after the hardening
+
+`existing discovery / watchlist scanners` → `EMA9+Session-VWAP closed-candle cross event`
+→ `single unified Watchlist row` → `existing institutional bridge (BUY and SELL)`
+→ `cross-location analysis + side-independent ranked queues` → `existing execution-side
+gates + one final cross readiness gate` → `single execute_entry/open_position/BingX path`
+→ `fill and native protection verification` → `existing TradeManagementBoard` →
+`verified close/reconciliation` → `same Watchlist and cross-event store produce the next
+opportunity`.
+
+No third scanner, second executor, second manager, second profit engine, second watchlist
+or second cross-event store was added. `roro_confluence.py`, `bingx_execution.py`,
+`roro_trade_journal.py`, `ggp_position_sizing.py` and `TradeManagementBoard` remain the
+single source of truth for their existing responsibilities.
+
+### 12.4 Required icon states
+
+| State | Badge |
+|---|---|
+| `cross_status=APPROACHING` | 🔵 APPROACHING CROSS |
+| `cross_status=CONFIRMED`, analysis not started | 🟡 CROSS CONFIRMED — ANALYZING |
+| `INSTITUTIONAL_ANALYSIS_PENDING` / `ZONE_ANALYSIS_COMPLETE` | 🟣 INSTITUTIONAL ZONE ANALYSIS |
+| `ENTRY_CANDIDATE` / `INSTITUTIONAL_APPROVED` | 🟢 ENTRY CANDIDATE |
+| `EXECUTION_READY` | 🚀 EXECUTION READY |
+| `INSTITUTIONAL_REJECTED` / `decision_state=REJECTED` | 🔴 REJECTED |
+| `CONSUMED` / expired / waiting | ⚪ EXPIRED / WAITING |
+
+### 12.5 BUY/SELL ranking and authorization
+
+`rank_cross_candidates_by_side()` produces separate BUY and SELL queues and independent
+`best_buy` / `best_sell` summaries. A best pick must be a confirmed EMA9/Session-VWAP
+cross with a stable event ID, approved EXCELLENT/GOOD location, ADX >= 18, no permanent
+rejection and a non-consumed approved/candidate/ready lifecycle state. `smart_opportunity_selection()`
+interleaves the two queues before the bounded `ready[:8]` work slice, so neither side can
+starve the other, and permanently rejected or expired identities are removed rather than
+blocking newer valid events.
+
+The final authorization remains strict: closed candles only; EMA9 cross only; EMA50 is
+diagnostic; BUY and SELL are independently re-analyzed; structural `UnifiedEntryAuthority`
+and location-window checks still apply; the same closed-candle ADX must be >= 18; the
+enriched candidate — not the raw event — must pass `execution_readiness()`; state must
+reach `EXECUTION_READY` before the single existing `execute_entry()` call. Submission,
+verified fill, native protection, journal consume and cross-event consume remain on the
+existing one-position path.
+
+### 12.6 SCALP / TREND policy after hardening
+
+- SCALP: only 0.25% and 0.50% **price-move** targets, always 100% remaining close, no
+  TP1/TP2 and no 1.00% tier.
+- TREND: existing TP1 at 50% of the original filled quantity, TP2 for the remaining
+  verified quantity, no TP3.
+- REVERSAL 0.50%/1.00% entry geometry and SNIPER_V2 1.00% constants are pre-existing
+  non-SCALP behavior and were deliberately left unchanged.
+
+### 12.7 Verification
+
+| Check | Result |
+|---|---|
+| `py_compile` on all changed Python files | clean |
+| Focused lifecycle/scanner/profit suite | **95 passed** |
+| Full offline regression with isolated venv | **653 passed, 1 warning in 139.86s** |
+| Skipped / xfail / weakened timeout tests | none |
+| Real exchange order, balance query, API setting change | none |
+| Demo / LIVE verification | **not performed** |
+| GitHub REST API (credential-helper auth) | repository and `main` SHA verified; `rate_limit.remaining=4982` at check time |
+
+The single warning remains the pre-existing Pandas `Timestamp.utcnow` deprecation in
+`test_professional_discovery_scanner.py`. The regenerated patch artifact is marked
+`-whitespace` in `.gitattributes` because it embeds unified diff context lines; all source
+and test files remain clean under `git diff --check`. `api_caller=safe_api_call` is present at all three
+runtime `TradeExecutionService` constructors and covered by an AST test; no API/rate-limit
+behavior was exercised against BingX.
+
+### 12.8 Remaining risks
+
+The earlier report's single-position architecture, unresolved exchange-state handling,
+post-fill journal consumption failure, pre-existing native-SL/UNKNOWN contradictions and
+same-symbol conflict behavior remain applicable. This hardening did not attempt the
+requested 5+1 portfolio redesign or add a News Engine. No 24-hour soak, exchange outage,
+demo order, LIVE trade, native-stop recovery soak or verified-close exchange test was
+performed. **The system is not demo-verified, not LIVE-verified and not LIVE-ready.**

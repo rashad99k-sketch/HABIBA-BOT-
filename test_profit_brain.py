@@ -164,7 +164,7 @@ def test_opposing_liquidity_scalp_plan_has_two_ordered_50_50_targets():
 
 
 
-def test_range_targets_use_price_move_tiers_025_050_100():
+def test_range_targets_use_only_price_move_tiers_025_050():
     weak, _ = select_range_target_pct({
         "side": "BUY", "adx": 14, "continuation_probability": 0.30,
         "volume_ratio": 0.50, "thin_liquidity": True,
@@ -179,12 +179,12 @@ def test_range_targets_use_price_move_tiers_025_050_100():
         "volume_ratio": 1.30, "di_plus": 12, "di_minus": 31,
         "aligned_closed_candles": 2,
     })
-    assert (weak, moderate, strong) == (0.25, 0.50, 1.00)
+    assert (weak, moderate, strong) == (0.25, 0.50, 0.50)
 
 
-def test_range_profit_targets_remain_capped_at_one_percent():
+def test_range_profit_targets_remain_capped_at_half_percent():
     from ggp_profit_brain import RANGE_PROFIT_TARGETS_PCT
-    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50, 1.00)
+    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50)
 
 
 def test_scalp_board_uses_one_full_close_not_partial_tp1():
