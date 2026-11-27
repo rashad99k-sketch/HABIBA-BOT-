@@ -2991,26 +2991,31 @@ class LiveTradeManager:
                                        remaining_qty=STATE.get("remaining_qty"))
         return False
 
-    def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2):
+    def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2,
+                    *, preserve_management_state=False):
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
-        # A new position must never inherit a prior trade's SCALP/TREND decision.
-        STATE["trade_regime_state"] = None
-        STATE["trade_regime_reason"] = ""
-        STATE["profit_mode"] = None
-        STATE["profit_mode_candidate"] = None
-        STATE["profit_mode_candidate_count"] = 0
-        STATE["profit_mode_last_candle_ts"] = 0.0
-        STATE["post_entry_behavior"] = "INSUFFICIENT_DATA"
-        STATE["post_entry_behavior_reason"] = ""
-        STATE["post_entry_behavior_evidence"] = {}
-        STATE["scalp_target_roe_pct"] = 0.0
-        STATE["scalp_target_price"] = 0.0
-        STATE["scalp_target_reason"] = ""
-        STATE["tp1_target_roe_pct"] = 0.0
-        STATE["tp2_target_roe_pct"] = 0.0
-        STATE["exit_required_reason"] = ""
+        # A NEW position must never inherit a prior trade's SCALP/TREND decision.
+        # Startup/runtime recovery is different: the persisted regime and ROE
+        # targets were already proven from completed candles before the restart,
+        # so wiping them here made TP2 targets disappear between TP1 and TP2.
+        if not preserve_management_state:
+            STATE["trade_regime_state"] = None
+            STATE["trade_regime_reason"] = ""
+            STATE["profit_mode"] = None
+            STATE["profit_mode_candidate"] = None
+            STATE["profit_mode_candidate_count"] = 0
+            STATE["profit_mode_last_candle_ts"] = 0.0
+            STATE["post_entry_behavior"] = "INSUFFICIENT_DATA"
+            STATE["post_entry_behavior_reason"] = ""
+            STATE["post_entry_behavior_evidence"] = {}
+            STATE["scalp_target_roe_pct"] = 0.0
+            STATE["scalp_target_price"] = 0.0
+            STATE["scalp_target_reason"] = ""
+            STATE["tp1_target_roe_pct"] = 0.0
+            STATE["tp2_target_roe_pct"] = 0.0
+            STATE["exit_required_reason"] = ""
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -9942,6 +9947,12 @@ def _apply_open_snapshot(symbol, snap):
         STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
         STATE["roe_pct"] = snap.roe_pct
         STATE["leverage"] = snap.leverage
+        # ROE targets are margin-normalized but require an exchange-proven
+        # leverage value. Never let a configured 20x default satisfy this gate.
+        STATE["leverage_verified"] = bool(getattr(snap, "leverage_verified", False))
+        STATE["leverage_source"] = ("exchange_snapshot" if STATE["leverage_verified"]
+                                    else "unverified_config_default")
+        STATE["contract_size"] = safe_float(getattr(snap, "contract_size", 0.0), 0.0)
         STATE["mark_price"] = snap.mark_price
         STATE["liquidation_price"] = snap.liquidation_price
         STATE["exchange_state"] = "OPEN"
@@ -10308,6 +10319,10 @@ def _restore_trade_from_journal(position, journal_row):
         STATE.update({"margin": snap.margin, "mark_price": snap.mark_price,
                       "unrealized_pnl_usdt": snap.unrealized_pnl, "roe_pct": snap.roe_pct,
                       "leverage": snap.leverage, "liquidation_price": snap.liquidation_price,
+                      "leverage_verified": bool(getattr(snap, "leverage_verified", False)),
+                      "leverage_source": ("exchange_snapshot" if getattr(snap, "leverage_verified", False)
+                                          else "unverified_config_default"),
+                      "contract_size": safe_float(getattr(snap, "contract_size", 0.0), 0.0),
                       "exchange_state": "OPEN", "current_symbol": symbol,
                       "position_mode": position_mode, "position_side": position_side})
         TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": snap.side,
@@ -10359,7 +10374,8 @@ def _restore_trade_from_journal(position, journal_row):
                                   event_type="RECOVERY_RESTORED_VERIFIED")
         _live_manager.start_trade(symbol, snap.side, snap.entry_price, snap.qty,
                                   safe_float(STATE.get("synthetic_sl")),
-                                  safe_float(STATE.get("tp1_price")), safe_float(STATE.get("tp2_price")))
+                                  safe_float(STATE.get("tp1_price")), safe_float(STATE.get("tp2_price")),
+                                  preserve_management_state=True)
         _live_manager.lifecycle_state = TradeLifecycleState.LIVE
         DASHBOARD_STATE["lifecycle_state"] = TradeLifecycleState.LIVE.value
         DASHBOARD_STATE["live_trade_mode"] = True
@@ -10522,7 +10538,8 @@ def startup_trade_recovery():
                             "tp2_hit": bool(STATE.get("tp2_hit")),
                             "trail_on": bool(STATE.get("trail_activated")),
                             "last_update_ts": time.time()})
-        _live_manager.start_trade(symbol, side, entry, remaining_qty, sl, tp1, tp2)
+        _live_manager.start_trade(symbol, side, entry, remaining_qty, sl, tp1, tp2,
+                                  preserve_management_state=True)
         _live_manager.lifecycle_state = TradeLifecycleState.LIVE
         DASHBOARD_STATE["lifecycle_state"] = TradeLifecycleState.LIVE.value
         DASHBOARD_STATE["live_trade_mode"] = True

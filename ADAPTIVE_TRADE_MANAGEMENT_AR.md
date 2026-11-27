@@ -34,7 +34,9 @@
 ### 2.2 `ggpbot.py`
 - استيراد دوال السياسة الجديدة دون إنشاء محرك موازٍ.
 - `PositionSnapshot` و`_snapshot_from_position()` و`sync_position_state()` تسجّل الآن ما إذا كانت الرافعة مُبلّغاً عنها فعلياً من المنصة؛ قيمة 20x الافتراضية صارت للعرض فقط ولا تسمح بأهداف ROE.
-- `LiveTradeManager.start_trade()` يعيد تهيئة حالة التصنيف حتى لا يرث مركز جديد قرار مركز سابق.
+- `LiveTradeManager.start_trade()` يعيد تهيئة حالة التصنيف للمراكز الجديدة فقط. عند الاستعادة من السجل أُضيف `preserve_management_state=True` حتى لا يُمسح `trade_regime_state` و`profit_mode` وأهداف ROE المحفوظة بين TP1 وTP2.
+- `sync_position_state()` و`ExchangeSyncService.fetch_live_snapshot()` و`_on_reconciled()` تنسخ الآن `leverage_verified` و`leverage_source` و`contract_size` من لقطة المنصة إلى `STATE`؛ الرافعة غير الموثّقة لا تسمح بأهداف ROE.
+- `verify_roe_inputs()` تُعيد الآن حقل `side` صراحةً؛ بدونه كان `roe_target_price()` يُرجع صفراً رغم صحة الهامش والرافعة والكمية، فتختفي مستويات TP1/TP2 التشخيصية ولا يُحفظ `tp2_price` في السجل.
 - `_apply_management()`:
   - يحسب `roe_verified`/`roe_diagnostic` قبل أي هدف،
   - يضيف تحليل السلوك بعد الدخول،
@@ -52,6 +54,13 @@
 ### 2.3 اختبارات
 أُضيف `test_adaptive_scalp_trend_management.py` بـ22 اختباراً: تصنيف، أهداف 5/10/20، إغلاق SCALP كامل، TP1/TP2، منع التكرار، بوابة ROE، كل أنواع السلوك، الانتقال بين الحالات، ومنع قرار جديد عند عدم وضوح التنفيذ.
 
+أُضيف أيضاً `test_adaptive_lifecycle_integration.py` بـ3 اختبارات تكامل مقلّدة بالكامل (بدون مفاتيح أو اتصال حي):
+1. فتح صفقة عبر `open_position()` الحقيقي، تحقق ثلاثي الحالة من المنصة، تصنيف SCALP من أدلة، هدف ROE واحد، ثم إغلاق كامل مُتحقق منه بحدث `SCALP_TARGET_VERIFIED` ومنع إغلاق مكرر.
+2. تصنيف TREND من شموم/مؤشرات متوافقة، TP1 عند 40% يغلق نصف الكمية ويتحقق من الكمية المتبقية على المنصة، إعادة تشغيل البوت (STATE فارغ + نفس قاعدة البيانات + نفس المنصة المقلّدة)، استعادة الحالة دون تكرار أمر، ثم TP2 عند 60% يغلق كل الباقي ويتحقق من FLAT.
+3. وضع One-Way: أمر الإغلاق يحمل `reduceOnly=true` و`positionSide=BOTH` مع تحقق فرق الكمية فعلياً.
+
+المنصة المقلّدة لا تغيّر الكمية إلا بعد إرسال أمر تقليص وقراءته، لذلك كل تأكيدات OPEN/FLAT والكمية المتبقية مبنية على ملاحظة من المنصة لا على افتراض محلي.
+
 ### 2.4 توثيق
 هذا الملف: `ADAPTIVE_TRADE_MANAGEMENT_AR.md`.
 
@@ -62,6 +71,7 @@
 - `ggp_profit_brain.py`
 - `ggpbot.py`
 - `test_adaptive_scalp_trend_management.py` (جديد)
+- `test_adaptive_lifecycle_integration.py` (جديد)
 - `ADAPTIVE_TRADE_MANAGEMENT_AR.md` (جديد)
 
 ## 4. الملفات التي لم تغيّر
@@ -120,8 +130,10 @@
 
 | الفحص | قبل التعديل | بعد التعديل |
 |---|---:|---:|
-| `python -m pytest -q` | 304 passed / 7 failed | **326 passed / 7 failed** |
-| اختبارات جديدة | — | 22 passed |
+| `python -m pytest -q` | 304 passed / 7 failed | **329 passed / 7 failed** |
+| اختبارات السياسات الجديدة | — | 22 passed |
+| اختبارات التكامل الجديدة | — | 3 passed |
+| اختبارات مستهدفة ( adaptive + integration + hardening + recovery + compatibility + market-data ) | — | 139 passed / 3 failed (نفس الـ3 القديمة) |
 | `python preflight.py` | PREFLIGHT OK | PREFLIGHT OK |
 | `python -m compileall -q .` | exit 0 | exit 0 |
 
@@ -133,6 +145,7 @@
 ## 10. Regression
 
 - لم يتغير كود الدخول، الـADX Gate، تأكيد الشمعة المغلقة، التفويض، تحديد الحجم، الرافعة، SL الأصلي، المزامنة، Scanner، Dashboard، Telegram، Runtime أو Watchdog.
+- `move_native_stop_on_exchange()` ما زال no-op عن قصد؛ الاختبارات الثلاثة القديمة التي تتوقع نقل SL الأصلي ما زالت تفشل كما في الخط الأساسي.
 - اختبارات `test_profit_brain.py`, `test_adaptive_profit_policy.py`, `test_emergency_telegram_surgical.py`, `test_management_log.py`, `test_main_engine_compatibility.py` و`test_market_data_refresh.py` نجحت بعد التعديل.
 - لم يُستخدم Live Trading ولا مفاتيح حساب حقيقية.
 
@@ -142,5 +155,5 @@
 
 - لم تُجرَ مصالحة حية مع BingX؛ الرافعة/Fee/Funding تُقرأ من الحقول المتاحة في اللقطة/الحالة، وحقول `fees_usdt`/`funding_usdt` غير معبّأة حالياً من بقية البوت فتُعامل كصفر مع إبقاء الواجهة جاهزة لها.
 - حجم العقد يُستخدم صراحةً إن وُجد في لقطة المنصة، وإلا يُستنتج من الهامش والرافعة والكمية؛ لم تُجرَ قراءة `market()` جديدة لتجنب تغيير مسار المنصة.
-- الاختبارات الجديدة تغطي القرارات والسياسات؛ اختبارات Partial Fill/Rejected/Timeout/Restart الموجودة بالفعل في `test_close_diagnostics.py` و`test_recovery_lifecycle.py` ما زالت المصدر الأساسي لها ولم تُكرّر.
+- اختبارات Partial Fill/Rejected/Timeout الموجودة بالفعل في `test_close_diagnostics.py` ما زالت المصدر الأساسي لها ولم تُكرّر؛ اختبار إعادة التشغيل بين TP1 وTP2 أُضيف في `test_adaptive_lifecycle_integration.py` بمحاكاة كاملة.
 - الـ7 اختبارات القديمة الفاشلة تحتاج قراراً منفصلاً لأن إصلاحها يغيّر سلوك المخاطرة/SL.

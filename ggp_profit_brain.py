@@ -372,7 +372,7 @@ def verify_roe_inputs(context: Dict[str, Any]) -> Dict[str, Any]:
     funding = _number(ctx.get("funding_usdt"), 0.0) or 0.0
 
     result: Dict[str, Any] = {
-        "ok": False, "reason": "", "leverage": leverage, "margin": margin,
+        "ok": False, "reason": "", "side": side, "leverage": leverage, "margin": margin,
         "qty": qty, "entry": entry, "computed_roe_pct": None,
         "reported_roe_pct": reported, "reported_roe_agreement": None,
         "implied_contract_size": None, "net_unrealized_pnl": None,
