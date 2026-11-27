@@ -12240,18 +12240,23 @@ def smart_opportunity_selection():
                 for zone in location_candidates
             ]
             actionable_locations = [check for check in location_checks if check.get("valid")]
+            setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
+            cross_entry = setup == "EMA9_VWAP_CROSS"
+            item["entry_location_status"] = "VALID" if actionable_locations else "LATE_OR_UNZONED_ENTRY"
+            item["entry_location_checks"] = location_checks
             _record_entry_path_diag(
-                exchange_sym, "LOCATION_GATE", side=side,
-                decision_state="PASSED" if actionable_locations else "REJECTED",
-                rejection_reason=None if actionable_locations else "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE",
-                cross_timestamp=item.get("crossover_ts"),
+                exchange_sym, "LOCATION_DIAGNOSTICS", side=side,
+                decision_state="PASSED" if actionable_locations else ("OBSERVED_NOT_VETOED" if cross_entry else "REJECTED"),
+                rejection_reason=None if actionable_locations or cross_entry else "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE",
+                cross_timestamp=item.get("cross_timestamp") or item.get("crossover_ts"),
                 details={"candidate_zone_count": len(location_candidates),
-                         "valid_zone_count": len(actionable_locations),
-                         "checks": location_checks,
-                         "decision_state": item.get("decision_state"),
+                         "valid_zone_count": len(actionable_locations), "checks": location_checks,
+                         "cross_entry": cross_entry, "decision_state": item.get("decision_state"),
                          "event_id": item.get("event_id")},
-                logger=lambda message: log_execution(message, "INFO" if actionable_locations else "WARN"))
-            if not actionable_locations:
+                logger=lambda message: log_execution(message, "INFO" if actionable_locations or cross_entry else "WARN"))
+            # Cross-entry location quality is recorded for management after fill;
+            # it does not delay or veto a valid closed-candle cross.
+            if not actionable_locations and not cross_entry:
                 item["decision_state"] = "NO_CHASE"
                 item["rejection_reason"] = "ENTRY_WINDOW_MISSED_EXECUTION_PRICE_OUTSIDE_INSTITUTIONAL_ZONE"
                 log_execution(
@@ -12260,8 +12265,7 @@ def smart_opportunity_selection():
                 )
                 continue
 
-            setup = str(item.get("decision_setup_type") or item.get("setup_type", "")).upper()
-            if not ("REVERSAL" in setup or "CONTINUATION" in setup):
+            if not ("REVERSAL" in setup or "CONTINUATION" in setup or cross_entry):
                 item["decision_state"] = "REJECTED"
                 item["rejection_reason"] = "unsupported_setup_type"
                 continue
@@ -12284,7 +12288,7 @@ def smart_opportunity_selection():
             _INSTITUTIONAL_ENTRY_CONTEXT = {
                 "setup_type": setup,
                 "decision_state": item.get("decision_state"),
-                "cross_timestamp": item.get("crossover_ts"),
+                "cross_timestamp": item.get("cross_timestamp") or item.get("crossover_ts"),
                 "rejection_reason": item.get("rejection_reason"),
                 "event_id": item.get("event_id"),
                 "evidence": evidence,

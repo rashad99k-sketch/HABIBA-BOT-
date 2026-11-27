@@ -18,7 +18,8 @@ from roro_institutional import (
     StructuralStopLossEngine,
 )
 from roro_opportunity_pipeline import validate_closed_frame, classify_regime, confirmed_swings
-from roro_confluence import classify_liquidity, find_causal_order_block, LiquidityEvent
+from roro_confluence import (classify_liquidity, find_causal_order_block, LiquidityEvent,
+                             validate_dual_ema_vwap_entry_gate)
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
                                      build_support_resistance_zones, validate_order_block_zone)
 
@@ -195,6 +196,65 @@ def _adx(df: pd.DataFrame, period: int = 14) -> float:
     value = adx[-1] if len(adx) else np.nan
     return float(value) if np.isfinite(value) else float("nan")
 
+
+
+def _ema_for_cross(values: pd.Series, period: int) -> pd.Series:
+    return values.astype(float).ewm(span=int(period), adjust=False).mean()
+
+
+def _cross_entry_authorization(symbol: str, side: str, closed: pd.DataFrame,
+                                context: Dict[str, Any], decision: Any,
+                                now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Authorize immediate entry on a fresh closed EMA9/Session-VWAP cross.
+
+    Retest/pullback are post-entry management evidence, never entry prerequisites.
+    ADX >= 18 and a valid protective stop remain hard execution gates.
+    """
+    gate = validate_dual_ema_vwap_entry_gate(
+        closed, side, _ema_for_cross, timeframe_seconds=TIMEFRAME_SECONDS,
+        now_ms=now_ms, lookback_candles=2,
+    )
+    adx_value = _adx(closed)
+    if not gate.get("ready") or not np.isfinite(adx_value) or float(adx_value) < 18.0:
+        return None
+    price = float(closed.close.iloc[-1])
+    atr = _atr(closed)
+    if not np.isfinite(price) or price <= 0 or not np.isfinite(atr) or atr <= 0:
+        return None
+    stop = getattr(decision, "structural_stop", None)
+    try:
+        stop = float(stop)
+        valid_stop = np.isfinite(stop) and ((side == "BUY" and 0 < stop < price) or
+                                            (side == "SELL" and stop > price))
+        if valid_stop and abs(price - stop) > 2.0 * atr:
+            valid_stop = False
+    except (TypeError, ValueError):
+        valid_stop = False
+    if not valid_stop:
+        window = closed.iloc[-6:]
+        extreme = float(window.low.min()) if side == "BUY" else float(window.high.max())
+        if not np.isfinite(extreme) or (side == "BUY" and extreme >= price) or (side == "SELL" and extreme <= price):
+            extreme = price - 1.5 * atr if side == "BUY" else price + 1.5 * atr
+        if abs(price - extreme) > 1.5 * atr:
+            extreme = price - 1.5 * atr if side == "BUY" else price + 1.5 * atr
+        stop, _ = StructuralStopLossEngine.calculate(side, "EMA9_VWAP_CROSS", price, extreme, atr)
+    if stop is None or not np.isfinite(float(stop)):
+        return None
+    signal_id = str(gate.get("signal_candle_id") or "").strip()
+    cross_ts = gate.get("ema9_cross_timestamp")
+    if not signal_id or cross_ts is None:
+        return None
+    timeframe = f"{TIMEFRAME_SECONDS // 60}m"
+    durable_event_id = f"{exchange_symbol(symbol)}:{timeframe}:{signal_id}"
+    evidence = ["closed_ema9_session_vwap_cross", f"adx_at_entry:{float(adx_value):.2f}",
+                f"cross_candle:{int(cross_ts)}",
+                "post_entry_management_owns_retest_pullback_and_liquidity_decisions"]
+    return {"ready": True, "side": side, "decision_state": DecisionState.ENTRY_READY.value,
+            "decision_setup_type": "EMA9_VWAP_CROSS", "setup_type": "EMA9_VWAP_CROSS",
+            "decision_reason": "immediate_closed_ema9_session_vwap_cross_adx_confirmed",
+            "event_id": durable_event_id, "cross_timestamp": int(cross_ts),
+            "structural_stop": float(stop), "adx": float(adx_value),
+            "evidence": evidence, "cross_gate": dict(gate)}
 
 def build_liquidity_pools(df: pd.DataFrame) -> Dict[str, List[float]]:
     """Build prior-known swing and clustered equal-high/low liquidity pools."""
@@ -597,6 +657,13 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
     except Exception:
         pass
     _adx_value = _adx(closed)
+    cross_entry = _cross_entry_authorization(symbol, side, closed, context, decision, now_ms=now_ms)
+    entry_state = cross_entry["decision_state"] if cross_entry else decision.state
+    entry_setup_type = cross_entry["decision_setup_type"] if cross_entry else decision.setup_type
+    entry_event_id = cross_entry["event_id"] if cross_entry else decision.event_id
+    entry_stop = cross_entry["structural_stop"] if cross_entry else decision.structural_stop
+    entry_evidence = list(cross_entry["evidence"]) if cross_entry else d.get("evidence", [])
+    entry_reason = cross_entry["decision_reason"] if cross_entry else decision.reason
     indicators = context.get("indicator_snapshot") or {}
     momentum_strength = None
     if _disp_atr is not None:
@@ -639,6 +706,13 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         volume_ratio=context.get("volume_ratio"), liquidity_confidence=_liq_conf,
         data_quality="VALID_CLOSED_CANDLES",
     ).to_dict()
+    if cross_entry:
+        _intelligence["mode"] = "CROSS_ENTRY_MANAGED"
+        _intelligence["entry_behavior"] = "IMMEDIATE_CROSS_ENTRY"
+        _intelligence["reason_codes"] = list(_intelligence.get("reason_codes") or []) + [
+            "ema9_vwap_cross_authorized", "retest_pullback_are_post_entry_management_inputs"
+        ]
+        _intelligence["confidence"] = max(float(_intelligence.get("confidence", 0.0) or 0.0), 0.80)
     # Chart-pattern recognition is observational metadata based exclusively on
     # the validated closed-candle frame; it cannot authorize or submit orders.
     _intelligence["price_pattern"] = classify_price_pattern(
@@ -649,10 +723,11 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "side": side, "price": context["price"], "market_regime": reg.state,
         "regime_direction": reg.direction, "market_structure": context["structure"],
         "setup_type": "REVERSAL_ENGINE" if "REVERSAL" in decision.setup_type or decision.setup_type == "FAILED_AUCTION_REVERSAL" else "TREND_CONTINUATION_ENGINE" if "CONTINUATION" in decision.setup_type else "NONE",
-        "decision_setup_type": decision.setup_type, "decision_state": decision.state,
-        "decision_reason": decision.reason, "evidence": d.get("evidence", []),
-        "rejection_reasons": d.get("rejection_reasons", []), "event_id": decision.event_id,
-        "origin_timestamp": decision.origin_timestamp, "structural_stop": decision.structural_stop,
+        "decision_setup_type": entry_setup_type, "decision_state": entry_state,
+        "decision_reason": entry_reason, "evidence": entry_evidence,
+        "rejection_reasons": [] if cross_entry else d.get("rejection_reasons", []), "event_id": entry_event_id,
+        "origin_timestamp": (cross_entry.get("cross_timestamp") if cross_entry else decision.origin_timestamp),
+        "structural_stop": entry_stop, "cross_entry_authorization": dict(cross_entry or {}),
         "invalidation_level": decision.invalidation_level, "score": float(decision.score),
         "last_updated": time.time(), "last_update": time.time(), "data_quality": "VALID_CLOSED_CANDLES",
         "liquidity": {"event": liq_name, "direction": liq_direction, "level": getattr(liq, "level", None),
@@ -669,16 +744,17 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
         "zone_quality": golden.get("score"), "order_block_status": ob_state,
         "indicator_snapshot": indicators,
         "data_freshness": indicators.get("quality", "DATA_UNAVAILABLE"),
-        "signal_direction": side, "entry_readiness": decision.state,
+        "signal_direction": side, "entry_readiness": entry_state,
         "market_intelligence": _intelligence,
         "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
-        "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
-        "entry_behavior_confidence": float(_intelligence.get("confidence", 0.0) or 0.0),
-        "entry_behavior_reasons": list(_intelligence.get("reason_codes") or []),
+        "entry_behavior": "IMMEDIATE_CROSS_ENTRY" if cross_entry else _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
+        "entry_behavior_confidence": 1.0 if cross_entry else float(_intelligence.get("confidence", 0.0) or 0.0),
+        "entry_behavior_reasons": (list(_intelligence.get("reason_codes") or []) + ["ema9_vwap_cross_entry; management_after_fill"]) if cross_entry else list(_intelligence.get("reason_codes") or []),
         "entry_zone_low": _intelligence.get("reference_low"),
         "entry_zone_high": _intelligence.get("reference_high"),
+        "cross_entry_gate": dict(cross_entry.get("cross_gate") or {}) if cross_entry else {},
         "adx": float(_adx_value) if np.isfinite(_adx_value) else None,
-        "reversal": _decision_result(rev), "continuation": _decision_result(cont), "entry_status": decision.state,
+        "reversal": _decision_result(rev), "continuation": _decision_result(cont), "entry_status": entry_state,
         "icons": {
             "regime": "📈" if reg.direction == "BULLISH" else "📉" if reg.direction == "BEARISH" else "⚪",
             "structure": "🧭" if context["structure"].get("confirmed") else "⚪",
@@ -688,10 +764,10 @@ def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
             "ob": "🧱" if ob_ok else "⚪", "fvg": "🟪" if fvg_ok else "⚪",
             "golden_zone": "🌟" if golden.get("state") == "GOLDEN_CONFLUENCE" else "🟨" if golden.get("score", 0) >= 35 else "⚪",
             "volume": "📊" if context["volume_confirmed"] else "⚪",
-            "setup": "🎯" if decision.state == DecisionState.ENTRY_READY.value else "👁",
+            "setup": "🎯" if entry_state == DecisionState.ENTRY_READY.value else "👁",
             "pullback": "🔄" if any(any(token in str(ev).lower() for token in ("retest", "pullback", "micro_pullback")) for ev in decision.evidence) else "⚪",
-            "stop": "🛑" if decision.structural_stop else "⚪",
-            "status": "✅" if decision.state == DecisionState.ENTRY_READY.value else "🟡" if decision.state.startswith("WAITING") or decision.state == "NO_CHASE" else "⚪",
+            "stop": "🛑" if entry_stop else "⚪",
+            "status": "✅" if entry_state == DecisionState.ENTRY_READY.value else "🟡" if entry_state.startswith("WAITING") or entry_state == "NO_CHASE" else "⚪",
         },
     }
 
