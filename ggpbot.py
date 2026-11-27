@@ -1985,10 +1985,6 @@ class ExchangeSyncService:
         """Tri-state reconciliation; force bypasses throttle, never bypasses safety."""
         global RECOVERY_BLOCK_ENTRIES
         now = time.time()
-        lock = getattr(self, "_reconcile_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._reconcile_lock = lock
         if not self._reconcile_lock.acquire(blocking=False):
             return "BUSY"
         try:
@@ -2042,7 +2038,7 @@ class ExchangeSyncService:
             self.event_bus.emit("reconciled", snap)
             return "OPEN"
         finally:
-            lock.release()
+            self._reconcile_lock.release()
 
 class RecoveryGuard:
     def __init__(self, event_bus, exchange_sync):
@@ -5394,9 +5390,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         return False
     df = get_ohlcv_safe(symbol, 100)
     adx_series = compute_adx(df) if df is not None else None
-    adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else 20.0
+    adx_val = adx_series.iloc[-1] if adx_series is not None and len(adx_series) > 0 else float("nan")
 
     if not PAPER_MODE and MODE_LIVE:
+        # The execution boundary must fail closed for direct callers too; do not
+        # rely solely on the Watchlist selection path having applied the gate.
+        if not entry_adx_gate_passed(adx_val):
+            log_execution(f"[ENTRY] ADX {adx_val} below 18 or unavailable; LIVE blocked at execution boundary", "WARN")
+            return False
         institutional_ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT")
         if institutional_ctx:
             setup = str(institutional_ctx.get("setup_type", "")).upper()
@@ -5719,10 +5720,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
         time.sleep(1)
         sync_position_state(symbol)
-        # The journal start is tied to this existing lifecycle, never a second manager.
-        if STATE.get("open"):
-            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-            _persist_trade_journal_start(ctx.get("setup_type"))
         return True
     else:
         return False

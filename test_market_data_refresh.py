@@ -8,6 +8,7 @@ and that a data problem never touches Native SL / TP1 / TP2.
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -769,5 +770,41 @@ def test_entry_adx_gate_is_wired_to_closed_candle_authority():
     assert "def entry_adx_gate_passed(adx_value):" in source
     assert "adx_below_18_hard_gate" in source
     assert "if not entry_adx_gate_passed(fresh_adx):" in source
+    assert "if not entry_adx_gate_passed(adx_val):" in source
+    assert "LIVE blocked at execution boundary" in source
     # EMA9/Session VWAP must remain ranking-only, never an independent entry gate.
     assert "RANKING_ONLY_NOT_ENTRY_GATE" in source
+
+
+def test_execute_entry_live_boundary_blocks_weak_adx_without_an_order(monkeypatch):
+    calls = {"orders": 0, "logs": []}
+
+    class FakeExchange:
+        def market(self, symbol):
+            return {"contractSize": 1.0, "limits": {}}
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.8f}"
+
+        def create_order(self, *args, **kwargs):
+            calls["orders"] += 1
+            raise AssertionError("no order may be created when ADX gate fails")
+
+    monkeypatch.setattr(ggpbot, "PAPER_MODE", False)
+    monkeypatch.setattr(ggpbot, "MODE_LIVE", True)
+    monkeypatch.setattr(ggpbot, "ex", FakeExchange())
+    monkeypatch.setattr(ggpbot, "get_available_balance_snapshot",
+                        lambda *a, **k: (100.0, "TEST_BALANCE", time.time()))
+    monkeypatch.setattr(ggpbot, "get_ohlcv_safe", lambda *a, **k: _frame(100))
+    monkeypatch.setattr(ggpbot, "compute_adx", lambda df: pd.Series([17.0]))
+    monkeypatch.setattr(ggpbot, "log_execution",
+                        lambda msg, *a, **k: calls["logs"].append(str(msg)))
+    monkeypatch.setattr(ggpbot, "_INSTITUTIONAL_ENTRY_CONTEXT", None)
+
+    ok = ggpbot.execute_entry(
+        "BUY", "DOGE/USDT", 0.06, 0.0597, 0.0606, 0.0612,
+        80, "adx-boundary-test", 0.001, "TREND", "TEST", "TREND")
+
+    assert ok is False
+    assert calls["orders"] == 0
+    assert any("blocked at execution boundary" in m for m in calls["logs"])

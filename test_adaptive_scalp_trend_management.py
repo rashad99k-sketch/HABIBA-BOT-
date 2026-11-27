@@ -358,6 +358,27 @@ def test_unknown_roe_basis_holds_with_diagnostic():
     assert held.reason == "roe_target_blocked_unknown_roe_basis"
 
 
+def test_conflicting_regime_plan_holds_profit_decision_with_diagnostic():
+    """A restored conflict must stay HOLD; it must never become SCALP or a close."""
+    board = _board()
+    held = board.evaluate(_base_context(
+        roe=99.0, scalp_target_roe_pct=5.0,
+        regime_plan_consistent=False,
+        regime_plan_consistency_reason="restored_tp_state_conflict"))
+    assert held.action is ggpbot.TradeDecisionType.HOLD
+    assert held.reason == "regime_plan_inconsistent_restored_tp_state_conflict"
+
+
+def test_emergency_exit_still_overrides_conflicting_regime_plan():
+    board = _board()
+    decision = board.evaluate(_base_context(
+        roe=99.0, scalp_target_roe_pct=5.0,
+        regime_plan_consistent=False, emergency_exit=True,
+        emergency_reason="exchange_position_vanished"))
+    assert decision.action is ggpbot.TradeDecisionType.EMERGENCY_EXIT
+    assert decision.reason == "exchange_position_vanished"
+
+
 def test_sell_scalp_full_close_at_selected_target():
     board = _board()
     decision = board.evaluate(_base_context(

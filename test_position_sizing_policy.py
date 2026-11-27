@@ -140,6 +140,7 @@ def test_stale_balance_cache_not_reused():
 # 13) Contract size and precision are applied correctly
 def test_contract_size_and_precision_applied():
     r = _size(100.0, 0.06, 0.05, contract_size=10.0, risk_pct=2.0)
+    assert r.binding_constraint == "ALLOCATION"
     # quantity is in contracts: notional = quantity * contract_size * entry
     assert r.quantity * r.contract_size * 0.06 == pytest.approx(r.final_notional)
     assert r.final_notional == pytest.approx(r.target_notional)
