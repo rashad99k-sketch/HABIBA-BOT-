@@ -12824,11 +12824,17 @@ _journal_last_snapshot_ts = 0.0
 
 
 def _position_contracts(pos):
+    """Read only authoritative total-position quantity, never closeable capacity.
+
+    BingX documents positionAmt as the total position and availableAmt as the
+    amount available to close. availableAmt and the undocumented positionSize
+    alias must not invent an open position when total-position data is absent.
+    """
     info = pos.get("info") if isinstance(pos, dict) else {}
     info = info if isinstance(info, dict) else {}
     raw = pos.get("contracts")
     if raw in (None, ""):
-        raw = info.get("positionAmt", info.get("positionSize", info.get("availableAmt", 0)))
+        raw = info.get("positionAmt", 0)
     try:
         return abs(float(raw or 0))
     except (TypeError, ValueError):
