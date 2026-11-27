@@ -158,8 +158,14 @@ failing test was ignored. The single warning is a pre-existing Pandas deprecatio
 
 ## 9. Git
 
-The change set is committed on an independent branch
+The implementation is committed independently on branch
 `unified-cross-lifecycle` from clean `main` at
-`908f29c836b417b0dac7560611cc5c6d7097efbb`. The exact commit hash and PR status are
-reported in the final response and can be verified with `git log -1 --oneline` and
-`git show --stat HEAD`. The full patch is in `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
+`908f29c836b417b0dac7560611cc5c6d7097efbb`:
+
+- Implementation commit: `1f80d691ff74ebe71a728e82b27ac014c6145899`
+  (`Unify EMA9/VWAP cross lifecycle from scanner to verified close`).
+- Pull request: https://github.com/rashad99k-sketch/HABIBA-BOT-/pull/44
+- The exact implementation patch is in `UNIFIED_CROSS_LIFECYCLE_DIFF.txt`.
+- This report's final metadata is a small follow-up commit on the same branch.
+
+No commit or PR claims LIVE readiness; both are for offline-verified code only.
