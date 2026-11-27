@@ -324,3 +324,305 @@ def adaptive_range_target_price(side: str, entry_price: float, atr: float,
     fallback_distance = 1.10 * volatility
     target = entry + fallback_distance if direction == "BUY" else entry - fallback_distance
     return round(target, 12), "atr_fallback_no_credible_nearby_liquidity"
+
+
+# ---------------------------------------------------------------------------
+# Adaptive SCALP/TREND trade-state policy (pure decision support only)
+#
+# These helpers never call the exchange and never create orders. The existing
+# TradeManagementBoard remains the only authority that emits trade decisions;
+# TradeExecutionService/CloseVerificationPipeline remain the only execution path.
+# ---------------------------------------------------------------------------
+
+SCALP_STATE = "SCALP"
+TREND_STATE = "TREND"
+EXIT_REQUIRED_STATE = "EXIT_REQUIRED"
+CLOSED_STATE = "CLOSED"
+
+SCALP_ROE_TARGETS_PCT = (5.0, 10.0, 20.0)
+TREND_ROE_TARGETS_PCT = (40.0, 60.0)
+
+BEHAVIOR_RETEST = "RETEST"
+BEHAVIOR_PULLBACK = "PULLBACK"
+BEHAVIOR_MICRO_PULLBACK = "MICRO_PULLBACK"
+BEHAVIOR_TREND_CONTINUATION = "TREND_CONTINUATION"
+BEHAVIOR_DISTRIBUTION = "DISTRIBUTION_PHASE"
+BEHAVIOR_INSTITUTIONAL_EXIT = "INSTITUTIONAL_EXIT"
+BEHAVIOR_INSUFFICIENT = "INSUFFICIENT_DATA"
+
+
+def verify_roe_inputs(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify that ROE targets may be used for a live position.
+
+    ROE is derived from the exchange-reported position quantity, entry, margin
+    and unrealized PnL. The configured 20x value is never used as a silent
+    fallback: an unverified actual leverage blocks ROE-target decisions.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    entry = _number(ctx.get("entry"))
+    mark = _number(ctx.get("mark_price") or ctx.get("current_price"))
+    qty = _number(ctx.get("remaining_qty") or ctx.get("qty"))
+    margin = _number(ctx.get("initial_margin") if ctx.get("initial_margin") is not None else ctx.get("margin"))
+    unrealized = _number(ctx.get("unrealized_pnl") if ctx.get("unrealized_pnl") is not None else ctx.get("unrealized_pnl_usdt"))
+    leverage = _number(ctx.get("actual_leverage") if ctx.get("actual_leverage") is not None else ctx.get("leverage"))
+    leverage_verified = bool(ctx.get("leverage_verified", False))
+    reported = _number(ctx.get("reported_roe_pct") if ctx.get("reported_roe_pct") is not None else ctx.get("roe_pct"))
+    fees = _number(ctx.get("fees_usdt"), 0.0) or 0.0
+    funding = _number(ctx.get("funding_usdt"), 0.0) or 0.0
+
+    result: Dict[str, Any] = {
+        "ok": False, "reason": "", "leverage": leverage, "margin": margin,
+        "qty": qty, "entry": entry, "computed_roe_pct": None,
+        "reported_roe_pct": reported, "reported_roe_agreement": None,
+        "implied_contract_size": None, "net_unrealized_pnl": None,
+    }
+    if side not in {"BUY", "SELL"}:
+        result["reason"] = "invalid_side"
+        return result
+    if not entry or entry <= 0 or not mark or mark <= 0 or not qty or qty <= 0:
+        result["reason"] = "missing_entry_mark_or_quantity"
+        return result
+    if not leverage_verified or not leverage or leverage <= 0:
+        result["reason"] = "actual_leverage_not_verified"
+        return result
+    if not margin or margin <= 0:
+        result["reason"] = "initial_margin_unavailable"
+        return result
+    if unrealized is None:
+        result["reason"] = "unrealized_pnl_unavailable"
+        return result
+
+    net = unrealized - fees - funding
+    computed = net / margin * 100.0
+    implied_cs = margin * leverage / (qty * entry)
+    result.update({
+        "computed_roe_pct": computed, "net_unrealized_pnl": net,
+        "implied_contract_size": implied_cs if implied_cs > 0 else None,
+    })
+    if reported is not None:
+        tolerance = max(0.25, abs(reported) * 0.01)
+        agreed = abs(computed - reported) <= tolerance
+        result["reported_roe_agreement"] = agreed
+        if not agreed:
+            result["reason"] = (
+                f"reported_roe_mismatch computed={computed:.4f} reported={reported:.4f}"
+            )
+            return result
+
+    if abs(leverage - 20.0) > 1e-9:
+        # ROE is margin-normalized, so it stays compatible with the verified
+        # actual leverage. The diagnostic is mandatory for observability.
+        result["ok"] = True
+        result["reason"] = (
+            f"roe_normalized_to_actual_leverage_{leverage:g}_target_policy_is_20x"
+        )
+    else:
+        result["ok"] = True
+        result["reason"] = "verified_20x_margin_basis"
+    return result
+
+
+def roe_target_price(context: Dict[str, Any], target_roe_pct: float) -> float:
+    """Translate an ROE target into a directional price level for logging only.
+
+    Decisions compare ROE directly. This level is a diagnostic aid and uses the
+    verified actual leverage plus exchange margin/quantity (which already
+    reflect the venue contract size).
+    """
+    ctx = context if isinstance(context, dict) else {}
+    side = str(ctx.get("side") or "").upper()
+    entry = _number(ctx.get("entry"), 0.0) or 0.0
+    margin = _number(ctx.get("initial_margin") if ctx.get("initial_margin") is not None else ctx.get("margin"), 0.0) or 0.0
+    qty = _number(ctx.get("remaining_qty") or ctx.get("qty"), 0.0) or 0.0
+    leverage = _number(ctx.get("actual_leverage") if ctx.get("actual_leverage") is not None else ctx.get("leverage"), 0.0) or 0.0
+    target = _number(target_roe_pct, 0.0) or 0.0
+    if side not in {"BUY", "SELL"} or entry <= 0 or margin <= 0 or qty <= 0 or leverage <= 0 or target <= 0:
+        return 0.0
+    contract_size = _number(ctx.get("contract_size"))
+    if not contract_size or contract_size <= 0:
+        contract_size = margin * leverage / (qty * entry)
+    if not contract_size or contract_size <= 0:
+        return 0.0
+    price_step = (target / 100.0) * margin / (qty * contract_size)
+    if price_step <= 0:
+        return 0.0
+    level = entry + price_step if side == "BUY" else entry - price_step
+    return round(level, 12)
+
+
+def select_scalp_roe_target(context: Dict[str, Any]) -> Tuple[float, str]:
+    """Pick exactly one 5/10/20% ROE exit from measurable post-entry evidence."""
+    ctx = context if isinstance(context, dict) else {}
+    adx = _number(ctx.get("adx"), 0.0) or 0.0
+    adx_slope = _number(ctx.get("adx_slope"), 0.0) or 0.0
+    continuation = _number(ctx.get("continuation_probability"), 0.0) or 0.0
+    volume_ratio = _number(ctx.get("volume_ratio"), 0.0) or 0.0
+    distance = _number(ctx.get("distance_to_opposing_pct"), 0.0) or 0.0
+    aligned = _number(ctx.get("aligned_closed_candles"), 0.0) or 0.0
+    zone_strength = _number(ctx.get("zone_strength"), 0.0) or 0.0
+    di_aligned = bool(ctx.get("di_aligned", False))
+    adverse_rejection = bool(ctx.get("adverse_rejection", False))
+    distribution_risk = _number(ctx.get("distribution_risk"), 0.0) or 0.0
+    behavior = str(ctx.get("post_entry_behavior") or "").upper()
+    weak = (
+        adverse_rejection or distribution_risk >= 50 or continuation < 0.45 or adx < 18
+        or volume_ratio < 0.75 or distance < 0.25
+        or behavior in {BEHAVIOR_DISTRIBUTION, BEHAVIOR_PULLBACK, BEHAVIOR_MICRO_PULLBACK}
+    )
+    if weak:
+        return SCALP_ROE_TARGETS_PCT[0], "weak_momentum_near_liquidity_or_rejection_conservative_5pct_roe"
+    strong = (
+        adx >= 24 and adx_slope >= 0 and continuation >= 0.72 and volume_ratio >= 1.20
+        and aligned >= 2 and di_aligned and not adverse_rejection and distribution_risk < 35
+        and distance >= 0.80 and zone_strength >= 0.60
+        and behavior in {BEHAVIOR_TREND_CONTINUATION, BEHAVIOR_RETEST}
+    )
+    if strong:
+        return SCALP_ROE_TARGETS_PCT[2], "strong_zone_closed_candle_and_volume_follow_through_20pct_roe"
+    moderate = (
+        adx >= 20 and continuation >= 0.58 and volume_ratio >= 0.90
+        and aligned >= 1 and distance >= 0.35 and not adverse_rejection
+    )
+    if moderate:
+        return SCALP_ROE_TARGETS_PCT[1], "moderate_follow_through_10pct_roe"
+    return SCALP_ROE_TARGETS_PCT[0], "insufficient_continuation_evidence_conservative_5pct_roe"
+
+
+def analyze_post_entry_behavior(df_closed: Any, side: str, entry_price: float, atr: float,
+                                context: Optional[Dict[str, Any]] = None) -> Tuple[str, str, Dict[str, Any]]:
+    """Classify price behaviour from completed candles only.
+
+    Every returned label is tied to observable candle/zone evidence. A counter
+    candle alone is never an exit; structural invalidation is required for
+    INSTITUTIONAL_EXIT.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    direction = str(side or "").upper()
+    entry = _number(entry_price, 0.0) or 0.0
+    volatility = _number(atr, 0.0) or 0.0
+    evidence: Dict[str, Any] = {
+        "source": "completed_candles_only", "aligned_closes": 0,
+        "counter_candles": 0, "adverse_atr": 0.0, "zone_touch": False,
+        "retest_success": False,
+    }
+    if direction not in {"BUY", "SELL"} or entry <= 0 or volatility <= 0 or df_closed is None or len(df_closed) < 3:
+        return BEHAVIOR_INSUFFICIENT, "insufficient_completed_candle_evidence", evidence
+    try:
+        import pandas as pd
+        recent = df_closed.tail(6)
+        highs = pd.to_numeric(recent["high"], errors="coerce").dropna().astype(float)
+        lows = pd.to_numeric(recent["low"], errors="coerce").dropna().astype(float)
+        closes = pd.to_numeric(recent["close"], errors="coerce").dropna().astype(float)
+        opens = pd.to_numeric(recent["open"], errors="coerce").dropna().astype(float)
+        if min(len(highs), len(lows), len(closes), len(opens)) < 3:
+            return BEHAVIOR_INSUFFICIENT, "insufficient_ohlcv_columns", evidence
+    except Exception:
+        return BEHAVIOR_INSUFFICIENT, "ohlcv_parse_error", evidence
+
+    last_close = float(closes.iloc[-1])
+    aligned = 0
+    counter = 0
+    for i in range(max(1, len(closes) - 3), len(closes)):
+        body = abs(float(closes.iloc[i]) - float(opens.iloc[i]))
+        if direction == "BUY":
+            if float(closes.iloc[i]) > float(closes.iloc[i - 1]):
+                aligned += 1
+            if float(closes.iloc[i]) < float(opens.iloc[i]) and body >= 0.25 * volatility:
+                counter += 1
+        else:
+            if float(closes.iloc[i]) < float(closes.iloc[i - 1]):
+                aligned += 1
+            if float(closes.iloc[i]) > float(opens.iloc[i]) and body >= 0.25 * volatility:
+                counter += 1
+    adverse = (entry - float(lows.min())) if direction == "BUY" else (float(highs.max()) - entry)
+    adverse_atr = max(0.0, adverse) / volatility
+    zone_low = _number(ctx.get("zone_low"))
+    zone_high = _number(ctx.get("zone_high"))
+    if zone_low is None or zone_high is None or zone_low > zone_high:
+        zone_low, zone_high = entry - 0.25 * volatility, entry + 0.25 * volatility
+    zone_touch = any(float(low) <= zone_high and float(high) >= zone_low
+                     for low, high in zip(lows.tolist(), highs.tolist()))
+    # A retest must be recent; merely touching the entry zone on the first bar
+    # of a strong impulse is continuation, not a retest.
+    zone_touch_recent = any(float(low) <= zone_high and float(high) >= zone_low
+                            for low, high in zip(lows.tolist()[-3:], highs.tolist()[-3:]))
+    reclaimed = last_close > zone_high if direction == "BUY" else last_close < zone_low
+    continuation = _number(ctx.get("continuation_probability"), 0.5) or 0.5
+    adx = _number(ctx.get("adx"), 0.0) or 0.0
+    distribution = _number(ctx.get("distribution_risk"), 0.0) or 0.0
+    volume_ratio = _number(ctx.get("volume_ratio"), 0.0) or 0.0
+    thesis_score = _number(ctx.get("thesis_failure_score"), 0.0) or 0.0
+    di_aligned = bool(ctx.get("di_aligned", False))
+    structure_aligned = bool(ctx.get("structure_aligned", False))
+    structure_broken = bool(ctx.get("structure_broken", False))
+    structural_invalidation = bool(ctx.get("structural_invalidation", False))
+    evidence.update({
+        "aligned_closes": aligned, "counter_candles": counter,
+        "adverse_atr": adverse_atr, "zone_touch": zone_touch_recent,
+        "retest_success": bool(zone_touch_recent and reclaimed),
+        "last_close": last_close, "zone_low": zone_low, "zone_high": zone_high,
+    })
+    if structural_invalidation or thesis_score >= 70.0 or (structure_broken and distribution >= 60.0):
+        return BEHAVIOR_INSTITUTIONAL_EXIT, "thesis_or_structure_invalidated", evidence
+    if distribution >= 55.0 or (counter >= 2 and volume_ratio >= 1.20 and continuation < 0.50):
+        return BEHAVIOR_DISTRIBUTION, "distribution_or_adverse_volume_expansion", evidence
+    near_zone = ((last_close <= zone_high + 0.75 * volatility) if direction == "BUY"
+                 else (last_close >= zone_low - 0.75 * volatility))
+    if zone_touch_recent and reclaimed and near_zone and adverse_atr <= 0.75 and continuation >= 0.50 and not structure_broken:
+        return BEHAVIOR_RETEST, "retest_held_inside_entry_zone", evidence
+    if zone_touch_recent and not reclaimed and not structure_broken and adverse_atr <= 1.50:
+        return BEHAVIOR_PULLBACK, "entry_zone_retested_without_reclaim", evidence
+    if aligned >= 2 and adx >= 22.0 and di_aligned and structure_aligned and continuation >= 0.60 and distribution < 45.0:
+        return BEHAVIOR_TREND_CONTINUATION, "adx_di_structure_and_closed_candles_aligned", evidence
+    if adverse_atr <= 0.35 and counter <= 1 and continuation >= 0.55:
+        return BEHAVIOR_MICRO_PULLBACK, "shallow_short_counter_move_with_continuation", evidence
+    if adverse_atr <= 1.25 and structure_aligned and continuation >= 0.50:
+        return BEHAVIOR_PULLBACK, "temporary_correction_inside_intact_structure", evidence
+    return "RANGE_CHOP", "no_dominant_post_entry_behavior", evidence
+
+
+def map_profit_mode_to_regime(profit_mode: str, behavior: str = "") -> str:
+    """Map the existing profit-mode vocabulary onto the explicit state machine."""
+    mode = str(profit_mode or "").upper()
+    active_behavior = str(behavior or "").upper()
+    if active_behavior == BEHAVIOR_INSTITUTIONAL_EXIT:
+        return EXIT_REQUIRED_STATE
+    if mode == TREND_MODE:
+        return TREND_STATE
+    # SCALP is the safe default when trend evidence is absent, matching the
+    # strategic requirement that insufficient trend proof must not ride a trend.
+    return SCALP_STATE
+
+
+def transition_trade_regime(current: str, candidate: str, behavior: str,
+                            confirmations: int, evidence: Optional[Dict[str, Any]] = None) -> Tuple[str, str, int]:
+    """Apply hysteresis to SCALP/TREND switches; structural failure exits at once."""
+    current_state = str(current or "").upper()
+    candidate_state = str(candidate or "").upper()
+    active_behavior = str(behavior or "").upper()
+    evidence = evidence if isinstance(evidence, dict) else {}
+    if current_state == CLOSED_STATE:
+        return CLOSED_STATE, "already_closed", 0
+    if active_behavior == BEHAVIOR_INSTITUTIONAL_EXIT or bool(evidence.get("structural_invalidation", False)):
+        return EXIT_REQUIRED_STATE, "institutional_exit_confirmed", 0
+    if current_state == EXIT_REQUIRED_STATE:
+        return EXIT_REQUIRED_STATE, "exit_already_required", 0
+    if candidate_state not in {SCALP_STATE, TREND_STATE}:
+        candidate_state = SCALP_STATE
+    if not current_state or current_state not in {SCALP_STATE, TREND_STATE}:
+        return candidate_state, f"initial_classification_{candidate_state.lower()}", 0
+    if candidate_state == current_state:
+        return current_state, "candidate_matches_current_regime", 0
+    count = max(0, int(confirmations or 0))
+    if count < 2:
+        return current_state, f"waiting_second_confirmed_candle_for_{candidate_state.lower()}", count
+    if current_state == SCALP_STATE and candidate_state == TREND_STATE:
+        if active_behavior in {BEHAVIOR_TREND_CONTINUATION, BEHAVIOR_RETEST, BEHAVIOR_PULLBACK} and not bool(evidence.get("adverse_rejection", False)):
+            return TREND_STATE, "scalp_to_trend_upgrade_confirmed", 0
+        return SCALP_STATE, "trend_upgrade_rejected_no_fresh_continuation_evidence", count
+    if current_state == TREND_STATE and candidate_state == SCALP_STATE:
+        if active_behavior in {BEHAVIOR_DISTRIBUTION, BEHAVIOR_PULLBACK, BEHAVIOR_MICRO_PULLBACK, "RANGE_CHOP"}:
+            return SCALP_STATE, "trend_downgraded_after_confirmed_structure_weakening", 0
+        return TREND_STATE, "trend_downgrade_rejected_no_weakening_evidence", count
+    return candidate_state, f"regime_changed_to_{candidate_state.lower()}", 0

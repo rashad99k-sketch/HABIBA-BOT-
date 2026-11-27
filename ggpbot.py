@@ -1863,6 +1863,8 @@ class PositionSnapshot:
         self.realized_pnl = 0.0
         self.roe_pct = 0.0
         self.leverage = LEVERAGE
+        self.leverage_verified = False
+        self.contract_size = 0.0
         self.margin = 0.0
         self.liquidation_price = 0.0
         self.tp1_hit = False
@@ -1886,6 +1888,8 @@ class PositionSnapshot:
             "realized_pnl": self.realized_pnl,
             "roe_pct": self.roe_pct,
             "leverage": self.leverage,
+            "leverage_verified": self.leverage_verified,
+            "contract_size": self.contract_size,
             "margin": self.margin,
             "liquidation_price": self.liquidation_price,
             "tp1_hit": self.tp1_hit,
@@ -1970,6 +1974,9 @@ class ExchangeSyncService:
         snap.mark_price = get_ticker_safe(symbol) or snap.entry_price
         snap.unrealized_pnl = (snap.mark_price - snap.entry_price) * snap.qty if snap.side == "BUY" else (snap.entry_price - snap.mark_price) * snap.qty
         snap.margin = snap.entry_price * snap.qty / LEVERAGE
+        snap.leverage = LEVERAGE
+        snap.leverage_verified = True
+        snap.contract_size = 1.0
         snap.roe_pct = (snap.unrealized_pnl / snap.margin) * 100 if snap.margin else 0
         snap.updated_at = time.time()
         snap.source = "paper"
@@ -2337,7 +2344,13 @@ from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached,
                               select_range_target_pct, tp2_reassessment, thesis_failure_action,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
-                              RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              RANGE_MODE, TREND_MODE, STANDARD_MODE,
+                              SCALP_STATE, TREND_STATE, EXIT_REQUIRED_STATE, CLOSED_STATE,
+                              SCALP_ROE_TARGETS_PCT, TREND_ROE_TARGETS_PCT,
+                              BEHAVIOR_DISTRIBUTION, BEHAVIOR_INSTITUTIONAL_EXIT,
+                              verify_roe_inputs, roe_target_price, select_scalp_roe_target,
+                              analyze_post_entry_behavior, map_profit_mode_to_regime,
+                              transition_trade_regime)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2436,16 +2449,22 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is an intentional exception: it is enabled only by the
-        # multi-evidence policy. The single target closes the entire remaining
-        # exposure, while a previously verified TP1 remains recorded as a real fill.
-        if profit_mode == "RANGE_SCALP":
-            range_target = safe_float(ctx.get("range_target_price"), 0.0)
-            if range_target > 0 and target_reached(side, current, range_target):
+        # ROE targets are only legal when leverage, margin, quantity and PnL
+        # basis are verified. Safety exits above remain active even if this gate
+        # holds target management, so protection is never weakened.
+        if not ctx.get("roe_ready", False):
+            return decision(TradeDecisionType.HOLD,
+                            f"roe_target_blocked_{str(ctx.get('roe_diagnostic') or 'unverified_basis')}")
+
+        # SCALP uses exactly one ROE target and closes the whole remaining
+        # exposure. It is never split into TP1/TP2.
+        if profit_mode == RANGE_MODE:
+            scalp_target = safe_float(ctx.get("scalp_target_roe_pct"), 0.0)
+            if scalp_target > 0 and roe >= scalp_target:
                 return decision(TradeDecisionType.FULL_CLOSE,
-                                f"range_scalp_single_target_hit_{safe_float(ctx.get('range_target_move_pct'), 0.5):.2f}pct",
-                                close_reason="RANGE_SCALP_TARGET")
-            return decision(TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target")
+                                f"scalp_single_target_hit_{scalp_target:.2f}pct_roe",
+                                close_reason="SCALP_TARGET")
+            return decision(TradeDecisionType.HOLD, "scalp_waiting_for_selected_roe_target")
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
         # This compensates for any previously confirmed partial fill and never
@@ -2453,28 +2472,28 @@ class TradeManagementBoard:
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
         if not tp1_hit and remaining > 0 and initial > 0:
-            tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
-            if tp1_price > 0 and target_reached(side, current, tp1_price):
+            tp1_roe = safe_float(ctx.get("tp1_target_roe_pct"), 0.0)
+            if tp1_roe > 0 and roe >= tp1_roe:
                 target_remaining = initial * 0.5
                 tolerance = max(initial * 0.002, 1e-10)
                 qty_to_close = max(0.0, remaining - target_remaining)
                 if qty_to_close <= tolerance:
                     return decision(TradeDecisionType.HOLD, "tp1_quantity_already_at_50pct_wait_for_reconciliation")
                 ratio = min(1.0, qty_to_close / remaining)
-                return decision(TradeDecisionType.PARTIAL_CLOSE, "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
+                return decision(TradeDecisionType.PARTIAL_CLOSE, f"TP1_FIXED_50_PERCENT_AT_{tp1_roe:.0f}pct_ROE",
                                 ratio=ratio, target_remaining_qty=target_remaining,
                                 close_reason="TP1")
 
         # TP2 is the final 50% runner exit. If it is objectively remote while
         # continuation/structure has failed, close the remaining runner strictly.
         if tp1_hit and not tp2_hit and remaining > 0:
-            tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
             if ctx.get("tp2_decision") == "CLOSE":
                 return decision(TradeDecisionType.FULL_CLOSE,
                                 str(ctx.get("tp2_decision_reason") or "tp2_remote_and_continuation_weak"),
                                 close_reason="TP2_ADAPTIVE_STRICT_EXIT")
-            if tp2_price > 0 and target_reached(side, current, tp2_price):
-                return decision(TradeDecisionType.FULL_CLOSE, "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+            tp2_roe = safe_float(ctx.get("tp2_target_roe_pct"), 0.0)
+            if tp2_roe > 0 and roe >= tp2_roe:
+                return decision(TradeDecisionType.FULL_CLOSE, f"TP2_FINAL_50_PERCENT_AT_{tp2_roe:.0f}pct_ROE",
                                 close_reason="TP2")
 
         # BE+ and trailing apply to the verified remaining runner only.
@@ -2976,6 +2995,22 @@ class LiveTradeManager:
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        # A new position must never inherit a prior trade's SCALP/TREND decision.
+        STATE["trade_regime_state"] = None
+        STATE["trade_regime_reason"] = ""
+        STATE["profit_mode"] = None
+        STATE["profit_mode_candidate"] = None
+        STATE["profit_mode_candidate_count"] = 0
+        STATE["profit_mode_last_candle_ts"] = 0.0
+        STATE["post_entry_behavior"] = "INSUFFICIENT_DATA"
+        STATE["post_entry_behavior_reason"] = ""
+        STATE["post_entry_behavior_evidence"] = {}
+        STATE["scalp_target_roe_pct"] = 0.0
+        STATE["scalp_target_price"] = 0.0
+        STATE["scalp_target_reason"] = ""
+        STATE["tp1_target_roe_pct"] = 0.0
+        STATE["tp2_target_roe_pct"] = 0.0
+        STATE["exit_required_reason"] = ""
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -3176,6 +3211,25 @@ class LiveTradeManager:
         side = STATE["side"]
         entry = STATE["entry"]
         roe = safe_float(STATE.get("roe_pct"), 0.0)
+        roe_check = verify_roe_inputs({
+            "side": side, "entry": entry, "mark_price": mark_price,
+            "remaining_qty": safe_float(STATE.get("remaining_qty"), STATE.get("qty")),
+            "initial_margin": safe_float(STATE.get("margin") or STATE.get("initial_margin")),
+            "unrealized_pnl": safe_float(STATE.get("unrealized_pnl_usdt")),
+            "actual_leverage": safe_float(STATE.get("leverage")),
+            "leverage_verified": bool(STATE.get("leverage_verified", False)),
+            "reported_roe_pct": roe,
+            "contract_size": safe_float(STATE.get("contract_size"), 0.0),
+            "fees_usdt": safe_float(STATE.get("fees_usdt"), 0.0),
+            "funding_usdt": safe_float(STATE.get("funding_usdt"), 0.0),
+        })
+        STATE["roe_verified"] = bool(roe_check.get("ok"))
+        STATE["roe_diagnostic"] = str(roe_check.get("reason") or "")
+        STATE["computed_roe_pct"] = safe_float(roe_check.get("computed_roe_pct"), 0.0)
+        STATE["actual_leverage"] = roe_check.get("leverage")
+        if not STATE["roe_verified"]:
+            log_execution(f"[ROE_GATE] {symbol}: ROE targets held; {STATE['roe_diagnostic']}",
+                          "WARN", debounce_key=f"roe_gate_{symbol}", debounce_sec=30)
         peak_roe = max(safe_float(STATE.get("peak_roe"), 0.0), roe)
         STATE["peak_roe"] = peak_roe
         STATE["peak_drawdown_roe"] = max(0.0, peak_roe - roe) if peak_roe > 0 else 0.0
@@ -3295,55 +3349,113 @@ class LiveTradeManager:
                 "trend_expansion": bool(momentum.get("trend_expansion", False)),
             }
             candidate_mode, candidate_reason, candidate_evidence = classify_profit_mode(mode_context)
-            current_mode = str(STATE.get("profit_mode") or STANDARD_MODE)
+            current_mode = str(STATE.get("profit_mode") or RANGE_MODE)
+
+            # Opposing swing liquidity is used only as contextual evidence for
+            # target selection; the executed target itself is ROE-based.
+            swing_levels = []
+            try:
+                recent = df_live.tail(61).reset_index(drop=True)
+                for i in range(2, len(recent) - 2):
+                    hi = safe_float(recent.iloc[i].get("high"), 0.0)
+                    lo = safe_float(recent.iloc[i].get("low"), 0.0)
+                    if hi > 0 and hi >= max(safe_float(x, 0.0) for x in recent["high"].iloc[i-2:i+3]):
+                        swing_levels.append(hi)
+                    if lo > 0 and lo <= min(safe_float(x, float("inf")) for x in recent["low"].iloc[i-2:i+3]):
+                        swing_levels.append(lo)
+            except Exception:
+                swing_levels = []
+            adaptive_target, target_reason = adaptive_range_target_price(side, entry, atr, swing_levels)
+            distance_to_opposing = (abs(adaptive_target - entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
+
+            zone = STATE.get("zone_info") if isinstance(STATE.get("zone_info"), dict) else {}
+            zone_low = safe_float(zone.get("low") or zone.get("zone_low") or zone.get("lower"), 0.0)
+            zone_high = safe_float(zone.get("high") or zone.get("zone_high") or zone.get("upper"), 0.0)
+            behavior, behavior_reason, behavior_evidence = analyze_post_entry_behavior(
+                df_live, side, entry, atr, {
+                    "zone_low": zone_low, "zone_high": zone_high,
+                    "continuation_probability": continuation_eval.continuation_probability,
+                    "adx": adx_now, "adx_slope": adx_slope,
+                    "volume_ratio": volume_ratio,
+                    "distribution_risk": safe_float(smart_money.get("distribution_risk"), 0.0),
+                    "thesis_failure_score": safe_float(STATE.get("thesis_failure_score"), 0.0),
+                    "di_aligned": (plus_di > minus_di) if side == "BUY" else (minus_di > plus_di),
+                    "structure_aligned": bool(structure_aligned),
+                    "structure_broken": bool(STATE.get("structure_broken", False)),
+                    "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
+                })
+            STATE["post_entry_behavior"] = behavior
+            STATE["post_entry_behavior_reason"] = behavior_reason
+            STATE["post_entry_behavior_evidence"] = behavior_evidence
+            adverse_rejection = bool(
+                behavior == BEHAVIOR_DISTRIBUTION or counter_displacement > 0
+                or (safe_float(behavior_evidence.get("counter_candles"), 0.0) >= 1
+                    and safe_float(behavior_evidence.get("adverse_atr"), 0.0) >= 0.5)
+            )
+            STATE["adverse_rejection"] = adverse_rejection
+
+            candidate_regime = map_profit_mode_to_regime(candidate_mode, behavior)
+            current_regime = str(STATE.get("trade_regime_state") or "").upper()
             last_mode_ts = safe_float(STATE.get("profit_mode_last_candle_ts"), 0.0)
             if closed_candle_ts > last_mode_ts:
                 STATE["profit_mode_last_candle_ts"] = closed_candle_ts
-                if candidate_mode == current_mode:
-                    STATE["profit_mode_candidate"] = candidate_mode
-                    STATE["profit_mode_candidate_count"] = 0
-                elif not STATE.get("profit_mode"):
-                    current_mode = candidate_mode
-                    STATE["profit_mode"] = current_mode
-                    STATE["profit_mode_candidate"] = candidate_mode
-                    STATE["profit_mode_candidate_count"] = 0
+                if current_regime not in {SCALP_STATE, TREND_STATE}:
+                    new_regime, transition_reason, confirmations = candidate_regime, f"initial_classification_{candidate_regime.lower()}", 0
                 else:
-                    if STATE.get("profit_mode_candidate") == candidate_mode:
-                        STATE["profit_mode_candidate_count"] = int(STATE.get("profit_mode_candidate_count", 0)) + 1
+                    prior_candidate = str(STATE.get("profit_mode_candidate") or "").upper()
+                    prior_count = int(safe_float(STATE.get("profit_mode_candidate_count"), 0))
+                    confirmations = prior_count + 1 if prior_candidate == candidate_regime else 1
+                    new_regime, transition_reason, confirmations = transition_trade_regime(
+                        current_regime, candidate_regime, behavior, confirmations, behavior_evidence)
+                STATE["profit_mode_candidate"] = candidate_regime
+                STATE["profit_mode_candidate_count"] = confirmations
+                STATE["trade_regime_state"] = new_regime
+                STATE["trade_regime_reason"] = transition_reason
+                if new_regime == EXIT_REQUIRED_STATE:
+                    STATE["exit_required_reason"] = behavior_reason
+                current_mode = TREND_MODE if new_regime == TREND_STATE else RANGE_MODE
+                STATE["profit_mode"] = current_mode
+                STATE["profit_mode_reason"] = f"{candidate_reason}|{transition_reason}|{behavior_reason}"
+                STATE["profit_mode_evidence"] = list(candidate_evidence) + [behavior]
+                STATE["range_target_price"] = adaptive_target if current_mode == RANGE_MODE else 0.0
+                STATE["range_target_move_pct"] = distance_to_opposing if current_mode == RANGE_MODE else 0.0
+                STATE["range_target_reason"] = target_reason if current_mode == RANGE_MODE else ""
+
+                if current_mode == RANGE_MODE:
+                    target_context = {
+                        "adx": adx_now, "adx_slope": adx_slope,
+                        "continuation_probability": continuation_eval.continuation_probability,
+                        "volume_ratio": volume_ratio, "distance_to_opposing_pct": distance_to_opposing,
+                        "aligned_closed_candles": behavior_evidence.get("aligned_closes", 0),
+                        "zone_strength": safe_float(STATE.get("zone_strength"), 0.0),
+                        "di_aligned": (plus_di > minus_di) if side == "BUY" else (minus_di > plus_di),
+                        "adverse_rejection": adverse_rejection,
+                        "distribution_risk": safe_float(smart_money.get("distribution_risk"), 0.0),
+                        "post_entry_behavior": behavior,
+                    }
+                    scalp_target, scalp_reason = select_scalp_roe_target(target_context)
+                    STATE["scalp_target_roe_pct"] = scalp_target
+                    STATE["scalp_target_reason"] = scalp_reason
+                    STATE["scalp_target_price"] = roe_target_price(roe_check, scalp_target) if roe_check.get("ok") else 0.0
+                    STATE["tp1_target_roe_pct"] = 0.0
+                    STATE["tp2_target_roe_pct"] = 0.0
+                else:
+                    STATE["scalp_target_roe_pct"] = 0.0
+                    STATE["scalp_target_price"] = 0.0
+                    STATE["scalp_target_reason"] = ""
+                    if roe_check.get("ok"):
+                        STATE["tp1_target_roe_pct"] = TREND_ROE_TARGETS_PCT[0]
+                        STATE["tp2_target_roe_pct"] = TREND_ROE_TARGETS_PCT[1]
+                        STATE["tp1_price"] = roe_target_price(roe_check, TREND_ROE_TARGETS_PCT[0])
+                        STATE["tp2_price"] = roe_target_price(roe_check, TREND_ROE_TARGETS_PCT[1])
                     else:
-                        STATE["profit_mode_candidate"] = candidate_mode
-                        STATE["profit_mode_candidate_count"] = 1
-                    # Require two completed candles before changing an established mode.
-                    if STATE["profit_mode_candidate_count"] >= 2:
-                        current_mode = candidate_mode
-                        STATE["profit_mode"] = current_mode
-                        STATE["profit_mode_candidate_count"] = 0
-                STATE["profit_mode_reason"] = candidate_reason
-                STATE["profit_mode_evidence"] = list(candidate_evidence)
-                if current_mode == RANGE_MODE and not safe_float(STATE.get("range_target_price"), 0.0):
-                    # Range exits are anchored to the nearest opposing swing-liquidity
-                    # pool, not a hard-coded 0.5/1/2% price move. Use completed bars only.
-                    swing_levels = []
-                    try:
-                        recent = df_live.tail(61).reset_index(drop=True)
-                        for i in range(2, len(recent) - 2):
-                            hi = safe_float(recent.iloc[i].get("high"), 0.0)
-                            lo = safe_float(recent.iloc[i].get("low"), 0.0)
-                            if hi > 0 and hi >= max(safe_float(x, 0.0) for x in recent["high"].iloc[i-2:i+3]):
-                                swing_levels.append(hi)
-                            if lo > 0 and lo <= min(safe_float(x, float("inf")) for x in recent["low"].iloc[i-2:i+3]):
-                                swing_levels.append(lo)
-                    except Exception:
-                        swing_levels = []
-                    adaptive_target, target_reason = adaptive_range_target_price(
-                        side, entry, atr, swing_levels)
-                    STATE["range_target_price"] = adaptive_target
-                    STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
-                    STATE["range_target_reason"] = target_reason
-                elif current_mode != RANGE_MODE:
-                    STATE["range_target_price"] = 0.0
-                    STATE["range_target_move_pct"] = 0.0
-                log_execution(f"[PROFIT_MODE] {symbol} mode={current_mode} candidate={candidate_mode} reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
+                        STATE["tp1_target_roe_pct"] = 0.0
+                        STATE["tp2_target_roe_pct"] = 0.0
+                log_execution(
+                    f"[PROFIT_MODE] {symbol} regime={new_regime} mode={current_mode} "
+                    f"behavior={behavior}/{behavior_reason} candidate={candidate_mode} "
+                    f"reason={candidate_reason} transition={transition_reason}",
+                    "INFO")
 
             # Thesis failure check
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
@@ -3508,8 +3620,16 @@ class LiveTradeManager:
             "synthetic_tp1": STATE.get("synthetic_tp1", 0), "tp2_price": STATE.get("tp2_price", 0),
             "range_target_price": STATE.get("range_target_price", 0),
             "range_target_move_pct": STATE.get("range_target_move_pct", 0),
-            "profit_mode": STATE.get("profit_mode", STANDARD_MODE),
+            "profit_mode": STATE.get("profit_mode", RANGE_MODE),
             "profit_mode_reason": STATE.get("profit_mode_reason", ""),
+            "trade_regime_state": STATE.get("trade_regime_state"),
+            "post_entry_behavior": STATE.get("post_entry_behavior"),
+            "behavior_reason": STATE.get("post_entry_behavior_reason", ""),
+            "roe_ready": bool(STATE.get("roe_verified", False)),
+            "roe_diagnostic": STATE.get("roe_diagnostic", ""),
+            "scalp_target_roe_pct": safe_float(STATE.get("scalp_target_roe_pct"), 0.0),
+            "tp1_target_roe_pct": safe_float(STATE.get("tp1_target_roe_pct"), 0.0),
+            "tp2_target_roe_pct": safe_float(STATE.get("tp2_target_roe_pct"), 0.0),
             "tp2_decision": tp2_action, "tp2_decision_reason": tp2_reason,
             "entry_type": STATE.get("entry_type", ""), "trade_state": trade_state,
             "be_done": STATE.get("be_done", False), "breakeven_done": STATE.get("be_done", False),
@@ -3673,6 +3793,13 @@ class LiveTradeManager:
                                                    remaining_qty=0.0, fill_price=fill_price, order_id=order_id,
                                                    realized_pnl_usdt=tp2_realized,
                                                    pnl_source=STATE.get("last_close_order_pnl_source", STATE.get("last_close_pnl_source")))
+                elif close_reason == "SCALP_TARGET":
+                    record_trade_management_event("SCALP_TARGET_VERIFIED", "PAPER_SIMULATED" if PAPER_MODE else "EXCHANGE_VERIFIED",
+                                                   log_level="SUCCESS", **common, qty_closed=filled,
+                                                   remaining_qty=0.0,
+                                                   scalp_target_roe_pct=STATE.get("scalp_target_roe_pct"),
+                                                   scalp_target_price=STATE.get("scalp_target_price"),
+                                                   fill_price=fill_price, order_id=order_id)
                 elif close_reason == "RANGE_SCALP_TARGET":
                     record_trade_management_event("RANGE_SCALP_VERIFIED", "PAPER_SIMULATED" if PAPER_MODE else "EXCHANGE_VERIFIED",
                                                    log_level="SUCCESS", **common, qty_closed=filled,
@@ -3689,12 +3816,14 @@ class LiveTradeManager:
                                                    qty_closed=filled, remaining_qty=0.0, fill_price=fill_price, order_id=order_id)
                 finalize_trade_with_reality(symbol, close_reason=close_reason)
                 self.lifecycle_state = TradeLifecycleState.CLOSED
+                STATE["trade_regime_state"] = CLOSED_STATE
                 DASHBOARD_STATE["live_trade_mode"] = False
             elif not STATE.get("open") and MEMORY.get("position_status") == "FLAT":
                 record_trade_management_event("EXTERNAL_CLOSE", "EXCHANGE_FLAT_CONFIRMED", log_level="WARN",
                                                **common, close_reason=STATE.get("last_close_reason", "EXTERNAL_CLOSE_UNKNOWN"),
                                                diagnostic=STATE.get("last_close_diagnostic"))
                 self.lifecycle_state = TradeLifecycleState.CLOSED
+                STATE["trade_regime_state"] = CLOSED_STATE
                 DASHBOARD_STATE["live_trade_mode"] = False
             else:
                 record_trade_management_event("EXECUTION_UNCERTAIN", "UNRESOLVED", log_level="ERROR",
@@ -3760,6 +3889,11 @@ def sync_position_state(symbol=None):
                 STATE["roe_pct"] = roe_pct
                 STATE["mark_price"] = price
                 STATE["unrealized_pnl_usdt"] = (price - STATE["entry"]) * STATE["qty"] if STATE["side"]=="BUY" else (STATE["entry"] - price) * STATE["qty"]
+                STATE["leverage"] = LEVERAGE
+                STATE["leverage_verified"] = True
+                STATE["leverage_source"] = "paper_config"
+                STATE["margin"] = STATE["entry"] * STATE["qty"] / LEVERAGE if STATE.get("entry") and STATE.get("qty") else 0.0
+                STATE["contract_size"] = 1.0
                 return price, 0.0, 0.0, roe_pct
         return None, None, None, None
 
@@ -3812,6 +3946,9 @@ def sync_position_state(symbol=None):
         STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
         STATE["roe_pct"] = snap.roe_pct
         STATE["leverage"] = snap.leverage
+        STATE["leverage_verified"] = bool(getattr(snap, "leverage_verified", False))
+        STATE["leverage_source"] = "exchange_snapshot" if STATE["leverage_verified"] else "unverified_config_default"
+        STATE["contract_size"] = safe_float(getattr(snap, "contract_size", 0.0), 0.0)
         STATE["mark_price"] = snap.mark_price
         STATE["liquidation_price"] = snap.liquidation_price
 
@@ -4753,6 +4890,14 @@ STATE = {
     "ema_profit_state": "INSUFFICIENT_DATA",
     "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
     "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
+    "trade_regime_state": None, "trade_regime_reason": "",
+    "post_entry_behavior": "INSUFFICIENT_DATA", "post_entry_behavior_reason": "",
+    "post_entry_behavior_evidence": {}, "adverse_rejection": False,
+    "roe_verified": False, "roe_diagnostic": "", "computed_roe_pct": 0.0,
+    "leverage_verified": False, "leverage_source": "UNKNOWN", "contract_size": 0.0,
+    "scalp_target_roe_pct": 0.0, "scalp_target_price": 0.0, "scalp_target_reason": "",
+    "tp1_target_roe_pct": 0.0, "tp2_target_roe_pct": 0.0,
+    "exit_required_reason": "",
     "range_target_price": 0.0, "range_target_move_pct": 0.0, "range_target_reason": "",
             "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
     "native_sl_policy": "FIXED_FROM_ENTRY", "be_local": False,
@@ -9422,7 +9567,13 @@ def _snapshot_from_position(symbol, pos):
     snap.mark_price = safe_float(pos.get("markPrice") or info.get("markPrice"))
     snap.unrealized_pnl = safe_float(pos.get("unrealizedPnl") or info.get("unrealizedProfit"))
     snap.margin = safe_float(pos.get("initialMargin") or info.get("initialMargin"))
-    snap.leverage = safe_float(pos.get("leverage") or info.get("leverage"), LEVERAGE)
+    raw_leverage = pos.get("leverage") if pos.get("leverage") is not None else info.get("leverage")
+    verified_leverage = safe_float(raw_leverage, 0.0)
+    snap.leverage_verified = verified_leverage > 0
+    # Configured leverage is retained only as a display fallback; ROE-target
+    # decisions require leverage_verified from the exchange response above.
+    snap.leverage = verified_leverage if snap.leverage_verified else LEVERAGE
+    snap.contract_size = safe_float(pos.get("contractSize") or info.get("contractSize") or info.get("contract_size"), 0.0)
     snap.liquidation_price = safe_float(pos.get("liquidationPrice") or info.get("liquidationPrice"))
     if snap.qty <= 0 or snap.entry_price <= 0:
         raise ValueError("exchange position lacks a valid quantity or entry price")
