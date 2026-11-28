@@ -26,6 +26,14 @@ Unified the live EMA9 + Session VWAP Cross lifecycle with the existing instituti
 - Python `py_compile` / `compileall` passed. Demo lifecycle suite: `11 passed, 1 skipped`. Runtime-independent strategy tests: `150 passed, 1 deselected`.
 - No BingX account/API order was submitted during validation. No real exchange execution, fills, Native SL or 24/7 hosted process was verified in this environment.
 
+## Section: Surgical Runtime Error Fix — 2026-11-28
+- Fixed the live-manager `NameError`: imported the existing `select_opposing_liquidity_pool` from `ggp_market_intelligence` into `ggpbot.py`; no duplicate implementation was introduced.
+- Corrected momentum semantics: quiet markets no longer imply decay. Decay requires prior EMA9/EMA21 spread >= 0.20% followed by contraction to <= max(0.05%, 35% of prior spread).
+- Added and propagated `momentum_collapse_confirmed` into the Profit Brain risk context.
+- Profit Brain now defers unconfirmed `MOMENTUM_COLLAPSE` labels; verified structural invalidation, `PANIC_EXIT`, and `LIQUIDITY_EXHAUSTION` remain immediate hard exits.
+- Added regression tests for import integrity, unconfirmed/confirmed collapse, plain decay warning and preserved emergency hard exits.
+- GitHub branch: `fix/opposing-liquidity-momentum-guard-20261128`; changes are not merged to `main`.
+- Tests are being verified against the repository's CI/dependency-complete environment before the PR is considered mergeable.
 ## Section: Not Yet Verified
 - Full repository pytest run with all `requirements.txt` dependencies installed.
 - Runtime import and Flask dashboard smoke test in a dependency-complete environment.
