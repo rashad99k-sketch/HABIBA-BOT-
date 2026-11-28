@@ -209,24 +209,18 @@ def test_range_target_does_not_select_one_percent_without_full_evidence():
     assert target == 0.50
 
 
-def test_scalp_board_uses_one_full_close_not_partial_tp1():
-    import ast
+def test_scalp_board_uses_two_stage_50_50_partial_tp1_and_runner_tp2():
     from pathlib import Path
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    board = next(node for node in ast.walk(tree)
-                 if isinstance(node, ast.ClassDef) and node.name == "TradeManagementBoard")
-    evaluate = next(node for node in board.body
-                    if isinstance(node, ast.FunctionDef) and node.name == "evaluate")
-    source_lines = source.splitlines()
-    block_start = next(i for i, line in enumerate(source_lines)
-                       if 'if profit_mode == "RANGE_SCALP":' in line)
-    block_end = next(i for i in range(block_start + 1, len(source_lines))
-                     if source_lines[i].startswith("        # Canonical TP1:"))
-    scalp_block = "\n".join(source_lines[block_start:block_end])
-    assert "TradeDecisionType.FULL_CLOSE" in scalp_block
-    assert "TradeDecisionType.PARTIAL_CLOSE" not in scalp_block
-    assert "range_scalp_waiting_for_single_target" in scalp_block
+    board_start = source.index("class TradeManagementBoard:")
+    board_end = source.index("# ========== REAL EXCHANGE ORDERS", board_start)
+    board = source[board_start:board_end]
+    assert 'range_mode = profit_mode == "RANGE_SCALP"' in board
+    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" in board
+    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" in board
+    assert "target_remaining = initial * 0.5" in board
+    assert "range_scalp_waiting_for_two_stage_targets" in board
+    assert "range_scalp_waiting_for_single_target" not in board
 
 
 
