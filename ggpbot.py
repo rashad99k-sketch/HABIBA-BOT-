@@ -7076,6 +7076,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 )
         effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
         estimated_stop_loss = qty * contract_size * effective_stop_distance
+        estimated_stop_risk_pct = (estimated_stop_loss / balance) * 100.0
+        if estimated_stop_risk_pct > MAX_TRADE_RISK_PCT + 1e-9:
+            raise ValueError(
+                f"STRUCTURAL_STOP_RISK_EXCEEDS_BUDGET: estimated_loss={estimated_stop_loss:.4f}USDT "
+                f"account_risk={estimated_stop_risk_pct:.2f}% limit={MAX_TRADE_RISK_PCT:.2f}%; "
+                "entry rejected; position allocation and 20x leverage were not silently changed"
+            )
         target_margin_cap = balance * sizing.allocation_pct
         if margin > target_margin_cap * 1.000001:
             raise ValueError("rounded quantity exceeds configured margin allocation cap")
@@ -7116,7 +7123,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             f"  Binding Constraint: {sizing.binding_constraint}\n"
             f"  Minimum Notional: {min_notional:.4f}\n"
             f"  Contract Size: {contract_size:g}\n"
-            f"  Stop-Loss Estimate (informational only): {estimated_stop_loss:.4f} USDT\n"
+            f"  Stop-Loss Estimate: {estimated_stop_loss:.4f} USDT ({estimated_stop_risk_pct:.2f}% of account)\n"
+            f"  Max Account Risk Gate: {MAX_TRADE_RISK_PCT:.2f}% | PASS\n"
             f"  Native SL Check: pending exchange verification\n"
             f"  Final Status: PASS",
             "INFO"
