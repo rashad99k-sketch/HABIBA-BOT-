@@ -112,9 +112,12 @@ class StructuralStopLossEngine:
             return None, "stop_wrong_side"
         distance = abs(entry - stop)
         risk_pct = distance / entry * 100.0
+        # The volatility allowance includes the protective buffer itself;
+        # otherwise the minimum 0.20% clearance could exceed the ATR cap in
+        # unusually quiet markets and reject every otherwise-valid setup.
         max_distance = min(
             abs(entry) * max(0.0, float(max_stop_distance_pct)) / 100.0,
-            atr * max(0.0, float(max_stop_atr_multiple)),
+            atr * max(0.0, float(max_stop_atr_multiple)) + buffer,
         )
         if max_distance <= 0 or distance > max_distance + 1e-12:
             return None, (
