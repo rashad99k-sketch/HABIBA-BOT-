@@ -266,6 +266,18 @@ def test_exit_risk_locks_profitable_trade_on_multi_engine_warning_until_thesis_c
     assert confirmed["action"] == "HARD_EXIT"
 
 
+def test_hbar_style_sweep_and_rejection_does_not_close_entire_profitable_position():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 1.135,
+        "liquidity": {"event": "SWEEP", "direction": "BULLISH"},
+        "opposing_zone_rejection": True,
+        "opposing_zone_distance_atr": 0.20,
+    })
+    assert result["action"] == "HOLD"
+    assert result["group_count"] == 1
+
+
 def test_exit_risk_does_not_close_profitable_trade_on_one_warning():
     from ggp_profit_brain import evaluate_exit_risk
     result = evaluate_exit_risk({
