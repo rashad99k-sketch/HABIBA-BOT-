@@ -6725,6 +6725,26 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         gate_result["frame_source"] = gate_frame_source
     except Exception as gate_exc:
         gate_result = {"ready": False, "reason": f"gate_error:{type(gate_exc).__name__}"}
+    if cross_authorized:
+        # The authorized event and the final execution gate must agree on the
+        # same EMA9/Session-VWAP crossover candle. An EMA50 cross, a different
+        # direction, or a refreshed candle can never authorize this event.
+        expected_direction = {"BUY": "BULLISH", "SELL": "BEARISH"}.get(side)
+        gate_direction = str(gate_result.get("ema9_cross") or "").strip().upper()
+        try:
+            event_ts = int(_cross_event_ctx.get("candle_timestamp") or 0)
+            gate_ts = int(gate_result.get("ema9_cross_timestamp") or 0)
+        except (TypeError, ValueError, OverflowError):
+            event_ts, gate_ts = 0, 0
+        if (not gate_result.get("ready") or gate_direction != expected_direction
+                or gate_ts <= 0 or gate_ts != event_ts):
+            log_execution(
+                f"[CROSS_ENTRY_GUARD] BLOCKED boundary mismatch event={_cross_event_id} "
+                f"event_dir={_cross_event_ctx.get('cross_direction')} gate_dir={gate_direction} "
+                f"event_ts={event_ts} gate_ema9_cross_ts={gate_ts}",
+                "ERROR",
+            )
+            return False
     raw_signal_id = str(gate_result.get("signal_candle_id") or "").strip()
     if raw_signal_id:
         try:
@@ -6745,9 +6765,20 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             debounce_sec=5,
         )
         return False
-    # Consume the current signal identity only after this call has computed it,
-    # and before sizing/order submission. Fail closed if durable state is unreadable.
+    # Carry the computed signal identity into the serialized wrapper. Consumption
+    # happens only there, after fill, position and protection are verified.
     entry_event_id = str(gate_result.get("durable_event_id") or "").strip()
+    cross_event_id_for_entry = str(
+        institutional_entry_ctx.get("cross_event_id")
+        or (_cross_event_ctx.get("event_id") if cross_authorized else "")
+        or ""
+    ).strip()
+    cross_event_direction_for_entry = str(
+        (_cross_event_ctx.get("cross_direction") if cross_authorized else "")
+        or institutional_entry_ctx.get("cross_direction") or ""
+    ).strip().upper()
+    cross_event_ts_for_entry = int((_cross_event_ctx.get("candle_timestamp")
+                                    if cross_authorized else 0) or 0)
     entry_event_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     if not entry_event_id and not PAPER_MODE and MODE_LIVE:
         log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: missing signal candle identity for {symbol}", "ERROR")
@@ -7149,6 +7180,13 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "orderbook_depth_usdt": entry_orderbook_depth,
             "synthetic_tp1": tp1,
             "trade_id": trade_id,
+            "cross_event_id": cross_event_id_for_entry,
+            "durable_event_id": entry_event_id,
+            "cross_event_direction": cross_event_direction_for_entry,
+            "cross_event_timestamp": cross_event_ts_for_entry,
+            "entry_execution_state": "PAPER_SIMULATED",
+            "entry_exchange_order_id": None,
+            "event_consumption_status": "PENDING_VERIFIED_EXECUTION",
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "trend_target_resolver_latched": False, "trend_target_resolver_status": "UNINITIALIZED",
@@ -7202,6 +7240,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "max_trade_risk_pct": MAX_TRADE_RISK_PCT,
         "entry_time": time.time(), "tp1_hit": False, "tp2_hit": False,
         "trail_activated": False, "be_done": False,
+        "cross_event_id": cross_event_id_for_entry,
+        "durable_event_id": entry_event_id,
+        "cross_event_direction": cross_event_direction_for_entry,
+        "cross_event_timestamp": cross_event_ts_for_entry,
+        "event_consumption_status": "PENDING_VERIFIED_EXECUTION",
     }
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
@@ -7280,6 +7323,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "orderbook_depth_usdt": entry_orderbook_depth,
             "synthetic_tp1": tp1,
             "trade_id": trade_id,
+            "cross_event_id": cross_event_id_for_entry,
+            "durable_event_id": entry_event_id,
+            "cross_event_direction": cross_event_direction_for_entry,
+            "cross_event_timestamp": cross_event_ts_for_entry,
+            "event_consumption_status": "PENDING_VERIFIED_EXECUTION",
             "position_mode": order.get("positionMode", "PAPER"),
             "position_side": order.get("positionSide"),
             "entry_client_order_id": order.get("clientOrderId"),
@@ -11779,7 +11827,11 @@ from ggp_cross_event_pipeline import (
     evaluate_stop_loss, get_cross_event_store, ingest_cross_event,
     log_decision_record, watchlist_status_for_decision, ICON_BY_STATUS,
     STATUS_APPROACHING, STATUS_CONFIRMED, STATUS_EXECUTING, STATUS_EXPIRED,
-    STATUS_OPEN, STATUS_REJECTED,
+    STATUS_OPEN, STATUS_REJECTED, STATUS_AUTHORIZED, STATUS_ORDER_SUBMITTED,
+    STATUS_FILL_VERIFIED, STATUS_POSITION_VERIFIED, STATUS_EVENT_CONSUMED,
+    STATUS_PERSISTENCE_EXCEPTION, CONSUMPTION_CONSUMED, CONSUMPTION_IDEMPOTENT,
+    CONSUMPTION_CONFLICT, CONSUMPTION_MISSING_EVENT,
+    CONSUMPTION_MISSING_TRADE_ID, CONSUMPTION_PERSISTENCE_ERROR,
 )
 try:
     from roro_resource_manager import ResourceManager
@@ -12170,6 +12222,8 @@ def _cross_market_state():
     unresolved = bool(
         STATE.get("execution_unresolved") or STATE.get("close_reconciliation_required")
         or STATE.get("recovery_hold") or globals().get("RECOVERY_BLOCK_ENTRIES", False)
+        or STATE.get("entry_event_persistence_failed")
+        or STATE.get("entry_event_consumption_pending")
     )
     flat_states = {"FLAT", "CLOSED", "PAPER_RECONCILED_FLAT", "RECONCILED_FLAT"}
     if unresolved:
@@ -12183,7 +12237,10 @@ def _cross_market_state():
     return {
         "position_state": normalized,
         "pending_order": unresolved,
-        "conflicting_order": bool(STATE.get("entry_event_persistence_failed")),
+        "conflicting_order": bool(
+            STATE.get("entry_event_persistence_failed")
+            or STATE.get("entry_event_consumption_pending")
+        ),
     }
 
 
@@ -12282,6 +12339,224 @@ def _sync_cross_events_from_watchlist(now_ms=None):
     return authorized_count
 
 
+_CROSS_EXECUTION_STAGES = {
+    STATUS_EXECUTING, STATUS_ORDER_SUBMITTED, STATUS_FILL_VERIFIED,
+    STATUS_POSITION_VERIFIED,
+}
+
+
+def _cross_consumption_failure(reason, *, persistence=False):
+    """Fail closed without disturbing an already adopted exchange position."""
+    STATE["entry_event_consumption_pending"] = True
+    if persistence:
+        STATE["entry_event_persistence_failed"] = True
+    globals()["RECOVERY_BLOCK_ENTRIES"] = True
+    log_execution(f"[CROSS_ENTRY_GUARD] CRITICAL: {reason}; new entries blocked", "ERROR")
+
+
+def _mark_cross_stage(status, *, event_id=None, trade_id=None,
+                      execution_state=None, reason=""):
+    """Persist one explicit cross lifecycle stage; fail closed if unavailable."""
+    ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
+    cross = ctx.get("cross_event") if isinstance(ctx.get("cross_event"), dict) else {}
+    event_id = str(event_id or cross.get("event_id") or ctx.get("cross_event_id") or "").strip()
+    if not event_id:
+        return False
+    try:
+        store = get_cross_event_store()
+        if status in _CROSS_EXECUTION_STAGES:
+            return bool(store.mark_execution(
+                event_id, status, trade_id=trade_id,
+                execution_state=execution_state, reason=reason,
+            ))
+        store.mark_status(event_id, status, reason)
+        return True
+    except Exception as exc:
+        _cross_consumption_failure(
+            f"could not persist lifecycle stage {status} for {event_id}: "
+            f"{type(exc).__name__}: {exc}", persistence=True,
+        )
+        return False
+
+
+def _verified_cross_execution():
+    """Only a verified fill/position may consume a cross or durable event."""
+    if not STATE.get("open") or not STATE.get("trade_id"):
+        return False
+    if (STATE.get("execution_unresolved") or STATE.get("recovery_hold")
+            or STATE.get("entry_event_persistence_failed")
+            or STATE.get("entry_event_consumption_pending")
+            or globals().get("RECOVERY_BLOCK_ENTRIES", False)):
+        return False
+    qty = safe_float(STATE.get("qty"), 0.0)
+    entry = safe_float(STATE.get("entry"), 0.0)
+    if qty <= 0 or entry <= 0:
+        return False
+    if PAPER_MODE:
+        return str(STATE.get("entry_execution_state") or "PAPER_SIMULATED").upper() == "PAPER_SIMULATED"
+    if not MODE_LIVE:
+        return False
+    return bool(
+        str(STATE.get("entry_execution_state") or "").upper() == "FILLED"
+        and str(STATE.get("entry_exchange_order_id") or "").strip()
+        and str(STATE.get("native_sl_status") or "").upper() == "VERIFIED"
+    )
+
+
+def _consume_verified_cross_events(event_id, trade_id, durable_event_id):
+    """Consume both one-time markers only after verified execution."""
+    marker = str(trade_id or "").strip()
+    durable = str(durable_event_id or "").strip()
+    if not marker or not event_id or not durable:
+        _cross_consumption_failure(
+            f"verified execution has incomplete event identity cross={event_id} "
+            f"durable={durable} trade={marker or 'MISSING'}", persistence=True,
+        )
+        return False
+    try:
+        consumption = get_cross_event_store().consume_exact(event_id, marker)
+    except Exception as exc:
+        _cross_consumption_failure(
+            f"cross event consumption failed for {event_id}: {type(exc).__name__}: {exc}",
+            persistence=True,
+        )
+        return False
+    if consumption.status not in {CONSUMPTION_CONSUMED, CONSUMPTION_IDEMPOTENT}:
+        _cross_consumption_failure(
+            f"cross event {event_id} returned {consumption.status} for trade {marker}",
+            persistence=consumption.status == CONSUMPTION_PERSISTENCE_ERROR,
+        )
+        return False
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    if journal is None:
+        _cross_consumption_failure("trade journal unavailable for durable signal consumption",
+                                   persistence=True)
+        return False
+    try:
+        get_trade_id = getattr(journal, "get_event_trade_id", None)
+        previous = get_trade_id(durable) if callable(get_trade_id) else None
+        if previous and str(previous) != marker:
+            _cross_consumption_failure(
+                f"durable signal {durable} belongs to trade {previous}, not {marker}")
+            return False
+        if previous and str(previous) == marker:
+            journal_ok = True
+        elif not callable(get_trade_id) and journal.is_event_consumed(durable):
+            _cross_consumption_failure(f"cannot prove ownership of durable signal {durable}")
+            return False
+        else:
+            journal_ok = bool(journal.consume_event(durable, marker))
+        if not journal_ok:
+            _cross_consumption_failure(f"durable signal {durable} could not be consumed by {marker}",
+                                       persistence=True)
+            return False
+    except Exception as exc:
+        _cross_consumption_failure(
+            f"durable signal consumption failed for {durable}: {type(exc).__name__}: {exc}",
+            persistence=True,
+        )
+        return False
+    return True
+
+
+def _reconcile_cross_event_consumption(trade_id, *, saved_state=None, journal_row=None,
+                                       verified=True):
+    """Finish cross-event consumption after a restart proved a real fill."""
+    saved = dict(saved_state or {})
+    row = dict(journal_row or {})
+    cross = saved.get("cross_event") if isinstance(saved.get("cross_event"), dict) else {}
+    event_id = str(saved.get("cross_event_id") or cross.get("event_id") or "").strip()
+    durable = str(saved.get("durable_event_id") or "").strip()
+    entry_type = str(saved.get("entry_type") or row.get("setup_type") or "").upper()
+    if not verified:
+        _cross_consumption_failure(
+            f"recovered trade {trade_id} has unconsumed event {event_id or durable or 'UNKNOWN'} "
+            "without verified fill/position/protection")
+        return False
+    if not event_id:
+        if "EMA9_VWAP_CROSS" in entry_type:
+            _cross_consumption_failure(
+                f"recovered cross trade {trade_id} has no cross event identity")
+            return False
+        # Non-cross entries still have one durable closed-candle signal. A
+        # restart may only clear its pending marker after proving ownership.
+        if durable:
+            journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+            if journal is None:
+                _cross_consumption_failure(
+                    f"trade journal unavailable for recovered signal {durable}", persistence=True)
+                return False
+            try:
+                get_trade_id = getattr(journal, "get_event_trade_id", None)
+                previous = get_trade_id(durable) if callable(get_trade_id) else None
+                if previous and str(previous) != str(trade_id):
+                    _cross_consumption_failure(
+                        f"durable signal {durable} belongs to trade {previous}, not recovered {trade_id}")
+                    return False
+                if not previous and not journal.consume_event(durable, trade_id):
+                    _cross_consumption_failure(
+                        f"recovered signal {durable} could not be consumed by {trade_id}",
+                        persistence=True,
+                    )
+                    return False
+            except Exception as exc:
+                _cross_consumption_failure(
+                    f"recovered signal consumption failed for {durable}: {type(exc).__name__}: {exc}",
+                    persistence=True,
+                )
+                return False
+        STATE["event_consumption_status"] = "CONSUMED"
+        STATE["entry_event_consumption_pending"] = False
+        return True
+    journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+    get_trade_id = getattr(journal, "get_event_trade_id", None) if journal else None
+    journal_owner = str(get_trade_id(durable) or "") if callable(get_trade_id) and durable else ""
+    state = get_cross_event_store().get_state(event_id) or {}
+    consumed = str(state.get("consumed_trade_id") or "").strip()
+    if consumed and consumed != str(trade_id):
+        _cross_consumption_failure(
+            f"cross event {event_id} belongs to trade {consumed}, not recovered {trade_id}")
+        return False
+    if journal_owner and journal_owner != str(trade_id):
+        _cross_consumption_failure(
+            f"durable signal {durable} belongs to trade {journal_owner}, not recovered {trade_id}")
+        return False
+    if consumed and journal_owner == str(trade_id):
+        _mark_cross_stage(STATUS_OPEN, event_id=event_id, trade_id=trade_id,
+                          reason="verified_execution_reconciled")
+        STATE["event_consumption_status"] = "CONSUMED"
+        STATE["entry_event_consumption_pending"] = False
+        STATE["entry_event_persistence_failed"] = False
+        return True
+    if not _consume_verified_cross_events(event_id, trade_id, durable):
+        return False
+    _mark_cross_stage(STATUS_OPEN, event_id=event_id, trade_id=trade_id,
+                      reason="verified_execution_reconciled")
+    STATE["event_consumption_status"] = "CONSUMED"
+    STATE["entry_event_consumption_pending"] = False
+    STATE["entry_event_persistence_failed"] = False
+    log_execution(f"[CROSS_ENTRY_RECOVERY] event={event_id} trade={trade_id} reconciled and consumed",
+                  "SUCCESS")
+    return True
+
+
+def _has_unresolved_cross_execution_events():
+    """A restart cannot clear entry blocks while an execution has no consumer."""
+    try:
+        candidates = get_cross_event_store().execution_recovery_candidates()
+    except Exception as exc:
+        log_execution(f"[CROSS_ENTRY_RECOVERY] event store unavailable: {type(exc).__name__}: {exc}",
+                      "ERROR")
+        return True
+    if candidates:
+        log_execution(
+            f"[CROSS_ENTRY_RECOVERY] {len(candidates)} cross event(s) have execution attempts "
+            "without confirmed consumption; new entries blocked", "ERROR",
+        )
+        return True
+    return False
+
+
 def _try_cross_event_entries():
     """Run the real authorization -> execute_entry path for READY cross events."""
     global _INSTITUTIONAL_ENTRY_CONTEXT
@@ -12372,6 +12647,12 @@ def _try_cross_event_entries():
                 "sizing_eligible_strong": sizing_class == "SNIPER",
             }
             reason = f"EMA9_VWAP_CROSS_AUTHORIZED | event={event.event_id} | ADX={event.adx:.2f}"
+            if not _mark_cross_stage(STATUS_AUTHORIZED, event_id=event.event_id,
+                                     reason="all_mandatory_gates_passed"):
+                continue
+            if not _mark_cross_stage(STATUS_EXECUTING, event_id=event.event_id,
+                                     reason="pre_order_execution_lock"):
+                continue
             try:
                 ok = execute_entry(
                     event.side, exchange_sym, price, float(stop["price"]), float(tp1), float(tp2),
@@ -12382,16 +12663,28 @@ def _try_cross_event_entries():
             finally:
                 _INSTITUTIONAL_ENTRY_CONTEXT = None
             if ok:
-                if STATE.get("entry_event_persistence_failed") or globals().get("RECOVERY_BLOCK_ENTRIES", False):
+                consumed = False
+                try:
+                    consumed = store.is_consumed(event.event_id)
+                except Exception as exc:
+                    _cross_consumption_failure(
+                        f"cannot verify consumption of {event.event_id}: {type(exc).__name__}: {exc}",
+                        persistence=True,
+                    )
+                if (not consumed or STATE.get("entry_event_persistence_failed")
+                        or STATE.get("entry_event_consumption_pending")
+                        or globals().get("RECOVERY_BLOCK_ENTRIES", False)):
                     item["watchlist_status"] = STATUS_REJECTED
                     item["watchlist_icon"] = ICON_BY_STATUS[STATUS_REJECTED]
                     item["authorization_reason"] = "cross_event_persistence_failed_after_fill"
                     log_execution(
-                        f"[CROSS_ENTRY] CRITICAL: {event.event_id} filled but event persistence failed; "
-                        "new entries remain blocked", "ERROR",
+                        f"[CROSS_ENTRY] CRITICAL: {event.event_id} filled but verified event "
+                        "consumption was not confirmed; new entries remain blocked", "ERROR",
                     )
                     return False
-                store.consume(event.event_id, str(STATE.get("trade_id") or ""))
+                _mark_cross_stage(STATUS_OPEN, event_id=event.event_id,
+                                  trade_id=str(STATE.get("trade_id") or ""),
+                                  reason="verified_execution_consumed")
                 item["entry_authorized"] = False
                 item["watchlist_status"] = STATUS_OPEN
                 item["watchlist_icon"] = ICON_BY_STATUS[STATUS_OPEN]
@@ -13949,6 +14242,19 @@ def _restore_trade_from_journal(position, journal_row):
         else:
             STATE["native_sl_status"] = "VERIFIED"
 
+        # The exchange position, fill and native stop are now proven. Cross-event
+        # markers must be reconciled with this same trade before entries unlock.
+        try:
+            if not _reconcile_cross_event_consumption(
+                STATE.get("trade_id"), saved_state=STATE, journal_row=row, verified=True,
+            ):
+                return _recovery_hold("cross_event_consumption_unverified", symbol=symbol,
+                                      trade_id=STATE.get("trade_id"))
+        except Exception as exc:
+            return _recovery_hold(
+                f"cross_event_reconciliation_exception:{type(exc).__name__}:{exc}",
+                symbol=symbol, trade_id=STATE.get("trade_id"))
+
         # Persist the recovered, exchange-confirmed state before unlocking management.
         STATE["recovery_hold"] = False
         STATE["recovery_reason"] = None
@@ -14060,6 +14366,11 @@ def startup_trade_recovery():
         if not rows:
             paper["position"] = None
             MEMORY["position_status"] = "FLAT"
+            unresolved_cross = _has_unresolved_cross_execution_events()
+            if unresolved_cross:
+                MEMORY["recovery_status"] = "PAPER_CROSS_EVENT_EXECUTION_UNRESOLVED"
+                RECOVERY_BLOCK_ENTRIES = True
+                return False
             MEMORY["recovery_status"] = "PAPER_RECONCILED_FLAT"
             RECOVERY_BLOCK_ENTRIES = False
             return True
@@ -14089,6 +14400,10 @@ def startup_trade_recovery():
             finalize_trade_with_reality(symbol, close_reason=str(saved.get("last_close_reason") or "PAPER_CLOSE_RECOVERED"))
             paper["position"] = None
             MEMORY["position_status"] = "FLAT"
+            if _has_unresolved_cross_execution_events():
+                MEMORY["recovery_status"] = "PAPER_CROSS_EVENT_EXECUTION_UNRESOLVED"
+                RECOVERY_BLOCK_ENTRIES = True
+                return False
             MEMORY["recovery_status"] = "PAPER_CLOSED_TRADE_FINALIZED_AFTER_RESTART"
             RECOVERY_BLOCK_ENTRIES = False
             log_execution(f"[PAPER_RECOVERY] Finalized verified pre-restart close for {symbol}; no duplicate close action", "SUCCESS")
@@ -14121,6 +14436,20 @@ def startup_trade_recovery():
                       "tp1_price": tp1, "tp2_price": tp2, "exchange_state": "OPEN",
                       "recovery_hold": False, "execution_unresolved": False,
                       "close_reconciliation_required": False, "close_verified": False})
+        try:
+            if not _reconcile_cross_event_consumption(
+                trade_id, saved_state=saved, journal_row=row, verified=True,
+            ):
+                MEMORY["position_status"] = "OPEN_RECOVERY_PENDING"
+                MEMORY["recovery_status"] = "PAPER_CROSS_EVENT_CONSUMPTION_PENDING"
+                RECOVERY_BLOCK_ENTRIES = True
+                return False
+        except Exception as exc:
+            MEMORY["position_status"] = "OPEN_RECOVERY_PENDING"
+            MEMORY["recovery_status"] = "PAPER_CROSS_EVENT_RECONCILIATION_ERROR"
+            log_execution(f"[PAPER_RECOVERY] cross event reconciliation failed: {exc}", "ERROR")
+            RECOVERY_BLOCK_ENTRIES = True
+            return False
         paper["position"] = {"side": side, "entry": entry, "qty": initial_qty,
                              "remaining_qty": remaining_qty, "recovered": True, "trade_id": trade_id}
         TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": side,
@@ -14179,6 +14508,10 @@ def startup_trade_recovery():
             except Exception as exc:
                 log_execution(f"[RECOVERY] close diagnosis/finalization pending: {exc}", "WARN")
         MEMORY["position_status"] = "FLAT"
+        if _has_unresolved_cross_execution_events():
+            MEMORY["recovery_status"] = "CROSS_EVENT_EXECUTION_UNRESOLVED"
+            RECOVERY_BLOCK_ENTRIES = True
+            return False
         MEMORY["recovery_status"] = "RECONCILED_FLAT"
         RECOVERY_BLOCK_ENTRIES = False
         return True
@@ -14403,54 +14736,84 @@ _original_execute_entry_for_journal = execute_entry
 def execute_entry(*args, **kwargs):
     with _ENTRY_EVENT_EXECUTION_LOCK:
         globals()["_LAST_EXECUTION_GATE_RESULT"] = {}
+        ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
         result = _original_execute_entry_for_journal(*args, **kwargs)
         gate = globals().get("_LAST_EXECUTION_GATE_RESULT") or {}
-        event_id = str(gate.get("durable_event_id") or "").strip()
+        durable_event_id = str(gate.get("durable_event_id")
+                               or STATE.get("durable_event_id") or "").strip()
         journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
+        cross_entry = str(ctx.get("entry_source") or "") == "EMA9_VWAP_CROSS_AUTHORIZED"
+        journal_started = False
         if result and STATE.get("open"):
-            ctx = globals().get("_INSTITUTIONAL_ENTRY_CONTEXT") or {}
-            if str(ctx.get("entry_source") or "") == "EMA9_VWAP_CROSS_AUTHORIZED":
-                cross_event_id = str((ctx.get("cross_event") or {}).get("event_id") or "")
-                trade_id = str(STATE.get("trade_id") or "")
-                if not cross_event_id:
-                    STATE["entry_event_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution("[CROSS_ENTRY_GUARD] CRITICAL: verified entry has no cross event identity", "ERROR")
+            journal_started = _persist_trade_journal_start(ctx.get("setup_type"))
+            trade_id = str(STATE.get("trade_id") or "")
+            if cross_entry:
+                cross_event_id = str(
+                    (ctx.get("cross_event") or {}).get("event_id")
+                    or ctx.get("cross_event_id") or ""
+                ).strip()
+                if not cross_event_id or not trade_id:
+                    _cross_consumption_failure(
+                        f"verified entry has incomplete cross identity event={cross_event_id} "
+                        f"trade={trade_id or 'MISSING'}", persistence=True,
+                    )
+                elif not _verified_cross_execution():
+                    _cross_consumption_failure(
+                        f"cross event {cross_event_id} has no verified fill/position/protection; "
+                        "event remains unconsumed",
+                    )
+                    _mark_cross_stage(STATUS_PERSISTENCE_EXCEPTION, event_id=cross_event_id,
+                                      trade_id=trade_id, reason="unverified_execution")
                 else:
-                    try:
-                        if not get_cross_event_store().consume(cross_event_id, trade_id):
-                            STATE["entry_event_persistence_failed"] = True
-                            globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                            log_execution(
-                                f"[CROSS_ENTRY_GUARD] CRITICAL: verified entry {trade_id} could not consume "
-                                f"cross event {cross_event_id}; new entries blocked", "ERROR",
-                            )
-                    except Exception as exc:
-                        STATE["entry_event_persistence_failed"] = True
-                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                        log_execution(
-                            f"[CROSS_ENTRY_GUARD] CRITICAL: cross event consumption failed for "
-                            f"{cross_event_id}: {type(exc).__name__}: {exc}; new entries blocked", "ERROR",
+                    if not _mark_cross_stage(
+                        STATUS_ORDER_SUBMITTED, event_id=cross_event_id, trade_id=trade_id,
+                        execution_state=STATE.get("entry_execution_state"),
+                        reason=str(STATE.get("entry_exchange_order_id") or "PAPER_SIMULATED"),
+                    ):
+                        return result
+                    if not _mark_cross_stage(
+                        STATUS_FILL_VERIFIED, event_id=cross_event_id, trade_id=trade_id,
+                        execution_state=STATE.get("entry_execution_state"),
+                        reason=f"qty={safe_float(STATE.get('qty'), 0.0)}",
+                    ):
+                        return result
+                    if not _mark_cross_stage(
+                        STATUS_POSITION_VERIFIED, event_id=cross_event_id, trade_id=trade_id,
+                        reason=f"symbol={STATE.get('current_symbol')} side={STATE.get('side')}",
+                    ):
+                        return result
+                    snapshot_ok = _persist_trade_journal_snapshot(force=True)
+                    if not (journal_started and snapshot_ok):
+                        _cross_consumption_failure(
+                            f"verified cross entry {trade_id} could not persist journal checkpoint "
+                            f"(start={journal_started}, snapshot={snapshot_ok})", persistence=True,
                         )
-            _persist_trade_journal_start(ctx.get("setup_type"))
-            if event_id and journal is not None:
-                trade_id = str(STATE.get("trade_id") or "")
+                        _mark_cross_stage(STATUS_PERSISTENCE_EXCEPTION, event_id=cross_event_id,
+                                          trade_id=trade_id, reason="journal_checkpoint_failed")
+                    elif _consume_verified_cross_events(cross_event_id, trade_id, durable_event_id):
+                        _mark_cross_stage(STATUS_OPEN, event_id=cross_event_id,
+                                          trade_id=trade_id, reason="verified_execution_consumed")
+                        STATE["event_consumption_status"] = "CONSUMED"
+                        STATE["entry_event_consumption_pending"] = False
+                        STATE["entry_event_persistence_failed"] = False
+            if not cross_entry and durable_event_id and journal is not None and trade_id:
                 try:
-                    if not trade_id or not journal.consume_event(event_id, trade_id):
-                        STATE["entry_event_persistence_failed"] = True
-                        globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                        log_execution(
-                            f"[ENTRY_EVENT_GUARD] CRITICAL: verified entry {trade_id or 'NO_TRADE_ID'} "
-                            f"but could not durably consume signal {event_id}; new entries blocked",
-                            "ERROR",
+                    get_trade_id = getattr(journal, "get_event_trade_id", None)
+                    previous = get_trade_id(durable_event_id) if callable(get_trade_id) else None
+                    if previous and str(previous) != trade_id:
+                        _cross_consumption_failure(
+                            f"durable signal {durable_event_id} belongs to trade {previous}")
+                    elif previous or journal.consume_event(durable_event_id, trade_id):
+                        STATE["entry_event_consumption_pending"] = False
+                    else:
+                        _cross_consumption_failure(
+                            f"verified entry {trade_id} could not durably consume "
+                            f"signal {durable_event_id}", persistence=True,
                         )
                 except Exception as exc:
-                    STATE["entry_event_persistence_failed"] = True
-                    globals()["RECOVERY_BLOCK_ENTRIES"] = True
-                    log_execution(
-                        f"[ENTRY_EVENT_GUARD] CRITICAL: durable signal consumption failed for "
-                        f"{event_id}: {type(exc).__name__}: {exc}; new entries blocked",
-                        "ERROR",
+                    _cross_consumption_failure(
+                        f"durable signal consumption failed for {durable_event_id}: "
+                        f"{type(exc).__name__}: {exc}", persistence=True,
                     )
         return result
 

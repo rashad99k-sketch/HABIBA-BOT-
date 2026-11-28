@@ -29,26 +29,39 @@ MIN_ENTRY_ADX = 18.0
 DEFAULT_EVENT_TTL_SECONDS = 3 * 900  # three closed 15-minute candles
 MAX_ZONE_DISTANCE_ATR = 1.5
 MAX_ZONE_AGE_BARS = 48
+CROSS_TIMEFRAME_SECONDS = 900  # ggp_institutional_bridge.TIMEFRAME_SECONDS
 
 # Actual backend states. These are never score-derived.
 STATUS_APPROACHING = "CROSS_APPROACHING"
 STATUS_CONFIRMED = "CROSS_CONFIRMED"
 STATUS_ANALYZING = "INSTITUTIONAL_ANALYSIS"
 STATUS_READY = "READY"
+STATUS_AUTHORIZED = "ENTRY_AUTHORIZED"
 STATUS_EXECUTING = "EXECUTING"
+STATUS_ORDER_SUBMITTED = "ORDER_SUBMITTED"
+STATUS_FILL_VERIFIED = "FILL_VERIFIED"
+STATUS_POSITION_VERIFIED = "POSITION_VERIFIED"
+STATUS_EVENT_CONSUMED = "EVENT_CONSUMED"
 STATUS_OPEN = "POSITION_OPEN"
 STATUS_REJECTED = "REJECTED"
 STATUS_EXPIRED = "EXPIRED"
+STATUS_PERSISTENCE_EXCEPTION = "PERSISTENCE_RECOVERY_EXCEPTION"
 
 ICON_BY_STATUS = {
     STATUS_APPROACHING: "\U0001F7E1",
     STATUS_CONFIRMED: "\U0001F535",
     STATUS_ANALYZING: "\U0001F7E3",
     STATUS_READY: "\U0001F7E2",
+    STATUS_AUTHORIZED: "\U0001F7E2",
     STATUS_EXECUTING: "\u26A1",
+    STATUS_ORDER_SUBMITTED: "\u26A1",
+    STATUS_FILL_VERIFIED: "\u26A1",
+    STATUS_POSITION_VERIFIED: "\u26A1",
+    STATUS_EVENT_CONSUMED: "\u2705",
     STATUS_OPEN: "\u2705",
     STATUS_REJECTED: "\U0001F534",
     STATUS_EXPIRED: "\u26AA",
+    STATUS_PERSISTENCE_EXCEPTION: "\U0001F534",
 }
 
 # Mandatory safety (A), setup-specific confirmation (B), optional evidence (C).
@@ -72,6 +85,7 @@ SMC_CONDITION_CLASSIFICATION = {
     "risk_gate_failed": "A",
     # Explicit mandatory gate names used by evaluate_cross_authorization.
     "cross_confirmed_closed_candle": "A",
+    "cross_math_proof": "A",
     "event_fresh_unconsumed": "A",
     "direction_preserved": "A",
     "adx_at_least_18": "A",
@@ -99,6 +113,23 @@ PENDING_ZONE_REASONS = {
     "no_fresh_nearby_order_block_or_fvg",
     "zone_unknown",
 }
+
+# Exact outcomes of an event-consumption attempt. A `False` from consume() is
+# deliberately ambiguous; recovery must distinguish idempotency from failure.
+CONSUMPTION_CONSUMED = "EVENT_CONSUMED"
+CONSUMPTION_IDEMPOTENT = "ALREADY_CONSUMED_SAME_TRADE"
+CONSUMPTION_CONFLICT = "CONSUMED_BY_DIFFERENT_TRADE"
+CONSUMPTION_MISSING_EVENT = "EVENT_MISSING"
+CONSUMPTION_MISSING_TRADE_ID = "MISSING_VERIFIED_TRADE_ID"
+CONSUMPTION_PERSISTENCE_ERROR = "PERSISTENCE_FAILURE"
+
+
+@dataclass(frozen=True)
+class ConsumptionResult:
+    status: str
+    trade_id: str = ""
+    ok: bool = False
+    idempotent: bool = False
 
 
 def watchlist_status_for_decision(decision: Mapping[str, Any]) -> str:
@@ -150,6 +181,27 @@ def _as_float(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def cross_math_proof(event: Mapping[str, Any]) -> bool:
+    """Re-validate the crossover inequality from the upstream closed-candle snapshot.
+
+    This does not recompute EMA9 or Session VWAP. The bridge already computes
+    both from validated closed candles; this gate proves that the values carried
+    into the immutable event really form the claimed mathematical crossover.
+    """
+    current_ema = _as_float(event.get("ema9"))
+    current_vwap = _as_float(event.get("vwap"))
+    previous_ema = _as_float(event.get("previous_ema9"))
+    previous_vwap = _as_float(event.get("previous_vwap"))
+    if current_ema is None or current_vwap is None or previous_ema is None or previous_vwap is None:
+        return False
+    direction = str(event.get("cross_direction") or "").strip().upper()
+    if direction == "BULLISH":
+        return previous_ema <= previous_vwap and current_ema > current_vwap
+    if direction == "BEARISH":
+        return previous_ema >= previous_vwap and current_ema < current_vwap
+    return False
+
+
 @dataclass(frozen=True)
 class CrossEvent:
     """Immutable, uniquely identified EMA9/Session-VWAP crossover event."""
@@ -188,8 +240,15 @@ def build_cross_event(
     data_freshness: Any = "FRESH",
     detection_timestamp: Any = None,
     now_ms: Any = None,
+    proof_timestamp: Any = None,
+    timeframe_seconds: Any = None,
 ) -> Optional[CrossEvent]:
-    """Build a validated immutable event. Returns None for non-confirmed crosses."""
+    """Build a validated immutable event. Returns None for non-confirmed crosses.
+
+    The supplied EMA9/Session-VWAP values must prove the claimed transition from
+    the previous closed candle to the current closed candle. No indicator is
+    recalculated here; the bridge remains the single calculation authority.
+    """
     status = str(cross_status or "").strip().upper()
     if status not in {"CONFIRMED", "CROSS_CONFIRMED"}:
         return None
@@ -211,9 +270,24 @@ def build_cross_event(
         return None
     now_value = int(now_ms if now_ms is not None else time.time() * 1000)
     detected = float(detection_timestamp if detection_timestamp is not None else time.time())
-    closed = candle_ts < now_value
+    tf_seconds = _as_float(timeframe_seconds)
+    tf_seconds = int(tf_seconds) if tf_seconds is not None else CROSS_TIMEFRAME_SECONDS
+    if tf_seconds != CROSS_TIMEFRAME_SECONDS:
+        return None
+    closed = candle_ts + tf_seconds * 1000 <= now_value
     if not closed:
         return None
+    proof = {
+        "ema9": ema_value, "vwap": vwap_value,
+        "previous_ema9": _as_float(previous_ema9), "previous_vwap": _as_float(previous_vwap),
+        "cross_direction": direction,
+    }
+    if not cross_math_proof(proof):
+        return None
+    if proof_timestamp is not None:
+        proof_ts = _as_float(proof_timestamp)
+        if proof_ts is None or int(proof_ts) != candle_ts:
+            return None
     return CrossEvent(
         event_id=event_id,
         symbol=str(symbol),
@@ -233,29 +307,50 @@ def build_cross_event(
 
 
 def build_cross_event_from_analysis(row: Mapping[str, Any], *, now_ms: Any = None) -> Optional[CrossEvent]:
-    """Convert an institutional-bridge analysis row into a CrossEvent."""
+    """Convert an institutional-bridge analysis row into a CrossEvent.
+
+    The bridge derives `cross_status` only from its EMA9/Session-VWAP crossover
+    proof. Rows carrying another trigger (for example EMA50/VWAP proximity) are
+    rejected here before they can become executable cross events.
+    """
     if str(row.get("cross_status") or "").strip().upper() not in {"CONFIRMED", "CROSS_CONFIRMED"}:
+        return None
+    trigger = str(row.get("cross_trigger") or row.get("cross_source") or "EMA9_VWAP").strip().upper()
+    if trigger not in {"EMA9_VWAP", "EMA9VWAP", "EMA9_VWAP_CROSS"}:
         return None
     snapshot = row.get("indicator_snapshot") if isinstance(row.get("indicator_snapshot"), Mapping) else {}
     side = side_for_cross_direction(row.get("cross_direction")) or str(row.get("side") or "").upper()
+    proof_timestamp = snapshot.get("latest_closed_timestamp", snapshot.get("cross_candle_timestamp"))
+    timeframe_seconds = snapshot.get("timeframe_seconds", CROSS_TIMEFRAME_SECONDS)
+    try:
+        tf_value = int(float(timeframe_seconds)) if timeframe_seconds is not None else CROSS_TIMEFRAME_SECONDS
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if tf_value != CROSS_TIMEFRAME_SECONDS:
+        return None
     return build_cross_event(
         symbol=row.get("exchange_symbol") or row.get("symbol"),
         side=side,
-        candle_timestamp=row.get("cross_candle_timestamp"),
+        candle_timestamp=row.get("cross_candle_timestamp", proof_timestamp),
         ema9=row.get("ema9", snapshot.get("ema9")),
-        previous_ema9=snapshot.get("previous_ema9"),
+        previous_ema9=row.get("previous_ema9", snapshot.get("previous_ema9")),
         vwap=row.get("vwap", snapshot.get("vwap")),
-        previous_vwap=snapshot.get("previous_vwap"),
+        previous_vwap=row.get("previous_vwap", snapshot.get("previous_vwap")),
         adx=row.get("adx"),
         cross_status=row.get("cross_status"),
         data_freshness=row.get("data_freshness", snapshot.get("quality")),
         now_ms=now_ms,
+        proof_timestamp=proof_timestamp,
+        timeframe_seconds=tf_value,
     )
 
 
 CROSS_FIELDS = (
     "cross_event_id", "cross_status", "cross_direction", "cross_candle_timestamp",
-    "cross_distance", "watchlist_status", "watchlist_icon", "watchlist_reason",
+    "cross_trigger", "cross_source", "cross_distance", "indicator_snapshot",
+    "previous_ema9", "previous_vwap",
+    "ema9", "vwap", "adx", "data_freshness",
+    "watchlist_status", "watchlist_icon", "watchlist_reason",
     "institutional_zone_decision", "zone_status", "zone_distance_atr", "stop_loss_status",
     "stop_loss_price", "entry_authorized", "authorization_reason", "decision_record",
     "decision_state", "entry_readiness", "trade_mode", "side_source",
@@ -296,9 +391,21 @@ def watchlist_row_for_event(event: CrossEvent) -> Dict[str, Any]:
         "cross_status": event.cross_status,
         "cross_direction": event.cross_direction,
         "cross_candle_timestamp": event.candle_timestamp,
+        "cross_trigger": "EMA9_VWAP",
         "ema9": event.ema9,
+        "previous_ema9": event.previous_ema9,
         "session_vwap": event.vwap,
         "vwap": event.vwap,
+        "previous_vwap": event.previous_vwap,
+        "indicator_snapshot": {
+            "ema9": event.ema9, "vwap": event.vwap,
+            "previous_ema9": event.previous_ema9, "previous_vwap": event.previous_vwap,
+            "latest_closed_timestamp": event.candle_timestamp,
+            "cross_candle_timestamp": event.candle_timestamp,
+            "timeframe_seconds": CROSS_TIMEFRAME_SECONDS,
+            "cross_status": event.cross_status, "cross_direction": event.cross_direction,
+            "quality": event.data_freshness,
+        },
         "adx": event.adx,
         "data_freshness": event.data_freshness,
         "watchlist_status": STATUS_CONFIRMED,
@@ -337,6 +444,9 @@ class CrossEventStore:
                 cross_status TEXT NOT NULL,
                 lifecycle_status TEXT NOT NULL,
                 consumed_trade_id TEXT,
+                execution_trade_id TEXT,
+                execution_state TEXT,
+                execution_status TEXT,
                 payload TEXT NOT NULL,
                 created_ts REAL NOT NULL
             );
@@ -349,6 +459,13 @@ class CrossEventStore:
                 created_ts REAL NOT NULL
             );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(cross_events)")}
+            for name, ddl in (
+                ("execution_trade_id", "TEXT"), ("execution_state", "TEXT"),
+                ("execution_status", "TEXT"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE cross_events ADD COLUMN {name} {ddl}")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -359,11 +476,22 @@ class CrossEventStore:
     def upsert(self, event: CrossEvent) -> None:
         payload = json.dumps(event.to_dict(), sort_keys=True)
         with self._lock, self._db() as db:
+            # A refresh must never roll an authorized/executing/consumed event
+            # back to CONFIRMED. Identity is stable, so only the original,
+            # pre-execution event payload may be replaced.
             db.execute(
                 "INSERT INTO cross_events (event_id, symbol, side, cross_direction, candle_timestamp, "
                 "detection_timestamp, adx, cross_status, lifecycle_status, payload, created_ts) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET "
-                "lifecycle_status=excluded.lifecycle_status, payload=excluded.payload",
+                "symbol=excluded.symbol, side=excluded.side, "
+                "cross_direction=excluded.cross_direction, "
+                "candle_timestamp=excluded.candle_timestamp, "
+                "lifecycle_status=CASE WHEN cross_events.consumed_trade_id IS NULL "
+                "AND cross_events.execution_status IS NULL THEN excluded.lifecycle_status "
+                "ELSE cross_events.lifecycle_status END, "
+                "payload=CASE WHEN cross_events.consumed_trade_id IS NULL "
+                "AND cross_events.execution_status IS NULL THEN excluded.payload "
+                "ELSE cross_events.payload END",
                 (event.event_id, event.symbol, event.side, event.cross_direction,
                  event.candle_timestamp, event.detection_timestamp, event.adx,
                  event.cross_status, event.lifecycle_status, payload, time.time()),
@@ -391,13 +519,100 @@ class CrossEventStore:
                 ).fetchall()
         return [json.loads(r[0]) for r in rows]
 
-    def mark_status(self, event_id: str, status: str, reason: str = "") -> None:
-        with self._lock, self._db() as db:
+    @staticmethod
+    def _payload_with_status(payload: Any, status: str) -> Optional[str]:
+        if not payload:
+            return None
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        parsed["lifecycle_status"] = status
+        return json.dumps(parsed, sort_keys=True)
+
+    def _set_lifecycle(self, db, event_id: str, status: str) -> None:
+        """Update both the indexed status and immutable-event payload."""
+        row = db.execute("SELECT payload FROM cross_events WHERE event_id=?", (event_id,)).fetchone()
+        payload = self._payload_with_status(row[0] if row else None, status)
+        if payload is None:
             db.execute("UPDATE cross_events SET lifecycle_status=? WHERE event_id=?", (status, event_id))
+        else:
+            db.execute(
+                "UPDATE cross_events SET lifecycle_status=?, payload=? WHERE event_id=?",
+                (status, payload, event_id),
+            )
+
+    def mark_status(self, event_id: str, status: str, reason: str = "") -> None:
+        """Persist one lifecycle transition, including inside the event payload."""
+        with self._lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._set_lifecycle(db, event_id, status)
             db.execute(
                 "INSERT INTO cross_event_history (event_id, status, reason, created_ts) VALUES (?,?,?,?)",
                 (event_id, status, reason, time.time()),
             )
+            db.execute("COMMIT")
+
+    def mark_execution(self, event_id: str, status: str, *, trade_id: Any = None,
+                       execution_state: Any = None, reason: str = "") -> bool:
+        """Record a durable execution stage before attempting order submission."""
+        marker = str(trade_id or "").strip()
+        state = str(execution_state or "").strip().upper() or None
+        with self._lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                "UPDATE cross_events SET execution_status=?, execution_state=COALESCE(?, execution_state), "
+                "execution_trade_id=COALESCE(?, execution_trade_id) WHERE event_id=?",
+                (status, state, marker or None, event_id),
+            )
+            if not cur.rowcount:
+                db.execute("ROLLBACK")
+                return False
+            self._set_lifecycle(db, event_id, status)
+            db.execute(
+                "INSERT INTO cross_event_history (event_id, status, reason, created_ts) VALUES (?,?,?,?)",
+                (event_id, status, reason or state or "", time.time()),
+            )
+            db.execute("COMMIT")
+            return True
+
+    def history(self, event_id: str) -> List[Dict[str, Any]]:
+        with self._lock, self._db() as db:
+            rows = db.execute(
+                "SELECT status, reason, created_ts FROM cross_event_history "
+                "WHERE event_id=? ORDER BY id", (event_id,)
+            ).fetchall()
+        return [{"status": r[0], "reason": r[1] or "", "created_ts": r[2]} for r in rows]
+
+    def get_state(self, event_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._db() as db:
+            row = db.execute(
+                "SELECT lifecycle_status, consumed_trade_id, execution_trade_id, execution_state, "
+                "execution_status FROM cross_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "lifecycle_status": row[0], "consumed_trade_id": row[1],
+            "execution_trade_id": row[2], "execution_state": row[3],
+            "execution_status": row[4],
+        }
+
+    def execution_recovery_candidates(self) -> List[Dict[str, Any]]:
+        """Events with an attempted execution but no confirmed consumption."""
+        with self._lock, self._db() as db:
+            rows = db.execute(
+                "SELECT event_id FROM cross_events WHERE consumed_trade_id IS NULL "
+                "AND (execution_trade_id IS NOT NULL OR execution_status IS NOT NULL) "
+                "ORDER BY candle_timestamp"
+            ).fetchall()
+        result = []
+        for (event_id,) in rows:
+            state = self.get_state(event_id) or {}
+            result.append({"event_id": event_id, **state})
+        return result
 
     def is_consumed(self, event_id: str) -> bool:
         with self._lock, self._db() as db:
@@ -406,39 +621,64 @@ class CrossEventStore:
             ).fetchone()
         return bool(row and row[0] is not None and str(row[0]) != "")
 
-    def consume(self, event_id: str, trade_id: str) -> bool:
-        marker = str(trade_id or "").strip() or f"CONSUMED:{event_id}"
+    def consume_exact(self, event_id: str, trade_id: str) -> ConsumptionResult:
+        """Consume one event only with the exact verified trade id.
+
+        Unlike the boolean wrapper, the result distinguishes an idempotent
+        repeat from a real persistence failure so the caller can fail closed
+        without treating an already-executed position as a new order.
+        """
+        marker = str(trade_id or "").strip()
+        if not marker:
+            return ConsumptionResult(CONSUMPTION_MISSING_TRADE_ID, "", False)
         with self._lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT consumed_trade_id FROM cross_events WHERE event_id=?", (event_id,)
-            ).fetchone()
-            if row is None:
-                db.execute("ROLLBACK")
-                return False
-            if row[0] is not None and str(row[0]) != "":
-                db.execute("ROLLBACK")
-                # Same trade re-confirming consumption after execution is safe.
-                return str(row[0]) == marker
-            db.execute(
-                "UPDATE cross_events SET consumed_trade_id=?, lifecycle_status=? WHERE event_id=?",
-                (marker, STATUS_OPEN, event_id),
-            )
-            db.execute(
-                "INSERT INTO cross_event_history (event_id, status, reason, created_ts) VALUES (?,?,?,?)",
-                (event_id, STATUS_OPEN, f"consumed_by:{marker}", time.time()),
-            )
-            db.execute("COMMIT")
-            return True
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT consumed_trade_id FROM cross_events WHERE event_id=?", (event_id,)
+                ).fetchone()
+                if row is None:
+                    db.execute("ROLLBACK")
+                    return ConsumptionResult(CONSUMPTION_MISSING_EVENT, marker, False)
+                previous = str(row[0] or "").strip()
+                if previous:
+                    db.execute("ROLLBACK")
+                    if previous == marker:
+                        return ConsumptionResult(CONSUMPTION_IDEMPOTENT, marker, True, True)
+                    return ConsumptionResult(CONSUMPTION_CONFLICT, marker, False)
+                db.execute(
+                    "UPDATE cross_events SET consumed_trade_id=?, "
+                    "execution_trade_id=?, execution_status=? WHERE event_id=?",
+                    (marker, marker, STATUS_EVENT_CONSUMED, event_id),
+                )
+                self._set_lifecycle(db, event_id, STATUS_EVENT_CONSUMED)
+                db.execute(
+                    "INSERT INTO cross_event_history (event_id, status, reason, created_ts) VALUES (?,?,?,?)",
+                    (event_id, STATUS_EVENT_CONSUMED, f"consumed_by:{marker}", time.time()),
+                )
+                db.execute("COMMIT")
+                return ConsumptionResult(CONSUMPTION_CONSUMED, marker, True)
+            except sqlite3.Error:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                return ConsumptionResult(CONSUMPTION_PERSISTENCE_ERROR, marker, False)
+
+    def consume(self, event_id: str, trade_id: str) -> bool:
+        """Backward-compatible boolean view of `consume_exact`."""
+        return self.consume_exact(event_id, trade_id).ok
 
     def expire_stale(self, *, now_ms: Any = None, ttl_seconds: int = DEFAULT_EVENT_TTL_SECONDS) -> int:
         now = int(now_ms if now_ms is not None else time.time() * 1000)
         cutoff = now - int(ttl_seconds) * 1000
         with self._lock, self._db() as db:
             rows = db.execute(
-                "SELECT event_id FROM cross_events WHERE consumed_trade_id IS NULL AND candle_timestamp < ? "
-                "AND lifecycle_status NOT IN (?,?)",
-                (cutoff, STATUS_REJECTED, STATUS_EXPIRED),
+                "SELECT event_id FROM cross_events WHERE consumed_trade_id IS NULL "
+                "AND execution_status IS NULL AND candle_timestamp < ? "
+                "AND lifecycle_status NOT IN (?,?,?,?,?,?)",
+                (cutoff, STATUS_REJECTED, STATUS_EXPIRED, STATUS_AUTHORIZED,
+                 STATUS_EXECUTING, STATUS_ORDER_SUBMITTED, STATUS_PERSISTENCE_EXCEPTION),
             ).fetchall()
             for (event_id,) in rows:
                 db.execute("UPDATE cross_events SET lifecycle_status=? WHERE event_id=?", (STATUS_EXPIRED, event_id))
@@ -475,71 +715,172 @@ def ingest_cross_event(
     return watchlist[key]
 
 
+_ZONE_DIRECTION_SOURCE = "SOURCE"
+_ZONE_DIRECTION_DERIVED = "DERIVED_STRUCTURAL"
+_ZONE_DIRECTION_UNKNOWN = "UNKNOWN"
+_ZONE_DIRECTION_CONTRADICTORY = "CONTRADICTORY"
+
+_OB_DEFINITION_DIRECTION = {
+    "BULLISH_LOW_TO_OPEN": "BULLISH",
+    "BEARISH_OPEN_TO_HIGH": "BEARISH",
+}
+_SR_KIND_DIRECTION = {"SUPPORT": "BULLISH", "RESISTANCE": "BEARISH"}
+_REJECTED_ORDER_BLOCK_STATUSES = {"INVALIDATED", "FULLY_MITIGATED"}
+
+
+def _resolve_zone_direction(zone: Mapping[str, Any], *, kind: str) -> tuple:
+    """Resolve a producer's real direction without ever inventing one from `side`.
+
+    Returns ``(status, direction, structural_derivation)``. An explicit source
+    direction wins; a canonical OB definition or SR type may be used only when
+    the source data itself supports the derivation. FVG boundaries alone are not
+    directional evidence. Any contradiction fails closed.
+    """
+    source = str(zone.get("direction") or "").strip().upper()
+    source = source if source in {"BULLISH", "BEARISH"} else ""
+    definition = str(zone.get("zone_definition") or "").strip().upper()
+    source_type = str(zone.get("type") or "").strip().upper()
+    source_kind = str(zone.get("kind") or "").strip().upper()
+    derived = ""
+
+    if kind == "ORDER_BLOCK":
+        derived = _OB_DEFINITION_DIRECTION.get(definition, "")
+        if source_kind and source_kind != "ORDER_BLOCK":
+            return _ZONE_DIRECTION_CONTRADICTORY, source or derived, derived
+    elif kind == "FVG":
+        if source_kind and source_kind != "FVG":
+            return _ZONE_DIRECTION_CONTRADICTORY, source, derived
+    elif kind in _SR_KIND_DIRECTION:
+        if source_type and source_type != kind:
+            return _ZONE_DIRECTION_CONTRADICTORY, source or _SR_KIND_DIRECTION.get(source_type, ""), derived
+        if source_kind and source_kind != kind:
+            return _ZONE_DIRECTION_CONTRADICTORY, source or _SR_KIND_DIRECTION.get(source_kind, ""), derived
+        derived = _SR_KIND_DIRECTION.get(source_type or source_kind, "")
+
+    if source and derived and source != derived:
+        return _ZONE_DIRECTION_CONTRADICTORY, source, derived
+    if source:
+        return _ZONE_DIRECTION_SOURCE, source, derived
+    if derived:
+        return _ZONE_DIRECTION_DERIVED, derived, derived
+    return _ZONE_DIRECTION_UNKNOWN, "", ""
+
+
+def _zone_availability_timestamp(zone: Mapping[str, Any], *, kind: str) -> Optional[int]:
+    """Use the first timestamp at which the producer could know the zone."""
+    keys = {
+        "ORDER_BLOCK": ("available_timestamp", "impulse_timestamp", "timestamp", "confirmed_at_timestamp"),
+        "FVG": ("available_timestamp", "timestamp", "confirmed_at_timestamp"),
+        "SUPPORT": ("available_timestamp", "confirmed_at_timestamp", "timestamp"),
+        "RESISTANCE": ("available_timestamp", "confirmed_at_timestamp", "timestamp"),
+    }.get(kind, ("available_timestamp", "confirmed_at_timestamp", "impulse_timestamp", "timestamp"))
+    for key in keys:
+        value = _as_float(zone.get(key))
+        if value is not None and math.isfinite(value) and value > 0:
+            return int(value)
+    return None
+
+
 def _normalize_zone(zone: Any, *, kind: str, side: str) -> Optional[Dict[str, Any]]:
+    """Copy producer zone data and add canonical, non-destructive aliases."""
     if not isinstance(zone, Mapping):
         return None
+    normalized = dict(zone)
+    source_direction = zone.get("source_direction", zone.get("direction"))
+    normalized["source_direction"] = (
+        str(source_direction).strip().upper() if source_direction is not None else None
+    )
     low = _as_float(zone.get("low", zone.get("lower")))
     high = _as_float(zone.get("high", zone.get("upper")))
-    if low is None or high is None:
-        return None
-    timestamp = zone.get("available_timestamp", zone.get("timestamp"))
-    return {
-        "kind": kind,
-        "low": low,
-        "high": high,
-        "direction": "BULLISH" if str(side).upper() == "BUY" else "BEARISH",
-        "status": str(zone.get("status") or "").upper(),
-        "strength": zone.get("strength"),
-        "zone_definition": str(zone.get("zone_definition") or "").upper(),
-        "size_atr": zone.get("size_atr"),
-        "available_timestamp": timestamp,
-    }
+    if low is not None:
+        normalized["low"] = low
+    if high is not None:
+        normalized["high"] = high
+    status = str(zone.get("status") or "").strip().upper()
+    if status:
+        normalized["status"] = status
+    strength = _as_float(zone.get("strength"))
+    if strength is not None:
+        normalized["strength"] = strength
+    size_atr = _as_float(zone.get("size_atr"))
+    if size_atr is not None:
+        normalized["size_atr"] = size_atr
+    available_timestamp = _zone_availability_timestamp(zone, kind=kind)
+    if available_timestamp is not None:
+        normalized["available_timestamp"] = available_timestamp
+
+    direction_status, direction, structural = _resolve_zone_direction(normalized, kind=kind)
+    normalized["kind"] = kind
+    normalized["direction_status"] = direction_status
+    normalized["derived_direction"] = structural or None
+    normalized["direction"] = direction or _ZONE_DIRECTION_UNKNOWN
+    normalized["evaluation_side"] = str(side or "").strip().upper()
+    normalized["source_kind"] = str(zone.get("kind") or zone.get("type") or "").strip().upper() or None
+    normalized["source_provenance"] = zone.get("source") or zone.get("source_definition") or None
+    return normalized
+
+
+def _zone_direction_precheck(zone: Mapping[str, Any], *, side: str) -> tuple:
+    """Fail closed before the central authority if producer direction is unusable."""
+    expected = {"BUY": "BULLISH", "SELL": "BEARISH"}.get(str(side or "").strip().upper())
+    if not expected:
+        return False, "unsupported_zone_or_side"
+    if str(zone.get("direction_status") or "") == _ZONE_DIRECTION_CONTRADICTORY:
+        return False, "zone_direction_contradictory"
+    direction = str(zone.get("direction") or "").strip().upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        return False, "zone_direction_unknown"
+    if direction != expected:
+        return False, "zone_direction_mismatch"
+    if zone.get("valid") is False:
+        return False, "zone_producer_invalid"
+    kind = str(zone.get("kind") or "").strip().upper()
+    status = str(zone.get("status") or "").strip().upper()
+    if kind == "ORDER_BLOCK" and status in _REJECTED_ORDER_BLOCK_STATUSES:
+        return False, "order_block_mitigated_or_invalidated"
+    return True, "zone_direction_confirmed"
 
 
 def evaluate_cross_zone(row: Mapping[str, Any], *, now_ms: Any = None) -> Dict[str, Any]:
     """Evaluate only the location of the confirmed crossover.
 
-    Reversal/MSS/sweep/retest evidence is not required here; it is classified
-    as optional or setup-specific evidence and cannot block a valid cross zone.
+    Direction comes from the confirmed crossover, not from the latest
+    institutional hypothesis. Producer zone direction/provenance is preserved;
+    contradictory, unknown or mitigated zones are excluded. Reversal/MSS/sweep/
+    retest evidence is optional and cannot block a valid cross zone.
     """
-    side = str(row.get("side") or "").upper()
+    side = side_for_cross_direction(row.get("cross_direction")) or str(row.get("side") or "").strip().upper()
     price = _as_float(row.get("price"))
     atr = _as_float(row.get("atr"))
     candle_ts = int(row.get("cross_candle_timestamp") or 0)
     if price is None or atr is None or atr <= 0 or candle_ts <= 0:
         return {"decision": "REJECTED", "valid": False, "reason": "invalid_zone_market_reference", "zones": []}
+    if side not in {"BUY", "SELL"}:
+        return {"decision": "REJECTED", "valid": False, "reason": "unsupported_zone_or_side", "zones": []}
 
     candidates: List[Dict[str, Any]] = []
     ob = _normalize_zone(row.get("order_block"), kind="ORDER_BLOCK", side=side)
     if ob:
-        ob["zone_definition"] = ob["zone_definition"] or (
-            "BULLISH_LOW_TO_OPEN" if side == "BUY" else "BEARISH_OPEN_TO_HIGH"
-        )
-        ob["strength"] = ob["strength"] if ob["strength"] is not None else 5
         candidates.append(ob)
     fvg = _normalize_zone(row.get("fvg"), kind="FVG", side=side)
     if fvg:
-        fvg["status"] = fvg["status"] or "UNFILLED"
-        fvg["size_atr"] = fvg["size_atr"] if fvg["size_atr"] is not None else 0.08
         candidates.append(fvg)
     sr = row.get("support_resistance") if isinstance(row.get("support_resistance"), Mapping) else {}
     sr_kind = "SUPPORT" if side == "BUY" else "RESISTANCE"
-    sr_level = None
-    levels = sr.get("supports") if side == "BUY" else sr.get("resistances")
-    if isinstance(levels, (list, tuple)) and levels:
-        first = levels[0]
-        sr_level = _as_float(first) if not isinstance(first, Mapping) else _as_float(first.get("price"))
-    if sr_level is not None and sr_level > 0:
-        width = max(atr * 0.25, price * 0.0002)
-        candidates.append({
-            "kind": sr_kind, "low": sr_level - width / 2, "high": sr_level + width / 2,
-            "direction": "BULLISH" if side == "BUY" else "BEARISH",
-            "status": "CONFIRMED", "strength": 5, "available_timestamp": candle_ts,
-        })
+    levels = sr.get("supports" if side == "BUY" else "resistances")
+    if isinstance(levels, (list, tuple)):
+        for raw in levels:
+            zone = _normalize_zone(raw, kind=sr_kind, side=side)
+            if zone:
+                candidates.append(zone)
 
     timeframe_ms = 900_000
     checked = []
     for zone in candidates:
+        direction_ok, direction_reason = _zone_direction_precheck(zone, side=side)
+        if not direction_ok:
+            checked.append({**zone, "valid": False, "reason": direction_reason})
+            continue
         verdict = validate_location_zone(
             zone, side, price, atr, candle_ts, timeframe_ms,
             max_age_bars=MAX_ZONE_AGE_BARS, max_distance_atr=MAX_ZONE_DISTANCE_ATR,
@@ -549,7 +890,7 @@ def evaluate_cross_zone(row: Mapping[str, Any], *, now_ms: Any = None) -> Dict[s
     if not valid_zones:
         reason = checked[0]["reason"] if checked else "no_fresh_nearby_order_block_or_fvg"
         return {
-            "decision": "REJECTED" if not checked else "WAITING",
+            "decision": "REJECTED" if checked else "WAITING",
             "valid": False,
             "reason": reason,
             "zones": checked,
@@ -563,6 +904,8 @@ def evaluate_cross_zone(row: Mapping[str, Any], *, now_ms: Any = None) -> Dict[s
         "reason": "crossover_zone_valid",
         "zones": checked,
         "selected_zone": best,
+        "zone_direction": best.get("direction"),
+        "zone_direction_status": best.get("direction_status"),
         "zone_distance_atr": best.get("distance_atr"),
     }
 
@@ -611,6 +954,9 @@ def evaluate_cross_authorization(
     gates["cross_confirmed_closed_candle"] = bool(event.closed_confirmed and event.cross_status == "CONFIRMED")
     reasons["cross_confirmed_closed_candle"] = "confirmed" if gates["cross_confirmed_closed_candle"] else "cross_not_confirmed"
 
+    gates["cross_math_proof"] = cross_math_proof(event.to_dict())
+    reasons["cross_math_proof"] = "ema9_vwap_inequality_verified" if gates["cross_math_proof"] else "cross_math_proof_missing"
+
     fresh = now - event.candle_timestamp <= DEFAULT_EVENT_TTL_SECONDS * 1000
     gates["event_fresh_unconsumed"] = bool(fresh and not (store or get_cross_event_store()).is_consumed(event.event_id))
     reasons["event_fresh_unconsumed"] = "fresh_and_unconsumed" if gates["event_fresh_unconsumed"] else (
@@ -627,7 +973,7 @@ def evaluate_cross_authorization(
     gates["adx_at_least_18"] = bool(entry_adx_allowed(event.adx, MIN_ENTRY_ADX))
     reasons["adx_at_least_18"] = "adx_ok" if gates["adx_at_least_18"] else "adx_below_18"
 
-    data_ok = str(analysis_row.get("data_quality") or "VALID_CLOSED_CANDLES") == "VALID_CLOSED_CANDLES"
+    data_ok = str(analysis_row.get("data_quality") or "").strip().upper() == "VALID_CLOSED_CANDLES"
     gates["market_data_valid_fresh"] = bool(data_ok and str(event.data_freshness).upper() in {"FRESH", "VALID_CLOSED_CANDLES"})
     reasons["market_data_valid_fresh"] = "data_fresh" if gates["market_data_valid_fresh"] else "data_unavailable_or_stale"
 
