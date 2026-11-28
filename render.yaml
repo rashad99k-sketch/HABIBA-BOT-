@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: naiso-live
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ggpbot.py
+    healthCheckPath: /naiso/health
+    autoDeploy: false
+    envVars:
+      - key: PAPER_MODE
+        value: "true"
+      - key: ENABLE_LIVE_TRADING
+        value: "false"
+      - key: BINGX_API_KEY
+        sync: false
+      - key: BINGX_API_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TRADE_JOURNAL_PATH
+        value: data/ggp_trade_journal.sqlite3
+      - key: DASHBOARD_BIND_HOST
+        value: 0.0.0.0
+      - key: NAISO_NATIVE_SL_REPAIR
+        value: "false"
