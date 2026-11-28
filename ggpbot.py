@@ -294,7 +294,14 @@ class MomentumFlowEngine:
         momentum_health = 50 + (norm_strength * 50)
         continuation_strength = min(100, max(0, abs_spread * 20))
         trend_expansion = abs_spread > 0.35
-        momentum_decay = abs_spread < 0.05
+        # A low absolute EMA spread describes a quiet market, not a collapse.
+        # Decay requires a previously established directional impulse followed
+        # by a material contraction of that impulse on closed-candle data.
+        prior_spread = abs(float(momentum_spread.iloc[-4])) if len(momentum_spread) >= 4 and pd.notna(momentum_spread.iloc[-4]) else 0.0
+        momentum_decay = bool(
+            prior_spread >= 0.20
+            and abs_spread <= max(0.05, prior_spread * 0.35)
+        )
         rsi_now = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
         climax_risk = max(0.0, rsi_now - 70.0, 30.0 - rsi_now) * 3.0
         exhaustion_risk = max(0, 40 - momentum_health)
