@@ -323,6 +323,7 @@ class MomentumFlowEngine:
             "momentum_health": safe_float_val(momentum_health),
             "trend_expansion": bool(trend_expansion),
             "momentum_decay": bool(momentum_decay),
+            "momentum_collapse_confirmed": bool(momentum_decay and prior_spread >= 0.20 and abs_spread <= max(0.05, prior_spread * 0.35)),
             "climax_risk": safe_float_val(climax_risk),
             "rsi_value": safe_float_val(rsi_now),
             "exhaustion_risk": safe_float_val(exhaustion_risk),
