@@ -914,8 +914,7 @@ if LEVERAGE != 20:
     print(f"[CONFIG] Requested LEVERAGE={LEVERAGE} rejected; GGP policy is fixed at 20x")
     LEVERAGE = 20  # Fixed policy: all LIVE entries require verified 20x on BingX.
 MAX_TRADE_RISK_PCT = 10.0  # fixed, owner-approved account loss budget
-# Compatibility-only setting. The exact account-balance allocation policy is
-# authoritative; this legacy stop-risk percentage must never reduce quantity.
+# Additional adverse-execution allowance included in the stop-loss risk estimate.
 try:
     STOP_EXECUTION_BUFFER_PCT = float(os.getenv("STOP_EXECUTION_BUFFER_PCT", "0.05"))
 except (TypeError, ValueError):
