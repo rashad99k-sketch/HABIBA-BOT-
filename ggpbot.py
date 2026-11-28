@@ -370,7 +370,19 @@ class TradeStateMachine:
         self.last_state_change = 0
         self.state_confidence = 0.0
         self.last_transition_reason = ""
+        self._momentum_collapse_confirm_count = 0
+        self._momentum_collapse_last_candle_ts = 0.0
         self._update_lock = threading.RLock()
+
+    def reset(self):
+        """Reset per-position state and confirmation history without replacing the lock."""
+        with self._update_lock:
+            self.current_state = "RANGE_CHOP"
+            self.last_state_change = 0
+            self.state_confidence = 0.0
+            self.last_transition_reason = ""
+            self._momentum_collapse_confirm_count = 0
+            self._momentum_collapse_last_candle_ts = 0.0
 
     def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None,
                *, source: str = "UNSPECIFIED", symbol: str = "", candle_ts=None,
@@ -407,13 +419,30 @@ class TradeStateMachine:
         momentum_aligned = (direction not in ("BUY", "SELL") or momentum_bias not in ("BUY", "SELL") or momentum_bias == direction) and not smart_opposed
         adverse_smart_flow = smart_opposed and (dist_risk > 60 or banker > 65)
 
+        # Require two distinct completed candles before a momentum contraction
+        # can become a hard-collapse state. Repeated loop calls cannot increment it.
+        collapse_candidate = (
+            cont_strength < 25 and decay
+            and (direction not in ("BUY", "SELL") or smart_opposed)
+        )
+        collapse_confirmation = advance_closed_candle_confirmation(
+            collapse_candidate,
+            candle_ts,
+            self._momentum_collapse_last_candle_ts,
+            self._momentum_collapse_confirm_count,
+            max_gap_seconds=max(60.0, _timeframe_seconds(INTERVAL) * 1.5),
+        )
+        self._momentum_collapse_confirm_count = collapse_confirmation["count"]
+        self._momentum_collapse_last_candle_ts = collapse_confirmation["last_candle_ts"]
+        momentum_collapse_confirmed = bool(collapse_confirmation["confirmed"])
+
         # PANIC_EXIT
         if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and
             dist_risk > 75 and cont_strength < 20 and decay
             and (direction not in ("BUY", "SELL") or smart_opposed)):
             new_state = "PANIC_EXIT"
-        # MOMENTUM_COLLAPSE uses directional strength/decay, not signed health.
-        elif cont_strength < 25 and decay and (direction not in ("BUY", "SELL") or smart_opposed):
+        # A normal momentum collapse must persist across two closed candles.
+        elif momentum_collapse_confirmed:
             new_state = "MOMENTUM_COLLAPSE"
         # LIQUIDITY_EXHAUSTION
         elif exh_risk > 70 or climax > 75:
@@ -439,7 +468,9 @@ class TradeStateMachine:
         elif adx < 22 or regime in ("CHOPPY", "COMPRESSION"):
             new_state = "RANGE_CHOP"
         else:
-            new_state = self.current_state
+            # Do not let a previously confirmed collapse remain latched after
+            # its evidence clears on a later completed candle.
+            new_state = "RANGE_CHOP" if self.current_state == "MOMENTUM_COLLAPSE" else self.current_state
 
         if new_state != self.current_state:
             previous_state = self.current_state
@@ -488,7 +519,8 @@ class TradeStateMachine:
         return self.current_state in ("EXHAUSTION", "DISTRIBUTION", "MOMENTUM_COLLAPSE", "PROFIT_DEFENSE", "LIQUIDITY_EXHAUSTION")
 
     def should_hard_exit(self) -> bool:
-        return self.current_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION")
+        # MOMENTUM_COLLAPSE is authorized only through the confirmed Profit Brain path.
+        return self.current_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION")
 
     def get_patience_level(self) -> str:
         if self.current_state in ("ACCUMULATION", "EXPANSION", "TREND_RIDE", "HEALTHY_PULLBACK"):
@@ -2611,6 +2643,11 @@ class InstitutionalTradeBrain:
         self.last_update = time.time()
         return self.current_trade_state
 
+    def reset(self):
+        self.state_machine.reset()
+        self.current_trade_state = "RANGE_CHOP"
+        self.last_update = 0.0
+
     def get_trail_multiplier(self) -> float:
         return self.state_machine.get_trail_multiplier()
 
@@ -2629,7 +2666,8 @@ class InstitutionalTradeBrain:
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
-                              tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
+                              advance_closed_candle_confirmation, tp2_reassessment,
+                              thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               trend_target_prices, resolve_trend_targets,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
@@ -2687,6 +2725,8 @@ class TradeManagementBoard:
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
                 "profit_mode": profit_mode,
+                "thesis_failure_confirm_count": int(safe_float(ctx.get("thesis_failure_confirm_count"), 0)),
+                "thesis_failure_confirmed": bool(ctx.get("thesis_failure_confirmed", False)),
                 "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
                 "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
@@ -2796,11 +2836,23 @@ class TradeManagementBoard:
                 side, roe, thesis_score, thesis_reasons,
                 structural_invalidation=bool(ctx.get("structural_invalidation")))
             if thesis_action == "EXIT":
+                # Losing positions need persistent evidence across two distinct
+                # completed candles unless structural invalidation is explicit.
+                if (roe <= 0.0 and not ctx.get("structural_invalidation")
+                        and not ctx.get("thesis_failure_confirmed")):
+                    return decision(
+                        TradeDecisionType.HOLD,
+                        "loss_exit_waiting_for_second_closed_candle_confirmation",
+                        failure_score=thesis_score,
+                        confirmation_count=int(safe_float(ctx.get("thesis_failure_confirm_count"), 0)),
+                    )
                 return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
                                 str(ctx.get("thesis_failure_reason") or thesis_reason))
             if thesis_action == "PROTECT" and not ctx.get("be_done"):
                 return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
-            if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
+            # MOMENTUM_COLLAPSE is handled only by evaluate_exit_risk after its
+            # two-closed-candle confirmation; never bypass that confirmation here.
+            if trade_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION"):
                 return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
 
         sl_price = safe_float(ctx.get("synthetic_sl"), 0.0)
@@ -2812,33 +2864,47 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is a SINGLE-TARGET mode: no partial TP1 and no runner.
-        # On target, close the full verified remaining exposure through the
-        # existing strict FULL_CLOSE execution/reconciliation path.
-        if profit_mode == "RANGE_SCALP":
+        # RANGE_SCALP and TREND/STANDARD share one verified 50/50 lifecycle.
+        # Range mode derives TP1 halfway to its latched opposing-liquidity target;
+        # TP2 is the final pool target. No range position is closed in one shot.
+        range_mode = profit_mode == "RANGE_SCALP"
+        tp1_hit = bool(ctx.get("tp1_hit"))
+        tp2_hit = bool(ctx.get("tp2_hit"))
+        if range_mode:
             scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
             scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
+            adaptive_range_target = safe_float(ctx.get("range_target_price"), 0.0)
+            # Preserve the range planner's nearer-of-pool/price-cap decision.
+            # The entry-anchored pool target is only the fallback when no
+            # adaptive range target was resolved.
             range_target = (
-                safe_float(ctx.get("range_target_price"), 0.0)
-                or (scalp_target if scalp_target_status == "VALID" else 0.0)
+                adaptive_range_target if adaptive_range_target > 0
+                else (scalp_target if scalp_target_status == "VALID" and scalp_target > 0 else 0.0)
             )
-            target_source = ("adaptive_price_target"
-                             if safe_float(ctx.get("range_target_price"), 0.0) > 0
-                             else "opposing_liquidity_fallback")
-            if range_target > 0 and entry > 0 and remaining > 0:
-                if target_reached(side, current, range_target):
-                    return decision(
-                        TradeDecisionType.FULL_CLOSE,
-                        f"range_scalp_{target_source}_single_target_full_exit",
-                        close_reason="SCALP_TARGET", target_price=range_target,
-                        target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
-                        opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0),
-                    )
-            return decision(
-                TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target",
-                target_price=range_target, target_source=target_source,
-                target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+            target_source = ("adaptive_range_target"
+                             if adaptive_range_target > 0
+                             else "opposing_liquidity_scalp_fallback")
+            tp1_price = safe_float(ctx.get("scalp_target_tp1_price"), 0.0)
+            valid_range_target = (
+                (side == "BUY" and range_target > entry)
+                or (side == "SELL" and 0 < range_target < entry)
             )
+            valid_range_tp1 = (
+                (side == "BUY" and entry < tp1_price < range_target)
+                or (side == "SELL" and range_target < tp1_price < entry)
+            )
+            if range_target <= 0 or entry <= 0 or remaining <= 0 or not valid_range_target:
+                return decision(
+                    TradeDecisionType.HOLD, "range_scalp_waiting_for_valid_two_stage_target",
+                    target_price=range_target, target_source=target_source,
+                    target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+                )
+            if not valid_range_tp1:
+                tp1_price = entry + (range_target - entry) * 0.5
+            tp2_price = range_target
+        else:
+            tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
+            tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
         # This compensates for any previously confirmed partial fill and never
@@ -2846,7 +2912,6 @@ class TradeManagementBoard:
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
         if not tp1_hit and remaining > 0 and initial > 0:
-            tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
             if tp1_price > 0 and target_reached(side, current, tp1_price):
                 target_remaining = initial * 0.5
                 tolerance = max(initial * 0.002, 1e-10)
@@ -2854,21 +2919,27 @@ class TradeManagementBoard:
                 if qty_to_close <= tolerance:
                     return decision(TradeDecisionType.HOLD, "tp1_quantity_already_at_50pct_wait_for_reconciliation")
                 ratio = min(1.0, qty_to_close / remaining)
-                return decision(TradeDecisionType.PARTIAL_CLOSE, "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
-                                ratio=ratio, target_remaining_qty=target_remaining,
-                                close_reason="TP1")
+                return decision(
+                    TradeDecisionType.PARTIAL_CLOSE,
+                    "RANGE_SCALP_TP1_FIXED_50_PERCENT" if range_mode else "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
+                    ratio=ratio, target_remaining_qty=target_remaining,
+                    close_reason="TP1", target_price=tp1_price,
+                    tp2_target_price=tp2_price if range_mode else None,
+                )
 
         # TP2 is the final 50% runner exit. If it is objectively remote while
         # continuation/structure has failed, close the remaining runner strictly.
         if tp1_hit and not tp2_hit and remaining > 0:
-            tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
-            if ctx.get("tp2_decision") == "CLOSE":
+            if not range_mode and ctx.get("tp2_decision") == "CLOSE":
                 return decision(TradeDecisionType.FULL_CLOSE,
                                 str(ctx.get("tp2_decision_reason") or "tp2_remote_and_continuation_weak"),
                                 close_reason="TP2_ADAPTIVE_STRICT_EXIT")
             if tp2_price > 0 and target_reached(side, current, tp2_price):
-                return decision(TradeDecisionType.FULL_CLOSE, "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
-                                close_reason="TP2")
+                return decision(
+                    TradeDecisionType.FULL_CLOSE,
+                    "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" if range_mode else "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+                    close_reason="TP2", target_price=tp2_price,
+                )
 
         # BE+ and trailing apply to the verified remaining runner only.
         if tp1_hit and not ctx.get("be_done"):
@@ -2910,7 +2981,11 @@ class TradeManagementBoard:
                 return decision(TradeDecisionType.TRAIL, "ratchet_runner_trailing_stop",
                                 new_stop=new_stop, multiplier=trail_mult)
 
-        return decision(TradeDecisionType.HOLD, "no_profit_management_trigger")
+        return decision(
+            TradeDecisionType.HOLD,
+            "range_scalp_waiting_for_two_stage_targets" if range_mode else "no_profit_management_trigger",
+            target_price=tp2_price if range_mode else None,
+        )
 
 # ========== REAL EXCHANGE ORDERS (SAFE) ==========
 def _is_definitive_close_rejection(exc):
@@ -3613,6 +3688,12 @@ class LiveTradeManager:
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        self.brain.reset()
+        STATE.update({
+            "thesis_failure_confirm_count": 0,
+            "thesis_failure_last_candle_ts": 0.0,
+            "thesis_failure_confirmed": False,
+        })
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -4351,10 +4432,37 @@ class LiveTradeManager:
                     f"management_mode={current_mode} candidate={candidate_mode} "
                     f"reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
 
-            # Thesis failure check
+            # Require a thesis-failure signal on two distinct completed candles
+            # before using it to close a losing position. Repeated polling loops
+            # over the same candle cannot increase the confirmation count.
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
-            STATE["thesis_failure_score"] = failure_score
-            STATE["thesis_failure_reasons"] = list(failure_reasons)
+            _thesis_confirmation = advance_closed_candle_confirmation(
+                failure_score >= 50.0,
+                closed_candle_ts,
+                STATE.get("thesis_failure_last_candle_ts", 0.0),
+                STATE.get("thesis_failure_confirm_count", 0),
+                max_gap_seconds=max(60.0, _timeframe_seconds(INTERVAL) * 1.5),
+            )
+            STATE.update({
+                "thesis_failure_score": failure_score,
+                "thesis_failure_reasons": list(failure_reasons),
+                "thesis_failure_confirm_count": _thesis_confirmation["count"],
+                "thesis_failure_last_candle_ts": _thesis_confirmation["last_candle_ts"],
+                "thesis_failure_confirmed": bool(_thesis_confirmation["confirmed"]),
+            })
+            if _thesis_confirmation["advanced"]:
+                record_trade_management_event(
+                    "THESIS_FAILURE_CONFIRMATION",
+                    "CONFIRMED" if _thesis_confirmation["confirmed"] else (
+                        "PENDING" if failure_score >= 50.0 else "CLEARED"
+                    ),
+                    dedupe_key=f"thesis_confirmation:{symbol}:{closed_candle_ts}",
+                    dedupe_seconds=0, symbol=symbol, side=side,
+                    failure_score=failure_score,
+                    confirmation_count=_thesis_confirmation["count"],
+                    candle_ts=closed_candle_ts,
+                    reasons=list(failure_reasons),
+                )
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis warning for {symbol}: {failure_reasons}", "WARN")
                 # Board will decide based on failure_score
@@ -4502,7 +4610,9 @@ class LiveTradeManager:
             "exhaustion_risk": safe_float(momentum.get("exhaustion_risk"), 0.0),
             "climax_risk": safe_float(momentum.get("climax_risk"), 0.0),
             "momentum_decay": bool(momentum.get("momentum_decay", False)),
-            "momentum_collapse_confirmed": bool(momentum.get("momentum_collapse_confirmed", False)),
+            # Collapse is hard only when the state machine confirms persistence
+            # across two distinct closed candles.
+            "momentum_collapse_confirmed": bool(trade_state == "MOMENTUM_COLLAPSE"),
             "flow_bias": str(momentum.get("flow_bias") or "UNKNOWN"),
             "counter_pressure": safe_float(STATE.get("counter_pressure"), 0.0),
             "reclaim_risk": safe_float(STATE.get("reclaim_risk"), 0.0),
@@ -4526,6 +4636,8 @@ class LiveTradeManager:
             "momentum_strength": safe_float(momentum.get("momentum_health"), 50.0),
             "volume_ratio": volume_ratio,
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
+            "thesis_failure_confirm_count": int(safe_float(STATE.get("thesis_failure_confirm_count"), 0)),
+            "thesis_failure_confirmed": bool(STATE.get("thesis_failure_confirmed", False)),
             "thesis_failure_reason": ",".join(STATE.get("thesis_failure_reasons", [])),
             "thesis_failure_reasons": list(STATE.get("thesis_failure_reasons", [])),
             "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
@@ -6103,6 +6215,8 @@ STATE = {
     "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
     "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
     "structural_invalidation": False, "thesis_failure_reasons": [],
+    "thesis_failure_confirm_count": 0, "thesis_failure_last_candle_ts": 0.0,
+    "thesis_failure_confirmed": False,
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
     "zone_event_last_candle_ts": 0.0,

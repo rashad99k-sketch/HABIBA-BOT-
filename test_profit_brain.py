@@ -2,6 +2,7 @@ from ggp_profit_brain import (
     RANGE_MODE, TREND_MODE, STANDARD_MODE,
     classify_profit_mode, range_target_price, target_reached,
     select_range_target_pct, tp2_reassessment,
+    advance_closed_candle_confirmation,
 )
 from ggp_market_intelligence import build_scalp_target
 
@@ -208,24 +209,19 @@ def test_range_target_does_not_select_one_percent_without_full_evidence():
     assert target == 0.50
 
 
-def test_scalp_board_uses_one_full_close_not_partial_tp1():
-    import ast
+def test_scalp_board_uses_two_stage_50_50_partial_tp1_and_runner_tp2():
     from pathlib import Path
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    board = next(node for node in ast.walk(tree)
-                 if isinstance(node, ast.ClassDef) and node.name == "TradeManagementBoard")
-    evaluate = next(node for node in board.body
-                    if isinstance(node, ast.FunctionDef) and node.name == "evaluate")
-    source_lines = source.splitlines()
-    block_start = next(i for i, line in enumerate(source_lines)
-                       if 'if profit_mode == "RANGE_SCALP":' in line)
-    block_end = next(i for i in range(block_start + 1, len(source_lines))
-                     if source_lines[i].startswith("        # Canonical TP1:"))
-    scalp_block = "\n".join(source_lines[block_start:block_end])
-    assert "TradeDecisionType.FULL_CLOSE" in scalp_block
-    assert "TradeDecisionType.PARTIAL_CLOSE" not in scalp_block
-    assert "range_scalp_waiting_for_single_target" in scalp_block
+    board_start = source.index("class TradeManagementBoard:")
+    board_end = source.index("# ========== REAL EXCHANGE ORDERS", board_start)
+    board = source[board_start:board_end]
+    assert 'range_mode = profit_mode == "RANGE_SCALP"' in board
+    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" in board
+    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" in board
+    assert "target_remaining = initial * 0.5" in board
+    assert "range_scalp_waiting_for_two_stage_targets" in board
+    assert "range_scalp_waiting_for_single_target" not in board
+    assert "adaptive_range_target if adaptive_range_target > 0" in board
 
 
 
@@ -419,3 +415,90 @@ def test_opposing_liquidity_selector_is_imported_where_live_manager_calls_it():
         for node in ast.walk(tree)
     )
     assert imported and called
+
+
+def test_loss_exit_confirmation_advances_only_on_distinct_closed_candles():
+    first = advance_closed_candle_confirmation(
+        True, 900, last_candle_ts=0, streak=0, max_gap_seconds=1350
+    )
+    repeated = advance_closed_candle_confirmation(
+        True, 900, last_candle_ts=first["last_candle_ts"],
+        streak=first["count"], max_gap_seconds=1350
+    )
+    second = advance_closed_candle_confirmation(
+        True, 1800, last_candle_ts=repeated["last_candle_ts"],
+        streak=repeated["count"], max_gap_seconds=1350
+    )
+    assert first["count"] == 1 and first["confirmed"] is False
+    assert repeated["count"] == 1 and repeated["confirmed"] is False
+    assert repeated["advanced"] is False
+    assert second["count"] == 2 and second["confirmed"] is True
+
+
+def test_loss_exit_confirmation_resets_after_non_signal_or_data_gap():
+    first = advance_closed_candle_confirmation(
+        True, 900, last_candle_ts=0, streak=0, max_gap_seconds=1350
+    )
+    no_signal = advance_closed_candle_confirmation(
+        False, 1800, last_candle_ts=first["last_candle_ts"],
+        streak=first["count"], max_gap_seconds=1350
+    )
+    assert no_signal["count"] == 0
+    assert no_signal["confirmed"] is False
+
+    after_gap = advance_closed_candle_confirmation(
+        True, 3600, last_candle_ts=900, streak=1, max_gap_seconds=1350
+    )
+    assert after_gap["count"] == 1
+    assert after_gap["confirmed"] is False
+
+
+def test_unconfirmed_high_thesis_score_does_not_hard_exit_losing_trade():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": -2.0,
+        "thesis_failure_score": 85,
+        "thesis_failure_confirmed": False,
+    })
+    assert result["action"] == "HOLD"
+    assert result["hard_exit"] is False
+    assert "unconfirmed_thesis_failure_deferred" in result["reasons"]
+
+
+def test_confirmed_high_thesis_score_remains_hard_exit():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": -2.0,
+        "thesis_failure_score": 85,
+        "thesis_failure_confirmed": True,
+    })
+    assert result["action"] == "HARD_EXIT"
+    assert result["hard_exit"] is True
+    assert "confirmed_thesis_failure_score_70_plus" in result["reasons"]
+
+
+def test_live_board_has_no_unconfirmed_momentum_collapse_bypass_and_range_is_two_stage():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    assert 'if trade_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION"):' in source
+    assert 'if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):' not in source
+    board_start = source.index("class TradeManagementBoard:")
+    board_end = source.index("# ========== REAL EXCHANGE ORDERS", board_start)
+    board = source[board_start:board_end]
+    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" in board
+    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" in board
+    assert "range_scalp_waiting_for_two_stage_targets" in board
+    assert "loss_exit_waiting_for_second_closed_candle_confirmation" in board
+
+
+def test_trade_state_machine_uses_distinct_closed_candle_collapse_confirmation():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    machine_start = source.index("class TradeStateMachine:")
+    machine_end = source.index("# ========== TRADE STATE & PERFORMANCE TRACKING", machine_start)
+    machine = source[machine_start:machine_end]
+    assert "advance_closed_candle_confirmation(" in machine
+    assert "momentum_collapse_confirmed" in machine
+    assert "def reset(self):" in machine
+    assert 'return self.current_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION")' in machine
+    assert 'new_state = "RANGE_CHOP" if self.current_state == "MOMENTUM_COLLAPSE" else self.current_state' in machine

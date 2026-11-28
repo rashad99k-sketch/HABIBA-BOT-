@@ -30,6 +30,61 @@ def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def advance_closed_candle_confirmation(
+    active: bool,
+    candle_ts: Any,
+    last_candle_ts: Any = 0.0,
+    streak: Any = 0,
+    max_gap_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Advance a confirmation streak once per distinct completed candle.
+
+    Repeated management loops on the same candle cannot increase the streak.
+    A non-signal candle or an excessive data gap resets it. Missing timestamps
+    never create confirmation, which keeps exit decisions fail-closed.
+    """
+    current_ts = _number(candle_ts)
+    previous_ts = _number(last_candle_ts, 0.0) or 0.0
+    try:
+        count = max(0, int(streak or 0))
+    except (TypeError, ValueError, OverflowError):
+        count = 0
+
+    if current_ts is None or current_ts <= 0.0:
+        return {
+            "count": count,
+            "last_candle_ts": previous_ts,
+            "confirmed": bool(active) and count >= 2,
+            "advanced": False,
+        }
+    if previous_ts > 0.0 and current_ts <= previous_ts:
+        return {
+            "count": count,
+            "last_candle_ts": previous_ts,
+            "confirmed": bool(active) and count >= 2,
+            "advanced": False,
+        }
+
+    gap_limit = _number(max_gap_seconds)
+    gap_exceeded = (
+        previous_ts > 0.0 and gap_limit is not None
+        and gap_limit > 0.0 and current_ts - previous_ts > gap_limit
+    )
+    if not active:
+        count = 0
+    elif previous_ts <= 0.0 or gap_exceeded:
+        count = 1
+    else:
+        count += 1
+
+    return {
+        "count": count,
+        "last_candle_ts": current_ts,
+        "confirmed": bool(active) and count >= 2,
+        "advanced": True,
+    }
+
+
 
 def adaptive_trail_multiplier(base_multiplier: float, continuation_probability: float, adx: float,
                               distribution_risk: float, exit_warning: int, ema_state: str = "UNKNOWN",
@@ -516,10 +571,15 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
             reasons.append("unconfirmed_momentum_collapse_deferred")
 
     failure_score = _number(ctx.get("thesis_failure_score"), 0.0) or 0.0
+    thesis_failure_confirmed = bool(ctx.get("thesis_failure_confirmed", False))
     if failure_score >= 70:
         score += 5
         groups.add("THESIS")
-        reasons.append("thesis_failure_score_70_plus")
+        reasons.append(
+            "confirmed_thesis_failure_score_70_plus"
+            if thesis_failure_confirmed
+            else "unconfirmed_thesis_failure_deferred"
+        )
 
     plus = _number(ctx.get("di_plus"))
     minus = _number(ctx.get("di_minus"))
@@ -630,7 +690,12 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         groups.add("SUPPORT_RESISTANCE")
         reasons.append("confirmed_rejection_at_opposing_sr")
 
-    hard_exit = structural or trade_state in hard_states or momentum_collapse_confirmed or failure_score >= 70
+    hard_exit = (
+        structural
+        or trade_state in hard_states
+        or momentum_collapse_confirmed
+        or (failure_score >= 70 and thesis_failure_confirmed)
+    )
     group_count = len(groups)
     if hard_exit:
         action = "HARD_EXIT"
