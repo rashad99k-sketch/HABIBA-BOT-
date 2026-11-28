@@ -71,6 +71,7 @@ from ggp_position_sizing import (
     extract_leverage_value,
     is_strong_candidate,
     validate_trade_geometry,
+    validate_stop_risk_budget,
 )
 from bingx_execution import (TradeExecutionService, BingXPositionModeAdapter,
                               ExecutionState, PositionMode, build_position_order_params,
@@ -912,13 +913,7 @@ except (TypeError, ValueError):
 if LEVERAGE != 20:
     print(f"[CONFIG] Requested LEVERAGE={LEVERAGE} rejected; GGP policy is fixed at 20x")
     LEVERAGE = 20  # Fixed policy: all LIVE entries require verified 20x on BingX.
-try:
-    MAX_TRADE_RISK_PCT = float(os.getenv("MAX_TRADE_RISK_PCT", "10.0"))
-except (TypeError, ValueError):
-    MAX_TRADE_RISK_PCT = 10.0
-if not math.isfinite(MAX_TRADE_RISK_PCT) or not (0.1 <= MAX_TRADE_RISK_PCT <= 25.0):
-    print("[CONFIG] Invalid legacy MAX_TRADE_RISK_PCT; compatibility default retained")
-    MAX_TRADE_RISK_PCT = 10.0
+MAX_TRADE_RISK_PCT = 10.0  # fixed, owner-approved account loss budget
 # Compatibility-only setting. The exact account-balance allocation policy is
 # authoritative; this legacy stop-risk percentage must never reduce quantity.
 try:
@@ -7073,13 +7068,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 )
         effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
         estimated_stop_loss = qty * contract_size * effective_stop_distance
-        estimated_stop_risk_pct = (estimated_stop_loss / balance) * 100.0
-        if estimated_stop_risk_pct > MAX_TRADE_RISK_PCT + 1e-9:
-            raise ValueError(
-                f"STRUCTURAL_STOP_RISK_EXCEEDS_BUDGET: estimated_loss={estimated_stop_loss:.4f}USDT "
-                f"account_risk={estimated_stop_risk_pct:.2f}% limit={MAX_TRADE_RISK_PCT:.2f}%; "
-                "entry rejected; position allocation and 20x leverage were not silently changed"
-            )
+        estimated_stop_risk_pct = validate_stop_risk_budget(
+            estimated_loss_usdt=estimated_stop_loss,
+            available_balance=balance,
+            max_risk_pct=MAX_TRADE_RISK_PCT,
+        )
         target_margin_cap = balance * sizing.allocation_pct
         if margin > target_margin_cap * 1.000001:
             raise ValueError("rounded quantity exceeds configured margin allocation cap")
