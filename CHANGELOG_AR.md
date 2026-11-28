@@ -1,5 +1,11 @@
 # سجل التغييرات — JGB/GGP
 
+## إصلاح 2026-11-28 — Opposing Liquidity NameError وMomentum Collapse
+- إضافة الاستيراد الناقص `select_opposing_liquidity_pool` إلى `ggpbot.py` من محرك `ggp_market_intelligence` الموجود؛ دون تكرار الدالة أو تغيير خوارزمية اختيار مستويات السيولة.
+- منع تصنيف السوق الهادئ على أنه `MOMENTUM_COLLAPSE`؛ يتطلب decay زخمًا سابقًا ثم انكماشًا مؤكدًا.
+- تمرير `momentum_collapse_confirmed` إلى Profit Brain، وتأجيل HARD_EXIT الناتج عن حالة MOMENTUM_COLLAPSE غير المؤكدة فقط.
+- الحفاظ على الخروج الفوري عند الكسر الهيكلي أو PANIC_EXIT أو LIQUIDITY_EXHAUSTION.
+- أضيفت اختبارات انحدار للاستيراد ومنطق الانهيار المؤكد وغير المؤكد.
 ## إضافة 2026-11-28 — HABIBA EMA9/VWAP Lifecycle Demo Preview
 - إضافة لوحة RTL مستقلة على `/lifecycle` داخل Flask Dashboard الحالي، مع رابط من الصفحة الرئيسية.
 - إضافة محرك Demo مستقل لكل Cross Event؛ لا يقرأ STATE/MEMORY الحي ولا يستدعي CCXT أو BingX أو `execute_entry()`.
