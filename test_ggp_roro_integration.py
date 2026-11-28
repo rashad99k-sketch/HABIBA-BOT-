@@ -147,3 +147,88 @@ def test_decision_serializer_flattens_tuple_evidence():
     assert result["evidence"] == ["sweep", "reclaim", "closed_mss"]
     assert result["rejection_reasons"] == ["trigger_pending"]
     assert all(isinstance(value, str) for value in result["evidence"] + result["rejection_reasons"])
+
+
+def test_confirmed_cross_is_persisted_as_independent_watchlist_event_and_survives_neutral_scan(monkeypatch):
+    import time
+    import ggp_institutional_bridge as bridge
+
+    cross_ts = int(time.time() * 1000) - 60_000
+    enabled = [True]
+
+    def fake_analyze(symbol, side, source_frame, now_ms=None):
+        is_match = enabled[0] and side == "BUY"
+        return {
+            "symbol": canonical_symbol(symbol), "exchange_symbol": "ETH/USDT:USDT", "side": side,
+            "decision_state": "ENTRY_READY" if is_match else "WAITING_FOR_CONFIRMATION",
+            "entry_status": "ENTRY_READY" if is_match else "WAITING_FOR_CONFIRMATION",
+            "score": 1.0, "decision_reason": "confirmed_cross_location_ready" if is_match else "no_current_cross",
+            "event_id": "EMA9VWAP:ETH:BULLISH:" + str(cross_ts) if is_match else None,
+            "cross_event_id": "EMA9VWAP:ETH:BULLISH:" + str(cross_ts) if is_match else None,
+            "cross_status": "CONFIRMED" if is_match else "NONE",
+            "cross_direction": "BULLISH" if is_match else None,
+            "cross_candle_timestamp": cross_ts if is_match else None,
+            "structural_stop": 98.5 if is_match else None,
+            "location_status": "GOOD" if is_match else "WAITING",
+            "location_distance_atr": 0.4 if is_match else None,
+            "location_factor_count": 2 if is_match else 0,
+            "trade_mode": "SCALP" if is_match else None,
+            "data_quality": "VALID_CLOSED_CANDLES", "icons": {"status": "✅" if is_match else "🟡"},
+            "golden_zone": {"score": 20}, "evidence": ["location_only_no_sweep_required"] if is_match else [],
+        }
+
+    monkeypatch.setattr(bridge, "analyze_symbol", fake_analyze)
+    memory = {
+        "market_universe": {"state": "READY", "symbols": ["ETH/USDT:USDT"]},
+        "watchlist": {},
+    }
+    bridge.update_unified_watchlist(memory, lambda _: frame(), max_items=10, batch_size=10)
+    event_id = "EMA9VWAP:ETH:BULLISH:" + str(cross_ts)
+    assert event_id in memory["cross_event_watchlist"]
+    assert memory["cross_event_watchlist"][event_id]["side"] == "BUY"
+    assert memory["cross_event_watchlist"][event_id]["event_lifecycle_state"] == "DISCOVERED"
+
+    enabled[0] = False
+    bridge.update_unified_watchlist(memory, lambda _: frame(), max_items=10, batch_size=10)
+    assert event_id in memory["cross_event_watchlist"]
+    assert memory["cross_event_watchlist"][event_id]["cross_status"] == "CONFIRMED"
+
+
+def test_confirmed_cross_below_adx_is_queued_as_rejected_event_not_lost_to_opposite_side(monkeypatch):
+    import time
+    import ggp_institutional_bridge as bridge
+
+    cross_ts = int(time.time() * 1000) - 60_000
+    event_id = f"EMA9VWAP:ETH:BULLISH:{cross_ts}"
+
+    def fake_analyze(symbol, side, source_frame, now_ms=None):
+        if side == "BUY":
+            return {
+                "symbol": "ETH", "exchange_symbol": "ETH/USDT:USDT", "side": "BUY",
+                "decision_state": "REJECTED", "entry_status": "REJECTED",
+                "decision_reason": "BASE_ADX_BELOW_18:17.99", "rejection_reason": "BASE_ADX_BELOW_18:17.99",
+                "event_id": event_id, "cross_event_id": event_id,
+                "cross_status": "CONFIRMED", "cross_direction": "BULLISH",
+                "cross_candle_timestamp": cross_ts, "adx": 17.99,
+                "location_status": "EXCELLENT", "location_distance_atr": 0.2,
+                "structural_stop": 98.0, "data_quality": "VALID_CLOSED_CANDLES",
+                "golden_zone": {"score": 99}, "evidence": ["BASE_ADX_BELOW_18"],
+            }
+        return {
+            "symbol": "ETH", "exchange_symbol": "ETH/USDT:USDT", "side": "SELL",
+            "decision_state": "WAITING_FOR_CONFIRMATION", "entry_status": "WAITING_FOR_CONFIRMATION",
+            "decision_reason": "no_current_cross", "event_id": None,
+            "cross_event_id": None, "cross_status": "NONE", "cross_direction": None,
+            "data_quality": "VALID_CLOSED_CANDLES", "golden_zone": {"score": 0}, "evidence": [],
+        }
+
+    monkeypatch.setattr(bridge, "analyze_symbol", fake_analyze)
+    memory = {
+        "market_universe": {"state": "READY", "symbols": ["ETH/USDT:USDT"]},
+        "watchlist": {},
+    }
+    bridge.update_unified_watchlist(memory, lambda _: frame(), max_items=10, batch_size=10)
+    assert event_id in memory["cross_event_watchlist"]
+    queued = memory["cross_event_watchlist"][event_id]
+    assert queued["decision_state"] == "REJECTED"
+    assert queued["rejection_reason"].startswith("BASE_ADX_BELOW_18")

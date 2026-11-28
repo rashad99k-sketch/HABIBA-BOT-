@@ -184,9 +184,28 @@ def test_range_targets_use_price_move_tiers_025_050():
     assert (weak, moderate, strong) == (0.25, 0.50, 0.50)
 
 
-def test_range_profit_targets_remain_capped_at_half_percent():
+def test_range_profit_targets_include_exceptional_one_percent_tier():
     from ggp_profit_brain import RANGE_PROFIT_TARGETS_PCT
-    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50)
+    assert RANGE_PROFIT_TARGETS_PCT == (0.25, 0.50, 1.00)
+
+
+def test_range_target_one_percent_requires_exceptional_closed_candle_evidence():
+    target, reason = select_range_target_pct({
+        "side": "BUY", "adx": 29, "continuation_probability": 0.85,
+        "volume_ratio": 1.42, "di_plus": 31, "di_minus": 12,
+        "aligned_closed_candles": 3,
+    })
+    assert target == 1.00
+    assert reason == "exceptional_closed_candle_follow_through_1.00pct"
+
+
+def test_range_target_does_not_select_one_percent_without_full_evidence():
+    target, _ = select_range_target_pct({
+        "side": "BUY", "adx": 29, "continuation_probability": 0.85,
+        "volume_ratio": 1.42, "di_plus": 31, "di_minus": 12,
+        "aligned_closed_candles": 2,
+    })
+    assert target == 0.50
 
 
 def test_scalp_board_uses_one_full_close_not_partial_tp1():

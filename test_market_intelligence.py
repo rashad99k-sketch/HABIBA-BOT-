@@ -602,7 +602,7 @@ def test_trade_management_context_exposes_entry_mode_separately_from_profit_mode
     assert 'management_mode={current_mode}' in source
 
 
-def test_bridge_adx_uses_sma_seeded_wilder_smoothing():
+def test_bridge_adx_matches_ggp_rma_calculation():
     import numpy as np
     import pandas as pd
     from ggp_institutional_bridge import _adx
@@ -617,28 +617,20 @@ def test_bridge_adx_uses_sma_seeded_wilder_smoothing():
                             0.9, 0.6, 0.8, 0.5, 0.7, 0.9, 0.6, 0.8, 0.5, 0.7, 0.9])
     frame = pd.DataFrame({"high": high, "low": low, "close": close})
 
-    def rma(values):
-        out = np.full(len(values), np.nan)
-        valid = np.flatnonzero(np.isfinite(values))
-        first = int(valid[0])
-        seed = first + period - 1
-        out[seed] = np.mean(values[first:seed + 1])
-        for idx in range(seed + 1, len(values)):
-            out[idx] = (out[idx - 1] * (period - 1) + values[idx]) / period
-        return out
-
-    up = np.diff(high, prepend=np.nan)
-    down = -np.diff(low, prepend=np.nan)
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    prev_close = np.roll(close, 1)
-    prev_close[0] = np.nan
-    tr = np.nanmax(np.column_stack((high-low, abs(high-prev_close), abs(low-prev_close))), axis=1)
-    atr = rma(tr)
-    pdi = 100 * rma(plus_dm) / atr
-    mdi = 100 * rma(minus_dm) / atr
-    dx = 100 * abs(pdi-mdi) / (pdi+mdi)
-    expected = rma(dx)[-1]
+    rma = lambda values: values.ewm(alpha=1.0 / period, adjust=False).mean()
+    tr = pd.concat([
+        (frame.high - frame.low).rename("hl"),
+        (frame.high - frame.close.shift(1)).abs().rename("hc"),
+        (frame.low - frame.close.shift(1)).abs().rename("lc"),
+    ], axis=1).max(axis=1)
+    atr = rma(tr) + 1e-9
+    up_move, down_move = frame.high.diff(), -frame.low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=frame.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=frame.index)
+    plus_di = 100.0 * rma(plus_dm) / (atr + 1e-9)
+    minus_di = 100.0 * rma(minus_dm) / (atr + 1e-9)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)) * 100.0
+    expected = rma(dx).bfill().ffill().fillna(0.0).clip(0.0, 100.0).iloc[-1]
     assert np.isfinite(expected)
     assert _adx(frame, period=period) == pytest.approx(expected, rel=1e-10, abs=1e-10)
 
@@ -1062,15 +1054,22 @@ def test_fvg_direction_gate_is_explicit_and_fails_closed_for_both_sides():
     assert not _fvg_matches_side(bullish, "UNKNOWN")
 
 
-def test_institutional_analyzer_uses_local_side_aware_fvg_gate():
+def test_cross_analyzer_uses_location_quality_not_legacy_setup_gates():
     from pathlib import Path
 
     source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
     start = source.index("def analyze_symbol(")
     end = source.index("\ndef analyze_symbol_both(", start)
     analyzer_source = source[start:end]
-    assert "fvg_ok = _fvg_matches_side(fvg, side)" in analyzer_source
-    assert "fvg.get(\"direction\") == expected" not in analyzer_source
+    location_start = source.index("def _evaluate_cross_location(")
+    location_end = source.index("\ndef _classify_cross_trade_mode(", location_start)
+    location_source = source[location_start:location_end]
+
+    assert '"SWEEP_MSS_RETEST_ARE_NOT_UNIVERSAL_ENTRY_GATES"' in analyzer_source
+    assert 'location.get("status") not in {"EXCELLENT", "GOOD", "MODERATE"}' in analyzer_source
+    assert 'fvg.get("direction")' in location_source
+    assert '"universal_sweep_mss_retest_gate": False' in location_source
+    assert "_sniper_evidence_matches_side" not in analyzer_source
 
 
 def test_bingx_ohlcv_rate_limit_uses_endpoint_specific_pacing(monkeypatch):
@@ -1241,18 +1240,22 @@ def test_institutional_engine_consumes_directional_confirmed_sr_for_retests():
     assert 'levels.append((low, high, expected_type, available_ts))' in helper
 
 
-def test_institutional_bridge_uses_one_authoritative_ob_validation_state():
+def test_cross_location_uses_authoritative_ob_validation_and_directional_zone():
     from pathlib import Path
 
     source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
-    analyze_start = source.index("def analyze_symbol(")
-    analyze_end = source.index("\ndef analyze_symbol_both(", analyze_start)
-    analyzer = source[analyze_start:analyze_end]
-    assert 'validation.get("valid") is True' in analyzer
-    assert 'validation.get("status")' in analyzer
-    assert 'ob["status"] = ob_state' in analyzer
-    assert "post_impulse.low.min()" not in analyzer
-    assert "post_impulse.high.max()" not in analyzer
+    context_start = source.index("def _build_context(")
+    context_end = source.index("\ndef _fvg_matches_side(", context_start)
+    context_builder = source[context_start:context_end]
+    location_start = source.index("def _evaluate_cross_location(")
+    location_end = source.index("\ndef _classify_cross_trade_mode(", location_start)
+    location = source[location_start:location_end]
+    assert 'ob["valid"] = bool(ob_validation.get("valid"))' in context_builder
+    assert 'ob["status"] = ob_validation.get("status", "UNKNOWN")' in context_builder
+    assert 'ob.get("valid") is True' in location
+    assert 'expected = "BULLISH" if side == "BUY" else "BEARISH"' in location
+    assert "post_impulse.low.min()" not in source
+    assert "post_impulse.high.max()" not in source
 
 
 def test_legacy_scanner_support_resistance_wrapper_uses_confirmed_zone_engine():

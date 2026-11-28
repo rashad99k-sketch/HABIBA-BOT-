@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 # Price-move percentages (not leveraged ROE percentages).
 # At 20x these correspond approximately to 5% and 10% ROE,
 # before fees, funding and slippage.
-RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50)
+RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
 TREND_TP1_MOVE_PCT = 2.00
 TREND_TP2_MOVE_PCT = 3.00
 RANGE_MODE = "RANGE_SCALP"
@@ -186,7 +186,18 @@ def classify_profit_mode(context: Dict[str, Any]) -> Tuple[str, str, Tuple[str, 
     if directional_vwap_cross:
         evidence.append("fresh_directional_ema_vwap_cross")
 
-    # Trend riding requires several independent, side-aligned observations.
+    # The cross classifier is the entry-time authority for this strategy. Keep
+    # that SCALP/TREND decision latched for the position lifecycle; the generic
+    # profit classifier must not silently upgrade a SCALP because it uses a
+    # looser legacy threshold (ADX 22) than the cross strategy's ADX 25 trend gate.
+    authorized_cross_mode = str(ctx.get("authorized_cross_mode") or "").upper()
+    if authorized_cross_mode == "SCALP":
+        return RANGE_MODE, "cross_strategy_market_not_strong_trend_use_authorized_scalp", tuple(evidence + ["authorized_cross_mode_scalp"])
+    if authorized_cross_mode == "TREND":
+        return TREND_MODE, "cross_strategy_confirmed_trend_mode", tuple(evidence + ["authorized_cross_mode_trend"])
+
+    # Trend riding for non-cross legacy entries still requires several
+    # independent, side-aligned observations.
     momentum_support = (momentum_strength is not None and momentum_strength >= 55.0) or bool(ctx.get("trend_expansion", False))
     regime_trend = regime in {"STRONG_TREND", "VERY_STRONG", "EXPANSION"} or state in {"TREND_RIDE", "EXPANSION", "HEALTHY_PULLBACK"}
     confirmed_trend = (
@@ -331,12 +342,11 @@ def target_reached(side: str, current_price: float, target_price: float) -> bool
 
 
 def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
-    """Select a 0.25/0.50% PRICE move from simple, observable evidence.
+    """Select 0.25%, 0.50% or 1.00% PRICE move from completed-candle evidence.
 
-    Targets are price movement percentages, not leveraged ROE. Weak/thin
-    conditions stay at 0.25%; moderate follow-through earns 0.50%; strong
-    directional evidence earns at most 0.50%. Larger directional moves belong to the
-    existing trend-mode TP2 path, not the range-scalp target selector.
+    These are underlying price moves, not leveraged ROE. One percent is reserved
+    for distinctly strong scalp follow-through; otherwise the 0.25% / 0.50%
+    ladder remains the default.
     """
     ctx = context if isinstance(context, dict) else {}
     adx = _number(ctx.get("adx"), 0.0) or 0.0
@@ -345,7 +355,7 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     plus = _number(ctx.get("di_plus"))
     minus = _number(ctx.get("di_minus"))
     side = str(ctx.get("side") or "").upper()
-    low_liquidity = bool(ctx.get("thin_liquidity", False)) or volume_ratio <= 0.75
+    low_liquidity = bool(ctx.get("thin_liquidity", False))
     if low_liquidity or adx < 18.0 or continuation < 0.45:
         return RANGE_PROFIT_TARGETS_PCT[0], "weak_or_thin_market_conservative_0.25pct"
 
@@ -353,6 +363,9 @@ def select_range_target_pct(context: Dict[str, Any]) -> Tuple[float, str]:
     di_aligned = ((plus > minus) if side == "BUY" else (minus > plus)) if di_known and side in {"BUY", "SELL"} else False
     aligned_count = int(_number(ctx.get("aligned_closed_candles"), 0.0) or 0)
     adverse_rejection = bool(ctx.get("adverse_rejection", False))
+    if (aligned_count >= 3 and continuation >= 0.82 and adx >= 28.0
+            and volume_ratio >= 1.35 and di_aligned and not adverse_rejection):
+        return RANGE_PROFIT_TARGETS_PCT[2], "exceptional_closed_candle_follow_through_1.00pct"
     if (aligned_count >= 2 and continuation >= 0.72 and adx >= 22.0
             and volume_ratio >= 1.20 and di_aligned and not adverse_rejection):
         return RANGE_PROFIT_TARGETS_PCT[1], "strong_closed_candle_follow_through_0.50pct"
