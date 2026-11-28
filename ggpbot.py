@@ -370,7 +370,19 @@ class TradeStateMachine:
         self.last_state_change = 0
         self.state_confidence = 0.0
         self.last_transition_reason = ""
+        self._momentum_collapse_confirm_count = 0
+        self._momentum_collapse_last_candle_ts = 0.0
         self._update_lock = threading.RLock()
+
+    def reset(self):
+        """Reset per-position state and confirmation history without replacing the lock."""
+        with self._update_lock:
+            self.current_state = "RANGE_CHOP"
+            self.last_state_change = 0
+            self.state_confidence = 0.0
+            self.last_transition_reason = ""
+            self._momentum_collapse_confirm_count = 0
+            self._momentum_collapse_last_candle_ts = 0.0
 
     def update(self, smart: dict, momentum: dict, adx: float, regime: str, side: str = None,
                *, source: str = "UNSPECIFIED", symbol: str = "", candle_ts=None,
@@ -407,13 +419,30 @@ class TradeStateMachine:
         momentum_aligned = (direction not in ("BUY", "SELL") or momentum_bias not in ("BUY", "SELL") or momentum_bias == direction) and not smart_opposed
         adverse_smart_flow = smart_opposed and (dist_risk > 60 or banker > 65)
 
+        # Require two distinct completed candles before a momentum contraction
+        # can become a hard-collapse state. Repeated loop calls cannot increment it.
+        collapse_candidate = (
+            cont_strength < 25 and decay
+            and (direction not in ("BUY", "SELL") or smart_opposed)
+        )
+        collapse_confirmation = advance_closed_candle_confirmation(
+            collapse_candidate,
+            candle_ts,
+            self._momentum_collapse_last_candle_ts,
+            self._momentum_collapse_confirm_count,
+            max_gap_seconds=max(60.0, _timeframe_seconds(INTERVAL) * 1.5),
+        )
+        self._momentum_collapse_confirm_count = collapse_confirmation["count"]
+        self._momentum_collapse_last_candle_ts = collapse_confirmation["last_candle_ts"]
+        momentum_collapse_confirmed = bool(collapse_confirmation["confirmed"])
+
         # PANIC_EXIT
         if (bias_detailed in ("STRONG_SELL", "STRONG_BUY") and
             dist_risk > 75 and cont_strength < 20 and decay
             and (direction not in ("BUY", "SELL") or smart_opposed)):
             new_state = "PANIC_EXIT"
-        # MOMENTUM_COLLAPSE uses directional strength/decay, not signed health.
-        elif cont_strength < 25 and decay and (direction not in ("BUY", "SELL") or smart_opposed):
+        # A normal momentum collapse must persist across two closed candles.
+        elif momentum_collapse_confirmed:
             new_state = "MOMENTUM_COLLAPSE"
         # LIQUIDITY_EXHAUSTION
         elif exh_risk > 70 or climax > 75:
@@ -488,7 +517,8 @@ class TradeStateMachine:
         return self.current_state in ("EXHAUSTION", "DISTRIBUTION", "MOMENTUM_COLLAPSE", "PROFIT_DEFENSE", "LIQUIDITY_EXHAUSTION")
 
     def should_hard_exit(self) -> bool:
-        return self.current_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION")
+        # MOMENTUM_COLLAPSE is authorized only through the confirmed Profit Brain path.
+        return self.current_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION")
 
     def get_patience_level(self) -> str:
         if self.current_state in ("ACCUMULATION", "EXPANSION", "TREND_RIDE", "HEALTHY_PULLBACK"):
@@ -2629,7 +2659,8 @@ class InstitutionalTradeBrain:
 # ========== NEW TRADE MANAGEMENT BOARD (INSTITUTIONAL GRADE) ==========
 from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
-                              tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
+                              advance_closed_candle_confirmation, tp2_reassessment,
+                              thesis_failure_action, evaluate_exit_risk,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               trend_target_prices, resolve_trend_targets,
                               RANGE_MODE, TREND_MODE, STANDARD_MODE)
