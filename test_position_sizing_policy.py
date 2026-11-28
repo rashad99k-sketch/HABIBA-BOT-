@@ -306,13 +306,14 @@ def test_adx_entry_filter_blocks_below_18_and_missing_values():
 def test_execute_entry_enforces_stop_risk_budget_without_resizing_quantity():
     from pathlib import Path
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
-    gate = source.index("estimated_stop_risk_pct = (estimated_stop_loss / balance) * 100.0")
+    gate = source.index("estimated_stop_risk_pct = validate_stop_risk_budget(")
     sizing = source.index("qty = sizing.quantity", gate - 5000)
     assert sizing < gate
-    block = source[gate:gate + 700]
-    assert "estimated_stop_risk_pct > MAX_TRADE_RISK_PCT" in block
-    assert "entry rejected" in block
-    assert "position allocation and 20x leverage were not silently changed" in block
+    block = source[gate:gate + 400]
+    assert "estimated_loss_usdt=estimated_stop_loss" in block
+    assert "available_balance=balance" in block
+    assert "max_risk_pct=MAX_TRADE_RISK_PCT" in block
+    assert "MAX_TRADE_RISK_PCT = 10.0" in source
 
 
 def test_structural_stop_estimate_includes_execution_buffer():
