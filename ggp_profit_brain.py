@@ -393,8 +393,10 @@ def resolve_trend_targets(context: Dict[str, Any]) -> Dict[str, Any]:
     tp2_distance = max(entry * (tp2_move_pct / 100.0), atr * 1.80 if atr > 0 else 0.0, tp1_distance * 1.25)
     return {"status": "FALLBACK", "tp1": round(entry + direction * tp1_distance, 12),
             "tp2": round(entry + direction * tp2_distance, 12),
-            "reason": "no_valid_directional_structure_conservative_reference_fallback",
-            "evidence": ("no_valid_structural_or_liquidity_level",)}
+            "reason": ("strong_trend_3pct_tp2_extension" if strong_extension else
+                       "no_valid_directional_structure_conservative_reference_fallback"),
+            "evidence": (("no_valid_structural_or_liquidity_level", "adx_continuation_volume_confirmed_3pct_extension")
+                         if strong_extension else ("no_valid_structural_or_liquidity_level",))}
 
 
 def target_reached(side: str, current_price: float, target_price: float) -> bool:
