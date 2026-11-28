@@ -221,6 +221,7 @@ def test_scalp_board_uses_two_stage_50_50_partial_tp1_and_runner_tp2():
     assert "target_remaining = initial * 0.5" in board
     assert "range_scalp_waiting_for_two_stage_targets" in board
     assert "range_scalp_waiting_for_single_target" not in board
+    assert "adaptive_range_target if adaptive_range_target > 0" in board
 
 
 
