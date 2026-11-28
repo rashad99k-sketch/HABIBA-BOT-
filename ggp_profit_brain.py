@@ -490,8 +490,15 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
     groups = set()
     reasons = []
     trade_state = str(ctx.get("trade_state") or "").upper()
-    hard_states = {"PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"}
+    # PANIC_EXIT and verified liquidity exhaustion remain immediate hard states.
+    # MOMENTUM_COLLAPSE must be backed by observed post-entry deterioration;
+    # the state label alone can be stale or produced by a low-strength range.
+    hard_states = {"PANIC_EXIT", "LIQUIDITY_EXHAUSTION"}
     structural = bool(ctx.get("structural_invalidation") or ctx.get("structure_broken"))
+    momentum_collapse_confirmed = (
+        trade_state == "MOMENTUM_COLLAPSE"
+        and bool(ctx.get("momentum_collapse_confirmed", False))
+    )
     if structural:
         score += 5
         groups.add("STRUCTURE")
@@ -500,6 +507,13 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         score += 5
         groups.add("STATE_MACHINE")
         reasons.append("hard_exit_state:" + trade_state)
+    elif trade_state == "MOMENTUM_COLLAPSE":
+        if momentum_collapse_confirmed:
+            score += 5
+            groups.add("STATE_MACHINE")
+            reasons.append("confirmed_momentum_collapse")
+        else:
+            reasons.append("unconfirmed_momentum_collapse_deferred")
 
     failure_score = _number(ctx.get("thesis_failure_score"), 0.0) or 0.0
     if failure_score >= 70:
