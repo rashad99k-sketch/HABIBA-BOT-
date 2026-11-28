@@ -86,6 +86,7 @@ from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, build_scalp_target,
     build_support_resistance_zones, classify_dynamic_trade_classification,
+    select_opposing_liquidity_pool,
 )
 from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
@@ -294,7 +295,14 @@ class MomentumFlowEngine:
         momentum_health = 50 + (norm_strength * 50)
         continuation_strength = min(100, max(0, abs_spread * 20))
         trend_expansion = abs_spread > 0.35
-        momentum_decay = abs_spread < 0.05
+        # A quiet market is not a momentum collapse. Require a prior directional
+        # impulse in the recent CLOSED candles followed by material contraction.
+        prior_spreads = momentum_spread.iloc[-5:-1].abs().dropna()
+        prior_peak_spread = float(prior_spreads.max()) if not prior_spreads.empty else 0.0
+        momentum_decay = bool(
+            prior_peak_spread >= 0.20
+            and abs_spread <= max(0.05, prior_peak_spread * 0.35)
+        )
         rsi_now = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
         climax_risk = max(0.0, rsi_now - 70.0, 30.0 - rsi_now) * 3.0
         exhaustion_risk = max(0, 40 - momentum_health)
@@ -316,6 +324,7 @@ class MomentumFlowEngine:
             "momentum_health": safe_float_val(momentum_health),
             "trend_expansion": bool(trend_expansion),
             "momentum_decay": bool(momentum_decay),
+            "momentum_collapse_confirmed": bool(momentum_decay),
             "climax_risk": safe_float_val(climax_risk),
             "rsi_value": safe_float_val(rsi_now),
             "exhaustion_risk": safe_float_val(exhaustion_risk),
@@ -330,6 +339,7 @@ class MomentumFlowEngine:
             "momentum_health": 50.0,
             "trend_expansion": False,
             "momentum_decay": False,
+            "momentum_collapse_confirmed": False,
             "climax_risk": 0.0,
             "rsi_value": 50.0,
             "exhaustion_risk": 0.0,
@@ -4492,6 +4502,7 @@ class LiveTradeManager:
             "exhaustion_risk": safe_float(momentum.get("exhaustion_risk"), 0.0),
             "climax_risk": safe_float(momentum.get("climax_risk"), 0.0),
             "momentum_decay": bool(momentum.get("momentum_decay", False)),
+            "momentum_collapse_confirmed": bool(momentum.get("momentum_collapse_confirmed", False)),
             "flow_bias": str(momentum.get("flow_bias") or "UNKNOWN"),
             "counter_pressure": safe_float(STATE.get("counter_pressure"), 0.0),
             "reclaim_risk": safe_float(STATE.get("reclaim_risk"), 0.0),

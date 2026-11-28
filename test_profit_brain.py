@@ -343,3 +343,79 @@ def test_momentum_engine_uses_direction_neutral_strength_and_separate_flow_bias(
     assert "abs_spread = abs(float(momentum_spread.iloc[-1]))" in source
     assert "trend_expansion = abs_spread > 0.35" in source
     assert 'flow_bias = "SELL"' in source
+
+
+
+def test_unconfirmed_momentum_collapse_state_does_not_force_hard_exit():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": -0.07,
+        "trade_state": "MOMENTUM_COLLAPSE",
+        "momentum_collapse_confirmed": False,
+        "momentum": {"momentum_decay": False, "flow_bias": "BUY"},
+    })
+    assert result["action"] == "HOLD"
+    assert result["hard_exit"] is False
+    assert "unconfirmed_momentum_collapse_deferred" in result["reasons"]
+
+
+def test_confirmed_momentum_collapse_still_forces_hard_exit():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": -0.07,
+        "trade_state": "MOMENTUM_COLLAPSE",
+        "momentum_collapse_confirmed": True,
+    })
+    assert result["action"] == "HARD_EXIT"
+    assert result["hard_exit"] is True
+    assert "confirmed_momentum_collapse" in result["reasons"]
+
+
+def test_panic_liquidity_and_structural_hard_exits_remain_immediate():
+    from ggp_profit_brain import evaluate_exit_risk
+    for context in (
+        {"trade_state": "PANIC_EXIT"},
+        {"trade_state": "LIQUIDITY_EXHAUSTION"},
+        {"structural_invalidation": True},
+    ):
+        result = evaluate_exit_risk({"side": "BUY", "roe": -0.1, **context})
+        assert result["action"] == "HARD_EXIT"
+
+
+def test_plain_momentum_decay_warning_is_not_a_hard_exit():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "BUY", "roe": -0.07,
+        "momentum": {"momentum_decay": True},
+    })
+    assert result["action"] == "HOLD"
+    assert result["hard_exit"] is False
+
+
+def test_momentum_engine_distinguishes_quiet_market_from_confirmed_decay():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    assert "prior_spreads = momentum_spread.iloc[-5:-1].abs().dropna()" in source
+    assert "prior_peak_spread >= 0.20" in source
+    assert "prior_peak_spread * 0.35" in source
+    assert '"momentum_collapse_confirmed": bool(momentum_decay)' in source
+
+
+def test_opposing_liquidity_selector_is_imported_where_live_manager_calls_it():
+    import ast
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "ggp_market_intelligence"
+        and any(alias.name == "select_opposing_liquidity_pool" for alias in node.names)
+        for node in tree.body
+    )
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "select_opposing_liquidity_pool"
+        for node in ast.walk(tree)
+    )
+    assert imported and called
