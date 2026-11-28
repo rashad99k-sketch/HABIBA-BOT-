@@ -96,22 +96,34 @@ def _closed(df: pd.DataFrame, now_ms: Optional[int] = None, timeframe_ms: int = 
 class StructuralStopLossEngine:
     @staticmethod
     def calculate(side: str, setup_type: str, entry: float, extreme: float, atr: float,
-                  tick_size: Optional[float] = None, max_risk_pct: Optional[float] = None) -> Tuple[Optional[float], str]:
+                  tick_size: Optional[float] = None, max_risk_pct: Optional[float] = None,
+                  max_stop_distance_pct: float = 1.50,
+                  max_stop_atr_multiple: float = 2.50) -> Tuple[Optional[float], str]:
         side = str(side).upper()
-        if side not in {"BUY", "SELL"} or not all(math.isfinite(float(v)) for v in (entry, extreme, atr)) or atr <= 0:
+        if side not in {"BUY", "SELL"} or not all(math.isfinite(float(v)) for v in (entry, extreme, atr)) or entry <= 0 or atr <= 0:
             return None, "invalid_stop_inputs"
-        # Give the confirmed swing/zone room for ordinary 15m noise. This is a
-        # structural clearance, not permission to increase account risk.
+        # Preserve the structural invalidation level, but reject setups whose
+        # required stop is too far away. Never pull a stop inside its invalidation zone.
         buffer = max(atr * 0.50, abs(entry) * 0.0020)
         stop = float(extreme) - buffer if side == "BUY" else float(extreme) + buffer
         if tick_size and tick_size > 0:
             stop = math.floor(stop / tick_size) * tick_size if side == "BUY" else math.ceil(stop / tick_size) * tick_size
         if (side == "BUY" and stop >= entry) or (side == "SELL" and stop <= entry):
             return None, "stop_wrong_side"
-        risk_pct = abs(entry - stop) / entry * 100.0
+        distance = abs(entry - stop)
+        risk_pct = distance / entry * 100.0
+        max_distance = min(
+            abs(entry) * max(0.0, float(max_stop_distance_pct)) / 100.0,
+            atr * max(0.0, float(max_stop_atr_multiple)),
+        )
+        if max_distance <= 0 or distance > max_distance + 1e-12:
+            return None, (
+                f"structural_stop_too_wide:risk_pct={risk_pct:.4f}:"
+                f"max_pct={max_stop_distance_pct:.4f}:max_atr={max_stop_atr_multiple:.2f}"
+            )
         if max_risk_pct is not None and risk_pct > float(max_risk_pct):
             return None, "structural_risk_exceeds_limit"
-        return stop, f"structural_stop:{setup_type}:risk_pct={risk_pct:.4f}"
+        return stop, f"structural_stop:{setup_type}:risk_pct={risk_pct:.4f}:atr_distance={distance / atr:.3f}"
 
 
 def _confirmed_pivots(df: pd.DataFrame, end: Optional[int] = None, left_right: int = 2):
