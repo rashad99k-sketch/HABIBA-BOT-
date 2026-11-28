@@ -88,15 +88,19 @@ def test_live_profit_manager_consumes_cross_diagnostics_without_gating_position_
     assert "if not STATE.get(\"fresh_ema50_vwap_cross\")" not in manage_body
 
 
-def test_watchlist_candidate_priority_uses_directional_cross_but_keeps_structural_authority():
+def test_cross_event_lifecycle_uses_location_only_and_does_not_make_sweep_a_global_gate():
     from pathlib import Path
 
-    source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
-    assert 'prior.get("ema9_vwap_proximity")' in source
-    assert 'cross_direction == expected_cross' in source
-    assert "vwap_cross_priority" in source
-    assert "AUTHORITY.decide" in source
-    assert "execute_entry remain the sole entry authorization path" in source
+    bridge_source = Path("ggp_institutional_bridge.py").read_text(encoding="utf-8")
+    bot_source = Path("ggpbot.py").read_text(encoding="utf-8")
+    assert 'prior.get("ema9_vwap_proximity")' in bridge_source
+    assert 'cross_direction == expected_cross' in bridge_source
+    assert "vwap_cross_priority" in bridge_source
+    assert "def _evaluate_cross_location" in bridge_source
+    assert "SWEEP_MSS_RETEST_ARE_NOT_UNIVERSAL_ENTRY_GATES" in bridge_source
+    assert 'memory.setdefault("cross_event_watchlist", {})' in bridge_source
+    assert 'def execute_entry(' in bot_source
+    assert 'setup == "EMA9_VWAP_CROSS_LOCATION"' in bot_source
 
 
 def test_cross_timestamp_fields_are_provided_to_profit_and_dashboard_context():

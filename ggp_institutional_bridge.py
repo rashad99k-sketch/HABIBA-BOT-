@@ -22,7 +22,6 @@ from roro_confluence import (classify_liquidity, find_causal_order_block, Liquid
                              compute_session_vwap)
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
                                      build_support_resistance_zones, validate_order_block_zone)
-from ggp_cross_event_pipeline import merge_cross_fields
 
 
 REVERSAL = ReversalEngine()
@@ -94,14 +93,15 @@ def _frame(df: Any) -> pd.DataFrame:
 
 
 def _indicator_snapshot(closed: pd.DataFrame, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
-    """Calculate one auditable indicator snapshot from validated closed candles."""
-    if closed is None or len(closed) < 20:
+    """Closed-candle EMA9/Session-VWAP event snapshot; never reads an open bar."""
+    if closed is None or len(closed) < 55:
         return {"quality": "DATA_UNAVAILABLE", "source": "CLOSED_CANDLE_FRAME",
                 "missing": ["insufficient_closed_candles"]}
     close = pd.to_numeric(closed["close"], errors="coerce")
     ema9 = close.ewm(span=9, adjust=False, min_periods=9).mean()
+    ema50 = close.ewm(span=50, adjust=False, min_periods=50).mean()
     vwap = compute_session_vwap(closed, timeframe_seconds=TIMEFRAME_SECONDS, now_ms=now_ms)
-    if vwap is None:
+    if vwap is None or len(vwap) != len(closed):
         return {"quality": "DATA_UNAVAILABLE", "source": "CANONICAL_SESSION_VWAP",
                 "missing": ["invalid_or_truncated_session_vwap"]}
     delta = close.diff()
@@ -111,6 +111,7 @@ def _indicator_snapshot(closed: pd.DataFrame, *, now_ms: Optional[int] = None) -
     atr_value = _atr(closed)
     price = float(close.iloc[-1])
     ema_value = float(ema9.iloc[-1]) if np.isfinite(ema9.iloc[-1]) else None
+    ema50_value = float(ema50.iloc[-1]) if np.isfinite(ema50.iloc[-1]) else None
     vwap_value = float(vwap.iloc[-1]) if np.isfinite(vwap.iloc[-1]) else None
     rsi_value = float(rsi.iloc[-1]) if np.isfinite(rsi.iloc[-1]) else None
     slope = None
@@ -122,33 +123,51 @@ def _indicator_snapshot(closed: pd.DataFrame, *, now_ms: Optional[int] = None) -
     now_value = int(now_ms if now_ms is not None else time.time() * 1000)
     age_seconds = max(0.0, (now_value - latest_ts) / 1000.0)
     quality = "FRESH" if age_seconds <= 2 * TIMEFRAME_SECONDS else "STALE_DATA"
-    previous_vwap = float(vwap.iloc[-2]) if len(vwap) >= 2 and np.isfinite(vwap.iloc[-2]) else None
-    previous_ema9 = float(ema9.iloc[-2]) if len(ema9) >= 2 and np.isfinite(ema9.iloc[-2]) else None
-    current_gap = (ema_value - vwap_value) if ema_value is not None and vwap_value is not None else None
-    previous_gap = (previous_ema9 - previous_vwap) if previous_ema9 is not None and previous_vwap is not None else None
-    cross_direction = (
-        "BULLISH" if previous_gap is not None and current_gap is not None and previous_gap <= 0 < current_gap
-        else "BEARISH" if previous_gap is not None and current_gap is not None and previous_gap >= 0 > current_gap
-        else None
-    )
+    gaps = (ema9 - vwap).astype(float)
+    cross_direction = None
+    cross_index = None
+    # Keep a cross observable across the following closed candle. This avoids
+    # missing a valid event merely because the 15-second watchlist cycle ran late.
+    for idx in range(len(closed) - 1, max(0, len(closed) - 3), -1):
+        before, after = gaps.iloc[idx - 1], gaps.iloc[idx]
+        if not (np.isfinite(before) and np.isfinite(after)):
+            continue
+        candidate = "BULLISH" if before < 0 < after else "BEARISH" if before > 0 > after else None
+        if candidate is None:
+            continue
+        latest_gap = gaps.iloc[-1]
+        still_aligned = (latest_gap > 0) if candidate == "BULLISH" else (latest_gap < 0)
+        if still_aligned:
+            cross_direction, cross_index = candidate, idx
+            break
+    current_gap = float(gaps.iloc[-1]) if np.isfinite(gaps.iloc[-1]) else None
+    previous_gap = float(gaps.iloc[-2]) if len(gaps) >= 2 and np.isfinite(gaps.iloc[-2]) else None
     approaching = bool(
-        current_gap is not None and previous_gap is not None and atr_value > 0
+        current_gap is not None and previous_gap is not None and np.isfinite(atr_value) and atr_value > 0
         and abs(current_gap) < 0.25 * atr_value and abs(current_gap) < abs(previous_gap)
     )
+    dmi = _dmi_components(closed)
+    cross_ts = int(float(closed["timestamp"].iloc[cross_index])) if cross_index is not None else None
+    cross_age_bars = (len(closed) - 1 - cross_index) if cross_index is not None else None
+    cross_age_seconds = (cross_age_bars or 0) * TIMEFRAME_SECONDS if cross_index is not None else None
     return {
-        "ema9": ema_value, "vwap": vwap_value, "rsi": rsi_value,
-        "previous_ema9": previous_ema9, "previous_vwap": previous_vwap,
+        "ema9": ema_value, "ema50": ema50_value, "vwap": vwap_value, "rsi": rsi_value,
         "atr": float(atr_value) if np.isfinite(atr_value) else None,
         "ema9_slope_atr": slope,
         "vwap_position": ("ABOVE" if price > vwap_value else "BELOW" if price < vwap_value else "AT_VWAP") if vwap_value is not None else "UNKNOWN",
+        "price_vwap_distance_atr": (abs(price - vwap_value) / atr_value) if vwap_value is not None and np.isfinite(atr_value) and atr_value > 0 else None,
         "volume_ratio": volume_ratio, "latest_closed_timestamp": latest_ts,
         "data_age_seconds": round(age_seconds, 3), "quality": quality,
         "source": "CLOSED_CANDLE_FRAME", "vwap_source": "roro_confluence.compute_session_vwap",
         "timeframe_seconds": TIMEFRAME_SECONDS,
         "cross_status": "CONFIRMED" if cross_direction else "APPROACHING" if approaching else "NONE",
         "cross_direction": cross_direction,
-        "cross_candle_timestamp": latest_ts if cross_direction else None,
+        "cross_candle_timestamp": cross_ts,
+        "cross_age_bars": cross_age_bars,
+        "cross_age_seconds": cross_age_seconds,
         "cross_distance": abs(current_gap) if current_gap is not None else None,
+        "adx": dmi.get("adx"), "di_plus": dmi.get("di_plus"), "di_minus": dmi.get("di_minus"),
+        "adx_slope": dmi.get("adx_slope"),
     }
 
 
@@ -161,71 +180,57 @@ def _atr(df: pd.DataFrame, period: int = 14) -> float:
     return float(value) if pd.notna(value) and np.isfinite(value) and value > 0 else float("nan")
 
 
+def _dmi_components(df: pd.DataFrame, period: int = 14) -> Dict[str, Optional[float]]:
+    """Return GGP-canonical Wilder/RMA ADX and DI values from closed candles.
+
+    This deliberately mirrors ``ggpbot.compute_adx`` and ``get_di_components``
+    so the discovery ADX>=18 gate and the final execution ADX>=18 gate cannot
+    disagree because they seeded the same indicator differently.
+    """
+    empty = {"adx": None, "di_plus": None, "di_minus": None, "adx_slope": None}
+    if (not isinstance(df, pd.DataFrame) or not isinstance(period, int) or period < 2
+            or len(df) < period * 2 or not {"high", "low", "close"}.issubset(df.columns)):
+        return empty
+    try:
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        if not (np.isfinite(high.to_numpy()).all() and np.isfinite(low.to_numpy()).all()
+                and np.isfinite(close.to_numpy()).all()):
+            return empty
+        if bool((high < low).any() or (close > high).any() or (close < low).any()):
+            return empty
+        tr = pd.concat([
+            (high - low).rename("hl"),
+            (high - close.shift(1)).abs().rename("hc"),
+            (low - close.shift(1)).abs().rename("lc"),
+        ], axis=1).max(axis=1)
+        rma = lambda values: values.ewm(alpha=1.0 / period, adjust=False).mean()
+        atr = rma(tr) + 1e-9
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+        plus_di = 100.0 * rma(plus_dm) / (atr + 1e-9)
+        minus_di = 100.0 * rma(minus_dm) / (atr + 1e-9)
+        dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)) * 100.0
+        adx_series = rma(dx).bfill().ffill().fillna(0.0).clip(0.0, 100.0)
+        adx_current = float(adx_series.iloc[-1])
+        adx_previous = float(adx_series.iloc[-2]) if len(adx_series) > 1 else adx_current
+        return {
+            "adx": adx_current,
+            "di_plus": float(plus_di.iloc[-1]),
+            "di_minus": float(minus_di.iloc[-1]),
+            "adx_slope": adx_current - adx_previous,
+        }
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return empty
+
+
 def _adx(df: pd.DataFrame, period: int = 14) -> float:
-    """Standard Wilder ADX with SMA-seeded Wilder smoothing; NaN means insufficient evidence."""
-    if (
-        not isinstance(df, pd.DataFrame)
-        or not isinstance(period, int) or period < 2
-        or len(df) < period * 2 + 1
-        or not {"high", "low", "close"}.issubset(df.columns)
-    ):
-        return float("nan")
-    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
-    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
-    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
-    if not (np.isfinite(high).all() and np.isfinite(low).all() and np.isfinite(close).all()):
-        return float("nan")
-    if np.any(high < low) or np.any(close > high) or np.any(close < low):
-        return float("nan")
-
-    up = np.diff(high, prepend=np.nan)
-    down = -np.diff(low, prepend=np.nan)
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    previous_close = np.roll(close, 1)
-    previous_close[0] = np.nan
-    tr = np.nanmax(np.column_stack((
-        high - low,
-        np.abs(high - previous_close),
-        np.abs(low - previous_close),
-    )), axis=1)
-
-    def _wilder_rma(values: np.ndarray) -> np.ndarray:
-        out = np.full(len(values), np.nan, dtype=float)
-        finite = np.isfinite(values)
-        starts = np.flatnonzero(finite)
-        if len(starts) < period:
-            return out
-        seed_start = None
-        for candidate in starts:
-            if candidate + period <= len(values) and finite[candidate:candidate + period].all():
-                seed_start = int(candidate)
-                break
-        if seed_start is None:
-            return out
-        seed_index = seed_start + period - 1
-        out[seed_index] = float(np.mean(values[seed_start:seed_index + 1]))
-        for idx in range(seed_index + 1, len(values)):
-            if not np.isfinite(values[idx]):
-                return out
-            out[idx] = (out[idx - 1] * (period - 1) + values[idx]) / period
-        return out
-
-    atr = _wilder_rma(tr)
-    plus_smoothed = _wilder_rma(plus_dm)
-    minus_smoothed = _wilder_rma(minus_dm)
-    plus_di = np.divide(100.0 * plus_smoothed, atr, out=np.full(len(atr), np.nan), where=atr > 0)
-    minus_di = np.divide(100.0 * minus_smoothed, atr, out=np.full(len(atr), np.nan), where=atr > 0)
-    denominator = plus_di + minus_di
-    dx = np.divide(
-        100.0 * np.abs(plus_di - minus_di),
-        denominator,
-        out=np.full(len(denominator), np.nan),
-        where=denominator > 0,
-    )
-    adx = _wilder_rma(dx)
-    value = adx[-1] if len(adx) else np.nan
-    return float(value) if np.isfinite(value) else float("nan")
+    """Compatibility wrapper retained for existing callers and tests."""
+    value = _dmi_components(df, period).get("adx")
+    return float(value) if value is not None else float("nan")
 
 
 def build_liquidity_pools(df: pd.DataFrame) -> Dict[str, List[float]]:
@@ -388,7 +393,11 @@ def _decision_result(decision) -> Dict[str, Any]:
 def merge_candidates(memory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Merge all candidate feeds without losing valid CCXT symbols or direction."""
     merged: Dict[str, Dict[str, Any]] = {}
+    universe = memory.get("market_universe", {}) if isinstance(memory.get("market_universe"), dict) else {}
+    universe_symbols = universe.get("symbols", []) if isinstance(universe, dict) else []
+    universe_items = [{"symbol": symbol, "source": "validated_market_universe"} for symbol in universe_symbols]
     sources = (
+        ("validated_market_universe", universe_items, None),
         ("professional_scan_candidates", memory.get("professional_scan_candidates", []), None),
         ("rf_watchlist", memory.get("rf_watchlist", []), None),
         ("scanner_v2_buy", memory.get("scanner_v2_buy", []), "BUY"),
@@ -572,175 +581,319 @@ def _fvg_matches_side(fvg: Any, side: str) -> bool:
     )
 
 
-def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
-                   now_ms: Optional[int] = None) -> Dict[str, Any]:
-    x = _frame(df)
-    closed = validate_closed_frame(x, now_ms=now_ms, timeframe_s=TIMEFRAME_SECONDS)
-    if len(closed) < 55:
-        return {
-            "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol), "side": side,
-            "decision_state": DecisionState.REJECTED.value,
-            "decision_reason": "insufficient_closed_data", "rejection_reason": "insufficient_closed_data",
-            "rejection_reasons": ["insufficient_closed_data"], "last_updated": time.time(),
-            "data_quality": "INSUFFICIENT_CLOSED_CANDLES", "icons": {"status": "⚪"},
-        }
-    side = str(side or "").upper()
-    if side not in {"BUY", "SELL"}:
-        return {"symbol": canonical_symbol(symbol), "decision_state": "REJECTED", "rejection_reason": "invalid_side"}
-    context = _build_context(closed, side, now_ms=now_ms)
-    rev = REVERSAL.analyze(symbol, side, closed, context=context)
-    cont = CONTINUATION.analyze(symbol, side, closed, context=context)
-    decision = AUTHORITY.decide(rev, cont, risk_ok=True)
-    reg, liq, ob, fvg = context["regime"], context["liquidity"], context["order_block"], context["fvg"]
-    ob_state = "UNKNOWN"
-    if isinstance(ob, dict):
-        validation = ob.get("validation") if isinstance(ob.get("validation"), dict) else {}
-        # The validator in _build_context is the single source of OB lifecycle state.
-        # Do not recompute the same mitigation metric here with a second label set.
-        if validation.get("valid") is True:
-            ob_state = str(validation.get("status") or ob.get("status") or "UNKNOWN").upper()
-            ob["status"] = ob_state
-            ob["fill_pct"] = float(validation.get("fill_pct", ob.get("fill_pct", 0.0)) or 0.0)
-        else:
-            ob = None
-
-    liq_name, liq_direction = getattr(liq, "event", "UNKNOWN"), getattr(liq, "direction", "UNKNOWN")
-    if decision.setup_type == "FAILED_AUCTION_REVERSAL":
-        liq_name, liq_direction = "FAILED_AUCTION", "BULLISH" if side == "BUY" else "BEARISH"
-    ob_ok = False
-    if isinstance(ob, dict):
-        try:
-            ob_strength = float(ob.get("strength", 0) if ob.get("strength") is not None else 0)
-            ob_distance = float(ob.get("distance_atr", 999) if ob.get("distance_atr") is not None else 999)
-            ob_ok = (np.isfinite(ob_strength) and np.isfinite(ob_distance)
-                     and ob_strength >= 5 and ob_distance <= 1.5
-                     and ob_state not in ("MITIGATED", "INVALIDATED"))
-        except (TypeError, ValueError):
-            ob_ok = False
-    fvg_ok = _fvg_matches_side(fvg, side)
-    d, golden = _decision_result(decision), context["golden_zone"]
-    # Explainable mode/entry-behavior classification. This is analytical metadata only;
-    # UnifiedEntryAuthority and execute_entry remain the sole entry authorization path.
-    _liq_conf = getattr(liq, "confidence", 0.0)
-    _disp_atr = None
+def _zone_distance_atr(zone: Dict[str, Any], price: float, atr: float) -> Optional[float]:
     try:
-        _last = closed.iloc[-1]
-        _disp_atr = abs(float(_last.close) - float(_last.open)) / max(_atr(closed), 1e-12)
+        low = float(zone.get("low", zone.get("lower")))
+        high = float(zone.get("high", zone.get("upper")))
+        if not (np.isfinite(low) and np.isfinite(high) and 0 < low < high and atr > 0):
+            return None
+        return max(low - price, 0.0, price - high) / atr
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _evaluate_cross_location(df: pd.DataFrame, side: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    """Score location quality only; sweep/MSS/retest are evidence, never universal gates."""
+    price = float(context.get("price") or 0.0)
+    atr = float(context.get("atr") or 0.0)
+    if price <= 0 or atr <= 0 or not np.isfinite(price) or not np.isfinite(atr):
+        return {"status": "WAITING", "distance_atr": None, "reason": "location_inputs_unavailable",
+                "evidence": ["location_inputs_unavailable"], "structural_stop": None,
+                "zone_low": None, "zone_high": None}
+
+    expected = "BULLISH" if side == "BUY" else "BEARISH"
+    evidence: List[str] = []
+    candidate_distances: List[float] = []
+    stop_extremes: List[float] = []
+    chosen_zone: Optional[Dict[str, Any]] = None
+    factor_count = 0
+    has_primary = False
+    ob = context.get("order_block") if isinstance(context.get("order_block"), dict) else None
+    fvg = context.get("fvg") if isinstance(context.get("fvg"), dict) else None
+    sr = context.get("support_resistance") if isinstance(context.get("support_resistance"), dict) else {}
+
+    if ob and ob.get("valid") is True and str(ob.get("status") or "").upper() not in {"MITIGATED", "INVALIDATED", "CANCELLED"}:
+        dist = _zone_distance_atr(ob, price, atr)
+        if dist is None:
+            try: dist = float(ob.get("distance_atr"))
+            except (TypeError, ValueError): dist = None
+        if dist is not None and np.isfinite(dist) and 0 <= dist <= 1.5:
+            factor_count += 1; has_primary = True; candidate_distances.append(float(dist))
+            evidence.append(f"OB_{str(ob.get('status') or 'FRESH').upper()}_ALIGNED_DISTANCE_{dist:.2f}ATR")
+            try:
+                stop_extremes.append(float(ob.get("low") if side == "BUY" else ob.get("high")))
+            except (TypeError, ValueError):
+                pass
+            chosen_zone = ob
+
+    if fvg and str(fvg.get("direction") or "").upper() == expected and str(fvg.get("status") or "").upper() in {"UNFILLED", "PARTIALLY_FILLED"}:
+        dist = _zone_distance_atr(fvg, price, atr)
+        if dist is not None and 0 <= dist <= 1.5:
+            factor_count += 1; has_primary = True; candidate_distances.append(float(dist))
+            evidence.append(f"FVG_{str(fvg.get('status')).upper()}_ALIGNED_DISTANCE_{dist:.2f}ATR")
+            try:
+                stop_extremes.append(float(fvg.get("lower") if side == "BUY" else fvg.get("upper")))
+            except (TypeError, ValueError):
+                pass
+            chosen_zone = chosen_zone or fvg
+
+    sr_key = "supports" if side == "BUY" else "resistances"
+    aligned_sr = []
+    for zone in sr.get(sr_key, []) if isinstance(sr.get(sr_key), list) else []:
+        if not isinstance(zone, dict) or str(zone.get("status") or "").upper() != "CONFIRMED":
+            continue
+        dist = _zone_distance_atr(zone, price, atr)
+        if dist is None:
+            try: dist = float(zone.get("distance_atr"))
+            except (TypeError, ValueError): dist = None
+        if dist is not None and np.isfinite(dist) and 0 <= dist <= 1.5:
+            aligned_sr.append((float(dist), zone))
+    if aligned_sr:
+        dist, zone = min(aligned_sr, key=lambda x: x[0])
+        factor_count += 1; candidate_distances.append(dist)
+        evidence.append(f"CONFIRMED_{'SUPPORT' if side == 'BUY' else 'RESISTANCE'}_DISTANCE_{dist:.2f}ATR")
+        try: stop_extremes.append(float(zone.get("low") if side == "BUY" else zone.get("high")))
+        except (TypeError, ValueError): pass
+        chosen_zone = chosen_zone or zone
+
+    golden = context.get("golden_zone") if isinstance(context.get("golden_zone"), dict) else {}
+    indicators = context.get("indicator_snapshot") if isinstance(context.get("indicator_snapshot"), dict) else {}
+    value_zone = str(golden.get("value_zone") or "UNKNOWN").upper()
+    vwap_distance = indicators.get("price_vwap_distance_atr")
+    value_aligned = (side == "BUY" and value_zone == "DISCOUNT") or (side == "SELL" and value_zone == "PREMIUM")
+    if value_aligned and vwap_distance is not None and np.isfinite(float(vwap_distance)) and float(vwap_distance) <= 1.5:
+        factor_count += 1; candidate_distances.append(float(vwap_distance))
+        evidence.append(f"{value_zone}_VALUE_LOCATION_WITHIN_{float(vwap_distance):.2f}ATR_OF_SESSION_VWAP")
+
+    liquidity = context.get("liquidity")
+    liquidity_direction = str(getattr(liquidity, "direction", "UNKNOWN") or "UNKNOWN").upper()
+    liquidity_event = str(getattr(liquidity, "event", "UNKNOWN") or "UNKNOWN").upper()
+    liquidity_level = getattr(liquidity, "level", None)
+    liquidity_aligned = False
+    try:
+        liquidity_aligned = (liquidity_direction == expected and liquidity_event in {"SWEEP", "GRAB", "RUN"}
+                             and liquidity_level is not None and abs(price - float(liquidity_level)) / atr <= 1.5)
+    except (TypeError, ValueError, ZeroDivisionError):
+        liquidity_aligned = False
+    if liquidity_aligned:
+        factor_count += 1; candidate_distances.append(abs(price - float(liquidity_level)) / atr)
+        evidence.append(f"OPTIONAL_LIQUIDITY_EVIDENCE_{liquidity_event}_ALIGNED")
+
+    min_distance = min(candidate_distances) if candidate_distances else None
+    if chosen_zone and factor_count >= 3:
+        status = "EXCELLENT"
+    elif has_primary and factor_count >= 2:
+        status = "GOOD"
+    elif has_primary and min_distance is not None and min_distance <= 0.75:
+        status = "GOOD"
+    elif factor_count >= 1:
+        status = "MODERATE"
+    else:
+        status = "WAITING"
+        evidence.append("NO_ACTIONABLE_DIRECTIONAL_LOCATION_WITHIN_1_5_ATR")
+
+    # Stop placement is anchored beyond the nearest valid directional zone or
+    # last confirmed swing. An ATR fallback is allowed only after location passed.
+    candidates = [v for v in stop_extremes if np.isfinite(v) and ((v < price) if side == "BUY" else (v > price))]
+    try:
+        highs, lows = confirmed_swings(df, left_right=2)
+        swing_values = [float(v) for _, v in (lows[-8:] if side == "BUY" else highs[-8:])]
+        candidates.extend(v for v in swing_values if np.isfinite(v) and ((v < price) if side == "BUY" else (v > price)))
     except Exception:
         pass
-    _adx_value = _adx(closed)
-    indicators = context.get("indicator_snapshot") or {}
-    momentum_strength = None
-    if _disp_atr is not None:
-        momentum_strength = max(0.0, min(100.0, 50.0 + _disp_atr * 20.0))
-    # Prefer the causal order block as the primary zone; use a directionally
-    # valid, unfilled FVG only when no qualified OB exists.
-    _zone_low = _zone_high = None
-    if ob_ok and isinstance(ob, dict):
-        _zone_low = float(ob.get("low", 0) or 0)
-        _zone_high = float(ob.get("high", 0) or 0)
-    elif fvg_ok and isinstance(fvg, dict):
-        _zone_low = float(fvg.get("lower", 0) or 0)
-        _zone_high = float(fvg.get("upper", 0) or 0)
-    if not (_zone_low is not None and _zone_high is not None
-            and np.isfinite(_zone_low) and np.isfinite(_zone_high)
-            and 0 < _zone_low < _zone_high):
-        _zone_low = _zone_high = None
-    _intelligence = build_intelligence_decision(
-        regime=reg.state, adx=_adx_value,
-        continuation_probability=(float(cont.score) / 100.0 if getattr(cont, "score", None) is not None else None),
-        liquidity_quality=("GOOD" if float(_liq_conf or 0) >= 65.0 else "ADEQUATE" if float(_liq_conf or 0) >= 50.0 else "UNKNOWN"),
-        displacement_atr=_disp_atr,
-        setup_type=decision.setup_type,
-        sweep_confirmed=_sniper_evidence_matches_side(
-            side, liq_name, liq_direction, context["structure"].get("mss"), bool(ob_ok or fvg_ok)
-        ),
-        mss_confirmed=(
-            str(context["structure"].get("mss") or "").upper()
-            == ("BULLISH_CHOCH" if side == "BUY" else "BEARISH_CHOCH")
-        ),
-        causal_zone_valid=bool(ob_ok or fvg_ok),
-        bos_level=(context["structure"].get("swing_high") if side == "BUY" else context["structure"].get("swing_low")),
-        reference_low=_zone_low, reference_high=_zone_high,
-        volatility_atr=(_atr(closed) / float(context["price"]) * 100.0 if float(context["price"] or 0) > 0 else None),
-        zone_quality=golden.get("score"),
-        order_block_fresh=bool(isinstance(ob, dict) and str(ob_state).upper() == "FRESH"),
-        ema9_slope=indicators.get("ema9_slope_atr"),
-        vwap_position=indicators.get("vwap_position", "UNKNOWN"),
-        rsi=indicators.get("rsi"), momentum_strength=momentum_strength,
-        volume_ratio=context.get("volume_ratio"), liquidity_confidence=_liq_conf,
-        data_quality="VALID_CLOSED_CANDLES",
-    ).to_dict()
-    # Chart-pattern recognition is observational metadata based exclusively on
-    # the validated closed-candle frame; it cannot authorize or submit orders.
-    _intelligence["price_pattern"] = classify_price_pattern(
-        closed.to_dict("records"), atr=_atr(closed)
+    if candidates:
+        extreme = max(candidates) if side == "BUY" else min(candidates)
+    else:
+        extreme = price - (1.2 * atr) if side == "BUY" else price + (1.2 * atr)
+    structural_stop, stop_reason = StructuralStopLossEngine.calculate(
+        side, "EMA9_VWAP_CROSS_LOCATION", price, float(extreme), atr
     )
+    if structural_stop is not None:
+        evidence.append(stop_reason)
+    else:
+        evidence.append(f"STOP_INVALID:{stop_reason}")
+
+    zone_low = zone_high = None
+    if chosen_zone:
+        try:
+            zone_low = float(chosen_zone.get("low", chosen_zone.get("lower")))
+            zone_high = float(chosen_zone.get("high", chosen_zone.get("upper")))
+        except (TypeError, ValueError):
+            zone_low = zone_high = None
+    return {
+        "status": status, "distance_atr": round(float(min_distance), 4) if min_distance is not None else None,
+        "factor_count": factor_count, "reason": ";".join(evidence), "evidence": evidence,
+        "structural_stop": structural_stop, "stop_reason": stop_reason,
+        "zone_low": zone_low, "zone_high": zone_high,
+        "liquidity_is_optional_evidence": True,
+        "universal_sweep_mss_retest_gate": False,
+    }
+
+
+def _classify_cross_trade_mode(side: str, regime: Any, indicators: Dict[str, Any], volume_ratio: Any) -> Tuple[str, str, List[str]]:
+    """TREND requires directional regime/ADX/DI confirmation; otherwise use SCALP."""
+    adx = indicators.get("adx")
+    plus = indicators.get("di_plus")
+    minus = indicators.get("di_minus")
+    slope = indicators.get("ema9_slope_atr")
+    reg_direction = str(getattr(regime, "direction", "UNKNOWN") or "UNKNOWN").upper()
+    expected = "BULLISH" if side == "BUY" else "BEARISH"
+    di_aligned = (plus is not None and minus is not None and
+                  ((plus > minus) if side == "BUY" else (minus > plus)))
+    slope_aligned = (slope is not None and ((slope > 0.05) if side == "BUY" else (slope < -0.05)))
+    volume_ok = volume_ratio is not None and float(volume_ratio) >= 0.90
+    strong = (adx is not None and float(adx) >= 25.0 and reg_direction == expected
+              and di_aligned and slope_aligned and volume_ok)
+    evidence = [f"ADX={float(adx):.2f}" if adx is not None else "ADX_UNKNOWN",
+                f"REGIME={reg_direction}", f"DI_ALIGNED={di_aligned}",
+                f"EMA9_SLOPE_ALIGNED={slope_aligned}", f"VOLUME_RATIO={volume_ratio}"]
+    if strong:
+        return "TREND", "strong_directional_regime_confirmed", evidence
+    return "SCALP", "trend_strength_not_fully_confirmed_use_scalp_management", evidence
+
+
+def analyze_symbol(symbol: str, side: str, df: pd.DataFrame,
+                   now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Analyze an EMA9/Session-VWAP event; institutional logic grades location only."""
+    x = _frame(df)
+    effective_now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    closed = validate_closed_frame(x, now_ms=effective_now_ms, timeframe_s=TIMEFRAME_SECONDS)
+    side = str(side or "").upper()
+    base = {"symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol), "side": side,
+            "last_updated": time.time(), "last_update": time.time(), "source": "EMA9_VWAP_CROSS_LIFECYCLE"}
+    if side not in {"BUY", "SELL"}:
+        return {**base, "decision_state": "REJECTED", "decision_reason": "invalid_side",
+                "rejection_reason": "invalid_side", "data_quality": "INVALID"}
+    if len(closed) < 55:
+        return {**base, "decision_state": DecisionState.REJECTED.value,
+                "decision_reason": "insufficient_closed_data", "rejection_reason": "insufficient_closed_data",
+                "rejection_reasons": ["insufficient_closed_data"], "data_quality": "INSUFFICIENT_CLOSED_CANDLES",
+                "icons": {"status": "⚪"}}
+
+    context = _build_context(closed, side, now_ms=effective_now_ms)
+    reg, liq = context["regime"], context["liquidity"]
+    indicators = context.get("indicator_snapshot") or {}
+    dmi = _dmi_components(closed)
+    adx_value = dmi.get("adx")
+    # The indicator snapshot and the authorization snapshot use the same validated frame.
+    indicators.update({"adx": adx_value, "di_plus": dmi.get("di_plus"), "di_minus": dmi.get("di_minus"),
+                       "adx_slope": dmi.get("adx_slope")})
     cross_status = str(indicators.get("cross_status") or "NONE").upper()
     cross_direction = str(indicators.get("cross_direction") or "").upper()
-    cross_ts = indicators.get("cross_candle_timestamp")
-    cross_event = cross_event_id(symbol, cross_direction, cross_ts)
-    institutional_status = (
-        "INSTITUTIONAL_APPROVED" if decision.state == DecisionState.ENTRY_READY.value
-        else "INSTITUTIONAL_REJECTED" if decision.state in {DecisionState.REJECTED.value, DecisionState.INVALIDATED.value, DecisionState.EXPIRED.value}
-        else "INSTITUTIONAL_ANALYSIS_PENDING"
+    expected_direction = "BULLISH" if side == "BUY" else "BEARISH"
+    cross_timestamp = indicators.get("cross_candle_timestamp")
+    cross_id = cross_event_id(symbol, cross_direction, cross_timestamp) if cross_status == "CONFIRMED" else None
+    side_matches = cross_status == "CONFIRMED" and cross_direction == expected_direction and bool(cross_id)
+
+    location = _evaluate_cross_location(closed, side, context)
+    trade_mode, trade_mode_reason, trade_mode_evidence = _classify_cross_trade_mode(
+        side, reg, indicators, context.get("volume_ratio")
     )
+    adx_pass = adx_value is not None and float(adx_value) >= 18.0
+    data_fresh = str(indicators.get("quality") or "UNKNOWN").upper() == "FRESH"
+
+    if cross_status != "CONFIRMED":
+        state, reason = "WAITING_FOR_CONFIRMATION", "ema9_session_vwap_cross_not_confirmed_on_closed_candle"
+    elif not side_matches:
+        state, reason = "WAITING_FOR_CONFIRMATION", "confirmed_cross_direction_does_not_match_side"
+    elif not data_fresh:
+        state, reason = "WAITING_FOR_CONFIRMATION", "cross_or_market_data_is_stale"
+    elif not adx_pass:
+        state, reason = "REJECTED", f"BASE_ADX_BELOW_18:{adx_value if adx_value is not None else 'UNKNOWN'}"
+    elif location.get("status") not in {"EXCELLENT", "GOOD", "MODERATE"}:
+        state, reason = "WAITING_FOR_CONFIRMATION", "institutional_location_not_actionable_yet"
+    elif location.get("structural_stop") is None:
+        state, reason = "REJECTED", "structural_stop_unavailable_or_invalid"
+    else:
+        state, reason = "ENTRY_READY", "confirmed_cross_adx_pass_and_location_approved"
+
+    evidence = [
+        f"CLOSED_CANDLE_EMA9_SESSION_VWAP_CROSS={cross_status}",
+        f"CROSS_DIRECTION={cross_direction or 'NONE'}",
+        f"BASE_ADX={adx_value if adx_value is not None else 'UNKNOWN'};REQUIRED>=18",
+        f"LOCATION_DECISION={location.get('status')}",
+        *list(location.get("evidence") or []),
+        f"TRADE_MODE={trade_mode}:{trade_mode_reason}",
+        "OB_FVG_SR_VALUE_ZONE_ARE_LOCATION_EVIDENCE_ONLY",
+        "SWEEP_MSS_RETEST_ARE_NOT_UNIVERSAL_ENTRY_GATES",
+    ]
+    golden = context.get("golden_zone") if isinstance(context.get("golden_zone"), dict) else {}
+    ob = context.get("order_block") if isinstance(context.get("order_block"), dict) else None
+    fvg = context.get("fvg") if isinstance(context.get("fvg"), dict) else None
+    ob_state = str((ob or {}).get("status") or "UNKNOWN").upper()
+    expected_regime = expected_direction
+    _intelligence = build_intelligence_decision(
+        regime=reg.state, adx=float(adx_value) if adx_value is not None else None,
+        continuation_probability=None,
+        liquidity_quality=("GOOD" if float(getattr(liq, "confidence", 0) or 0) >= 65 else "ADEQUATE" if float(getattr(liq, "confidence", 0) or 0) >= 50 else "UNKNOWN"),
+        displacement_atr=None, setup_type="EMA9_VWAP_CROSS_LOCATION",
+        sweep_confirmed=False,
+        mss_confirmed=False,
+        causal_zone_valid=location.get("status") in {"EXCELLENT", "GOOD", "MODERATE"},
+        reference_low=location.get("zone_low"), reference_high=location.get("zone_high"),
+        volatility_atr=(float(context["atr"]) / float(context["price"]) * 100.0 if float(context["price"] or 0) > 0 else None),
+        zone_quality=golden.get("score"), order_block_fresh=ob_state == "FRESH",
+        ema9_slope=indicators.get("ema9_slope_atr"), vwap_position=indicators.get("vwap_position", "UNKNOWN"),
+        rsi=indicators.get("rsi"), momentum_strength=None,
+        volume_ratio=context.get("volume_ratio"), liquidity_confidence=getattr(liq, "confidence", 0),
+        data_quality="VALID_CLOSED_CANDLES",
+    ).to_dict()
+    _intelligence["price_pattern"] = classify_price_pattern(closed.to_dict("records"), atr=_atr(closed))
     return {
-        "symbol": canonical_symbol(symbol), "exchange_symbol": exchange_symbol(symbol),
-        "side": side, "price": context["price"], "market_regime": reg.state,
-        "regime_direction": reg.direction, "market_structure": context["structure"],
-        "setup_type": "REVERSAL_ENGINE" if "REVERSAL" in decision.setup_type or decision.setup_type == "FAILED_AUCTION_REVERSAL" else "TREND_CONTINUATION_ENGINE" if "CONTINUATION" in decision.setup_type else "NONE",
-        "decision_setup_type": decision.setup_type, "decision_state": decision.state,
-        "decision_reason": decision.reason, "evidence": d.get("evidence", []),
-        "rejection_reasons": d.get("rejection_reasons", []), "event_id": decision.event_id,
-        "cross_event_id": cross_event,
-        "cross_status": cross_status,
-        "cross_direction": cross_direction or None,
-        "cross_candle_timestamp": cross_ts,
+        **base,
+        "price": context["price"], "market_regime": reg.state, "regime_direction": reg.direction,
+        "market_structure": context["structure"],
+        "setup_type": "EMA9_VWAP_CROSS_LOCATION", "decision_setup_type": "EMA9_VWAP_CROSS_LOCATION",
+        "decision_state": state, "entry_status": state, "entry_readiness": state,
+        "decision_reason": reason, "rejection_reason": reason if state == "REJECTED" else "",
+        "rejection_reasons": [reason] if state == "REJECTED" else [],
+        "evidence": evidence, "event_id": cross_id if side_matches else None,
+        "cross_event_id": cross_id, "cross_status": cross_status,
+        "cross_direction": cross_direction or None, "cross_candle_timestamp": cross_timestamp,
+        "cross_age_bars": indicators.get("cross_age_bars"), "cross_age_seconds": indicators.get("cross_age_seconds"),
         "cross_distance": indicators.get("cross_distance"),
-        "institutional_analysis_status": institutional_status,
-        "final_rejection_reason": decision.reason if institutional_status == "INSTITUTIONAL_REJECTED" else "",
-        "origin_timestamp": decision.origin_timestamp, "structural_stop": decision.structural_stop,
-        "invalidation_level": decision.invalidation_level, "score": float(decision.score),
+        "institutional_analysis_status": "INSTITUTIONAL_APPROVED" if location.get("status") in {"EXCELLENT", "GOOD", "MODERATE"} else "INSTITUTIONAL_ANALYSIS_PENDING",
+        "final_rejection_reason": reason if state == "REJECTED" else "",
+        "origin_timestamp": cross_timestamp, "structural_stop": location.get("structural_stop"),
+        "score": float(golden.get("score", 0) or 0),
         "last_updated": time.time(), "last_update": time.time(), "data_quality": "VALID_CLOSED_CANDLES",
-        "liquidity": {"event": liq_name, "direction": liq_direction, "level": getattr(liq, "level", None),
-                      "confidence": getattr(liq, "confidence", 0), "reasons": list(getattr(liq, "reasons", []))},
+        "liquidity": {"event": getattr(liq, "event", "UNKNOWN"), "direction": getattr(liq, "direction", "UNKNOWN"),
+                      "level": getattr(liq, "level", None), "confidence": getattr(liq, "confidence", 0),
+                      "reasons": list(getattr(liq, "reasons", []))},
         "order_block": ob, "order_block_state": ob_state, "fvg": fvg, "golden_zone": golden,
         "support_resistance": context.get("support_resistance", {"status": "UNKNOWN", "supports": [], "resistances": []}),
         "support_resistance_aligned": bool(context.get("support_resistance_aligned", False)),
-        "volume_ratio": context["volume_ratio"], "volume_confirmed": context["volume_confirmed"],
-        "ema9": indicators.get("ema9"), "vwap": indicators.get("vwap"),
-        "ema50": indicators.get("ema50"), "session_vwap": indicators.get("vwap"),
-        "rsi": indicators.get("rsi"), "atr": indicators.get("atr"),
-        "ema9_slope": indicators.get("ema9_slope_atr"),
-        "vwap_position": indicators.get("vwap_position", "UNKNOWN"),
+        "volume_ratio": context.get("volume_ratio"), "volume_confirmed": bool(context.get("volume_confirmed")),
+        "ema9": indicators.get("ema9"), "ema50": indicators.get("ema50"), "vwap": indicators.get("vwap"),
+        "session_vwap": indicators.get("vwap"), "rsi": indicators.get("rsi"), "atr": indicators.get("atr"),
+        "ema9_slope": indicators.get("ema9_slope_atr"), "vwap_position": indicators.get("vwap_position", "UNKNOWN"),
         "trend_direction": reg.direction, "zone_type": "DEMAND" if side == "BUY" else "SUPPLY",
-        "zone_quality": golden.get("score"), "order_block_status": ob_state,
-        "indicator_snapshot": indicators,
+        "zone_quality": golden.get("score"), "indicator_snapshot": indicators,
         "data_freshness": indicators.get("quality", "DATA_UNAVAILABLE"),
-        "signal_direction": side, "entry_readiness": decision.state,
-        "market_intelligence": _intelligence,
-        "trading_mode": _intelligence.get("mode", "UNCLASSIFIED"),
-        "entry_behavior": _intelligence.get("entry_behavior", "WAIT_FOR_STRUCTURE"),
-        "entry_behavior_confidence": float(_intelligence.get("confidence", 0.0) or 0.0),
-        "entry_behavior_reasons": list(_intelligence.get("reason_codes") or []),
-        "entry_zone_low": _intelligence.get("reference_low"),
-        "entry_zone_high": _intelligence.get("reference_high"),
-        "adx": float(_adx_value) if np.isfinite(_adx_value) else None,
-        "reversal": _decision_result(rev), "continuation": _decision_result(cont), "entry_status": decision.state,
+        "signal_direction": side, "market_intelligence": _intelligence,
+        "trading_mode": trade_mode, "trade_mode": trade_mode, "profit_mode": "RANGE_SCALP" if trade_mode == "SCALP" else "TREND_RIDE",
+        "trade_mode_reason": trade_mode_reason, "trade_mode_evidence": trade_mode_evidence,
+        "entry_behavior": "CROSS_IMMEDIATE_LOCATION_CHECK", "entry_behavior_confidence": 1.0 if side_matches else 0.0,
+        "entry_behavior_reasons": [reason], "entry_zone_low": location.get("zone_low"),
+        "entry_zone_high": location.get("zone_high"), "adx": adx_value,
+        "di_plus": indicators.get("di_plus"), "di_minus": indicators.get("di_minus"),
+        "location_status": location.get("status"), "location_decision": location.get("status"),
+        "location_distance_atr": location.get("distance_atr"), "location_reason": location.get("reason"),
+        "location_evidence": location.get("evidence", []), "location_factor_count": location.get("factor_count", 0),
+        "location_is_authority_not_strategy_replacement": True,
+        "reversal": {"state": "DIAGNOSTIC_ONLY_NOT_USED_FOR_CROSS_ENTRY"},
+        "continuation": {"state": "DIAGNOSTIC_ONLY_NOT_USED_FOR_CROSS_ENTRY"},
         "icons": {
             "regime": "📈" if reg.direction == "BULLISH" else "📉" if reg.direction == "BEARISH" else "⚪",
             "structure": "🧭" if context["structure"].get("confirmed") else "⚪",
-            "liquidity": "💧" if liq_name not in ("UNKNOWN", "NONE") else "⚪",
-            "sweep": "🧲" if liq_name in ("SWEEP", "GRAB") else "⚪",
-            "failed_auction": "🪤" if liq_name == "FAILED_AUCTION" else "⚪",
-            "ob": "🧱" if ob_ok else "⚪", "fvg": "🟪" if fvg_ok else "⚪",
+            "liquidity": "💧" if getattr(liq, "event", "UNKNOWN") not in ("UNKNOWN", "NONE") else "⚪",
+            "sweep": "🧲" if getattr(liq, "event", "UNKNOWN") in ("SWEEP", "GRAB") else "⚪",
+            "ob": "🧱" if ob else "⚪", "fvg": "🟪" if fvg else "⚪",
             "golden_zone": "🌟" if golden.get("state") == "GOLDEN_CONFLUENCE" else "🟨" if golden.get("score", 0) >= 35 else "⚪",
-            "volume": "📊" if context["volume_confirmed"] else "⚪",
-            "setup": "🎯" if decision.state == DecisionState.ENTRY_READY.value else "👁",
-            "pullback": "🔄" if any(any(token in str(ev).lower() for token in ("retest", "pullback", "micro_pullback")) for ev in decision.evidence) else "⚪",
-            "stop": "🛑" if decision.structural_stop else "⚪",
-            "status": "✅" if decision.state == DecisionState.ENTRY_READY.value else "🟡" if decision.state.startswith("WAITING") or decision.state == "NO_CHASE" else "⚪",
+            "volume": "📊" if context.get("volume_confirmed") else "⚪",
+            "setup": "🎯" if state == "ENTRY_READY" else "👁",
+            "stop": "🛑" if location.get("structural_stop") else "⚪",
+            "status": "✅" if state == "ENTRY_READY" else "🟡" if state.startswith("WAITING") else "⛔" if state == "REJECTED" else "⚪",
         },
     }
 
@@ -761,7 +914,10 @@ def analyze_symbol_both(symbol: str, frame: pd.DataFrame, now_ms: Optional[int] 
                          "structural_stop": None, "event_id": None,
                          "icons": {**(selected.get("icons") or {}), "status": "⛔", "setup": "⚠️", "stop": "⚪"}})
     else:
-        selected = dict(max(results, key=lambda row: (_decision_priority(row), row.get("side") in hints)))
+        selected = dict(max(results, key=lambda row: (
+            bool(row.get("cross_status") == "CONFIRMED" and row.get("cross_direction") == ("BULLISH" if row.get("side") == "BUY" else "BEARISH")),
+            _decision_priority(row), row.get("side") in hints
+        )))
     selected["side_hints"] = sorted(hints)
     selected["side_hint_used_as_gate"] = False
     selected["side_analyses"] = {
@@ -786,10 +942,12 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 return number if np.isfinite(number) else default
             except (TypeError, ValueError, OverflowError):
                 return default
-        state_bonus = {"ENTRY_READY": 3.0, "READY": 3.0, "CROSS_CONFIRMED": 2.6,
-                       "WAITING_FOR_RETEST": 2.4, "WAITING_FOR_CONFIRMATION": 1.8,
-                       "INSTITUTIONAL_ANALYSIS": 1.6, "NO_CHASE": 1.0,
-                       "SHADOW_ONLY": 0.25}.get(str(prior.get("decision_state", "")), 0.0)
+        state_bonus = {"ENTRY_READY": 3.0, "WAITING_FOR_CONFIRMATION": 1.8,
+                       "REJECTED": 0.4, "EXPIRED": 0.0}.get(str(prior.get("decision_state", "")), 0.0)
+        if str(prior.get("cross_status") or "").upper() == "CONFIRMED":
+            state_bonus += 2.0
+        location_bonus = {"EXCELLENT": 1.0, "GOOD": 0.7, "MODERATE": 0.4, "WAITING": 0.0}.get(
+            str(prior.get("location_status") or "WAITING").upper(), 0.0)
         golden = prior.get("golden_zone") if isinstance(prior.get("golden_zone"), dict) else {}
         golden_score = max(0.0, min(100.0, rank_number(golden.get("score")))) / 100.0
         ob = prior.get("order_block") if isinstance(prior.get("order_block"), dict) else {}
@@ -815,7 +973,7 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
             0.0 <= cross_age <= cross_max_age
             and bool(proximity.get("cross_fresh", True))
         )
-        # Crosses affect ordering only; structural EntryAuthority remains final.
+        # A confirmed EMA9/Session-VWAP event is now the primary lifecycle trigger.
         vwap_cross_priority = (
             0.65 if cross_fresh and cross_direction and cross_direction == expected_cross
             else -0.35 if cross_fresh and cross_direction and expected_cross and cross_direction != expected_cross
@@ -831,9 +989,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         freshness = max(0.0, 1.0 - max(0.0, time.time() - updated) / 1800.0) if updated else 0.0
         # Re-rank using actual structural confluence/proximity from the previous analysis,
         # while rotating all symbols to prevent low-ranked candidates starving forever.
-        priority = (state_bonus + 0.9 * golden_score + 0.55 * ob_near
-                    + 0.35 * liquidity_quality + 0.45 * analysis_priority
-                    + 0.30 * discovery_score + 0.20 * freshness
+        priority = (state_bonus + location_bonus + 0.9 * golden_score + 0.55 * ob_near
+                    + 0.20 * liquidity_quality + 0.20 * analysis_priority
+                    + 0.20 * discovery_score + 0.20 * freshness
                     + vwap_cross_priority)
         return (priority, state_bonus, golden_score, float(item.get("score", 0) or 0), key)
     ordered = sorted(items.items(), key=candidate_rank, reverse=True)
@@ -874,7 +1032,20 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 result["discovery_score"] = candidate.get("score", 0)
                 result["side_hints"] = list(candidate.get("sides", []))
             ready = [row for row in results if row.get("decision_state") == DecisionState.ENTRY_READY.value]
-            if len(ready) > 1:
+            confirmed_crosses = [
+                row for row in results
+                if str(row.get("cross_status") or "").upper() == "CONFIRMED"
+                and str(row.get("cross_direction") or "").upper() == ("BULLISH" if row.get("side") == "BUY" else "BEARISH")
+                and bool(row.get("event_id"))
+            ]
+            # Cross identity outranks generic side ranking even when its ADX or
+            # location result is a rejection/wait. That rejected event must still
+            # be written to the independent queue for audit and UI visibility.
+            if len(confirmed_crosses) == 1:
+                best = dict(confirmed_crosses[0])
+                best["side_hint_used_as_gate"] = False
+                best["side_selection_reason"] = "confirmed_cross_event_is_authoritative_even_when_not_ready"
+            elif len(ready) > 1:
                 best = dict(max(ready, key=lambda row: (float(row.get("score", 0) or 0), float((row.get("golden_zone") or {}).get("score", 0) or 0))))
                 best.update({"decision_state": DecisionState.REJECTED.value, "entry_status": DecisionState.REJECTED.value,
                              "decision_reason": "conflicting_opposing_setups_require_resolution",
@@ -901,9 +1072,67 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         best["analysis_priority_score"] = round(_decision_priority(best)[0] * 10
             + float(best.get("score", 0) or 0) * 0.25
             + float((best.get("golden_zone") or {}).get("score", 0) or 0) * 0.15, 2)
-        out[key] = merge_cross_fields(previous, best)
+        out[key] = {**previous, **best}
+        # Cross Event is an independent lifecycle object; a later neutral scan
+        # must not overwrite or erase the event merely because the symbol row changed.
+        event_id = str(best.get("event_id") or "")
+        if best.get("cross_status") == "CONFIRMED" and event_id and best.get("side") in {"BUY", "SELL"}:
+            event_queue = memory.setdefault("cross_event_watchlist", {})
+            prior_event = event_queue.get(event_id, {}) if isinstance(event_queue.get(event_id), dict) else {}
+            event_queue[event_id] = {
+                **prior_event, **best,
+                "event_id": event_id, "cross_event_id": event_id,
+                "first_seen": prior_event.get("first_seen", time.time()),
+                "event_lifecycle_state": prior_event.get("event_lifecycle_state", "DISCOVERED"),
+            }
     now = time.time()
-    protected = {"ENTRY_READY", "READY", "WAITING_FOR_RETEST", "WAITING_FOR_CONFIRMATION", "NO_CHASE"}
+    now_ms = int(now * 1000)
+    event_queue = memory.setdefault("cross_event_watchlist", {})
+    if isinstance(event_queue, dict):
+        for event_id, event in list(event_queue.items()):
+            if not isinstance(event, dict):
+                event_queue.pop(event_id, None)
+                continue
+            if str(event.get("event_lifecycle_state") or "").upper() == "CONSUMED":
+                continue
+            try:
+                cross_ts = int(event.get("cross_candle_timestamp") or 0)
+                timeframe_ms = int(float(event.get("indicator_snapshot", {}).get("timeframe_seconds", TIMEFRAME_SECONDS)) * 1000)
+                stale = cross_ts <= 0 or now_ms - cross_ts > max(1, timeframe_ms * 2)
+            except (TypeError, ValueError, AttributeError):
+                stale = True
+            if stale:
+                event["decision_state"] = "EXPIRED"
+                event["entry_status"] = "EXPIRED"
+                event["event_lifecycle_state"] = "EXPIRED"
+                event["decision_reason"] = "cross_event_expired_after_two_closed_candles"
+        # The durable trade journal is the long-term idempotency authority. Keep
+        # the in-memory event queue bounded: retain active events, but age out
+        # terminal Demo/Live lifecycle records after one day and cap leftovers.
+        terminal = []
+        for event_id, event in event_queue.items():
+            if not isinstance(event, dict):
+                terminal.append((0.0, event_id))
+                continue
+            lifecycle = str(event.get("event_lifecycle_state") or "").upper()
+            if lifecycle in {"CONSUMED", "EXPIRED", "REJECTED"}:
+                seen_at = float(event.get("last_update", event.get("first_seen", 0.0)) or 0.0)
+                terminal.append((seen_at, event_id))
+        retention_cutoff = now - 86_400.0
+        for seen_at, event_id in terminal:
+            if seen_at <= 0 or seen_at < retention_cutoff:
+                event_queue.pop(event_id, None)
+        if len(event_queue) > 2000:
+            terminal = sorted(
+                ((float(event.get("last_update", event.get("first_seen", 0.0)) or 0.0), event_id)
+                 for event_id, event in event_queue.items()
+                 if isinstance(event, dict)
+                 and str(event.get("event_lifecycle_state") or "").upper() in {"CONSUMED", "EXPIRED", "REJECTED"}),
+                key=lambda item: item[0],
+            )
+            for _, event_id in terminal[:max(0, len(event_queue) - 2000)]:
+                event_queue.pop(event_id, None)
+    protected = {"ENTRY_READY", "WAITING_FOR_RETEST", "WAITING_FOR_CONFIRMATION", "NO_CHASE"}
     for key, value in list(out.items()):
         age = now - float(value.get("last_update", value.get("last_updated", now)) or now)
         if age > 1800 and value.get("decision_state") not in protected:
