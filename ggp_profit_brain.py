@@ -630,7 +630,7 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
         groups.add("SUPPORT_RESISTANCE")
         reasons.append("confirmed_rejection_at_opposing_sr")
 
-    hard_exit = structural or trade_state in hard_states or failure_score >= 70
+    hard_exit = structural or trade_state in hard_states or momentum_collapse_confirmed or failure_score >= 70
     group_count = len(groups)
     if hard_exit:
         action = "HARD_EXIT"
