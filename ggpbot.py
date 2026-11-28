@@ -2723,6 +2723,8 @@ class TradeManagementBoard:
                 "side": side, "price": current, "roe_pct": roe,
                 "initial_qty": initial, "remaining_qty": remaining,
                 "profit_mode": profit_mode,
+                "thesis_failure_confirm_count": int(safe_float(ctx.get("thesis_failure_confirm_count"), 0)),
+                "thesis_failure_confirmed": bool(ctx.get("thesis_failure_confirmed", False)),
                 "entry_mode": str(ctx.get("entry_mode") or "UNCLASSIFIED"),
                 "entry_behavior": str(ctx.get("entry_behavior") or "WAIT_FOR_STRUCTURE"),
                 "entry_mode_confidence": safe_float(ctx.get("entry_mode_confidence"), 0.0),
@@ -4442,6 +4444,19 @@ class LiveTradeManager:
                 "thesis_failure_last_candle_ts": _thesis_confirmation["last_candle_ts"],
                 "thesis_failure_confirmed": bool(_thesis_confirmation["confirmed"]),
             })
+            if _thesis_confirmation["advanced"]:
+                record_trade_management_event(
+                    "THESIS_FAILURE_CONFIRMATION",
+                    "CONFIRMED" if _thesis_confirmation["confirmed"] else (
+                        "PENDING" if failure_score >= 50.0 else "CLEARED"
+                    ),
+                    dedupe_key=f"thesis_confirmation:{symbol}:{closed_candle_ts}",
+                    dedupe_seconds=0, symbol=symbol, side=side,
+                    failure_score=failure_score,
+                    confirmation_count=_thesis_confirmation["count"],
+                    candle_ts=closed_candle_ts,
+                    reasons=list(failure_reasons),
+                )
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis warning for {symbol}: {failure_reasons}", "WARN")
                 # Board will decide based on failure_score
