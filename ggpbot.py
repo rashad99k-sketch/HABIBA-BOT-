@@ -86,6 +86,7 @@ from ggp_market_intelligence import (
     classify_zone_event, advance_failed_breakout_confirmation,
     is_confirmed_failed_breakout_evidence, build_scalp_target,
     build_support_resistance_zones, classify_dynamic_trade_classification,
+    select_opposing_liquidity_pool,
 )
 from ggp_institutional_bridge import build_liquidity_pools
 from roro_confluence import classify_liquidity as _classify_live_liquidity
