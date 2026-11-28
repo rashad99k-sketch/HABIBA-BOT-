@@ -521,6 +521,8 @@ def test_live_board_keeps_hard_exits_and_one_shot_scalp_policy():
     assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" not in board
     assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" not in board
     assert "thesis_failure_waiting_for_second_closed_candle_confirmation" in board
+    assert "profit_warning_only_wait_for_1_5_atr_clearance" in board
+    assert "PROFIT_DANGER_TIGHTEN_WITH_1_5_ATR_ROOM" in board
 
 
 def test_trade_state_machine_uses_distinct_closed_candle_collapse_confirmation():
