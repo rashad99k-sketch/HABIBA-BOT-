@@ -36,6 +36,13 @@ The repository is the Python GGP / HABIBA trading bot. It contains both the inde
 - Every simulated order and position is tagged `DEMO_SIMULATION_ONLY` / `SIM-*`.
 - Demo code must not import CCXT or invoke live execution/protection functions.
 
+## Section: Surgical Runtime Error Fix
+- Import `select_opposing_liquidity_pool` explicitly from `ggp_market_intelligence` in `ggpbot.py`, where the live manager calls it; reuse the existing pure selector and preserve its no-pool/unknown statuses.
+- Do not silently hide selector failures or fabricate a pool level; keep target planning fail-safe when no opposing liquidity pool is available.
+- Quiet/low-strength EMA spread is not by itself a momentum collapse. `momentum_decay` now requires prior directional spread >= 0.20% and current spread <= max(0.05%, 35% of prior spread).
+- `MOMENTUM_COLLAPSE` is a hard exit only when the momentum engine explicitly confirms the prior-impulse contraction. Structural invalidation, PANIC_EXIT, and LIQUIDITY_EXHAUSTION remain immediate hard exits.
+- Pass `momentum_collapse_confirmed` into the profit-risk context; add tests for the selector import contract, quiet markets, confirmed collapse, and preserved emergency exits.
+- Never edit LIVE credentials or trading-mode secrets while repairing this runtime error.
 ## Section: Validation Requirements
 - Test strict closed-candle cross detection and rejection of an exact-touch-without-cross.
 - Test unique Cross Event identity, persistence, neutral-scan survival and retention of rejected ADX events.
