@@ -4500,6 +4500,7 @@ class LiveTradeManager:
             "exhaustion_risk": safe_float(momentum.get("exhaustion_risk"), 0.0),
             "climax_risk": safe_float(momentum.get("climax_risk"), 0.0),
             "momentum_decay": bool(momentum.get("momentum_decay", False)),
+            "momentum_collapse_confirmed": bool(momentum.get("momentum_collapse_confirmed", False)),
             "flow_bias": str(momentum.get("flow_bias") or "UNKNOWN"),
             "counter_pressure": safe_float(STATE.get("counter_pressure"), 0.0),
             "reclaim_risk": safe_float(STATE.get("reclaim_risk"), 0.0),
