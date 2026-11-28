@@ -502,3 +502,19 @@ def test_trade_state_machine_uses_distinct_closed_candle_collapse_confirmation()
     assert "def reset(self):" in machine
     assert 'return self.current_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION")' in machine
     assert 'new_state = "RANGE_CHOP" if self.current_state == "MOMENTUM_COLLAPSE" else self.current_state' in machine
+
+
+def test_range_status_log_reports_the_same_effective_targets_as_board():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    logger_start = source.index("    def _log_live_status(self):")
+    logger_end = source.index("    def _apply_price_only_management", logger_start)
+    logger = source[logger_start:logger_end]
+    assert "effective_tp1, effective_tp2 = tp1, tp2" in logger
+    assert "adaptive_target if adaptive_target > 0" in logger
+    assert "entry + (range_target - entry) * 0.5" in logger
+    assert 'phase = (' in logger and '"RANGE_WAIT_TP1"' in logger
+    assert "TP1={effective_tp1:.8f}" in logger
+    assert "TP2={effective_tp2:.8f}" in logger
+    assert "TargetSource={target_source}" in logger
+    assert 'TP1={tp1:.8f}' not in logger
