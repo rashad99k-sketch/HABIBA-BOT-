@@ -468,7 +468,9 @@ class TradeStateMachine:
         elif adx < 22 or regime in ("CHOPPY", "COMPRESSION"):
             new_state = "RANGE_CHOP"
         else:
-            new_state = self.current_state
+            # Do not let a previously confirmed collapse remain latched after
+            # its evidence clears on a later completed candle.
+            new_state = "RANGE_CHOP" if self.current_state == "MOMENTUM_COLLAPSE" else self.current_state
 
         if new_state != self.current_state:
             previous_state = self.current_state
