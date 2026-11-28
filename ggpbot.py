@@ -2873,13 +2873,17 @@ class TradeManagementBoard:
         if range_mode:
             scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
             scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
+            adaptive_range_target = safe_float(ctx.get("range_target_price"), 0.0)
+            # Preserve the range planner's nearer-of-pool/price-cap decision.
+            # The entry-anchored pool target is only the fallback when no
+            # adaptive range target was resolved.
             range_target = (
-                scalp_target if scalp_target_status == "VALID" and scalp_target > 0
-                else safe_float(ctx.get("range_target_price"), 0.0)
+                adaptive_range_target if adaptive_range_target > 0
+                else (scalp_target if scalp_target_status == "VALID" and scalp_target > 0 else 0.0)
             )
-            target_source = ("opposing_liquidity_scalp_target"
-                             if scalp_target_status == "VALID" and scalp_target > 0
-                             else "adaptive_range_fallback")
+            target_source = ("adaptive_range_target"
+                             if adaptive_range_target > 0
+                             else "opposing_liquidity_scalp_fallback")
             tp1_price = safe_float(ctx.get("scalp_target_tp1_price"), 0.0)
             valid_range_target = (
                 (side == "BUY" and range_target > entry)
