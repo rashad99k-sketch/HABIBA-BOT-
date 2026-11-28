@@ -209,19 +209,20 @@ def test_range_target_does_not_select_one_percent_without_full_evidence():
     assert target == 0.50
 
 
-def test_scalp_board_uses_two_stage_50_50_partial_tp1_and_runner_tp2():
+def test_scalp_board_uses_one_shot_full_close_and_trend_keeps_two_stages():
     from pathlib import Path
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
     board_start = source.index("class TradeManagementBoard:")
     board_end = source.index("# ========== REAL EXCHANGE ORDERS", board_start)
     board = source[board_start:board_end]
     assert 'range_mode = profit_mode == "RANGE_SCALP"' in board
-    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" in board
-    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" in board
-    assert "target_remaining = initial * 0.5" in board
-    assert "range_scalp_waiting_for_two_stage_targets" in board
-    assert "range_scalp_waiting_for_single_target" not in board
+    assert "RANGE_SCALP_SINGLE_SHOT_FULL_CLOSE" in board
+    assert "range_scalp_waiting_for_single_target" in board
+    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" not in board
+    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" not in board
     assert "adaptive_range_target if adaptive_range_target > 0" in board
+    assert "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY" in board
+    assert "TP2_FINAL_50_PERCENT_RUNNER_TARGET" in board
 
 
 
@@ -250,16 +251,31 @@ def test_only_recent_directional_vwap_cross_blocks_range_scalp():
 
 
 
-def test_exit_risk_closes_profitable_trade_only_on_multi_engine_confluence():
+def test_exit_risk_locks_profitable_trade_on_multi_engine_warning_until_thesis_confirmed():
     from ggp_profit_brain import evaluate_exit_risk
-    result = evaluate_exit_risk({
+    context = {
         "side": "BUY", "roe": 4.2, "di_plus": 12, "di_minus": 28,
         "momentum": {"flow_bias": "SELL", "momentum_decay": True, "exhaustion_risk": 72},
         "smart_money": {"distribution_risk": 68},
         "continuation_probability": 0.32,
-    })
-    assert result["action"] == "CLOSE_PROFIT"
+    }
+    result = evaluate_exit_risk(context)
+    assert result["action"] == "LOCK_PROFIT"
     assert result["group_count"] >= 2
+    confirmed = evaluate_exit_risk({**context, "thesis_failure_score": 75, "thesis_failure_confirmed": True})
+    assert confirmed["action"] == "HARD_EXIT"
+
+
+def test_hbar_style_sweep_and_rejection_does_not_close_entire_profitable_position():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 1.135,
+        "liquidity": {"event": "SWEEP", "direction": "BULLISH"},
+        "opposing_zone_rejection": True,
+        "opposing_zone_distance_atr": 0.20,
+    })
+    assert result["action"] == "HOLD"
+    assert result["group_count"] == 1
 
 
 def test_exit_risk_does_not_close_profitable_trade_on_one_warning():
@@ -288,6 +304,21 @@ def test_institutional_flow_and_di_opposition_tighten_profitable_trade():
     assert result["action"] == "LOCK_PROFIT"
     assert "DIRECTIONAL_FLOW" in result["groups"]
     assert "INSTITUTIONAL_FLOW" in result["groups"]
+
+
+def test_liquidity_sweep_and_same_level_rejection_are_correlated_not_two_groups():
+    from ggp_profit_brain import evaluate_exit_risk
+    result = evaluate_exit_risk({
+        "side": "SELL", "roe": 1.1,
+        "liquidity": {"event": "SWEEP", "direction": "BULLISH"},
+        "opposing_zone_rejection": True,
+        "opposing_zone_distance_atr": 0.20,
+    })
+    assert result["action"] == "HOLD"
+    assert result["group_count"] == 1
+    assert result["groups"] == ("PRICE_REJECTION",)
+    assert "opposing_liquidity_sweep" in result["reasons"]
+    assert "confirmed_rejection_at_opposing_sr" in result["reasons"]
 
 
 def test_opposing_sr_rejection_adds_independent_risk_evidence():
@@ -477,7 +508,7 @@ def test_confirmed_high_thesis_score_remains_hard_exit():
     assert "confirmed_thesis_failure_score_70_plus" in result["reasons"]
 
 
-def test_live_board_has_no_unconfirmed_momentum_collapse_bypass_and_range_is_two_stage():
+def test_live_board_keeps_hard_exits_and_one_shot_scalp_policy():
     from pathlib import Path
     source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
     assert 'if trade_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION"):' in source
@@ -485,10 +516,13 @@ def test_live_board_has_no_unconfirmed_momentum_collapse_bypass_and_range_is_two
     board_start = source.index("class TradeManagementBoard:")
     board_end = source.index("# ========== REAL EXCHANGE ORDERS", board_start)
     board = source[board_start:board_end]
-    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" in board
-    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" in board
-    assert "range_scalp_waiting_for_two_stage_targets" in board
-    assert "loss_exit_waiting_for_second_closed_candle_confirmation" in board
+    assert "RANGE_SCALP_SINGLE_SHOT_FULL_CLOSE" in board
+    assert "range_scalp_waiting_for_single_target" in board
+    assert "RANGE_SCALP_TP1_FIXED_50_PERCENT" not in board
+    assert "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" not in board
+    assert "thesis_failure_waiting_for_second_closed_candle_confirmation" in board
+    assert "profit_warning_only_wait_for_1_5_atr_clearance" in board
+    assert "PROFIT_DANGER_TIGHTEN_WITH_1_5_ATR_ROOM" in board
 
 
 def test_trade_state_machine_uses_distinct_closed_candle_collapse_confirmation():

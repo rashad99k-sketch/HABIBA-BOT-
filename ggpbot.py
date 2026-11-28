@@ -71,6 +71,7 @@ from ggp_position_sizing import (
     extract_leverage_value,
     is_strong_candidate,
     validate_trade_geometry,
+    validate_stop_risk_budget,
 )
 from bingx_execution import (TradeExecutionService, BingXPositionModeAdapter,
                               ExecutionState, PositionMode, build_position_order_params,
@@ -912,15 +913,8 @@ except (TypeError, ValueError):
 if LEVERAGE != 20:
     print(f"[CONFIG] Requested LEVERAGE={LEVERAGE} rejected; GGP policy is fixed at 20x")
     LEVERAGE = 20  # Fixed policy: all LIVE entries require verified 20x on BingX.
-try:
-    MAX_TRADE_RISK_PCT = float(os.getenv("MAX_TRADE_RISK_PCT", "10.0"))
-except (TypeError, ValueError):
-    MAX_TRADE_RISK_PCT = 10.0
-if not math.isfinite(MAX_TRADE_RISK_PCT) or not (0.1 <= MAX_TRADE_RISK_PCT <= 25.0):
-    print("[CONFIG] Invalid legacy MAX_TRADE_RISK_PCT; compatibility default retained")
-    MAX_TRADE_RISK_PCT = 10.0
-# Compatibility-only setting. The exact account-balance allocation policy is
-# authoritative; this legacy stop-risk percentage must never reduce quantity.
+MAX_TRADE_RISK_PCT = 10.0  # fixed, owner-approved account loss budget
+# Additional adverse-execution allowance included in the stop-loss risk estimate.
 try:
     STOP_EXECUTION_BUFFER_PCT = float(os.getenv("STOP_EXECUTION_BUFFER_PCT", "0.05"))
 except (TypeError, ValueError):
@@ -2807,17 +2801,29 @@ class TradeManagementBoard:
                 )
             if exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
                 fee_buffer = max(entry * 0.0010, atr * 0.10)
-                candidate_stop = (
-                    max(entry + fee_buffer, current - 0.50 * atr)
-                    if side == "BUY" else
-                    min(entry - fee_buffer, current + 0.50 * atr)
-                )
-                if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+                # Do not ratchet a warning stop into ordinary candle noise. Wait
+                # until the open profit has at least 1.5 ATR of clearance, then
+                # preserve BE+ while leaving a 1.5 ATR pullback corridor.
+                lock_clearance = max(atr * 1.50, entry * 0.0020)
+                favourable_distance = current - entry if side == "BUY" else entry - current
+                if favourable_distance >= lock_clearance + fee_buffer:
+                    candidate_stop = (
+                        max(entry + fee_buffer, current - lock_clearance)
+                        if side == "BUY" else
+                        min(entry - fee_buffer, current + lock_clearance)
+                    )
+                    if (side == "BUY" and candidate_stop < current) or (side == "SELL" and candidate_stop > current):
+                        return decision(
+                            TradeDecisionType.LOCK_PROFITS,
+                            "PROFIT_DANGER_TIGHTEN_WITH_1_5_ATR_ROOM:" + ",".join(exit_risk.get("reasons", ())),
+                            new_sl=candidate_stop, risk_score=exit_risk.get("score"),
+                            risk_groups=exit_risk.get("groups"),
+                        )
+                else:
                     return decision(
-                        TradeDecisionType.LOCK_PROFITS,
-                        "PROFIT_DANGER_TIGHTEN:" + ",".join(exit_risk.get("reasons", ())),
-                        new_sl=candidate_stop, risk_score=exit_risk.get("score"),
-                        risk_groups=exit_risk.get("groups"),
+                        TradeDecisionType.HOLD,
+                        "profit_warning_only_wait_for_1_5_atr_clearance",
+                        risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
                     )
 
             # A failed breakout is supporting thesis evidence, not an independent
@@ -2836,13 +2842,13 @@ class TradeManagementBoard:
                 side, roe, thesis_score, thesis_reasons,
                 structural_invalidation=bool(ctx.get("structural_invalidation")))
             if thesis_action == "EXIT":
-                # Losing positions need persistent evidence across two distinct
-                # completed candles unless structural invalidation is explicit.
-                if (roe <= 0.0 and not ctx.get("structural_invalidation")
+                # A non-structural thesis failure must persist across two distinct
+                # completed candles even when the position is currently profitable.
+                if (not ctx.get("structural_invalidation")
                         and not ctx.get("thesis_failure_confirmed")):
                     return decision(
                         TradeDecisionType.HOLD,
-                        "loss_exit_waiting_for_second_closed_candle_confirmation",
+                        "thesis_failure_waiting_for_second_closed_candle_confirmation",
                         failure_score=thesis_score,
                         confirmation_count=int(safe_float(ctx.get("thesis_failure_confirm_count"), 0)),
                     )
@@ -2864,9 +2870,8 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP and TREND/STANDARD share one verified 50/50 lifecycle.
-        # Range mode derives TP1 halfway to its latched opposing-liquidity target;
-        # TP2 is the final pool target. No range position is closed in one shot.
+        # RANGE_SCALP is a one-shot full-position exit. TREND/STANDARD retain
+        # the verified 50/50 TP1 -> TP2 lifecycle.
         range_mode = profit_mode == "RANGE_SCALP"
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
@@ -2899,16 +2904,29 @@ class TradeManagementBoard:
                     target_price=range_target, target_source=target_source,
                     target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
                 )
-            if not valid_range_tp1:
-                tp1_price = entry + (range_target - entry) * 0.5
-            tp2_price = range_target
+            # A scalp has exactly one objective: close the verified remaining
+            # quantity in full at its selected 0.25/0.50/1.00% price target.
+            if target_reached(side, current, range_target):
+                return decision(
+                    TradeDecisionType.FULL_CLOSE,
+                    "RANGE_SCALP_SINGLE_SHOT_FULL_CLOSE",
+                    close_reason="RANGE_SCALP_TP",
+                    target_price=range_target,
+                    target_source=target_source,
+                )
+            return decision(
+                TradeDecisionType.HOLD,
+                "range_scalp_waiting_for_single_target",
+                target_price=range_target,
+                target_source=target_source,
+                target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+            )
         else:
             tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
             tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
 
-        # Canonical TP1: reduce the original filled quantity to exactly 50%.
-        # This compensates for any previously confirmed partial fill and never
-        # changes the policy to 30%/60% based on a score.
+        # Canonical trend/standard TP1: reduce original filled quantity to exactly 50%.
+        # RANGE_SCALP has already returned through the one-shot branch above.
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
         if not tp1_hit and remaining > 0 and initial > 0:
@@ -2921,23 +2939,21 @@ class TradeManagementBoard:
                 ratio = min(1.0, qty_to_close / remaining)
                 return decision(
                     TradeDecisionType.PARTIAL_CLOSE,
-                    "RANGE_SCALP_TP1_FIXED_50_PERCENT" if range_mode else "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
+                    "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
                     ratio=ratio, target_remaining_qty=target_remaining,
                     close_reason="TP1", target_price=tp1_price,
-                    tp2_target_price=tp2_price if range_mode else None,
                 )
 
-        # TP2 is the final 50% runner exit. If it is objectively remote while
-        # continuation/structure has failed, close the remaining runner strictly.
+        # TP2 is the final 50% trend/standard runner exit.
         if tp1_hit and not tp2_hit and remaining > 0:
-            if not range_mode and ctx.get("tp2_decision") == "CLOSE":
+            if ctx.get("tp2_decision") == "CLOSE":
                 return decision(TradeDecisionType.FULL_CLOSE,
                                 str(ctx.get("tp2_decision_reason") or "tp2_remote_and_continuation_weak"),
                                 close_reason="TP2_ADAPTIVE_STRICT_EXIT")
             if tp2_price > 0 and target_reached(side, current, tp2_price):
                 return decision(
                     TradeDecisionType.FULL_CLOSE,
-                    "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" if range_mode else "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+                    "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
                     close_reason="TP2", target_price=tp2_price,
                 )
 
@@ -7051,6 +7067,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 )
         effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)
         estimated_stop_loss = qty * contract_size * effective_stop_distance
+        estimated_stop_risk_pct = validate_stop_risk_budget(
+            estimated_loss_usdt=estimated_stop_loss,
+            available_balance=balance,
+            max_risk_pct=MAX_TRADE_RISK_PCT,
+        )
         target_margin_cap = balance * sizing.allocation_pct
         if margin > target_margin_cap * 1.000001:
             raise ValueError("rounded quantity exceeds configured margin allocation cap")
@@ -7091,7 +7112,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             f"  Binding Constraint: {sizing.binding_constraint}\n"
             f"  Minimum Notional: {min_notional:.4f}\n"
             f"  Contract Size: {contract_size:g}\n"
-            f"  Stop-Loss Estimate (informational only): {estimated_stop_loss:.4f} USDT\n"
+            f"  Stop-Loss Estimate: {estimated_stop_loss:.4f} USDT ({estimated_stop_risk_pct:.2f}% of account)\n"
+            f"  Max Account Risk Gate: {MAX_TRADE_RISK_PCT:.2f}% | PASS\n"
             f"  Native SL Check: pending exchange verification\n"
             f"  Final Status: PASS",
             "INFO"

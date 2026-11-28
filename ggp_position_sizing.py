@@ -84,6 +84,32 @@ def validate_trade_geometry(*, side: str, entry_price: float, stop_price: float,
     if direction == "SELL" and not (tp2 < tp1 < entry < stop):
         raise ValueError("SELL geometry requires TP2 < TP1 < Entry < SL")
 
+def validate_stop_risk_budget(*, estimated_loss_usdt: Any, available_balance: Any,
+                              max_risk_pct: Any = 10.0) -> float:
+    """Return account-risk percentage or reject a stop loss above the hard budget.
+
+    Call this with the estimated loss calculated from the final exchange-rounded
+    quantity, not the pre-precision order size.
+    """
+    try:
+        loss = float(estimated_loss_usdt)
+        balance = _finite_positive(available_balance, "available_balance")
+        risk_limit = float(max_risk_pct)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("stop-risk inputs must be numeric") from exc
+    if not isfinite(loss) or loss < 0:
+        raise ValueError("estimated_loss_usdt must be finite and >= 0")
+    if not isfinite(risk_limit) or not (0.0 < risk_limit <= 100.0):
+        raise ValueError("max_risk_pct must be finite and between 0 and 100")
+    risk_pct = (loss / balance) * 100.0
+    if risk_pct > risk_limit + 1e-9:
+        raise ValueError(
+            f"STRUCTURAL_STOP_RISK_EXCEEDS_BUDGET: estimated_loss={loss:.4f}USDT "
+            f"account_risk={risk_pct:.2f}% limit={risk_limit:.2f}%"
+        )
+    return risk_pct
+
+
 def effective_sizing_classification(requested: str, *, strong_tier_authorized: bool) -> str:
     """Prevent caller labels/manual routes from receiving the 40% tier by themselves."""
     label = str(requested or "TREND").strip().upper()
