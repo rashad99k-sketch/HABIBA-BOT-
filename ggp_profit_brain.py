@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+import os
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
@@ -29,6 +30,85 @@ def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
     except (TypeError, ValueError, OverflowError):
         return default
 
+
+# Ordinary early exits must be confirmed on completed candles. Exchange-side
+# stops, verified structural invalidation, confirmed thesis failure, critical
+# market risk and exchange/position safety emergencies bypass this gate.
+EXIT_GATE_DEFAULT_CLOSED_CANDLES = 2
+EXIT_GATE_MIN_CLOSED_CANDLES = 1
+EXIT_GATE_MAX_CLOSED_CANDLES = 6
+
+
+def exit_gate_enabled() -> bool:
+    """Allow an operator to disable the *ordinary* exit gate without code edits."""
+    return str(os.getenv("PROFIT_BRAIN_EXIT_GATE_ENABLED", "true")).strip().lower() not in {
+        "0", "false", "no", "off"
+    }
+
+
+def exit_gate_min_closed_candles() -> int:
+    """Minimum distinct closed candles after entry before an ordinary exit."""
+    raw = _number(os.getenv("PROFIT_BRAIN_MIN_EXIT_CLOSED_CANDLES"), EXIT_GATE_DEFAULT_CLOSED_CANDLES)
+    minimum = int(raw if raw is not None else EXIT_GATE_DEFAULT_CLOSED_CANDLES)
+    return max(EXIT_GATE_MIN_CLOSED_CANDLES, min(EXIT_GATE_MAX_CLOSED_CANDLES, minimum))
+
+
+def urgent_exit_reasons(context: Dict[str, Any]) -> Tuple[str, ...]:
+    """Independently verified reasons that must never wait for a holding window."""
+    ctx = context if isinstance(context, dict) else {}
+    reason_set = []
+    if bool(ctx.get("emergency_exit") or ctx.get("emergency_verified")):
+        reason_set.append("verified_emergency")
+    if bool(ctx.get("structural_invalidation") or ctx.get("structure_broken")
+            or ctx.get("structural_invalidation_verified")):
+        reason_set.append("verified_structural_invalidation")
+    if bool(ctx.get("critical_market_risk_verified") or ctx.get("exchange_safety_exit")):
+        reason_set.append("verified_critical_risk")
+    action, detail = thesis_failure_action(
+        ctx.get("side"), ctx.get("roe", 0.0), ctx.get("thesis_failure_score", 0.0),
+        ctx.get("thesis_failure_reasons") or (),
+        structural_invalidation=bool(ctx.get("structural_invalidation") or ctx.get("structure_broken")),
+    )
+    if action == "EXIT":
+        reason_set.append("confirmed_thesis_failure:" + str(detail))
+    return tuple(dict.fromkeys(reason_set))
+
+
+def ordinary_exit_allowed(context: Dict[str, Any],
+                          exit_risk: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, Tuple[str, ...]]:
+    """Decide whether an indicator-derived exit may act on a young position.
+
+    Returns ``(allowed, gate_reason, pending_reasons)``. This is deliberately a
+    policy helper only: it never changes the risk score and never sends orders.
+    Legacy callers that supply no closed-candle context are not deferred.
+    """
+    ctx = context if isinstance(context, dict) else {}
+    if not exit_gate_enabled():
+        return True, "ordinary_exit_gate_disabled", ()
+    urgent = urgent_exit_reasons(ctx)
+    if urgent:
+        return True, "urgent_exit_verified:" + ",".join(urgent), ()
+    gate_keys = ("entry_closed_candle_ts", "closed_candles_since_entry",
+                 "post_entry_closed_candle_timestamps", "last_closed_candle_ts")
+    if not any(key in ctx for key in gate_keys):
+        return True, "ordinary_exit_gate_context_unavailable", ()
+
+    observed = _number(ctx.get("closed_candles_since_entry"))
+    if observed is None:
+        stamps = ctx.get("post_entry_closed_candle_timestamps")
+        if isinstance(stamps, (list, tuple, set)):
+            observed = float(len({_number(item) for item in stamps if _number(item) is not None}))
+        else:
+            anchor = _number(ctx.get("entry_closed_candle_ts"))
+            latest = _number(ctx.get("last_closed_candle_ts"))
+            observed = 1.0 if (anchor is not None and latest is not None and latest > anchor) else 0.0
+    observed = max(0, int(observed or 0))
+    minimum = exit_gate_min_closed_candles()
+    risk = exit_risk if isinstance(exit_risk, dict) else evaluate_exit_risk(ctx)
+    pending = tuple(str(item) for item in (risk.get("reasons") or ()))
+    if observed < minimum:
+        return False, f"ordinary_exit_deferred_closed_candles_{observed}_{minimum}", pending
+    return True, f"ordinary_exit_confirmed_closed_candles_{observed}_{minimum}", ()
 
 
 def adaptive_trail_multiplier(base_multiplier: float, continuation_probability: float, adx: float,
