@@ -301,3 +301,21 @@ def test_adx_entry_filter_blocks_below_18_and_missing_values():
     assert entry_adx_allowed(17.99) is False
     assert entry_adx_allowed(None) is False
     assert entry_adx_allowed(float("nan")) is False
+
+
+def test_execute_entry_enforces_stop_risk_budget_without_resizing_quantity():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    gate = source.index("estimated_stop_risk_pct = (estimated_stop_loss / balance) * 100.0")
+    sizing = source.index("qty = sizing.quantity", gate - 5000)
+    assert sizing < gate
+    block = source[gate:gate + 700]
+    assert "estimated_stop_risk_pct > MAX_TRADE_RISK_PCT" in block
+    assert "entry rejected" in block
+    assert "position allocation and 20x leverage were not silently changed" in block
+
+
+def test_structural_stop_estimate_includes_execution_buffer():
+    from pathlib import Path
+    source = Path(__file__).with_name("ggpbot.py").read_text(encoding="utf-8")
+    assert "effective_stop_distance = abs(reference_price - structural_stop) + reference_price * (STOP_EXECUTION_BUFFER_PCT / 100.0)" in source
