@@ -3767,8 +3767,45 @@ class LiveTradeManager:
         tp2 = safe_float(STATE.get("tp2_price"))
         remaining = safe_float(STATE.get("remaining_qty"), safe_float(STATE.get("qty")))
         mode = str(STATE.get("profit_mode") or STANDARD_MODE)
+        effective_tp1, effective_tp2 = tp1, tp2
+        target_source = "POSITION_STATE"
         if mode == RANGE_MODE:
-            phase = f"RANGE_TARGET={safe_float(STATE.get('range_target_price')):.8f}"
+            # Print the exact targets the range board evaluates, not the generic
+            # trend TP fields which may still be present in STATE from entry.
+            scalp_status = str(STATE.get("scalp_target_status") or "UNKNOWN").upper()
+            scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
+            adaptive_target = safe_float(STATE.get("range_target_price"), 0.0)
+            range_target = (
+                adaptive_target if adaptive_target > 0
+                else (scalp_target if scalp_status == "VALID" and scalp_target > 0 else 0.0)
+            )
+            target_source = (
+                "ADAPTIVE_RANGE_TARGET" if adaptive_target > 0
+                else "OPPOSING_LIQUIDITY_FALLBACK" if range_target > 0
+                else "NO_VALID_TARGET"
+            )
+            proposed_tp1 = safe_float(STATE.get("scalp_target_tp1_price"), 0.0)
+            valid_target = (
+                (side == "BUY" and range_target > entry)
+                or (side == "SELL" and 0 < range_target < entry)
+            )
+            valid_tp1 = (
+                (side == "BUY" and entry < proposed_tp1 < range_target)
+                or (side == "SELL" and range_target < proposed_tp1 < entry)
+            )
+            if valid_target:
+                effective_tp1 = (
+                    proposed_tp1 if valid_tp1
+                    else entry + (range_target - entry) * 0.5
+                )
+                effective_tp2 = range_target
+            else:
+                effective_tp1 = 0.0
+                effective_tp2 = 0.0
+            phase = (
+                "RANGE_RUNNER_TP2" if STATE.get("tp1_hit")
+                else "RANGE_WAIT_TP1"
+            )
         elif STATE.get("tp1_hit"):
             phase = "🥈 RUNNER / TP2"
         else:
@@ -3779,8 +3816,8 @@ class LiveTradeManager:
             f"[🧠 PROFIT BRAIN] 📊 STATUS | {symbol} {side} | phase={phase} | mode={mode} | "
             f"Entry={entry:.8f} Mark={mark:.8f} ROE={roe:+.2f}% PnL={pnl_usdt:+.4f} USDT Margin={margin:.4f} | "
             f"QtyLeft={remaining:.8f} | NativeSL={native_sl} SL(local)={sl:.8f} | "
-            f"TP1={tp1:.8f} {'✅' if STATE.get('tp1_hit') else '⏳'} | TP2={tp2:.8f} {'✅' if STATE.get('tp2_hit') else '⏳'} | "
-            f"BE={bool(STATE.get('be_done'))} Trail(local)={bool(STATE.get('trail_activated'))} | "
+            f"TP1={effective_tp1:.8f} {'✅' if STATE.get('tp1_hit') else '⏳'} | TP2={effective_tp2:.8f} {'✅' if STATE.get('tp2_hit') else '⏳'} | "
+            f"TargetSource={target_source} | "
             f"ADX={safe_float(STATE.get('adx_live')):.1f} DI+={safe_float(STATE.get('di_plus_live')):.1f} "
             f"DI-={safe_float(STATE.get('di_minus_live')):.1f} Continuation={safe_float(STATE.get('continuation_probability'),0.5):.2f} | "
             f"VWAPCross={STATE.get('vwap_cross_trigger', 'UNKNOWN')} Direction={STATE.get('vwap_cross_direction', 'UNKNOWN')} | "
