@@ -2931,9 +2931,8 @@ class TradeManagementBoard:
             tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
             tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
 
-        # Canonical TP1: reduce the original filled quantity to exactly 50%.
-        # This compensates for any previously confirmed partial fill and never
-        # changes the policy to 30%/60% based on a score.
+        # Canonical trend/standard TP1: reduce original filled quantity to exactly 50%.
+        # RANGE_SCALP has already returned through the one-shot branch above.
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
         if not tp1_hit and remaining > 0 and initial > 0:
@@ -2946,23 +2945,21 @@ class TradeManagementBoard:
                 ratio = min(1.0, qty_to_close / remaining)
                 return decision(
                     TradeDecisionType.PARTIAL_CLOSE,
-                    "RANGE_SCALP_TP1_FIXED_50_PERCENT" if range_mode else "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
+                    "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
                     ratio=ratio, target_remaining_qty=target_remaining,
                     close_reason="TP1", target_price=tp1_price,
-                    tp2_target_price=tp2_price if range_mode else None,
                 )
 
-        # TP2 is the final 50% runner exit. If it is objectively remote while
-        # continuation/structure has failed, close the remaining runner strictly.
+        # TP2 is the final 50% trend/standard runner exit.
         if tp1_hit and not tp2_hit and remaining > 0:
-            if not range_mode and ctx.get("tp2_decision") == "CLOSE":
+            if ctx.get("tp2_decision") == "CLOSE":
                 return decision(TradeDecisionType.FULL_CLOSE,
                                 str(ctx.get("tp2_decision_reason") or "tp2_remote_and_continuation_weak"),
                                 close_reason="TP2_ADAPTIVE_STRICT_EXIT")
             if tp2_price > 0 and target_reached(side, current, tp2_price):
                 return decision(
                     TradeDecisionType.FULL_CLOSE,
-                    "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" if range_mode else "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+                    "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
                     close_reason="TP2", target_price=tp2_price,
                 )
 
