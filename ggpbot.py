@@ -2827,11 +2827,23 @@ class TradeManagementBoard:
                 side, roe, thesis_score, thesis_reasons,
                 structural_invalidation=bool(ctx.get("structural_invalidation")))
             if thesis_action == "EXIT":
+                # Losing positions need persistent evidence across two distinct
+                # completed candles unless structural invalidation is explicit.
+                if (roe <= 0.0 and not ctx.get("structural_invalidation")
+                        and not ctx.get("thesis_failure_confirmed")):
+                    return decision(
+                        TradeDecisionType.HOLD,
+                        "loss_exit_waiting_for_second_closed_candle_confirmation",
+                        failure_score=thesis_score,
+                        confirmation_count=int(safe_float(ctx.get("thesis_failure_confirm_count"), 0)),
+                    )
                 return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
                                 str(ctx.get("thesis_failure_reason") or thesis_reason))
             if thesis_action == "PROTECT" and not ctx.get("be_done"):
                 return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
-            if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
+            # MOMENTUM_COLLAPSE is handled only by evaluate_exit_risk after its
+            # two-closed-candle confirmation; never bypass that confirmation here.
+            if trade_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION"):
                 return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
 
         sl_price = safe_float(ctx.get("synthetic_sl"), 0.0)
@@ -2843,33 +2855,43 @@ class TradeManagementBoard:
             if (side == "BUY" and current <= trail_stop) or (side == "SELL" and current >= trail_stop):
                 return decision(TradeDecisionType.FULL_CLOSE, "profit_trailing_stop_triggered")
 
-        # RANGE_SCALP is a SINGLE-TARGET mode: no partial TP1 and no runner.
-        # On target, close the full verified remaining exposure through the
-        # existing strict FULL_CLOSE execution/reconciliation path.
-        if profit_mode == "RANGE_SCALP":
+        # RANGE_SCALP and TREND/STANDARD share one verified 50/50 lifecycle.
+        # Range mode derives TP1 halfway to its latched opposing-liquidity target;
+        # TP2 is the final pool target. No range position is closed in one shot.
+        range_mode = profit_mode == "RANGE_SCALP"
+        tp1_hit = bool(ctx.get("tp1_hit"))
+        tp2_hit = bool(ctx.get("tp2_hit"))
+        if range_mode:
             scalp_target_status = str(ctx.get("scalp_target_status") or "UNKNOWN").upper()
             scalp_target = safe_float(ctx.get("scalp_target_price"), 0.0)
             range_target = (
-                safe_float(ctx.get("range_target_price"), 0.0)
-                or (scalp_target if scalp_target_status == "VALID" else 0.0)
+                scalp_target if scalp_target_status == "VALID" and scalp_target > 0
+                else safe_float(ctx.get("range_target_price"), 0.0)
             )
-            target_source = ("adaptive_price_target"
-                             if safe_float(ctx.get("range_target_price"), 0.0) > 0
-                             else "opposing_liquidity_fallback")
-            if range_target > 0 and entry > 0 and remaining > 0:
-                if target_reached(side, current, range_target):
-                    return decision(
-                        TradeDecisionType.FULL_CLOSE,
-                        f"range_scalp_{target_source}_single_target_full_exit",
-                        close_reason="SCALP_TARGET", target_price=range_target,
-                        target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
-                        opposing_liquidity_level=safe_float(ctx.get("opposing_liquidity_level"), 0.0),
-                    )
-            return decision(
-                TradeDecisionType.HOLD, "range_scalp_waiting_for_single_target",
-                target_price=range_target, target_source=target_source,
-                target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+            target_source = ("opposing_liquidity_scalp_target"
+                             if scalp_target_status == "VALID" and scalp_target > 0
+                             else "adaptive_range_fallback")
+            tp1_price = safe_float(ctx.get("scalp_target_tp1_price"), 0.0)
+            valid_range_target = (
+                (side == "BUY" and range_target > entry)
+                or (side == "SELL" and 0 < range_target < entry)
             )
+            valid_range_tp1 = (
+                (side == "BUY" and entry < tp1_price < range_target)
+                or (side == "SELL" and range_target < tp1_price < entry)
+            )
+            if range_target <= 0 or entry <= 0 or remaining <= 0 or not valid_range_target:
+                return decision(
+                    TradeDecisionType.HOLD, "range_scalp_waiting_for_valid_two_stage_target",
+                    target_price=range_target, target_source=target_source,
+                    target_move_pct=safe_float(ctx.get("range_target_move_pct"), 0.0),
+                )
+            if not valid_range_tp1:
+                tp1_price = entry + (range_target - entry) * 0.5
+            tp2_price = range_target
+        else:
+            tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
+            tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
 
         # Canonical TP1: reduce the original filled quantity to exactly 50%.
         # This compensates for any previously confirmed partial fill and never
@@ -2877,7 +2899,6 @@ class TradeManagementBoard:
         tp1_hit = bool(ctx.get("tp1_hit"))
         tp2_hit = bool(ctx.get("tp2_hit"))
         if not tp1_hit and remaining > 0 and initial > 0:
-            tp1_price = safe_float(ctx.get("tp1_price", ctx.get("synthetic_tp1")), 0.0)
             if tp1_price > 0 and target_reached(side, current, tp1_price):
                 target_remaining = initial * 0.5
                 tolerance = max(initial * 0.002, 1e-10)
@@ -2885,21 +2906,27 @@ class TradeManagementBoard:
                 if qty_to_close <= tolerance:
                     return decision(TradeDecisionType.HOLD, "tp1_quantity_already_at_50pct_wait_for_reconciliation")
                 ratio = min(1.0, qty_to_close / remaining)
-                return decision(TradeDecisionType.PARTIAL_CLOSE, "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
-                                ratio=ratio, target_remaining_qty=target_remaining,
-                                close_reason="TP1")
+                return decision(
+                    TradeDecisionType.PARTIAL_CLOSE,
+                    "RANGE_SCALP_TP1_FIXED_50_PERCENT" if range_mode else "TP1_FIXED_50_PERCENT_OF_ORIGINAL_FILLED_QTY",
+                    ratio=ratio, target_remaining_qty=target_remaining,
+                    close_reason="TP1", target_price=tp1_price,
+                    tp2_target_price=tp2_price if range_mode else None,
+                )
 
         # TP2 is the final 50% runner exit. If it is objectively remote while
         # continuation/structure has failed, close the remaining runner strictly.
         if tp1_hit and not tp2_hit and remaining > 0:
-            tp2_price = safe_float(ctx.get("tp2_price"), 0.0)
-            if ctx.get("tp2_decision") == "CLOSE":
+            if not range_mode and ctx.get("tp2_decision") == "CLOSE":
                 return decision(TradeDecisionType.FULL_CLOSE,
                                 str(ctx.get("tp2_decision_reason") or "tp2_remote_and_continuation_weak"),
                                 close_reason="TP2_ADAPTIVE_STRICT_EXIT")
             if tp2_price > 0 and target_reached(side, current, tp2_price):
-                return decision(TradeDecisionType.FULL_CLOSE, "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
-                                close_reason="TP2")
+                return decision(
+                    TradeDecisionType.FULL_CLOSE,
+                    "RANGE_SCALP_TP2_FINAL_50_PERCENT_RUNNER" if range_mode else "TP2_FINAL_50_PERCENT_RUNNER_TARGET",
+                    close_reason="TP2", target_price=tp2_price,
+                )
 
         # BE+ and trailing apply to the verified remaining runner only.
         if tp1_hit and not ctx.get("be_done"):
@@ -2941,7 +2968,11 @@ class TradeManagementBoard:
                 return decision(TradeDecisionType.TRAIL, "ratchet_runner_trailing_stop",
                                 new_stop=new_stop, multiplier=trail_mult)
 
-        return decision(TradeDecisionType.HOLD, "no_profit_management_trigger")
+        return decision(
+            TradeDecisionType.HOLD,
+            "range_scalp_waiting_for_two_stage_targets" if range_mode else "no_profit_management_trigger",
+            target_price=tp2_price if range_mode else None,
+        )
 
 # ========== REAL EXCHANGE ORDERS (SAFE) ==========
 def _is_definitive_close_rejection(exc):
