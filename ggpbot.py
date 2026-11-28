@@ -3675,6 +3675,12 @@ class LiveTradeManager:
         # Do not inherit a previous position's reconcile throttle or cached regime.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        self.brain.reset()
+        STATE.update({
+            "thesis_failure_confirm_count": 0,
+            "thesis_failure_last_candle_ts": 0.0,
+            "thesis_failure_confirmed": False,
+        })
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -4413,10 +4419,24 @@ class LiveTradeManager:
                     f"management_mode={current_mode} candidate={candidate_mode} "
                     f"reason={candidate_reason} evidence={','.join(candidate_evidence)}", "INFO")
 
-            # Thesis failure check
+            # Require a thesis-failure signal on two distinct completed candles
+            # before using it to close a losing position. Repeated polling loops
+            # over the same candle cannot increase the confirmation count.
             failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
-            STATE["thesis_failure_score"] = failure_score
-            STATE["thesis_failure_reasons"] = list(failure_reasons)
+            _thesis_confirmation = advance_closed_candle_confirmation(
+                failure_score >= 50.0,
+                closed_candle_ts,
+                STATE.get("thesis_failure_last_candle_ts", 0.0),
+                STATE.get("thesis_failure_confirm_count", 0),
+                max_gap_seconds=max(60.0, _timeframe_seconds(INTERVAL) * 1.5),
+            )
+            STATE.update({
+                "thesis_failure_score": failure_score,
+                "thesis_failure_reasons": list(failure_reasons),
+                "thesis_failure_confirm_count": _thesis_confirmation["count"],
+                "thesis_failure_last_candle_ts": _thesis_confirmation["last_candle_ts"],
+                "thesis_failure_confirmed": bool(_thesis_confirmation["confirmed"]),
+            })
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis warning for {symbol}: {failure_reasons}", "WARN")
                 # Board will decide based on failure_score
@@ -4564,7 +4584,9 @@ class LiveTradeManager:
             "exhaustion_risk": safe_float(momentum.get("exhaustion_risk"), 0.0),
             "climax_risk": safe_float(momentum.get("climax_risk"), 0.0),
             "momentum_decay": bool(momentum.get("momentum_decay", False)),
-            "momentum_collapse_confirmed": bool(momentum.get("momentum_collapse_confirmed", False)),
+            # Collapse is hard only when the state machine confirms persistence
+            # across two distinct closed candles.
+            "momentum_collapse_confirmed": bool(trade_state == "MOMENTUM_COLLAPSE"),
             "flow_bias": str(momentum.get("flow_bias") or "UNKNOWN"),
             "counter_pressure": safe_float(STATE.get("counter_pressure"), 0.0),
             "reclaim_risk": safe_float(STATE.get("reclaim_risk"), 0.0),
@@ -4588,6 +4610,8 @@ class LiveTradeManager:
             "momentum_strength": safe_float(momentum.get("momentum_health"), 50.0),
             "volume_ratio": volume_ratio,
             "thesis_failure_score": STATE.get("thesis_failure_score", 0),
+            "thesis_failure_confirm_count": int(safe_float(STATE.get("thesis_failure_confirm_count"), 0)),
+            "thesis_failure_confirmed": bool(STATE.get("thesis_failure_confirmed", False)),
             "thesis_failure_reason": ",".join(STATE.get("thesis_failure_reasons", [])),
             "thesis_failure_reasons": list(STATE.get("thesis_failure_reasons", [])),
             "structural_invalidation": bool(STATE.get("structural_invalidation", False)),
@@ -6165,6 +6189,8 @@ STATE = {
     "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
     "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
     "structural_invalidation": False, "thesis_failure_reasons": [],
+    "thesis_failure_confirm_count": 0, "thesis_failure_last_candle_ts": 0.0,
+    "thesis_failure_confirmed": False,
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
     "zone_event_last_candle_ts": 0.0,
