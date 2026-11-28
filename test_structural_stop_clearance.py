@@ -1,3 +1,5 @@
+import pytest
+
 from roro_institutional import StructuralStopLossEngine
 
 
@@ -21,5 +23,5 @@ def test_structural_stop_uses_two_tenths_percent_floor_when_atr_is_tiny():
     sell_stop, _ = StructuralStopLossEngine.calculate(
         "SELL", "TEST", entry=100.0, extreme=100.01, atr=0.01,
     )
-    assert buy_stop == 99.79
-    assert sell_stop == 100.21
+    assert buy_stop == pytest.approx(99.79)
+    assert sell_stop == pytest.approx(100.21)
