@@ -25,3 +25,16 @@ def test_structural_stop_uses_two_tenths_percent_floor_when_atr_is_tiny():
     )
     assert buy_stop == pytest.approx(99.79)
     assert sell_stop == pytest.approx(100.21)
+
+
+def test_structural_stop_rejects_wide_invalidation_instead_of_pulling_stop_inside_zone():
+    buy_stop, buy_reason = StructuralStopLossEngine.calculate(
+        "BUY", "TEST", entry=100.0, extreme=97.8, atr=0.5,
+    )
+    sell_stop, sell_reason = StructuralStopLossEngine.calculate(
+        "SELL", "TEST", entry=100.0, extreme=102.2, atr=0.5,
+    )
+    assert buy_stop is None
+    assert sell_stop is None
+    assert "structural_stop_too_wide" in buy_reason
+    assert "structural_stop_too_wide" in sell_reason

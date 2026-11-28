@@ -11213,7 +11213,13 @@ def _run_sniper_scan_if_due():
 # ========== SCANNER CONTEXT MODE – update institutional flow without a trade ==========
 def update_institutional_flow_scanner():
     try:
+        # Dashboard-only institutional flow is intentionally paused while a
+        # position is open; it must not compete with the live trade manager.
+        if STATE.get("open") or TRADE_STATE.get("in_position"):
+            return
         df = get_ohlcv_safe(DEFAULT_SYMBOL, 100)
+        if STATE.get("open") or TRADE_STATE.get("in_position"):
+            return
         if df is None or not validate_dataframe(df, 80):
             log_execution("[SCANNER] No valid data for institutional flow update, using defaults", "WARN")
             DASHBOARD_STATE["institutional_flow"] = {
@@ -11248,7 +11254,12 @@ def update_institutional_flow_scanner():
 
 
 def _run_institutional_flow_scan_with_progress():
-    """Run dashboard flow analysis outside the foreground main loop."""
+    """Run dashboard flow analysis only while flat and outside recovery holds."""
+    if (STATE.get("open") or TRADE_STATE.get("in_position")
+            or _scanner_recovery_hard_blocked()):
+        _scanner_progress("institutional_flow", "paused_for_position_or_recovery",
+                          state="BLOCKED", reason="POSITION_OR_RECOVERY")
+        return
     _scanner_progress("institutional_flow", "cycle_enter")
     update_institutional_flow_scanner()
     _scanner_progress("institutional_flow", "cycle_complete")
@@ -11269,7 +11280,7 @@ def live_institutional_updater():
             if watchdog is not None:
                 watchdog.beat("institutional_updater", paused=bool(STATE.get("open")))
             # Do not run during open trade to avoid duplicate API calls and thread contention
-            if STATE.get("open"):
+            if STATE.get("open") or TRADE_STATE.get("in_position"):
                 time.sleep(5)
                 continue
             symbol = DEFAULT_SYMBOL
@@ -11495,12 +11506,16 @@ def main_loop_sniper():
                 time.sleep(1)
                 continue
 
-            if now - last_flow_update > 60:
+            if (now - last_flow_update > 60
+                    and not (STATE.get("open") or TRADE_STATE.get("in_position"))
+                    and not _scanner_recovery_hard_blocked()):
                 if dispatch_scanner_task("institutional_flow", _run_institutional_flow_scan_with_progress):
                     last_flow_update = now
                     _main_loop_progress("flow_scan_dispatched")
                 else:
                     _main_loop_progress("flow_scan_in_flight")
+            elif STATE.get("open") or TRADE_STATE.get("in_position"):
+                _main_loop_progress("flow_scan_paused_for_open_position")
 
             if not (TRADE_STATE["in_position"] or STATE["open"]):
                 sync_position_state()
@@ -11643,8 +11658,13 @@ def _verify_engine_recovery(symbol=None):
     never authorizes management or scanner work.
     """
     raw_symbol = symbol or STATE.get("current_symbol") or TRADE_STATE.get("symbol") or ""
-    sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
     local_open = bool(STATE.get("open") or TRADE_STATE.get("in_position"))
+    if raw_symbol:
+        sym, symbol_reason, symbol_diagnostics = resolve_position_symbol(raw_symbol)
+    else:
+        # A flat-account recovery check is intentionally symbol-agnostic.
+        # Do not feed an empty symbol into the per-position SYMBOL_GUARD.
+        sym, symbol_reason, symbol_diagnostics = "", "NO_SYMBOL_PROVIDED", {}
     expected_side = str(STATE.get("side") or TRADE_STATE.get("side") or "").upper()
     expected_qty = safe_float(STATE.get("remaining_qty") or STATE.get("exchange_qty")
                               or TRADE_STATE.get("qty"), 0.0)
@@ -11658,6 +11678,36 @@ def _verify_engine_recovery(symbol=None):
         context.update({"open_position_verified": local_open, "flat_verified": not local_open,
                         "paper_only": True})
         return True, "PAPER_MODE_RECOVERY", context
+    if not raw_symbol:
+        if local_open:
+            reason = "engine_recovery_symbol_missing_with_open_position"
+            _recovery_hold(reason, symbol="", trade_id=STATE.get("trade_id"))
+            return False, reason, context
+        try:
+            all_positions = safe_api_call(ex.fetch_positions)
+        except Exception as exc:
+            reason = f"engine_recovery_account_wide_position_query_unknown:{type(exc).__name__}"
+            return False, reason, context
+        if not isinstance(all_positions, list):
+            return False, "engine_recovery_account_wide_position_query_invalid", context
+        active_positions = []
+        for row in all_positions:
+            if not isinstance(row, dict):
+                continue
+            info = row.get("info") if isinstance(row.get("info"), dict) else {}
+            contracts = safe_float(row.get("contracts"),
+                                   safe_float(info.get("positionAmt"), 0.0))
+            if abs(contracts) > 0:
+                active_positions.append({
+                    "symbol": str(row.get("symbol") or info.get("symbol") or "UNKNOWN")[:80],
+                    "contracts": contracts,
+                })
+        if active_positions:
+            reason = "engine_recovery_unexpected_exchange_positions"
+            _recovery_hold(reason, symbol="", details={"active_positions": active_positions[:10]})
+            return False, reason, context
+        context["flat_verified"] = True
+        return True, "FLAT_VERIFIED_ACCOUNT_WIDE", context
     if not sym:
         reason = f"engine_recovery_{symbol_reason.lower()}"
         if local_open:
@@ -12801,12 +12851,15 @@ def dispatch_scanner_task(name, function, *args, **kwargs):
     started = False
     try:
         if watchdog is not None:
+            is_global_discovery = str(name) == "global_discovery"
+            task_interval = (float(GLOBAL_SCAN_INTERVAL) if is_global_discovery else 60.0)
+            task_grace = (max(180.0, task_interval * 0.25) if is_global_discovery else 180.0)
             watchdog.register(
-                watchdog_name, interval_sec=float(GLOBAL_SCAN_INTERVAL),
-                grace_sec=max(180.0, float(GLOBAL_SCAN_INTERVAL) * 0.25),
-                critical=False, restartable=True,
-                recovery_verifier=_verify_scanner_recovery,
-                restart_fn=_resume_scanner_after_flat_verification)
+                watchdog_name, interval_sec=task_interval,
+                grace_sec=task_grace,
+                critical=False, restartable=is_global_discovery,
+                recovery_verifier=_verify_scanner_recovery if is_global_discovery else None,
+                restart_fn=_resume_scanner_after_flat_verification if is_global_discovery else None)
             _scanner_progress(name, "dispatch", cycle_id=cycle_id)
         thread = threading.Thread(target=runner, daemon=True, name=f"ggp_{name}")
         _SCANNER_TASK_THREADS[name] = thread
