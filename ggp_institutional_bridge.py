@@ -22,6 +22,7 @@ from roro_confluence import (classify_liquidity, find_causal_order_block, Liquid
                              compute_session_vwap)
 from ggp_market_intelligence import (build_intelligence_decision, classify_price_pattern,
                                      build_support_resistance_zones, validate_order_block_zone)
+from ggp_cross_event_pipeline import merge_cross_fields
 
 
 REVERSAL = ReversalEngine()
@@ -136,6 +137,7 @@ def _indicator_snapshot(closed: pd.DataFrame, *, now_ms: Optional[int] = None) -
     )
     return {
         "ema9": ema_value, "vwap": vwap_value, "rsi": rsi_value,
+        "previous_ema9": previous_ema9, "previous_vwap": previous_vwap,
         "atr": float(atr_value) if np.isfinite(atr_value) else None,
         "ema9_slope_atr": slope,
         "vwap_position": ("ABOVE" if price > vwap_value else "BELOW" if price < vwap_value else "AT_VWAP") if vwap_value is not None else "UNKNOWN",
@@ -784,8 +786,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
                 return number if np.isfinite(number) else default
             except (TypeError, ValueError, OverflowError):
                 return default
-        state_bonus = {"ENTRY_READY": 3.0, "WAITING_FOR_RETEST": 2.4,
-                       "WAITING_FOR_CONFIRMATION": 1.8, "NO_CHASE": 1.0,
+        state_bonus = {"ENTRY_READY": 3.0, "READY": 3.0, "CROSS_CONFIRMED": 2.6,
+                       "WAITING_FOR_RETEST": 2.4, "WAITING_FOR_CONFIRMATION": 1.8,
+                       "INSTITUTIONAL_ANALYSIS": 1.6, "NO_CHASE": 1.0,
                        "SHADOW_ONLY": 0.25}.get(str(prior.get("decision_state", "")), 0.0)
         golden = prior.get("golden_zone") if isinstance(prior.get("golden_zone"), dict) else {}
         golden_score = max(0.0, min(100.0, rank_number(golden.get("score")))) / 100.0
@@ -898,9 +901,9 @@ def update_unified_watchlist(memory: Dict[str, Any], fetch_frame,
         best["analysis_priority_score"] = round(_decision_priority(best)[0] * 10
             + float(best.get("score", 0) or 0) * 0.25
             + float((best.get("golden_zone") or {}).get("score", 0) or 0) * 0.15, 2)
-        out[key] = {**previous, **best}
+        out[key] = merge_cross_fields(previous, best)
     now = time.time()
-    protected = {"ENTRY_READY", "WAITING_FOR_RETEST", "WAITING_FOR_CONFIRMATION", "NO_CHASE"}
+    protected = {"ENTRY_READY", "READY", "WAITING_FOR_RETEST", "WAITING_FOR_CONFIRMATION", "NO_CHASE"}
     for key, value in list(out.items()):
         age = now - float(value.get("last_update", value.get("last_updated", now)) or now)
         if age > 1800 and value.get("decision_state") not in protected:
