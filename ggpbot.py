@@ -2620,9 +2620,10 @@ class InstitutionalTradeBrain:
 from enum import Enum as PyEnum
 from ggp_profit_brain import (classify_profit_mode, range_target_price, target_reached, select_range_target_pct,
                               tp2_reassessment, thesis_failure_action, evaluate_exit_risk,
+                              ordinary_exit_allowed,
                               adaptive_trail_multiplier, ema_trend_context, adaptive_range_target_price,
                               trend_target_prices, resolve_trend_targets,
-                              RANGE_MODE, TREND_MODE, STANDARD_MODE)
+                              RANGE_MODE, TREND_MODE, STANDARD_MODE, RANGE_PROFIT_TARGETS_PCT)
 
 class TradeDecisionType(PyEnum):
     NO_ACTION = "NO_ACTION"
@@ -2733,29 +2734,47 @@ class TradeManagementBoard:
             # smart-money, momentum, DI/ADX, continuation, EMA structure, liquidity,
             # order-block/FVG and support/resistance engines.
             exit_risk = evaluate_exit_risk(ctx)
-            STATE["exit_risk_snapshot"] = dict(exit_risk)
+            # A young position must not be closed by momentum/flow chatter before
+            # completed candles confirm it. Verified emergencies, exchange stops,
+            # structural invalidation and confirmed thesis failure bypass this gate;
+            # target/SL branches below are never gated.
+            ordinary_allowed, gate_reason, gate_pending = ordinary_exit_allowed(ctx, exit_risk)
+            risk_snapshot = dict(exit_risk)
+            risk_snapshot["ordinary_exit_allowed"] = ordinary_allowed
+            risk_snapshot["exit_gate_reason"] = gate_reason
+            risk_snapshot["exit_gate_pending_reasons"] = list(gate_pending)
+            STATE["exit_risk_snapshot"] = risk_snapshot
             record_trade_management_event(
                 "PROFIT_RISK_ASSESSMENT", exit_risk.get("action", "HOLD"),
                 dedupe_key=f"profit_risk:{ctx.get('symbol')}:{ctx.get('side')}:{exit_risk.get('action')}:{exit_risk.get('score')}",
                 dedupe_seconds=10, symbol=ctx.get("symbol"), side=side,
                 risk_score=exit_risk.get("score"), risk_groups=list(exit_risk.get("groups") or []),
                 reasons=list(exit_risk.get("reasons") or ()), roe_pct=roe,
+                ordinary_exit_allowed=ordinary_allowed, exit_gate_reason=gate_reason,
             )
-            if exit_risk.get("action") == "HARD_EXIT":
+            if not ordinary_allowed:
+                record_trade_management_event(
+                    "PROFIT_EXIT_DEFERRED", "WAITING", log_level="INFO",
+                    dedupe_key=f"profit_exit_deferred:{ctx.get('symbol')}:{gate_reason}",
+                    dedupe_seconds=30, symbol=ctx.get("symbol"), side=side,
+                    exit_gate_reason=gate_reason, pending_reasons=list(gate_pending),
+                    risk_score=exit_risk.get("score"), roe_pct=roe,
+                )
+            if ordinary_allowed and exit_risk.get("action") == "HARD_EXIT":
                 return decision(
                     TradeDecisionType.THESIS_FAILURE_EXIT,
                     "PROFIT_BRAIN_HARD_RISK:" + ",".join(exit_risk.get("reasons", ())),
                     close_reason="PROFIT_DANGER_HARD_EXIT",
                     risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
                 )
-            if exit_risk.get("action") == "CLOSE_PROFIT":
+            if ordinary_allowed and exit_risk.get("action") == "CLOSE_PROFIT":
                 return decision(
                     TradeDecisionType.FULL_CLOSE,
                     "PROFIT_DANGER_LOCK:" + ",".join(exit_risk.get("reasons", ())),
                     close_reason="PROFIT_DANGER_LOCK",
                     risk_score=exit_risk.get("score"), risk_groups=exit_risk.get("groups"),
                 )
-            if exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
+            if ordinary_allowed and exit_risk.get("action") == "LOCK_PROFIT" and entry > 0 and current > 0 and atr > 0:
                 fee_buffer = max(entry * 0.0010, atr * 0.10)
                 candidate_stop = (
                     max(entry + fee_buffer, current - 0.50 * atr)
@@ -2785,12 +2804,12 @@ class TradeManagementBoard:
             thesis_action, thesis_reason = thesis_failure_action(
                 side, roe, thesis_score, thesis_reasons,
                 structural_invalidation=bool(ctx.get("structural_invalidation")))
-            if thesis_action == "EXIT":
+            if ordinary_allowed and thesis_action == "EXIT":
                 return decision(TradeDecisionType.THESIS_FAILURE_EXIT,
                                 str(ctx.get("thesis_failure_reason") or thesis_reason))
-            if thesis_action == "PROTECT" and not ctx.get("be_done"):
+            if ordinary_allowed and thesis_action == "PROTECT" and not ctx.get("be_done"):
                 return decision(TradeDecisionType.BREAKEVEN, thesis_reason)
-            if trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
+            if ordinary_allowed and trade_state in ("PANIC_EXIT", "MOMENTUM_COLLAPSE", "LIQUIDITY_EXHAUSTION"):
                 return decision(TradeDecisionType.FULL_CLOSE, f"hard_exit_state_{trade_state.lower()}")
 
         sl_price = safe_float(ctx.get("synthetic_sl"), 0.0)
@@ -3600,9 +3619,18 @@ class LiveTradeManager:
         return False
 
     def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2):
-        # Do not inherit a previous position's reconcile throttle or cached regime.
+        # Do not inherit a previous position's reconcile throttle, cached regime
+        # or hard state. A stale MOMENTUM_COLLAPSE must not close the next trade.
         self.last_position_sync_ts = 0.0
         self.last_heavy_calc_ts = 0.0
+        self.brain.state_machine.current_state = "RANGE_CHOP"
+        self.brain.state_machine.last_state_change = 0
+        self.brain.state_machine.state_confidence = 0.0
+        self.brain.state_machine.last_transition_reason = ""
+        self.brain.current_trade_state = "RANGE_CHOP"
+        self.brain.last_update = 0.0
+        STATE["last_trade_state_candle_ts"] = 0.0
+        STATE["trade_state"] = "RANGE_CHOP"
         if hasattr(self.exchange_sync, "_last_reconcile"):
             self.exchange_sync._last_reconcile = 0.0
         if PAPER_MODE:
@@ -4013,6 +4041,16 @@ class LiveTradeManager:
             STATE["adx_slope"] = adx_slope
             STATE["volume_ratio"] = volume_ratio
             STATE["last_management_closed_candle_ts"] = closed_candle_ts
+            # Count distinct completed candles observed after the entry signal,
+            # never management-loop iterations. The entry anchor is the confirmed
+            # cross candle; ordinary exit decisions wait for real confirmation.
+            _entry_anchor_ts = safe_float(STATE.get("entry_closed_candle_ts"), 0.0)
+            if closed_candle_ts and _entry_anchor_ts > 0 and closed_candle_ts > _entry_anchor_ts:
+                _post_entry_ts = [safe_float(item, 0.0) for item in
+                                  (STATE.get("post_entry_closed_candle_timestamps") or [])]
+                if closed_candle_ts not in _post_entry_ts:
+                    _post_entry_ts.append(closed_candle_ts)
+                    STATE["post_entry_closed_candle_timestamps"] = _post_entry_ts[-12:]
             STATE["di_plus_live"] = plus_di
             STATE["di_minus_live"] = minus_di
             STATE["smart_money"] = smart_money
@@ -4274,7 +4312,6 @@ class LiveTradeManager:
                         "aligned_closed_candles": _aligned_closed,
                         "adverse_rejection": bool(STATE.get("adverse_rejection", False)),
                     })
-                    _percent_target = range_target_price(side, entry, _target_pct)
                     _pool_level = safe_float(STATE.get("opposing_liquidity_level"), 0.0)
                     _scalp_target = safe_float(STATE.get("scalp_target_price"), 0.0)
                     if _pool_level > 0 and str(STATE.get("scalp_target_status") or "").upper() == "VALID" and _scalp_target > 0:
@@ -4287,13 +4324,21 @@ class LiveTradeManager:
                             target_reason = "opposing_pool_geometry_rejected_atr_fallback"
                     elif _pool_level > 0:
                         target_reason = str(STATE.get("scalp_target_selection_reason") or "no_valid_scalp_target") + "_atr_fallback"
-                    # Apply the percentage cap AFTER liquidity-pool geometry so no
-                    # later pool adjustment can turn a scalp into a distant target.
-                    if _percent_target > 0:
-                        if side == "BUY":
-                            adaptive_target = min(adaptive_target, _percent_target) if adaptive_target > 0 else _percent_target
-                        else:
-                            adaptive_target = max(adaptive_target, _percent_target) if adaptive_target > 0 else _percent_target
+                    # Apply the 0.25/0.50% PRICE-move band AFTER geometry so a
+                    # nearby pool cannot make a scalp target closer than 0.25%
+                    # or turn it into a distant trend target.
+                    _min_pct, _max_pct = RANGE_PROFIT_TARGETS_PCT
+                    _band_pct = min(max(float(_target_pct), _min_pct), _max_pct)
+                    _move_pct = (
+                        (abs(adaptive_target - entry) / entry * 100.0)
+                        if entry > 0 and adaptive_target > 0 else _band_pct
+                    )
+                    _move_pct = min(max(_move_pct, _min_pct), _band_pct)
+                    adaptive_target = (
+                        round(entry * (1.0 + _move_pct / 100.0), 12)
+                        if side == "BUY" else
+                        round(entry * (1.0 - _move_pct / 100.0), 12)
+                    )
                     STATE["range_target_price"] = adaptive_target
                     STATE["range_target_move_pct"] = (abs(adaptive_target-entry) / entry * 100.0) if entry > 0 and adaptive_target > 0 else 0.0
                     STATE["range_target_reason"] = target_reason
@@ -4556,6 +4601,13 @@ class LiveTradeManager:
             "trade_classification": str(STATE.get("trade_classification") or "UNCLASSIFIED"),
             "trade_classification_reasons": list(STATE.get("trade_classification_reasons") or []),
             "entry_time": safe_float(STATE.get("entry_time"), time.time()),
+            "entry_closed_candle_ts": safe_float(STATE.get("entry_closed_candle_ts"), 0.0),
+            "last_closed_candle_ts": safe_float(STATE.get("last_management_closed_candle_ts"), 0.0),
+            "post_entry_closed_candle_timestamps": list(STATE.get("post_entry_closed_candle_timestamps") or []),
+            "closed_candles_since_entry": len(STATE.get("post_entry_closed_candle_timestamps") or []),
+            "critical_market_risk_verified": bool(STATE.get("critical_market_risk_verified", False)),
+            "exchange_safety_exit": bool(STATE.get("exchange_safety_exit", False)),
+            "emergency_verified": bool(STATE.get("emergency_exit", False)),
             "native_sl_verified": bool(STATE.get("native_sl_verified")),
             "protection_status": "PAPER_SIMULATED" if PAPER_MODE else ("EXCHANGE_VERIFIED" if STATE.get("native_sl_verified") else "UNVERIFIED"),
             "execution_result": "UNRESOLVED" if STATE.get("execution_unresolved") else "NOT_SUBMITTED",
@@ -5974,6 +6026,15 @@ def compute_sl_tp(entry_price, side, classification, atr, df, symbol=None):
         # 2.00% / 3.00% target by accident.
         tp1 = entry_price * (1.0 + (0.50 / 100.0 if side == "BUY" else -0.50 / 100.0))
         tp2 = entry_price * (1.0 + (1.00 / 100.0 if side == "BUY" else -1.00 / 100.0))
+    elif classification == "SCALP":
+        # Planning reference levels only. The RANGE_SCALP board branch still
+        # closes the full verified remainder at one active target; it never
+        # treats these as TP1/TP2 partial exits.
+        sl = entry_price - atr * 1.2 if side == "BUY" else entry_price + atr * 1.2
+        tp1 = entry_price * (1.0 + (RANGE_PROFIT_TARGETS_PCT[0] / 100.0 if side == "BUY"
+                                    else -RANGE_PROFIT_TARGETS_PCT[0] / 100.0))
+        tp2 = entry_price * (1.0 + (RANGE_PROFIT_TARGETS_PCT[1] / 100.0 if side == "BUY"
+                                    else -RANGE_PROFIT_TARGETS_PCT[1] / 100.0))
     elif classification == "EARLY_TREND":
         ema50 = ema(df['close'], 50).iloc[-1]
         sl = ema50 - atr * 1.2 if side == "BUY" else ema50 + atr * 1.2
@@ -6089,6 +6150,8 @@ STATE = {
     "pending_close_before_qty": 0.0, "pending_close_requested_qty": 0.0,
     "pending_close_target_remaining_qty": None, "pending_close_started_at": 0.0,
     "structural_invalidation": False, "thesis_failure_reasons": [],
+    "entry_closed_candle_ts": 0.0, "post_entry_closed_candle_timestamps": [],
+    "critical_market_risk_verified": False, "exchange_safety_exit": False,
     "emergency_exit": False, "emergency_reason": None,
     "emergency_source": None, "emergency_ts": 0.0,
     "zone_event_last_candle_ts": 0.0,
@@ -6779,6 +6842,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     ).strip().upper()
     cross_event_ts_for_entry = int((_cross_event_ctx.get("candle_timestamp")
                                     if cross_authorized else 0) or 0)
+    entry_closed_anchor_ts = float(cross_event_ts_for_entry or 0.0)
+    if entry_closed_anchor_ts > 1e12:
+        entry_closed_anchor_ts /= 1000.0
+    if entry_closed_anchor_ts <= 0:
+        entry_closed_anchor_ts = safe_float(STATE.get("last_management_closed_candle_ts"), 0.0)
     entry_event_journal = globals().get("INSTITUTIONAL_TRADE_JOURNAL")
     if not entry_event_id and not PAPER_MODE and MODE_LIVE:
         log_execution(f"[ENTRY_EVENT_GUARD] BLOCKED live entry: missing signal candle identity for {symbol}", "ERROR")
@@ -7187,6 +7255,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "entry_execution_state": "PAPER_SIMULATED",
             "entry_exchange_order_id": None,
             "event_consumption_status": "PENDING_VERIFIED_EXECUTION",
+            "entry_closed_candle_ts": entry_closed_anchor_ts,
+            "post_entry_closed_candle_timestamps": [],
+            "critical_market_risk_verified": False, "exchange_safety_exit": False,
             "profit_mode": None, "profit_mode_reason": "", "profit_mode_evidence": [],
             "profit_mode_candidate": None, "profit_mode_candidate_count": 0, "profit_mode_last_candle_ts": 0.0,
             "trend_target_resolver_latched": False, "trend_target_resolver_status": "UNINITIALIZED",
@@ -7245,6 +7316,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         "cross_event_direction": cross_event_direction_for_entry,
         "cross_event_timestamp": cross_event_ts_for_entry,
         "event_consumption_status": "PENDING_VERIFIED_EXECUTION",
+        "entry_closed_candle_ts": entry_closed_anchor_ts,
+        "post_entry_closed_candle_timestamps": [],
+        "critical_market_risk_verified": False, "exchange_safety_exit": False,
     }
     if daily_loss_cooldown_active():
         log_execution(f"[ENTRY_BLOCKED] cooldown activated during validation; order not submitted for {symbol}", "WARN")
@@ -7255,9 +7329,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         actual_filled_qty = safe_float(order.get("filled"), 0.0)
         actual_entry_price = safe_float(order.get("average"), 0.0)
         if actual_filled_qty <= 0 or actual_entry_price <= 0:
-            STATE.update({"open": True, "current_symbol": symbol, "side": side,
-                          "trade_id": trade_id, "qty": qty, "recovery_hold": True,
-                          "execution_unresolved": True})
+            STATE.update({"open": False, "current_symbol": symbol, "side": side,
+                          "trade_id": trade_id, "qty": qty, "pending_exposure": True,
+                          "recovery_hold": True, "execution_unresolved": True})
             globals()["RECOVERY_BLOCK_ENTRIES"] = True
             log_execution("[RECOVERY_HOLD] Exchange acknowledged exposure but actual fill quantity/price is unavailable", "ERROR")
             return False
@@ -7328,6 +7402,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "cross_event_direction": cross_event_direction_for_entry,
             "cross_event_timestamp": cross_event_ts_for_entry,
             "event_consumption_status": "PENDING_VERIFIED_EXECUTION",
+            "entry_closed_candle_ts": entry_closed_anchor_ts,
+            "post_entry_closed_candle_timestamps": [],
+            "critical_market_risk_verified": False, "exchange_safety_exit": False,
             "position_mode": order.get("positionMode", "PAPER"),
             "position_side": order.get("positionSide"),
             "entry_client_order_id": order.get("clientOrderId"),

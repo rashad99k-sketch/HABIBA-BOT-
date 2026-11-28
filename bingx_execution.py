@@ -419,10 +419,14 @@ class TradeExecutionService:
         position_query_available = callable(getattr(self.exchange, "fetch_positions", None))
         if _status(observed_order) in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} and filled <= 0:
             state = ExecutionState.REJECTED
-        elif position_query_available and position is None:
+        elif not position_query_available:
+            # An order acknowledgement is never proof of exchange exposure.
             state = ExecutionState.EXECUTION_UNCERTAIN
-        elif filled <= 0 and position is None:
-            state = ExecutionState.REJECTED if _status(observed_order) in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"} else ExecutionState.EXECUTION_UNCERTAIN
+        elif position is None:
+            state = ExecutionState.EXECUTION_UNCERTAIN
+        elif filled <= 0:
+            # FILLED requires a read-back fill quantity, not merely an open position.
+            state = ExecutionState.EXECUTION_UNCERTAIN
         elif average is None:
             state = ExecutionState.ENTRY_PRICE_UNKNOWN
         elif remaining > 0:
