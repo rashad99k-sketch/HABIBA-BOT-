@@ -15,8 +15,9 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 # At 20x these correspond approximately to 5% and 10% ROE,
 # before fees, funding and slippage.
 RANGE_PROFIT_TARGETS_PCT = (0.25, 0.50, 1.00)
-TREND_TP1_MOVE_PCT = 2.00
-TREND_TP2_MOVE_PCT = 3.00
+TREND_TP1_MOVE_PCT = 1.00
+TREND_TP2_MOVE_PCT = 2.00
+TREND_TP2_EXTENSION_MOVE_PCT = 3.00
 RANGE_MODE = "RANGE_SCALP"
 TREND_MODE = "TREND_RIDE"
 STANDARD_MODE = "TWO_STAGE_50_50"
@@ -331,8 +332,17 @@ def resolve_trend_targets(context: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": "trend_target_insufficient_entry_data", "evidence": ()}
 
     direction = 1.0 if side == "BUY" else -1.0
-    minimum_tp1_distance = max(entry * 0.005, atr * 0.55 if atr > 0 else 0.0)
-    minimum_tp2_distance = max(entry * 0.010, atr * 1.10 if atr > 0 else 0.0)
+    continuation = _number(ctx.get("continuation_probability"), 0.0) or 0.0
+    adx = _number(ctx.get("adx"), 0.0) or 0.0
+    volume_ratio = _number(ctx.get("volume_ratio"), 0.0) or 0.0
+    aligned_candles = int(_number(ctx.get("aligned_closed_candles"), 0.0) or 0)
+    strong_extension = bool(
+        adx >= 28.0 and continuation >= 0.82 and volume_ratio >= 1.20
+        and aligned_candles >= 3
+    )
+    tp2_move_pct = TREND_TP2_EXTENSION_MOVE_PCT if strong_extension else TREND_TP2_MOVE_PCT
+    minimum_tp1_distance = max(entry * (TREND_TP1_MOVE_PCT / 100.0), atr * 0.55 if atr > 0 else 0.0)
+    minimum_tp2_distance = max(entry * (tp2_move_pct / 100.0), atr * 1.10 if atr > 0 else 0.0)
     levels = []
 
     def add_level(raw: Any, source: str, buffer_atr: float = 0.10) -> None:
@@ -377,10 +387,10 @@ def resolve_trend_targets(context: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": "nearest_directional_structure_then_continuation_space",
                 "evidence": (tp1_source, tp2_source)}
 
-    # No credible level was present. The fallback is explicit and conservative;
-    # +2% remains only a reference distance for the first trend stage.
-    tp1_distance = max(entry * 0.02, atr * 1.10 if atr > 0 else 0.0)
-    tp2_distance = max(entry * 0.03, atr * 1.80 if atr > 0 else 0.0, tp1_distance * 1.25)
+    # No credible level was present. Use 1% / 2% price-move references;
+    # reserve the 3% TP2 extension for sustained, independently confirmed strength.
+    tp1_distance = max(entry * (TREND_TP1_MOVE_PCT / 100.0), atr * 1.10 if atr > 0 else 0.0)
+    tp2_distance = max(entry * (tp2_move_pct / 100.0), atr * 1.80 if atr > 0 else 0.0, tp1_distance * 1.25)
     return {"status": "FALLBACK", "tp1": round(entry + direction * tp1_distance, 12),
             "tp2": round(entry + direction * tp2_distance, 12),
             "reason": "no_valid_directional_structure_conservative_reference_fallback",
@@ -679,16 +689,25 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
     liq_event = str(liquidity.get("event") or "").upper()
     liq_direction = str(liquidity.get("direction") or "").upper()
     expected = "BULLISH" if side == "BUY" else "BEARISH"
-    if liq_event in {"SWEEP", "GRAB"} and liq_direction not in {"", "UNKNOWN", expected}:
-        score += 2
-        groups.add("LIQUIDITY")
-        reasons.append("opposing_liquidity_sweep")
+    opposing_sweep = liq_event in {"SWEEP", "GRAB"} and liq_direction not in {"", "UNKNOWN", expected}
     sr_rejection = bool(ctx.get("opposing_zone_rejection"))
     sr_distance = _number(ctx.get("opposing_zone_distance_atr"))
-    if sr_rejection and (sr_distance is None or sr_distance <= 0.5):
+    nearby_sr_rejection = sr_rejection and (sr_distance is None or sr_distance <= 0.5)
+    if opposing_sweep and nearby_sr_rejection:
+        # Same-candle sweep + rejection around one opposing level is correlated
+        # price-action evidence, not two independent engines. Treat it as one group.
         score += 2
-        groups.add("SUPPORT_RESISTANCE")
-        reasons.append("confirmed_rejection_at_opposing_sr")
+        groups.add("PRICE_REJECTION")
+        reasons.extend(("opposing_liquidity_sweep", "confirmed_rejection_at_opposing_sr"))
+    else:
+        if opposing_sweep:
+            score += 2
+            groups.add("LIQUIDITY")
+            reasons.append("opposing_liquidity_sweep")
+        if nearby_sr_rejection:
+            score += 2
+            groups.add("SUPPORT_RESISTANCE")
+            reasons.append("confirmed_rejection_at_opposing_sr")
 
     hard_exit = (
         structural
@@ -699,7 +718,7 @@ def evaluate_exit_risk(context: Dict[str, Any]) -> Dict[str, Any]:
     group_count = len(groups)
     if hard_exit:
         action = "HARD_EXIT"
-    elif roe > 0 and score >= 4 and group_count >= 2:
+    elif roe > 0 and score >= 6 and group_count >= 3 and thesis_failure_confirmed:
         action = "CLOSE_PROFIT"
     elif roe > 0 and score >= 2 and group_count >= 2:
         action = "LOCK_PROFIT"
