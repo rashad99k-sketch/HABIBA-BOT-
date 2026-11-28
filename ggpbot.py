@@ -2641,6 +2641,11 @@ class InstitutionalTradeBrain:
         self.last_update = time.time()
         return self.current_trade_state
 
+    def reset(self):
+        self.state_machine.reset()
+        self.current_trade_state = "RANGE_CHOP"
+        self.last_update = 0.0
+
     def get_trail_multiplier(self) -> float:
         return self.state_machine.get_trail_multiplier()
 
