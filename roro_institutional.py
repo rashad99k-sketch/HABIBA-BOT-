@@ -100,9 +100,9 @@ class StructuralStopLossEngine:
         side = str(side).upper()
         if side not in {"BUY", "SELL"} or not all(math.isfinite(float(v)) for v in (entry, extreme, atr)) or atr <= 0:
             return None, "invalid_stop_inputs"
-        # A small volatility-aware buffer protects the invalidation point without
-        # widening the stop to rescue an invalid trade.
-        buffer = max(atr * 0.10, abs(entry) * 0.0002)
+        # Give the confirmed swing/zone room for ordinary 15m noise. This is a
+        # structural clearance, not permission to increase account risk.
+        buffer = max(atr * 0.50, abs(entry) * 0.0020)
         stop = float(extreme) - buffer if side == "BUY" else float(extreme) + buffer
         if tick_size and tick_size > 0:
             stop = math.floor(stop / tick_size) * tick_size if side == "BUY" else math.ceil(stop / tick_size) * tick_size
