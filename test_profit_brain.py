@@ -500,3 +500,4 @@ def test_trade_state_machine_uses_distinct_closed_candle_collapse_confirmation()
     assert "momentum_collapse_confirmed" in machine
     assert "def reset(self):" in machine
     assert 'return self.current_state in ("PANIC_EXIT", "LIQUIDITY_EXHAUSTION")' in machine
+    assert 'new_state = "RANGE_CHOP" if self.current_state == "MOMENTUM_COLLAPSE" else self.current_state' in machine
