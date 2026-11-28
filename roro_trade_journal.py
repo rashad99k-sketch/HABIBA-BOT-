@@ -349,6 +349,15 @@ class TradeJournal:
             row = db.execute("SELECT 1 FROM consumed_events WHERE event_id=?", (str(event_id),)).fetchone()
             return row is not None
 
+    def get_event_trade_id(self, event_id: str) -> Optional[str]:
+        """Return the trade that owns a durable signal, if already consumed."""
+        if not event_id:
+            return None
+        with self._db() as db:
+            row = db.execute("SELECT trade_id FROM consumed_events WHERE event_id=?",
+                             (str(event_id),)).fetchone()
+        return str(row[0]) if row and row[0] else None
+
     def consume_event(self, event_id: str, trade_id: str) -> bool:
         """Persist one-time event consumption across process restarts."""
         if not event_id or not trade_id:
