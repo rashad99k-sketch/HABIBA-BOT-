@@ -12526,13 +12526,19 @@ def _scanner_progress(name, phase, **extra):
     watchdog = globals().get("NAISO_WATCHDOG")
     if watchdog is None:
         return
+    # Call sites may report lifecycle transitions (e.g. BLOCKED) through
+    # extra. Extract it before building diagnostics so beat() receives state
+    # exactly once rather than raising "multiple values for keyword argument".
+    lifecycle_state = str(extra.pop("state", "RUNNING")).upper()
+    if lifecycle_state not in {"RUNNING", "IDLE", "BLOCKED", "FAILED"}:
+        lifecycle_state = "RUNNING"
     details = {
         "phase": phase,
         "cycle_id": _SCANNER_TASK_CYCLES.get(name, 0),
         "thread_name": f"ggp_{name}",
     }
     details.update(extra)
-    watchdog.beat(f"scanner:{name}", state="RUNNING", **details)
+    watchdog.beat(f"scanner:{name}", state=lifecycle_state, **details)
 
 
 def _scanner_cycle_active(name):

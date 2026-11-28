@@ -187,3 +187,29 @@ def test_effective_watchlist_cleanup_uses_copy_snapshot():
     )
     source = ast.get_source_segment(SOURCE, fn)
     assert "wl.copy().items()" in source
+
+
+def test_scanner_progress_passes_lifecycle_state_once_to_watchdog():
+    fn = _function("_scanner_progress")
+    isolated = ast.Module(body=[fn], type_ignores=[])
+    calls = []
+
+    class Watchdog:
+        def beat(self, name, **diagnostics):
+            calls.append((name, diagnostics))
+
+    namespace = {
+        "NAISO_WATCHDOG": Watchdog(),
+        "_SCANNER_TASK_CYCLES": {"global_discovery": 7},
+    }
+    exec(compile(isolated, str(ROOT / "ggpbot.py"), "exec"), namespace)
+    progress = namespace["_scanner_progress"]
+
+    progress("global_discovery", "cycle_enter")
+    progress("global_discovery", "blocked_open_position", state="BLOCKED", reason="OPEN_POSITION")
+
+    assert calls[0][0] == "scanner:global_discovery"
+    assert calls[0][1]["state"] == "RUNNING"
+    assert calls[0][1]["cycle_id"] == 7
+    assert calls[1][1]["state"] == "BLOCKED"
+    assert calls[1][1]["reason"] == "OPEN_POSITION"
